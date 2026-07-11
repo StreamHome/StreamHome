@@ -38,6 +38,7 @@ ENV/
 server/database.db
 server/database.db-shm
 server/database.db-wal
+server/backup/
 server/temp/
 temp/
 
