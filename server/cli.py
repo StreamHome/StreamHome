@@ -12,7 +12,6 @@ if sys.platform == "win32":
 import secrets
 import asyncio
 import bcrypt
-import msvcrt
 import shutil
 import pyotp
 import httpx
@@ -40,22 +39,65 @@ console = Console()
 
 # ─────────────────────────── Input Utilities ───────────────────────────
 
+if sys.platform == "win32":
+    import msvcrt
+    
+    def getch() -> str:
+        return msvcrt.getwch()
+        
+    def kbhit() -> bool:
+        return msvcrt.kbhit()
+else:
+    import termios
+    import tty
+    import select
+    
+    def getch() -> str:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+        
+    def kbhit() -> bool:
+        dr, dw, de = select.select([sys.stdin], [], [], 0)
+        return len(dr) > 0
+
 def clear_screen():
     os.system("cls" if os.name == "nt" else "clear")
 
 def get_key():
-    """Read a single keypress with arrow key support (Windows)."""
-    ch = msvcrt.getwch()
-    if ch in ("\xe0", "\x00"):
-        ch2 = msvcrt.getwch()
-        return {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT"}.get(ch2)
-    if ch == "\r":
-        return "ENTER"
-    if ch == "\x1b":
-        return "ESC"
-    if ch == "\x03":
-        raise KeyboardInterrupt
-    return ch
+    """Read a single keypress with arrow key support (Cross-platform)."""
+    if sys.platform == "win32":
+        ch = getch()
+        if ch in ("\xe0", "\x00"):
+            ch2 = getch()
+            return {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT"}.get(ch2)
+        if ch == "\r":
+            return "ENTER"
+        if ch == "\x1b":
+            return "ESC"
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        return ch
+    else:
+        ch = getch()
+        if ch == "\x1b":
+            if kbhit():
+                ch2 = getch()
+                if ch2 == "[":
+                    if kbhit():
+                        ch3 = getch()
+                        return {"A": "UP", "B": "DOWN", "D": "LEFT", "C": "RIGHT"}.get(ch3)
+            return "ESC"
+        if ch in ("\r", "\n"):
+            return "ENTER"
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        return ch
 
 def get_text_input(prompt_text: str, default_val: str = "", is_masked: bool = False) -> str:
     """
@@ -69,7 +111,7 @@ def get_text_input(prompt_text: str, default_val: str = "", is_masked: bool = Fa
     chars = []
     
     while True:
-        ch = msvcrt.getwch()
+        ch = getch()
         
         if ch in ("\r", "\n"):  # Enter committed
             sys.stdout.write("\n")
@@ -77,7 +119,13 @@ def get_text_input(prompt_text: str, default_val: str = "", is_masked: bool = Fa
             result = "".join(chars).strip()
             return result if result else default_val
             
-        elif ch == "\x1b":  # INSTANT ESCAPE ABORT DETECTED
+        elif ch == "\x1b":  # ESC or Arrow key
+            if sys.platform != "win32" and kbhit():
+                ch2 = getch()
+                if ch2 == "[":
+                    if kbhit():
+                        getch()  # Consume the arrow key suffix
+                continue  # Ignore arrow key
             sys.stdout.write("\n")
             sys.stdout.flush()
             return "ESC"
@@ -91,16 +139,17 @@ def get_text_input(prompt_text: str, default_val: str = "", is_masked: bool = Fa
         elif ch == "\x03":  # Ctrl+C abort
             raise KeyboardInterrupt
             
-        elif ch in ("\xe0", "\x00"):  # Skip prefix byte for arrows/special function keys
-            msvcrt.getwch()
+        elif sys.platform == "win32" and ch in ("\xe0", "\x00"):  # Skip prefix byte for arrows/special function keys on Windows
+            getch()
             
         else:  # Append standard characters
-            chars.append(ch)
-            if is_masked:
-                sys.stdout.write("*")
-            else:
-                sys.stdout.write(ch)
-            sys.stdout.flush()
+            if ord(ch) >= 32:
+                chars.append(ch)
+                if is_masked:
+                    sys.stdout.write("*")
+                else:
+                    sys.stdout.write(ch)
+                sys.stdout.flush()
 
 def prompt_input(label: str, default: str = "", is_masked: bool = False) -> str:
     """Styled interface prompt with safe fallback to prevent Rich parsing syntax breaks."""
@@ -638,7 +687,7 @@ async def monitor_downloads():
     console.print("   [dim]Press ESC or Enter to return to Main Menu...[/dim]", end="")
     
     while True:
-        if msvcrt.kbhit():
+        if kbhit():
             k = get_key()
             if k in ("ENTER", "ESC"):
                 break
@@ -818,9 +867,9 @@ async def run_setup_wizard():
         import time
         print_centered("[bold bright_red]Are you sure? Press ESC again to abort setup, or any other key to continue...[/bold bright_red]")
         time.sleep(0.3)
-        while msvcrt.kbhit():
+        while kbhit():
             try:
-                msvcrt.getwch()
+                getch()
             except Exception:
                 pass
         key = get_key()
@@ -871,6 +920,7 @@ async def run_setup_wizard():
         "email": "",
         "password": "",
         "2fa_enabled": None,  # True/False
+        "totp_secret": None,
         "tmdb_token": "",
         "storage_mode": "",
         "rclone_path": "",
@@ -982,15 +1032,21 @@ async def run_setup_wizard():
     def get_inline_input(is_masked=False):
         val = ""
         while True:
-            ch = msvcrt.getwch()
+            ch = getch()
             if ch in ("\r", "\n"):
                 break
-            elif ch == "\x1b": # ESC
+            elif ch == "\x1b": # ESC or Arrow key on Unix
+                if sys.platform != "win32" and kbhit():
+                    ch2 = getch()
+                    if ch2 == "[":
+                        if kbhit():
+                            getch()
+                    continue
                 val = "ESC"
                 break
-            elif ch in ("\xe0", "\x00"): # Arrow/Special keys header
+            elif sys.platform == "win32" and ch in ("\xe0", "\x00"): # Arrow/Special keys header on Windows
                 try:
-                    msvcrt.getwch() # Consume second character
+                    getch() # Consume second character
                 except Exception:
                     pass
                 continue
@@ -1001,12 +1057,13 @@ async def run_setup_wizard():
                     sys.stdout.flush()
             else:
                 try:
-                    val += ch
-                    if is_masked:
-                        sys.stdout.write("*")
-                    else:
-                        sys.stdout.write(ch)
-                    sys.stdout.flush()
+                    if ord(ch) >= 32:
+                        val += ch
+                        if is_masked:
+                            sys.stdout.write("*")
+                        else:
+                            sys.stdout.write(ch)
+                        sys.stdout.flush()
                 except Exception:
                     pass
         
@@ -1015,76 +1072,180 @@ async def run_setup_wizard():
             sys.stdout.flush()
         return val
 
-    # Execute step 1: Admin account
-    # Email Address
-    while True:
-        draw_wizard_state(1, "email")
-        email = get_inline_input()
-        if email == "ESC":
-            return
-        if not email or "@" not in email:
-            print_centered("[bold bright_red]Please enter a valid email address.[/bold bright_red]")
-            await asyncio.sleep(1.5)
-            continue
-        state["email"] = email
-        break
+    # Step transition state machine
+    step = 0
+    while step < 9:
+        if step == 0:
+            draw_wizard_state(1, "email")
+            email = get_inline_input()
+            if email == "ESC":
+                if confirm_abort():
+                    console.print("\n   [bold bright_red][✗][/bold bright_red] [white]Setup aborted.[/white]\n")
+                    return
+                continue
+            if not email or "@" not in email:
+                print_centered("[bold bright_red]Please enter a valid email address.[/bold bright_red]")
+                await asyncio.sleep(1.5)
+                continue
+            state["email"] = email
+            step = 1
 
-    # Password
-    while True:
-        draw_wizard_state(1, "password")
-        password = get_inline_input(is_masked=True)
-        if password == "ESC":
-            return
-        if len(password) < 6:
-            print_centered("[bold bright_red]Password must be at least 6 characters long.[/bold bright_red]")
-            await asyncio.sleep(1.5)
-            continue
-        state["password"] = password
-        break
+        elif step == 1:
+            draw_wizard_state(1, "password")
+            password = get_inline_input(is_masked=True)
+            if password == "ESC":
+                step = 0
+                continue
+            if len(password) < 6:
+                print_centered("[bold bright_red]Password must be at least 6 characters long.[/bold bright_red]")
+                await asyncio.sleep(1.5)
+                continue
+            state["password"] = password
+            step = 2
 
-    # Enable 2FA
-    while True:
-        draw_wizard_state(1, "2fa")
-        confirm_2fa = get_inline_input()
-        if confirm_2fa == "ESC":
-            return
-        if not confirm_2fa:
-            confirm_2fa = "N"
-        if confirm_2fa.lower() in ["y", "yes", "n", "no"]:
-            state["2fa_enabled"] = confirm_2fa.lower() in ["y", "yes"]
-            break
+        elif step == 2:
+            draw_wizard_state(1, "2fa")
+            confirm_2fa = get_inline_input()
+            if confirm_2fa == "ESC":
+                step = 1
+                continue
+            if not confirm_2fa:
+                confirm_2fa = "N"
+            if confirm_2fa.lower() in ["y", "yes", "n", "no"]:
+                state["2fa_enabled"] = confirm_2fa.lower() in ["y", "yes"]
+                if state["2fa_enabled"]:
+                    step = 3
+                else:
+                    step = 4
+            else:
+                print_centered("[bold bright_red]Please enter Y or N.[/bold bright_red]")
+                await asyncio.sleep(1.5)
 
-    # 2FA setup if enabled
-    secret = None
-    if state["2fa_enabled"]:
-        secret = pyotp.random_base32()
-        totp = pyotp.TOTP(secret)
-        prov_uri = totp.provisioning_uri(name=state["email"], issuer_name="StreamHome")
-        
-        # Show secret details first
-        clear_screen()
-        print_centered_block(LITTLEBANNER)
-        console.print()
-        print_centered("[bold white]🛡️   TWO-FACTOR AUTHENTICATION SETUP[/bold white]")
-        print_centered("─" * 68)
-        console.print()
-        print_centered(f"TOTP Secret Key: [bold white]{secret}[/bold white]")
-        print_centered(f"Provisioning URI: [dim]{prov_uri}[/dim]")
-        print_centered("Add this secret key to your authenticator app (Google Authenticator, Authy, etc.).")
-        console.print()
-        
-        while True:
+        elif step == 3:
+            secret = pyotp.random_base32()
+            totp = pyotp.TOTP(secret)
+            prov_uri = totp.provisioning_uri(name=state["email"], issuer_name="StreamHome")
+            
+            clear_screen()
+            print_centered_block(LITTLEBANNER)
+            console.print()
+            print_centered("[bold white]🛡️   TWO-FACTOR AUTHENTICATION SETUP[/bold white]")
+            print_centered("─" * 68)
+            console.print()
+            print_centered(f"TOTP Secret Key: [bold white]{secret}[/bold white]")
+            print_centered(f"Provisioning URI: [dim]{prov_uri}[/dim]")
+            print_centered("Add this secret key to your authenticator app (Google Authenticator, Authy, etc.).")
+            console.print()
+            
             draw_wizard_state(1, "2fa_code")
             code = get_inline_input()
             if code == "ESC":
                 state["2fa_enabled"] = False
-                break
+                step = 2
+                continue
             if totp.verify(code):
                 print_centered("[bold green]2FA successfully validated and enabled![/bold green]")
+                state["totp_secret"] = secret
                 await asyncio.sleep(1.5)
-                break
+                step = 4
             else:
-                print_centered("[bold bright_red]Invalid verification code. Try again or press ESC to skip.[/bold bright_red]")
+                print_centered("[bold bright_red]Invalid verification code. Try again.[/bold bright_red]")
+                await asyncio.sleep(1.5)
+
+        elif step == 4:
+            draw_wizard_state(2, "tmdb_token")
+            token = get_inline_input()
+            if token == "ESC":
+                if state["2fa_enabled"]:
+                    step = 3
+                else:
+                    step = 2
+                continue
+            if not token:
+                state["tmdb_token"] = ""
+                step = 5
+                continue
+                
+            print_centered("Validating TMDB Read Access Token with Movie ID 290250...")
+            try:
+                headers = {"Authorization": f"Bearer {token}"}
+                response = httpx.get("https://api.themoviedb.org/3/movie/290250", headers=headers, timeout=10.0)
+                if response.status_code == 200:
+                    data = response.json()
+                    movie_title = data.get("title", "Unknown")
+                    print_centered(f"[bold green]Token is valid! Verified movie: '{movie_title}'[/bold green]")
+                    state["tmdb_token"] = token
+                    await asyncio.sleep(1.5)
+                    step = 5
+                else:
+                    print_centered(f"[bold bright_red]Validation failed. TMDB API returned status: {response.status_code}[/bold bright_red]")
+                    await asyncio.sleep(1.5)
+            except Exception as e:
+                print_centered(f"[bold bright_red]Connection error validating TMDB token: {e}[/bold bright_red]")
+                await asyncio.sleep(1.5)
+
+        elif step == 5:
+            draw_wizard_state(3, "storage_mode")
+            mode = get_inline_input()
+            if mode == "ESC":
+                step = 4
+                continue
+            if not mode:
+                mode = "LOCAL"
+            if mode.upper() in ["LOCAL", "CLOUD"]:
+                state["storage_mode"] = mode.upper()
+                if mode.upper() == "CLOUD":
+                    step = 6
+                else:
+                    step = 7
+            else:
+                print_centered("[bold bright_red]Invalid mode. Please type LOCAL or CLOUD.[/bold bright_red]")
+                await asyncio.sleep(1.5)
+
+        elif step == 6:
+            draw_wizard_state(3, "rclone_path")
+            path = get_inline_input()
+            if path == "ESC":
+                step = 5
+                continue
+            if path.strip():
+                state["rclone_path"] = path.strip()
+                step = 7
+            else:
+                print_centered("[bold bright_red]Rclone Remote Path cannot be empty.[/bold bright_red]")
+                await asyncio.sleep(1.5)
+
+        elif step == 7:
+            draw_wizard_state(3, "backup_enabled")
+            confirm_backup = get_inline_input()
+            if confirm_backup == "ESC":
+                if state["storage_mode"] == "CLOUD":
+                    step = 6
+                else:
+                    step = 5
+                continue
+            if not confirm_backup:
+                confirm_backup = "N"
+            if confirm_backup.lower() in ["y", "yes", "n", "no"]:
+                state["backup_enabled"] = confirm_backup.lower() in ["y", "yes"]
+                step = 8
+            else:
+                print_centered("[bold bright_red]Please enter Y or N.[/bold bright_red]")
+                await asyncio.sleep(1.5)
+
+        elif step == 8:
+            draw_wizard_state(3, "auto_update_enabled")
+            confirm_update = get_inline_input()
+            if confirm_update == "ESC":
+                step = 7
+                continue
+            if not confirm_update:
+                confirm_update = "N"
+            if confirm_update.lower() in ["y", "yes", "n", "no"]:
+                state["auto_update_enabled"] = confirm_update.lower() in ["y", "yes"]
+                step = 9
+            else:
+                print_centered("[bold bright_red]Please enter Y or N.[/bold bright_red]")
                 await asyncio.sleep(1.5)
 
     # Save to database
@@ -1097,125 +1258,30 @@ async def run_setup_wizard():
         if existing_user:
             existing_user.password_hash = hashed
             existing_user.two_factor_enabled = state["2fa_enabled"]
-            existing_user.totp_secret = secret if state["2fa_enabled"] else None
+            existing_user.totp_secret = state["totp_secret"] if state["2fa_enabled"] else None
             session.add(existing_user)
         else:
             new_user = User(
                 email=state["email"],
                 password_hash=hashed,
                 two_factor_enabled=state["2fa_enabled"],
-                totp_secret=secret if state["2fa_enabled"] else None
+                totp_secret=state["totp_secret"] if state["2fa_enabled"] else None
             )
             session.add(new_user)
         await session.commit()
 
-    # Step 2: TMDB access
-    while True:
-        draw_wizard_state(2, "tmdb_token")
-        token = get_inline_input()
-        if token == "ESC":
-            break
-        if not token:
-            # Skip TMDB
-            break
-            
-        print_centered("Validating TMDB Read Access Token with Movie ID 290250...")
-        try:
-            headers = {"Authorization": f"Bearer {token}"}
-            response = httpx.get("https://api.themoviedb.org/3/movie/290250", headers=headers, timeout=10.0)
-            if response.status_code == 200:
-                data = response.json()
-                movie_title = data.get("title", "Unknown")
-                print_centered(f"[bold green]Token is valid! Verified movie: '{movie_title}'[/bold green]")
-                update_env_file("TMDB_READ_ACCESS_TOKEN", token)
-                settings.TMDB_READ_ACCESS_TOKEN = token
-                state["tmdb_token"] = token
-                await asyncio.sleep(1.5)
-                break
-            else:
-                print_centered(f"[bold bright_red]Validation failed. TMDB API returned status: {response.status_code}[/bold bright_red]")
-                await asyncio.sleep(1.5)
-        except Exception as e:
-            print_centered(f"[bold bright_red]Connection error validating TMDB token: {e}[/bold bright_red]")
-            await asyncio.sleep(1.5)
-            
-        print_centered("Press Enter to retry, or ESC to skip TMDB setup...")
-        k = get_key()
-        if k == "ESC":
-            break
-
-    # Step 3: Storage
-    # Storage Engine
-    while True:
-        draw_wizard_state(3, "storage_mode")
-        mode = get_inline_input()
-        if mode == "ESC":
-            break
-        if not mode:
-            mode = "LOCAL"
-        if mode.upper() in ["LOCAL", "CLOUD"]:
-            state["storage_mode"] = mode.upper()
-            update_env_file("STORAGE_ENGINE", mode.upper())
-            settings.STORAGE_ENGINE = mode.upper()
-            break
-        else:
-            print_centered("[bold bright_red]Invalid mode. Please type LOCAL or CLOUD.[/bold bright_red]")
-            await asyncio.sleep(1.5)
-
-    # Rclone Remote Path
+    if state["tmdb_token"]:
+        update_env_file("TMDB_READ_ACCESS_TOKEN", state["tmdb_token"])
+        settings.TMDB_READ_ACCESS_TOKEN = state["tmdb_token"]
+    update_env_file("STORAGE_ENGINE", state["storage_mode"])
+    settings.STORAGE_ENGINE = state["storage_mode"]
     if state["storage_mode"] == "CLOUD":
-        while True:
-            draw_wizard_state(3, "rclone_path")
-            path = get_inline_input()
-            if path == "ESC":
-                break
-            if path.strip():
-                state["rclone_path"] = path.strip()
-                update_env_file("RCLONE_REMOTE_PATH", path.strip())
-                settings.RCLONE_REMOTE_PATH = path.strip()
-                break
-            else:
-                print_centered("[bold bright_red]Rclone Remote Path cannot be empty.[/bold bright_red]")
-                await asyncio.sleep(1.5)
-    else:
-        # Default to LOCAL if not explicitly set to CLOUD
-        state["storage_mode"] = "LOCAL"
-        update_env_file("STORAGE_ENGINE", "LOCAL")
-        settings.STORAGE_ENGINE = "LOCAL"
-    
-    # Enable backups
-    while True:
-        draw_wizard_state(3, "backup_enabled")
-        confirm_backup = get_inline_input()
-        if confirm_backup == "ESC":
-            if confirm_abort():
-                return
-            continue
-        if not confirm_backup:
-            confirm_backup = "N"
-        if confirm_backup.lower() in ["y", "yes", "n", "no"]:
-            is_enabled = confirm_backup.lower() in ["y", "yes"]
-            state["backup_enabled"] = is_enabled
-            update_env_file("BACKUP_ENABLED", str(is_enabled))
-            settings.BACKUP_ENABLED = is_enabled
-            break
-
-    # Enable automatic updates
-    while True:
-        draw_wizard_state(3, "auto_update_enabled")
-        confirm_update = get_inline_input()
-        if confirm_update == "ESC":
-            if confirm_abort():
-                return
-            continue
-        if not confirm_update:
-            confirm_update = "N"
-        if confirm_update.lower() in ["y", "yes", "n", "no"]:
-            is_enabled = confirm_update.lower() in ["y", "yes"]
-            state["auto_update_enabled"] = is_enabled
-            update_env_file("AUTO_UPDATE_ENABLED", str(is_enabled))
-            settings.AUTO_UPDATE_ENABLED = is_enabled
-            break
+        update_env_file("RCLONE_REMOTE_PATH", state["rclone_path"])
+        settings.RCLONE_REMOTE_PATH = state["rclone_path"]
+    update_env_file("BACKUP_ENABLED", str(state["backup_enabled"]))
+    settings.BACKUP_ENABLED = state["backup_enabled"]
+    update_env_file("AUTO_UPDATE_ENABLED", str(state["auto_update_enabled"]))
+    settings.AUTO_UPDATE_ENABLED = state["auto_update_enabled"]
 
     settings.save_to_json()
 

@@ -13,14 +13,26 @@ if not exist "bin" mkdir bin
 python --version >nul 2>&1
 if "%errorlevel%"=="0" goto :python_installed
 
-echo Python is not installed. Installing Python 3.11...
-echo Downloading installer...
-powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.11.8/python-3.11.8-amd64.exe' -OutFile 'python_installer.exe'"
-echo Installing Python silently...
-start /wait python_installer.exe /quiet InstallAllUsers=1 PrependPath=1
-del python_installer.exe
-echo Python installation finished.
-set "PATH=C:\Program Files\Python311\;C:\Program Files\Python311\Scripts\;%PATH%"
+echo Python is not installed. Attempting to install...
+winget --version >nul 2>&1
+if "%errorlevel%"=="0" (
+    echo Installing Python 3.11 via winget...
+    winget install --id Python.Python.3.11 --exact --source winget --accept-package-agreements --accept-source-agreements
+    if "!errorlevel!"=="0" (
+        echo Python installed successfully. Please restart your command prompt and run setup.bat again.
+        pause
+        exit /b 0
+    )
+)
+
+echo.
+echo [ERROR] Python is not installed or not in your PATH.
+echo Please download and install Python 3.11 manually from:
+echo https://www.python.org/downloads/
+echo Make sure to check "Add Python to PATH" during installation.
+echo.
+pause
+exit /b 1
 
 :python_installed
 echo Python is ready.
@@ -29,14 +41,25 @@ echo Python is ready.
 node --version >nul 2>&1
 if "%errorlevel%"=="0" goto :node_installed
 
-echo Node.js is not installed. Installing Node.js 20...
-echo Downloading installer...
-powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://nodejs.org/dist/v20.11.1/node-v20.11.1-x64.msi' -OutFile 'node_installer.msi'"
-echo Installing Node.js silently...
-start /wait msiexec /i node_installer.msi /qn /norestart
-del node_installer.msi
-echo Node.js installation finished.
-set "PATH=C:\Program Files\nodejs\;%PATH%"
+echo Node.js is not installed. Attempting to install...
+winget --version >nul 2>&1
+if "%errorlevel%"=="0" (
+    echo Installing Node.js via winget...
+    winget install --id OpenJS.NodeJS --source winget --accept-package-agreements --accept-source-agreements
+    if "!errorlevel!"=="0" (
+        echo Node.js installed successfully. Please restart your command prompt and run setup.bat again.
+        pause
+        exit /b 0
+    )
+)
+
+echo.
+echo [ERROR] Node.js is not installed or not in your PATH.
+echo Please download and install Node.js manually from:
+echo https://nodejs.org/
+echo.
+pause
+exit /b 1
 
 :node_installed
 echo Node.js is ready.
@@ -63,18 +86,29 @@ if exist "bin\ffmpeg.exe" (
 
 echo FFmpeg binaries are missing. Downloading FFmpeg Essentials...
 if not exist "server\temp" mkdir server\temp
-powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile 'server\temp\ffmpeg.zip'"
+curl.exe -L -o server\temp\ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+if not "%errorlevel%"=="0" (
+    echo [ERROR] Failed to download FFmpeg via curl.
+    pause
+    exit /b 1
+)
+
 echo Extracting FFmpeg...
-powershell -Command "Expand-Archive -Path 'server\temp\ffmpeg.zip' -DestinationPath 'server\temp\ffmpeg_temp' -Force"
+tar.exe -xf server\temp\ffmpeg.zip -C server\temp
+if not "%errorlevel%"=="0" (
+    echo [ERROR] Failed to extract FFmpeg via tar.
+    pause
+    exit /b 1
+)
 
 :: Move binaries to bin/
-for /r server\temp\ffmpeg_temp %%f in (ffmpeg.exe ffprobe.exe) do (
+for /r server\temp %%f in (ffmpeg.exe ffprobe.exe) do (
     if exist "%%f" copy /y "%%f" bin\ >nul
 )
 
 :: Clean up
-rmdir /s /q server\temp\ffmpeg_temp
-del server\temp\ffmpeg.zip
+for /d %%d in (server\temp\ffmpeg-*) do rmdir /s /q "%%d" >nul 2>&1
+del /q server\temp\ffmpeg.zip >nul 2>&1
 echo FFmpeg installation finished.
 
 :ffmpeg_ready
@@ -95,18 +129,29 @@ if exist "bin\rclone.exe" (
 
 echo Rclone binary is missing. Downloading Rclone...
 if not exist "server\temp" mkdir server\temp
-powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://downloads.rclone.org/rclone-current-windows-amd64.zip' -OutFile 'server\temp\rclone.zip'"
+curl.exe -L -o server\temp\rclone.zip https://downloads.rclone.org/rclone-current-windows-amd64.zip
+if not "%errorlevel%"=="0" (
+    echo [ERROR] Failed to download Rclone via curl.
+    pause
+    exit /b 1
+)
+
 echo Extracting Rclone...
-powershell -Command "Expand-Archive -Path 'server\temp\rclone.zip' -DestinationPath 'server\temp\rclone_temp' -Force"
+tar.exe -xf server\temp\rclone.zip -C server\temp
+if not "%errorlevel%"=="0" (
+    echo [ERROR] Failed to extract Rclone via tar.
+    pause
+    exit /b 1
+)
 
 :: Move rclone.exe to bin/
-for /r server\temp\rclone_temp %%f in (rclone.exe) do (
+for /r server\temp %%f in (rclone.exe) do (
     if exist "%%f" copy /y "%%f" bin\ >nul
 )
 
 :: Clean up
-rmdir /s /q server\temp\rclone_temp
-del server\temp\rclone.zip
+for /d %%d in (server\temp\rclone-*) do rmdir /s /q "%%d" >nul 2>&1
+del /q server\temp\rclone.zip >nul 2>&1
 echo Rclone installation finished.
 
 :rclone_ready
