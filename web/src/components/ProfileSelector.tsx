@@ -107,9 +107,12 @@ export default function ProfileSelector({ profiles, setProfiles, onSelectProfile
     };
 
     try {
+      const token = localStorage.getItem("stream_access_token");
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
       const response = await fetch(`${apiBaseUrl}/profiles`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: headers,
         body: JSON.stringify(newProfile),
       });
       if (response.ok) {
@@ -150,9 +153,12 @@ export default function ProfileSelector({ profiles, setProfiles, onSelectProfile
     };
 
     try {
+      const token = localStorage.getItem("stream_access_token");
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
       const response = await fetch(`${apiBaseUrl}/profiles`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: headers,
         body: JSON.stringify(updatedProfile),
       });
       if (response.ok) {
@@ -179,8 +185,12 @@ export default function ProfileSelector({ profiles, setProfiles, onSelectProfile
   const handleDeleteProfile = async (profileId: string) => {
     if (confirm("Are you sure you want to delete this profile? All saved progress will be removed.")) {
       try {
+        const token = localStorage.getItem("stream_access_token");
+        const headers: Record<string, string> = {};
+        if (token) headers["Authorization"] = `Bearer ${token}`;
         const response = await fetch(`${apiBaseUrl}/profiles/${profileId}`, {
           method: "DELETE",
+          headers: headers,
         });
         if (response.ok) {
           setProfiles((prev) => prev.filter((p) => p.id !== profileId));

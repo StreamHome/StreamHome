@@ -19,6 +19,7 @@ from services.state import ACTIVE_DOWNLOAD_METRICS, cancel_and_kill_process
 from services.tmdb import tmdb_client
 
 from services.logger import logger
+from routes.auth import get_current_user
 
 router = APIRouter()
 
@@ -201,7 +202,7 @@ async def download_progress_generator():
             await asyncio.sleep(2.0)
 
 @router.get("/api/downloads/stream")
-async def get_downloads_stream():
+async def get_downloads_stream(user = Depends(get_current_user)):
     """SSE streaming channel tracking download state queues in real time."""
     return StreamingResponse(
         download_progress_generator(),

@@ -235,7 +235,10 @@ export default function Dashboard({
     const delayDebounceFn = setTimeout(async () => {
       setIsSearchingTmdb(true);
       try {
-        const response = await fetch(`${apiBaseUrl}/search?query=${encodeURIComponent(searchQuery)}`);
+        const token = localStorage.getItem("stream_access_token");
+        const headers: Record<string, string> = {};
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        const response = await fetch(`${apiBaseUrl}/search?query=${encodeURIComponent(searchQuery)}`, { headers });
         if (response.ok) {
           const data = await response.json();
           const formatted = data.map((item: any) => ({
@@ -279,7 +282,10 @@ export default function Dashboard({
       
       try {
         console.log(`[Frontend] Fetching episodes for series TMDB ID: ${tmdbId}`);
-        const res = await fetch(`${apiBaseUrl}/series/${tmdbId}/episodes`);
+        const token = localStorage.getItem("stream_access_token");
+        const headers: Record<string, string> = {};
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        const res = await fetch(`${apiBaseUrl}/series/${tmdbId}/episodes`, { headers });
         if (res.ok) {
           const episodesData = await res.json();
           console.log(`[Frontend] Successfully loaded ${episodesData.length} episodes.`);
@@ -312,7 +318,10 @@ export default function Dashboard({
       try {
         const typeStr = selectedMovieForDetails.type === "series" ? "tv" : "movie";
         console.log(`[Frontend] Fetching detailed TMDB metadata for ${typeStr} ID: ${tmdbId}`);
-        const res = await fetch(`${apiBaseUrl}/tmdb/${typeStr}/${tmdbId}`);
+        const token = localStorage.getItem("stream_access_token");
+        const headers: Record<string, string> = {};
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        const res = await fetch(`${apiBaseUrl}/tmdb/${typeStr}/${tmdbId}`, { headers });
         if (res.ok) {
           const detailedData = await res.json();
           console.log("[Frontend] Successfully loaded detailed TMDB metadata:", detailedData);
@@ -361,9 +370,12 @@ export default function Dashboard({
     };
 
     try {
+      const token = localStorage.getItem("stream_access_token");
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
       const response = await fetch(`${apiBaseUrl}/profiles`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: headers,
         body: JSON.stringify(updated),
       });
       if (response.ok) {
@@ -399,9 +411,12 @@ export default function Dashboard({
     };
 
     try {
+      const token = localStorage.getItem("stream_access_token");
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
       const response = await fetch(`${apiBaseUrl}/profiles`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: headers,
         body: JSON.stringify(updated),
       });
       if (response.ok) {
@@ -550,7 +565,10 @@ export default function Dashboard({
   useEffect(() => {
     const fetchSystemSettings = async () => {
       try {
-        const res = await fetch(`${apiBaseUrl}/system/settings`);
+        const token = localStorage.getItem("stream_access_token");
+        const headers: Record<string, string> = {};
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        const res = await fetch(`${apiBaseUrl}/system/settings`, { headers });
         if (res.ok) {
           const data = await res.json();
           setIsRcloneEnabled(data.storageEngine === "CLOUD");
@@ -566,11 +584,14 @@ export default function Dashboard({
   const handleUpdateSystemSettings = async (enabled: boolean, path: string) => {
     setIsRcloneSaving(true);
     try {
+      const token = localStorage.getItem("stream_access_token");
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json"
+      };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
       const res = await fetch(`${apiBaseUrl}/system/settings`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
+        headers: headers,
         body: JSON.stringify({
           storageEngine: enabled ? "CLOUD" : "LOCAL",
           rcloneRemotePath: path
@@ -618,7 +639,10 @@ export default function Dashboard({
     if (activeTab !== "downloads") return;
 
     console.log("[Dashboard] Initializing Server-Sent Events stream for queue tracking...");
-    const streamUrl = `${apiBaseUrl}/downloads/stream`;
+    const token = localStorage.getItem("stream_access_token");
+    const streamUrl = token 
+      ? `${apiBaseUrl}/downloads/stream?token=${encodeURIComponent(token)}`
+      : `${apiBaseUrl}/downloads/stream`;
     const eventSource = new EventSource(streamUrl);
 
     eventSource.onmessage = (event) => {
@@ -809,7 +833,10 @@ export default function Dashboard({
 
     // 2. Fetch from API
     try {
-      const res = await fetch(`${apiBaseUrl}/track/${activeProfile.id}`);
+      const token = localStorage.getItem("stream_access_token");
+      const headers: Record<string, string> = {};
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+      const res = await fetch(`${apiBaseUrl}/track/${activeProfile.id}`, { headers });
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data)) {
@@ -848,7 +875,10 @@ export default function Dashboard({
 
     // 2. Fetch from API
     try {
-      const res = await fetch(`${apiBaseUrl}/watchlist/${activeProfile.id}`);
+      const token = localStorage.getItem("stream_access_token");
+      const headers: Record<string, string> = {};
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+      const res = await fetch(`${apiBaseUrl}/watchlist/${activeProfile.id}`, { headers });
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data)) {
@@ -882,9 +912,12 @@ export default function Dashboard({
     });
 
     try {
+      const token = localStorage.getItem("stream_access_token");
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
       const res = await fetch(`${apiBaseUrl}/watchlist/toggle`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: headers,
         body: JSON.stringify({
           profile_id: activeProfile.id,
           movie_id: movieId
@@ -1046,7 +1079,10 @@ export default function Dashboard({
       console.log(`[Frontend] Fetching movies from API Base: ${apiBaseUrl}`);
       
       // Fetch movies
-      const moviesRes = await fetch(`${apiBaseUrl}/movies`);
+      const token = localStorage.getItem("stream_access_token");
+      const headers: Record<string, string> = {};
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+      const moviesRes = await fetch(`${apiBaseUrl}/movies`, { headers });
       if (!moviesRes.ok) {
         throw new Error(`Failed to fetch movies (Status: ${moviesRes.status})`);
       }
@@ -1060,7 +1096,10 @@ export default function Dashboard({
 
       // Fetch featured movie specifically, or pick the first one
       try {
-        const featuredRes = await fetch(`${apiBaseUrl}/movies/featured`);
+        const token = localStorage.getItem("stream_access_token");
+        const headers: Record<string, string> = {};
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        const featuredRes = await fetch(`${apiBaseUrl}/movies/featured`, { headers });
         if (featuredRes.ok) {
           const featuredData = await featuredRes.json();
           if (featuredData && typeof featuredData === "object" && featuredData.id) {
@@ -1091,7 +1130,10 @@ export default function Dashboard({
   const fetchDiscoverData = async () => {
     const typeParam = activeTab === "series" ? "series" : "movie";
     try {
-      const discActionRes = await fetch(`${apiBaseUrl}/discover?category=action&type=${typeParam}`);
+      const token = localStorage.getItem("stream_access_token");
+      const headers: Record<string, string> = {};
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+      const discActionRes = await fetch(`${apiBaseUrl}/discover?category=action&type=${typeParam}`, { headers });
       if (discActionRes.ok) {
         const discActionData = await discActionRes.json();
         setDiscoverAction(discActionData);
@@ -1101,7 +1143,10 @@ export default function Dashboard({
     }
 
     try {
-      const discScifiRes = await fetch(`${apiBaseUrl}/discover?category=scifi&type=${typeParam}`);
+      const token = localStorage.getItem("stream_access_token");
+      const headers: Record<string, string> = {};
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+      const discScifiRes = await fetch(`${apiBaseUrl}/discover?category=scifi&type=${typeParam}`, { headers });
       if (discScifiRes.ok) {
         const discScifiData = await discScifiRes.json();
         setDiscoverScifi(discScifiData);

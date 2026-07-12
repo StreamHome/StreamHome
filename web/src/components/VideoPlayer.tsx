@@ -136,9 +136,13 @@ export default function VideoPlayer({ movie, activeProfile, onBack, apiBaseUrl }
     }
 
     // Then fire the API request (best-effort, fire-and-forget, never block navigation)
+    const token = localStorage.getItem("stream_access_token");
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
     fetch(`${apiBaseUrl}/track`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: headers,
       body: JSON.stringify(payload),
     }).then((res) => {
       if (!res.ok) console.warn("[Playback Tracker] API save failed:", res.status, res.statusText);
@@ -199,9 +203,12 @@ export default function VideoPlayer({ movie, activeProfile, onBack, apiBaseUrl }
       const mediaId = movie.activeEpisodeId || movie.id;
       const sourceQualityLabel = movie.quality || "Source";
       
+      const token = localStorage.getItem("stream_access_token");
+      const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : "";
+      
       const newSrc = selectedQuality === "Source" || selectedQuality === sourceQualityLabel
         ? `${serverRoot}${movie.videoUrl}`
-        : `${apiBaseUrl}/stream/${mediaId}?quality=${selectedQuality}&audio_track=${selectedAudioTrack}&start=${currentPos}`;
+        : `${apiBaseUrl}/stream/${mediaId}?quality=${selectedQuality}&audio_track=${selectedAudioTrack}&start=${currentPos}${tokenQuery}`;
         
       videoRef.current.src = newSrc;
       videoRef.current.load();
@@ -386,7 +393,10 @@ export default function VideoPlayer({ movie, activeProfile, onBack, apiBaseUrl }
         } catch (e) {}
 
         try {
-          const response = await fetch(`${apiBaseUrl}/track/${activeProfile.id}`);
+          const token = localStorage.getItem("stream_access_token");
+          const headers: Record<string, string> = {};
+          if (token) headers["Authorization"] = `Bearer ${token}`;
+          const response = await fetch(`${apiBaseUrl}/track/${activeProfile.id}`, { headers });
           if (response.ok) {
             const sessions = await response.json();
             if (Array.isArray(sessions)) {

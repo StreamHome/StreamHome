@@ -5,7 +5,7 @@ import pyotp
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Depends, status, Security
+from fastapi import APIRouter, HTTPException, Depends, status, Security, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from sqlmodel import select
@@ -17,7 +17,7 @@ from config import settings
 from services.logger import logger
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 class LoginRequest(BaseModel):
     email: str
@@ -35,10 +35,23 @@ class TOTPDisableRequest(BaseModel):
 
 # Helper dependency to authenticate JWT requests
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Security(security),
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     db: AsyncSession = Depends(get_session)
 ) -> User:
-    token = credentials.credentials
+    token = None
+    if credentials:
+        token = credentials.credentials
+    else:
+        token = request.query_params.get("token")
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated. Missing token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     try:
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
         email = payload.get("sub")

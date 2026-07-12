@@ -21,7 +21,7 @@ from services.logger import logger
 from services.queue import queue_manager
 import services.state as state
 from routes.queue import router as queue_router
-from routes.auth import router as auth_router
+from routes.auth import router as auth_router, get_current_user
 from routes.stream import router as stream_router
 from routes.backup import router as backup_router
 from routes.update import router as update_router
@@ -214,7 +214,7 @@ app.mount("/media", StaticFiles(directory=settings.MEDIA_DIR), name="media")
 # ----------------- Movies Catalog API -----------------
 
 @app.get("/api/movies", response_model=List[MovieResponse])
-async def get_movies():
+async def get_movies(user = Depends(get_current_user)):
     """Fetches all cataloged media assets with linked episode detail mappings."""
     async with AsyncSession(engine) as db:
         stmt = select(Movie)
@@ -234,7 +234,7 @@ async def get_movies():
         return results
 
 @app.get("/api/movies/featured", response_model=Optional[MovieResponse])
-async def get_featured_movie():
+async def get_featured_movie(user = Depends(get_current_user)):
     """Returns the featured or most recently cataloged movie asset."""
     async with AsyncSession(engine) as db:
         stmt = select(Movie).order_by(Movie.release_year.desc())
@@ -256,7 +256,7 @@ async def get_featured_movie():
 # ----------------- Playback Tracking & Pulse -----------------
 
 @app.get("/api/track/{profile_id}", response_model=List[PlaybackSessionResponse])
-async def get_playback_tracking(profile_id: str):
+async def get_playback_tracking(profile_id: str, user = Depends(get_current_user)):
     """Retrieves continue-watching tracking playback states for a profile."""
     async with AsyncSession(engine) as db:
         stmt = select(PlaybackSession).where(PlaybackSession.profile_id == profile_id)
@@ -277,7 +277,7 @@ async def get_playback_tracking(profile_id: str):
         ]
 
 @app.post("/api/track")
-async def update_playback_tracking(request: Request):
+async def update_playback_tracking(request: Request, user = Depends(get_current_user)):
     """Receives 10-second playback tracker pulses from the VideoPlayer."""
     from starlette.requests import ClientDisconnect
     try:
@@ -346,7 +346,7 @@ class WatchlistToggleRequest(BaseModel):
     movie_id: str
 
 @app.get("/api/watchlist/{profile_id}", response_model=List[str])
-async def get_watchlist(profile_id: str):
+async def get_watchlist(profile_id: str, user = Depends(get_current_user)):
     """Retrieves watchlist items for a profile."""
     async with AsyncSession(engine) as db:
         stmt = select(WatchlistItem).where(WatchlistItem.profile_id == profile_id)
@@ -357,7 +357,7 @@ async def get_watchlist(profile_id: str):
         return [item.movie_id for item in items]
 
 @app.post("/api/watchlist/toggle")
-async def toggle_watchlist(req: WatchlistToggleRequest):
+async def toggle_watchlist(req: WatchlistToggleRequest, user = Depends(get_current_user)):
     """Toggles movie presence in the profile's server watchlist."""
     async with AsyncSession(engine) as db:
         stmt = select(WatchlistItem).where(
@@ -390,13 +390,13 @@ async def toggle_watchlist(req: WatchlistToggleRequest):
 
 
 @app.get("/api/discover", response_model=List[DiscoverMovieResponse])
-async def get_discover_movies(category: str = "action", type: str = "movie"):
+async def get_discover_movies(category: str = "action", type: str = "movie", user = Depends(get_current_user)):
     """Fetches trending movies or series from TMDB for the discover rows."""
     from services.tmdb import tmdb_client
     return await tmdb_client.discover_media(category, type)
 
 @app.get("/api/search", response_model=List[DiscoverMovieResponse])
-async def search_tmdb_movies(query: str):
+async def search_tmdb_movies(query: str, user = Depends(get_current_user)):
     """Searches movies from TMDB for search suggestion results and caches posters/backdrops."""
     from services.tmdb import tmdb_client
     if not query:
@@ -404,7 +404,7 @@ async def search_tmdb_movies(query: str):
     return await tmdb_client.search_media(query)
 
 @app.get("/api/tmdb/{media_type}/{tmdb_id}")
-async def get_tmdb_metadata(media_type: str, tmdb_id: int):
+async def get_tmdb_metadata(media_type: str, tmdb_id: int, user = Depends(get_current_user)):
     """Fetch detailed movie or TV show metadata from TMDB API."""
     from services.tmdb import tmdb_client
     try:
@@ -418,7 +418,7 @@ async def get_tmdb_metadata(media_type: str, tmdb_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/series/{tmdb_id}/episodes", response_model=List[EpisodeResponse])
-async def get_series_episodes(tmdb_id: int):
+async def get_series_episodes(tmdb_id: int, user = Depends(get_current_user)):
     """Fetches real seasons and episodes for a TV series from TMDB, enriched with local catalog data if available."""
     from services.tmdb import tmdb_client
     
@@ -547,7 +547,7 @@ class ProfileSaveRequest(APIModel):
     pin: Optional[str] = None
 
 @app.get("/api/profiles", response_model=List[ProfileResponse])
-async def get_profiles():
+async def get_profiles(user = Depends(get_current_user)):
     """Retrieves all profile records from the database."""
     async with AsyncSession(engine) as db:
         stmt = select(Profile)
@@ -566,7 +566,7 @@ async def get_profiles():
         ]
 
 @app.post("/api/profiles", response_model=ProfileResponse)
-async def save_profile(req: ProfileSaveRequest):
+async def save_profile(req: ProfileSaveRequest, user = Depends(get_current_user)):
     """Creates a new profile or updates an existing profile configuration in the database."""
     async with AsyncSession(engine) as db:
         stmt = select(Profile).where(Profile.id == req.id)
@@ -603,7 +603,7 @@ async def save_profile(req: ProfileSaveRequest):
         )
 
 @app.delete("/api/profiles/{profile_id}")
-async def delete_profile(profile_id: str):
+async def delete_profile(profile_id: str, user = Depends(get_current_user)):
     """Deletes a profile from the database."""
     async with AsyncSession(engine) as db:
         stmt = select(Profile).where(Profile.id == profile_id)
@@ -627,7 +627,7 @@ class SystemSettingsResponse(APIModel):
     rclone_remote_path: str
 
 @app.get("/api/system/settings", response_model=SystemSettingsResponse)
-async def get_system_settings():
+async def get_system_settings(user = Depends(get_current_user)):
     """Retrieves current server storage engine and Rclone settings."""
     return SystemSettingsResponse(
         storage_engine=settings.STORAGE_ENGINE,
@@ -635,7 +635,7 @@ async def get_system_settings():
     )
 
 @app.post("/api/system/settings", response_model=SystemSettingsResponse)
-async def save_system_settings(req: SystemSettingsRequest):
+async def save_system_settings(req: SystemSettingsRequest, user = Depends(get_current_user)):
     """Updates server storage engine settings and persists them to settings.json."""
     if req.storage_engine not in ["LOCAL", "CLOUD"]:
         raise HTTPException(status_code=400, detail="Invalid storage engine value. Must be LOCAL or CLOUD.")

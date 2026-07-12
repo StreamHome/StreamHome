@@ -48,7 +48,10 @@ export default function App() {
   useEffect(() => {
     const fetchProfiles = async () => {
       try {
-        const res = await fetch(`${apiBaseUrl}/profiles`);
+        const token = localStorage.getItem("stream_access_token");
+        const headers: Record<string, string> = {};
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        const res = await fetch(`${apiBaseUrl}/profiles`, { headers });
         if (res.ok) {
           const data = await res.json();
           if (Array.isArray(data)) {
@@ -90,7 +93,10 @@ export default function App() {
   useEffect(() => {
     const fetchMovies = async () => {
       try {
-        const res = await fetch(`${apiBaseUrl}/movies`);
+        const token = localStorage.getItem("stream_access_token");
+        const headers: Record<string, string> = {};
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        const res = await fetch(`${apiBaseUrl}/movies`, { headers });
         if (res.ok) {
           const data = await res.json();
           if (Array.isArray(data)) {
@@ -103,7 +109,7 @@ export default function App() {
       }
     };
     fetchMovies();
-  }, [apiBaseUrl]);
+  }, [apiBaseUrl, accessToken]);
 
   // Read URL query parameters and synchronize them to React State
   const syncStateFromUrl = () => {

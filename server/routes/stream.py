@@ -11,6 +11,7 @@ from db import engine, get_session
 from models import Movie, Episode
 from config import settings
 from services.logger import logger
+from routes.auth import get_current_user
 
 router = APIRouter(prefix="/api/stream", tags=["Streaming"])
 
@@ -120,7 +121,8 @@ async def stream_media(
     media_id: str,
     quality: Optional[str] = Query(None), # "Source", "720p", "480p"
     start: float = Query(0.0), # Start seek point in seconds
-    db: AsyncSession = Depends(get_session)
+    db: AsyncSession = Depends(get_session),
+    user = Depends(get_current_user)
 ):
     """
     Streams media file dynamically. If quality matches Source, serves directly.

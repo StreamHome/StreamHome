@@ -237,7 +237,10 @@ export default function ThemeDetailsPage({
       try {
         const typeStr = selectedMovieForDetails.type === "series" ? "tv" : "movie";
         console.log(`[ThemeDetailsPage] Fetching detailed TMDB metadata for ${typeStr} ID: ${tmdbId}`);
-        const res = await fetch(`${apiBaseUrl}/tmdb/${typeStr}/${tmdbId}`);
+        const token = localStorage.getItem("stream_access_token");
+        const headers: Record<string, string> = {};
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        const res = await fetch(`${apiBaseUrl}/tmdb/${typeStr}/${tmdbId}`, { headers });
         if (res.ok) {
           const detailedData = await res.json();
           console.log("[ThemeDetailsPage] Successfully loaded detailed TMDB metadata:", detailedData);
