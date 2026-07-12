@@ -52,6 +52,7 @@ AGENTS.md
 banner.txt
 bin/
 server/bin/
+reports.md
 
 # IDEs, Editors, & OS Files
 .vscode/
