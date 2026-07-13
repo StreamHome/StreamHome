@@ -107,11 +107,21 @@ def get_key():
             raise KeyboardInterrupt
         return ch
     else:
+        import time
         ch = getch()
         if ch == "\x1b":
+            # Wait up to 50ms for the next byte to arrive
+            for _ in range(5):
+                if kbhit():
+                    break
+                time.sleep(0.01)
             if kbhit():
                 ch2 = getch()
                 if ch2 == "[":
+                    for _ in range(5):
+                        if kbhit():
+                            break
+                        time.sleep(0.01)
                     if kbhit():
                         ch3 = getch()
                         return {"A": "UP", "B": "DOWN", "D": "LEFT", "C": "RIGHT"}.get(ch3)
