@@ -121,11 +121,9 @@ def get_text_input(prompt_text: str, default_val: str = "", is_masked: bool = Fa
             
         elif ch == "\x1b":  # ESC or Arrow key
             if sys.platform != "win32" and kbhit():
-                ch2 = getch()
-                if ch2 == "[":
-                    if kbhit():
-                        getch()  # Consume the arrow key suffix
-                continue  # Ignore arrow key
+                while kbhit():
+                    getch()
+                continue  # Ignore arrow key or escape sequence
             sys.stdout.write("\n")
             sys.stdout.flush()
             return "ESC"
@@ -171,10 +169,8 @@ def get_inline_input(is_masked: bool = False) -> str:
             break
         elif ch == "\x1b": # ESC or Arrow key on Unix
             if sys.platform != "win32" and kbhit():
-                ch2 = getch()
-                if ch2 == "[":
-                    if kbhit():
-                        getch()
+                while kbhit():
+                    getch()
                 continue
             val = "ESC"
             break
@@ -300,16 +296,15 @@ async def configure_settings():
     sub_options = [
         "Storage Settings",
         "API Key Manager Center (Bearer Token)",
-        "Internal JWT Authentication Secrets",
         "TMDB Catalog Metadata Secrets",
         "Back to Main Menu"
     ]
-    sub_icons = ["💾", "🔑", "🛡️", "🎬", "↩️"]
+    sub_icons = ["💾", "🔑", "🎬", "↩️"]
     
     while True:
         choice = arrow_menu(sub_options, sub_icons, is_sub_menu=True)
         
-        if choice == -1 or choice == 4:  # ESC pressed or Back selected
+        if choice == -1 or choice == 3:  # ESC pressed or Back selected
             return
             
         clear_screen()
@@ -414,28 +409,25 @@ async def configure_settings():
                 # Sub-Case 1: Generate Key
                 if key_choice == 0:
                     console.print(Panel("[bold white]⚡ AUTONOMOUS API KEY GENERATION[/bold white]", border_style="bright_yellow", width=68))
-                    # Generates a highly secure alphanumeric token (combination of hex digits)
-                    generated_token = secrets.token_hex(16) # 32 Characters length total
+                    console.print("\n[dim]   Generating a new cryptographically secure 32-character API key...[/dim]\n")
+                    new_key = secrets.token_hex(16)  # 32 characters hex
                     
-                    console.print(f"\n   [bold bright_green]Generated Token:[/bold bright_green] [bold white]{generated_token}[/bold white]\n")
-                    confirm = prompt_input("Inject and muffle this token as your server active Ingest API-Key? (y/N)", "N")
-                    
-                    if confirm.lower() == "y" and confirm != "ESC":
-                        update_env_file("API_BEARER_TOKEN", generated_token)
-                        console.print("\n   [bold bright_green][✓][/bold bright_green] [white]Token committed. Your key is available now![/white]")
-                    else:
-                        console.print("\n   [bold bright_red][✗][/bold bright_red] [dim]Generation sequence aborted.[/dim]")
+                    update_env_file("API_BEARER_TOKEN", new_key)
+                    console.print(f"   [bold bright_green][✓][/bold bright_green] [white]New API key generated and written directly to .env:[/white]")
+                    console.print(f"   👉 [bold bright_yellow]{new_key}[/bold bright_yellow]\n")
+                    console.print("   [bold red]⚠️  IMPORTANT: COPY THIS KEY NOW. YOU CANNOT VIEW IT AGAIN EASILY.[/bold red]")
                 
-                # Sub-Case 2: View Active Key
+                # Sub-Case 2: View Key
                 elif key_choice == 1:
-                    console.print(Panel("[bold white]🔍 CURRENT ACTIVE INGEST API KEY[/bold white]", border_style="bright_cyan", width=68))
-                    current_key = settings.API_BEARER_TOKEN
-                    if current_key:
-                        console.print(f"\n   [bold cyan]Active Key Value:[/bold cyan] [bold white]{current_key}[/bold white]\n")
+                    console.print(Panel("[bold white]🔍 VIEW ACTIVE INGESTION API KEY[/bold white]", border_style="bright_yellow", width=68))
+                    active_key = settings.API_BEARER_TOKEN
+                    if active_key:
+                        console.print(f"\n   Current active API key in runtime memory:")
+                        console.print(f"   👉 [bold bright_yellow]{active_key}[/bold bright_yellow]\n")
                     else:
-                        console.print("\n   [bold bright_red][!][/bold bright_red] [white]No active Ingest API key found in storage database.[/white]\n")
-                
-                # Sub-Case 3: Delete/Revoke Key
+                        console.print("\n   [bold bright_red][✗][/bold bright_red] [white]No active Ingestion API key found in config settings.[/white]\n")
+                        
+                # Sub-Case 3: Delete Key
                 elif key_choice == 2:
                     console.print(Panel("[bold white]🔥 REVOKE INGEST API KEY CONTROL[/bold white]", border_style="bright_red", width=68))
                     confirm = prompt_input("Are you absolutely sure you want to completely clear the active API key? (y/N)", "N")
@@ -448,28 +440,8 @@ async def configure_settings():
                 console.print("\n   [dim]Press Enter to return to Key Manager...[/dim]", end="")
                 get_text_input("", default_val="")
             
-        # ─── CASE 3: INTERNAL JWT SECRETS ───
+        # ─── CASE 3: TMDB SECRETS ───
         elif choice == 2:
-            console.print(Panel("[bold white]🛡️ INTERNAL JWT SECURITY SECRETS[/bold white]", border_style="bright_yellow", width=68))
-            console.print("\n[dim italic]   Used for signing browser session profiles. Do not share.[/dim italic]\n")
-            
-            val = prompt_input("Enter JWT Signing Secret Key", settings.JWT_SECRET, is_masked=True)
-            if val == "ESC": continue
-            collected["JWT_SECRET"] = val
-            
-            console.print()
-            confirm = prompt_input("Save changes for internal JWT signing secret? (y/N)", "N")
-            if confirm.lower() == "y" and confirm != "ESC":
-                for key, value in collected.items():
-                    if value: update_env_file(key, value)
-                console.print("\n   [bold bright_green][✓][/bold bright_green] [white]JWT settings committed directly to .env![/white]")
-            else:
-                console.print("\n   [bold bright_red][✗][/bold bright_red] [dim]Changes discarded.[/dim]")
-            console.print("   [dim]Press Enter to continue...[/dim]", end="")
-            get_text_input("", default_val="")
-            
-        # ─── CASE 4: TMDB SECRETS ───
-        elif choice == 3:
             console.print(Panel("[bold white]🎬 TMDB API CONNECTIONS CONFIGURATION[/bold white]", border_style="bright_yellow", width=68))
             console.print("\n[dim italic]   Press ESC at any prompt to abort and return to settings menu[/dim italic]\n")
             
@@ -1104,7 +1076,7 @@ async def run_setup_wizard():
     while step < 9:
         if step == 0:
             draw_wizard_state(1, "email")
-            email = get_inline_input()
+            email = get_inline_input().strip()
             if email == "ESC":
                 if confirm_abort():
                     console.print("\n   [bold bright_red][✗][/bold bright_red] [white]Setup aborted.[/white]\n")
@@ -1119,7 +1091,7 @@ async def run_setup_wizard():
 
         elif step == 1:
             draw_wizard_state(1, "password")
-            password = get_inline_input(is_masked=True)
+            password = get_inline_input(is_masked=True).strip()
             if password == "ESC":
                 step = 0
                 continue
@@ -1165,7 +1137,7 @@ async def run_setup_wizard():
             console.print()
             
             draw_wizard_state(1, "2fa_code")
-            code = get_inline_input()
+            code = get_inline_input().strip()
             if code == "ESC":
                 state["2fa_enabled"] = False
                 step = 2
@@ -1181,7 +1153,7 @@ async def run_setup_wizard():
 
         elif step == 4:
             draw_wizard_state(2, "tmdb_token")
-            token = get_inline_input()
+            token = get_inline_input().strip()
             if token == "ESC":
                 if state["2fa_enabled"]:
                     step = 3
@@ -1213,7 +1185,7 @@ async def run_setup_wizard():
 
         elif step == 5:
             draw_wizard_state(3, "storage_mode")
-            mode = get_inline_input()
+            mode = get_inline_input().strip()
             if mode == "ESC":
                 step = 4
                 continue
@@ -1231,7 +1203,7 @@ async def run_setup_wizard():
 
         elif step == 6:
             draw_wizard_state(3, "rclone_path")
-            path = get_inline_input()
+            path = get_inline_input().strip()
             if path == "ESC":
                 step = 5
                 continue
@@ -1244,7 +1216,7 @@ async def run_setup_wizard():
 
         elif step == 7:
             draw_wizard_state(3, "backup_enabled")
-            confirm_backup = get_inline_input()
+            confirm_backup = get_inline_input().strip()
             if confirm_backup == "ESC":
                 if state["storage_mode"] == "CLOUD":
                     step = 6
@@ -1262,7 +1234,7 @@ async def run_setup_wizard():
 
         elif step == 8:
             draw_wizard_state(3, "auto_update_enabled")
-            confirm_update = get_inline_input()
+            confirm_update = get_inline_input().strip()
             if confirm_update == "ESC":
                 step = 7
                 continue

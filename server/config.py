@@ -25,7 +25,16 @@ class Settings:
     # 2FA Authentication JWT settings
     JWT_SECRET = os.getenv("JWT_SECRET")
     if not JWT_SECRET:
-        raise ValueError("CRITICAL ERROR: JWT_SECRET environment variable is missing! Server cannot start insecurely.")
+        import secrets
+        generated_secret = secrets.token_hex(32)
+        env_file = os.path.join(config_dir, ".env")
+        try:
+            with open(env_file, "a") as f:
+                f.write(f'\nJWT_SECRET="{generated_secret}"\n')
+        except Exception:
+            pass
+        os.environ["JWT_SECRET"] = generated_secret
+        JWT_SECRET = generated_secret
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRATION_MINUTES: int = 60 * 24  # 1 day session
 
