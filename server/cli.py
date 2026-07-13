@@ -703,92 +703,101 @@ async def manage_account_and_security():
 # ─────────────────────── 3. Monitor Downloads ───────────────────────
 
 async def monitor_downloads():
-    """Display active download queue status from the database. Supports ESC instant return."""
-    clear_screen()
-    console.print(f"[bright_cyan]{'═' * 70}[/bright_cyan]")
-    console.print(Panel(
-        "[bold white]📊   ACTIVE DOWNLOAD QUEUE & WORKERS[/bold white]\n"
-        "[dim italic]Press ESC or Enter to instantly return to Main Menu[/dim italic]",
-        border_style="bright_blue",
-        width=68,
-        padding=(0, 2)
-    ))
-    console.print()
-    
+    """Display active download queue status from the database. Supports ESC instant return with 1s auto-refresh."""
     engine = create_async_engine(settings.DATABASE_URL)
-    try:
-        async with AsyncSession(engine) as session:
-            stmt = select(DownloadTask).order_by(DownloadTask.created_at.desc())
-            result = await session.exec(stmt)
-            tasks = result.all()
-    except Exception as e:
-        console.print(f"   [bold bright_red][✗][/bold bright_red] [white]Failed to query database: {e}[/white]")
-        console.print("   [dim]Press Enter to return to Main Menu...[/dim]", end="")
-        get_text_input("", default_val="")
-        return
-    
-    if not tasks:
-        console.print("   [dim]No download tasks found in the queue.[/dim]")
-    else:
-        table = Table(
-            show_header=True,
-            header_style="bold bright_cyan",
-            border_style="dim",
-            width=68,
-            pad_edge=True,
-        )
-        table.add_column("Title", style="white", max_width=26, no_wrap=True)
-        table.add_column("Type", style="dim", width=6, justify="center")
-        table.add_column("Quality", style="dim", width=7, justify="center")
-        table.add_column("Status", width=15)
-        table.add_column("Created", style="dim", width=11, justify="right")
-        
-        status_labels = {
-            "COMPLETED":    "[bold bright_green]✓ Done[/bold bright_green]",
-            "FAILED":       "[bold bright_red]✗ Failed[/bold bright_red]",
-            "DOWNLOADING":  "[bold bright_yellow]↓ Downloading[/bold bright_yellow]",
-            "PENDING":      "[dim]⧗ Pending[/dim]",
-            "MERGING":      "[bold bright_cyan]⚙ Merging[/bold bright_cyan]",
-            "MOVING_CLOUD": "[bold bright_magenta]☁ Uploading[/bold bright_magenta]",
-        }
-        
-        for t in tasks[:20]:
-            label = status_labels.get(t.status, f"[dim]{t.status}[/dim]")
-            title_display = (t.title or f"TMDB {t.tmdb_id}")[:26]
-            created_display = t.created_at[:10] if t.created_at else "—"
-            
-            table.add_row(
-                title_display,
-                t.media_type or "—",
-                t.quality or "Source",
-                label,
-                created_display,
-            )
-        
-        console.print(table)
-        
-        # Summary counters
-        total = len(tasks)
-        completed = sum(1 for t in tasks if t.status == "COMPLETED")
-        failed = sum(1 for t in tasks if t.status == "FAILED")
-        active = sum(1 for t in tasks if t.status in ("DOWNLOADING", "MERGING", "MOVING_CLOUD"))
-        pending = sum(1 for t in tasks if t.status == "PENDING")
-        
-        console.print()
-        console.print(
-            f"   [dim]Total: {total}  ·  Active: {active}  ·  "
-            f"Pending: {pending}  ·  Completed: {completed}  ·  Failed: {failed}[/dim]"
-        )
-    
-    console.print()
-    console.print("   [dim]Press ESC or Enter to return to Main Menu...[/dim]", end="")
     
     while True:
-        if kbhit():
-            k = get_key()
-            if k in ("ENTER", "ESC"):
-                break
-        await asyncio.sleep(0.05)
+        clear_screen()
+        console.print(f"[bright_cyan]{'═' * 70}[/bright_cyan]")
+        console.print(Panel(
+            "[bold white]📊   ACTIVE DOWNLOAD QUEUE & WORKERS (Auto-refreshing...)[/bold white]\n"
+            "[dim italic]Press ESC or Enter at any time to return to Main Menu[/dim italic]",
+            border_style="bright_blue",
+            width=68,
+            padding=(0, 2)
+        ))
+        console.print()
+        
+        try:
+            async with AsyncSession(engine) as session:
+                stmt = select(DownloadTask).order_by(DownloadTask.created_at.desc())
+                result = await session.exec(stmt)
+                tasks = result.all()
+        except Exception as e:
+            console.print(f"   [bold bright_red][✗][/bold bright_red] [white]Failed to query database: {e}[/white]")
+            console.print("   [dim]Press Enter to return to Main Menu...[/dim]", end="")
+            get_text_input("", default_val="")
+            return
+        
+        if not tasks:
+            console.print("   [dim]No download tasks found in the queue.[/dim]")
+        else:
+            table = Table(
+                show_header=True,
+                header_style="bold bright_cyan",
+                border_style="dim",
+                width=68,
+                pad_edge=True,
+            )
+            table.add_column("Title", style="white", max_width=26, no_wrap=True)
+            table.add_column("Type", style="dim", width=6, justify="center")
+            table.add_column("Quality", style="dim", width=7, justify="center")
+            table.add_column("Status", width=15)
+            table.add_column("Created", style="dim", width=11, justify="right")
+            
+            status_labels = {
+                "COMPLETED":    "[bold bright_green]✓ Done[/bold bright_green]",
+                "FAILED":       "[bold bright_red]✗ Failed[/bold bright_red]",
+                "DOWNLOADING":  "[bold bright_yellow]↓ Downloading[/bold bright_yellow]",
+                "PENDING":      "[dim]⧗ Pending[/dim]",
+                "MERGING":      "[bold bright_cyan]⚙ Merging[/bold bright_cyan]",
+                "MOVING_CLOUD": "[bold bright_magenta]☁ Uploading[/bold bright_magenta]",
+            }
+            
+            for t in tasks[:20]:
+                label = status_labels.get(t.status, f"[dim]{t.status}[/dim]")
+                title_display = (t.title or f"TMDB {t.tmdb_id}")[:26]
+                created_display = t.created_at[:10] if t.created_at else "—"
+                
+                table.add_row(
+                    title_display,
+                    t.media_type or "—",
+                    t.quality or "Source",
+                    label,
+                    created_display,
+                )
+            
+            console.print(table)
+            
+            # Summary counters
+            total = len(tasks)
+            completed = sum(1 for t in tasks if t.status == "COMPLETED")
+            failed = sum(1 for t in tasks if t.status == "FAILED")
+            active = sum(1 for t in tasks if t.status in ("DOWNLOADING", "MERGING", "MOVING_CLOUD"))
+            pending = sum(1 for t in tasks if t.status == "PENDING")
+            
+            console.print()
+            console.print(
+                f"   [dim]Total: {total}  ·  Active: {active}  ·  "
+                f"Pending: {pending}  ·  Completed: {completed}  ·  Failed: {failed}[/dim]"
+            )
+        
+        console.print()
+        console.print("   [dim]Press ESC or Enter to return to Main Menu...[/dim]", end="")
+        sys.stdout.flush()
+        
+        # Poll kbhit every 50ms up to 20 times (1 second cooldown) to remain responsive to exits
+        user_exited = False
+        for _ in range(20):
+            if kbhit():
+                k = get_key()
+                if k in ("ENTER", "ESC"):
+                    user_exited = True
+                    break
+            await asyncio.sleep(0.05)
+            
+        if user_exited:
+            break
 
 # ─────────────────────── 4. Remove Media Asset ───────────────────────
 
