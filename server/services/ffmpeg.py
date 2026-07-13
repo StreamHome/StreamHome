@@ -69,8 +69,6 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[boo
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            text=True,
-            errors="ignore",
             bufsize=1, # Line buffering (Fix for Linux stdout/stderr buffering)
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
@@ -87,10 +85,10 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[boo
                 pass
         current_speed_str = "0 Mbps"
 
-        # Read from raw binary stream buffer to bypass TextIOWrapper block buffering
+        # Read from raw binary stream buffer unbuffered
         buffer = ""
         while True:
-            char_bytes = process.stderr.buffer.read(1)
+            char_bytes = process.stderr.read(1)
             if not char_bytes:
                 break
             char = char_bytes.decode("utf-8", errors="ignore")
