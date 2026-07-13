@@ -714,19 +714,9 @@ async def monitor_downloads():
         except Exception:
             pass
 
+    last_state = None
     try:
         while True:
-            clear_screen()
-            
-            console.print(Panel(
-                "[bold white]📊   ACTIVE DOWNLOAD QUEUE & WORKERS (Auto-refreshing...)[/bold white]\n"
-                "[dim italic]Press ESC, Q or Enter at any time to return to Main Menu[/dim italic]",
-                border_style="bright_blue",
-                width=68,
-                padding=(0, 2)
-            ))
-            console.print()
-            
             try:
                 async with AsyncSession(engine) as session:
                     stmt = select(DownloadTask).order_by(DownloadTask.created_at.desc())
@@ -747,97 +737,122 @@ async def monitor_downloads():
                         metrics = json.load(f)
             except Exception:
                 pass
-    
-            if not tasks:
-                console.print("   [dim]No download tasks found in the queue.[/dim]")
-            else:
-                table = Table(
-                    show_header=True,
-                    header_style="bold bright_cyan",
-                    border_style="dim",
+            
+            # Build current state signature to detect changes
+            current_state = []
+            for t in tasks[:20]:
+                task_metrics = None
+                if t.status in ("DOWNLOADING", "MERGING", "MOVING_CLOUD") and t.id in metrics:
+                    m = metrics[t.id]
+                    task_metrics = (m.get("progress"), m.get("speed"), m.get("eta"), m.get("size"))
+                current_state.append((
+                    t.id, t.status, t.error_message, t.title, t.media_type, t.quality, t.created_at, task_metrics
+                ))
+            
+            # Redraw only if the state has changed
+            if current_state != last_state:
+                last_state = current_state
+                
+                clear_screen()
+                
+                console.print(Panel(
+                    "[bold white]📊   ACTIVE DOWNLOAD QUEUE & WORKERS (Auto-refreshing...)[/bold white]\n"
+                    "[dim italic]Press ESC, Q or Enter at any time to return to Main Menu[/dim italic]",
+                    border_style="bright_blue",
                     width=68,
-                    pad_edge=True,
-                )
-                table.add_column("Title", style="white", max_width=26, no_wrap=True)
-                table.add_column("Type", style="dim", width=6, justify="center")
-                table.add_column("Quality", style="dim", width=7, justify="center")
-                table.add_column("Status", width=25)
-                table.add_column("Created", style="dim", width=11, justify="right")
+                    padding=(0, 2)
+                ))
+                console.print()
                 
-                status_labels = {
-                    "COMPLETED":    "[bold bright_green]✓ Done[/bold bright_green]",
-                    "FAILED":       "[bold bright_red]✗ Failed[/bold bright_red]",
-                    "DOWNLOADING":  "[bold bright_yellow]↓ Downloading[/bold bright_yellow]",
-                    "PENDING":      "[dim]⧗ Pending[/dim]",
-                    "MERGING":      "[bold bright_cyan]⚙ Merging[/bold bright_cyan]",
-                    "MOVING_CLOUD": "[bold bright_magenta]☁ Uploading[/bold bright_magenta]",
-                }
-                
-                for t in tasks[:20]:
-                    label = status_labels.get(t.status, f"[dim]{t.status}[/dim]")
+                if not tasks:
+                    console.print("   [dim]No download tasks found in the queue.[/dim]")
+                else:
+                    table = Table(
+                        show_header=True,
+                        header_style="bold bright_cyan",
+                        border_style="dim",
+                        width=68,
+                        pad_edge=True,
+                    )
+                    table.add_column("Title", style="white", max_width=26, no_wrap=True)
+                    table.add_column("Type", style="dim", width=6, justify="center")
+                    table.add_column("Quality", style="dim", width=7, justify="center")
+                    table.add_column("Status", width=25)
+                    table.add_column("Created", style="dim", width=11, justify="right")
                     
-                    # Enhance status label dynamically if active metrics exist
-                    if t.status in ("DOWNLOADING", "MERGING", "MOVING_CLOUD") and t.id in metrics:
-                        task_metrics = metrics[t.id]
-                        progress_val = task_metrics.get("progress", 0.0)
-                        speed_val = task_metrics.get("speed", "0 Mbps")
-                        eta_val = task_metrics.get("eta", "00:00:00")
-                        size_val = task_metrics.get("size", "0 MB")
+                    status_labels = {
+                        "COMPLETED":    "[bold bright_green]✓ Done[/bold bright_green]",
+                        "FAILED":       "[bold bright_red]✗ Failed[/bold bright_red]",
+                        "DOWNLOADING":  "[bold bright_yellow]↓ Downloading[/bold bright_yellow]",
+                        "PENDING":      "[dim]⧗ Pending[/dim]",
+                        "MERGING":      "[bold bright_cyan]⚙ Merging[/bold bright_cyan]",
+                        "MOVING_CLOUD": "[bold bright_magenta]☁ Uploading[/bold bright_magenta]",
+                    }
+                    
+                    for t in tasks[:20]:
+                        label = status_labels.get(t.status, f"[dim]{t.status}[/dim]")
                         
-                        if t.status == "DOWNLOADING":
-                            label = (
-                                f"[bold bright_yellow]↓ Downloading ({progress_val}%)[/bold bright_yellow]\n"
-                                f"[dim]{size_val} @ {speed_val}[/dim]\n"
-                                f"[dim]ETA: {eta_val}[/dim]"
-                            )
-                        elif t.status == "MERGING":
-                            label = (
-                                f"[bold bright_cyan]⚙ Merging ({progress_val}%)[/bold bright_cyan]\n"
-                                f"[dim]{size_val} @ {speed_val}[/dim]\n"
-                                f"[dim]ETA: {eta_val}[/dim]"
-                            )
-                        elif t.status == "MOVING_CLOUD":
-                            label = (
-                                f"[bold bright_magenta]☁ Uploading ({progress_val}%)[/bold bright_magenta]\n"
-                                f"[dim]{size_val} @ {speed_val}[/dim]\n"
-                                f"[dim]ETA: {eta_val}[/dim]"
-                            )
-                    elif t.status == "FAILED" and t.error_message:
-                        err_clean = t.error_message.replace("\n", " ").strip()
-                        if len(err_clean) > 28:
-                            err_clean = err_clean[:25] + "..."
-                        label = f"[bold bright_red]✗ Failed[/bold bright_red]\n[dim red]{err_clean}[/dim red]"
+                        # Enhance status label dynamically if active metrics exist
+                        if t.status in ("DOWNLOADING", "MERGING", "MOVING_CLOUD") and t.id in metrics:
+                            task_metrics = metrics[t.id]
+                            progress_val = task_metrics.get("progress", 0.0)
+                            speed_val = task_metrics.get("speed", "0 Mbps")
+                            eta_val = task_metrics.get("eta", "00:00:00")
+                            size_val = task_metrics.get("size", "0 MB")
+                            
+                            if t.status == "DOWNLOADING":
+                                label = (
+                                    f"[bold bright_yellow]↓ Downloading ({progress_val}%)[/bold bright_yellow]\n"
+                                    f"[dim]{size_val} @ {speed_val}[/dim]\n"
+                                    f"[dim]ETA: {eta_val}[/dim]"
+                                )
+                            elif t.status == "MERGING":
+                                label = (
+                                    f"[bold bright_cyan]⚙ Merging ({progress_val}%)[/bold bright_cyan]\n"
+                                    f"[dim]{size_val} @ {speed_val}[/dim]\n"
+                                    f"[dim]ETA: {eta_val}[/dim]"
+                                )
+                            elif t.status == "MOVING_CLOUD":
+                                label = (
+                                    f"[bold bright_magenta]☁ Uploading ({progress_val}%)[/bold bright_magenta]\n"
+                                    f"[dim]{size_val} @ {speed_val}[/dim]\n"
+                                    f"[dim]ETA: {eta_val}[/dim]"
+                                )
+                        elif t.status == "FAILED" and t.error_message:
+                            err_clean = t.error_message.replace("\n", " ").strip()
+                            if len(err_clean) > 28:
+                                err_clean = err_clean[:25] + "..."
+                            label = f"[bold bright_red]✗ Failed[/bold bright_red]\n[dim red]{err_clean}[/dim red]"
+                        
+                        title_display = (t.title or f"TMDB {t.tmdb_id}")[:26]
+                        created_display = t.created_at[:10] if t.created_at else "—"
+                        
+                        table.add_row(
+                            title_display,
+                            t.media_type or "—",
+                            t.quality or "Source",
+                            label,
+                            created_display,
+                        )
                     
-                    title_display = (t.title or f"TMDB {t.tmdb_id}")[:26]
-                    created_display = t.created_at[:10] if t.created_at else "—"
+                    console.print(table)
                     
-                    table.add_row(
-                        title_display,
-                        t.media_type or "—",
-                        t.quality or "Source",
-                        label,
-                        created_display,
+                    # Summary counters
+                    total = len(tasks)
+                    completed = sum(1 for t in tasks if t.status == "COMPLETED")
+                    failed = sum(1 for t in tasks if t.status == "FAILED")
+                    active = sum(1 for t in tasks if t.status in ("DOWNLOADING", "MERGING", "MOVING_CLOUD"))
+                    pending = sum(1 for t in tasks if t.status == "PENDING")
+                    
+                    console.print()
+                    console.print(
+                        f"   [dim]Total: {total}  ·  Active: {active}  ·  "
+                        f"Pending: {pending}  ·  Completed: {completed}  ·  Failed: {failed}[/dim]"
                     )
                 
-                
-                console.print(table)
-                
-                # Summary counters
-                total = len(tasks)
-                completed = sum(1 for t in tasks if t.status == "COMPLETED")
-                failed = sum(1 for t in tasks if t.status == "FAILED")
-                active = sum(1 for t in tasks if t.status in ("DOWNLOADING", "MERGING", "MOVING_CLOUD"))
-                pending = sum(1 for t in tasks if t.status == "PENDING")
-                
                 console.print()
-                console.print(
-                    f"   [dim]Total: {total}  ·  Active: {active}  ·  "
-                    f"Pending: {pending}  ·  Completed: {completed}  ·  Failed: {failed}[/dim]"
-                )
-            
-            console.print()
-            console.print("   [dim]Press ESC, Q or Enter to return to Main Menu...[/dim]", end="")
-            sys.stdout.flush()
+                console.print("   [dim]Press ESC, Q or Enter to return to Main Menu...[/dim]", end="")
+                sys.stdout.flush()
             
             # Poll kbhit every 50ms up to 20 times (1 second cooldown) to remain responsive to exits
             user_exited = False
