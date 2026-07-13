@@ -104,11 +104,18 @@ check_and_install() {
 # 1. Run the dependency checks
 check_and_install
 
-# 2. Install requirements
+# 2. Setup Virtual Environment and Install requirements
 echo ""
-echo "Installing Server Python dependencies..."
-python3 -m pip install --upgrade pip
-python3 -m pip install -r server/requirements.txt
+echo "Setting up Python virtual environment..."
+if [ ! -d "venv" ]; then
+    python3 -m venv venv
+fi
+echo "Activating virtual environment..."
+source venv/bin/activate
+
+echo "Installing Server Python dependencies inside virtual environment..."
+pip install --upgrade pip
+pip install -r server/requirements.txt
 
 echo ""
 echo "Installing Web Client Node dependencies..."

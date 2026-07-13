@@ -161,7 +161,14 @@ echo Rclone is ready.
 set "PATH=%CD%\bin;%PATH%"
 
 echo.
-echo Installing Server Python dependencies...
+echo Setting up Python virtual environment...
+if not exist "venv" (
+    python -m venv venv
+)
+echo Activating virtual environment...
+call venv\Scripts\activate
+
+echo Installing Server Python dependencies inside virtual environment...
 python -m pip install --upgrade pip
 python -m pip install -r server\requirements.txt
 
