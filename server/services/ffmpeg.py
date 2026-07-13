@@ -12,7 +12,7 @@ from services.state import update_task_metrics, remove_task_metrics, register_pr
 from services.logger import logger
 
 # Regular expressions for parsing FFmpeg stderr progress
-time_regex = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})")
+time_regex = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)")
 speed_regex = re.compile(r"speed=\s*(\d+\.?\d*)x")
 bitrate_regex = re.compile(r"bitrate=\s*(\d+\.?\d*)\s*kbits/s")
 
@@ -96,8 +96,8 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[boo
             
             time_match = time_regex.search(line)
             if time_match:
-                hours, minutes, seconds, centiseconds = map(float, time_match.groups())
-                current_time = hours * 3600 + minutes * 60 + seconds + centiseconds / 100.0
+                hours_str, minutes_str, seconds_str = time_match.groups()
+                current_time = float(hours_str) * 3600 + float(minutes_str) * 60 + float(seconds_str)
                 
                 base_duration = duration_secs if duration_secs > 0 else 3600.0
                 progress = min((current_time / base_duration) * 100.0, 99.9)
