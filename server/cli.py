@@ -99,9 +99,23 @@ else:
                                     ch3 = ch3_bytes.decode("utf-8", errors="ignore")
                                     return f"\x1b{ch2}{ch3}"
                         return f"\x1b{ch2}"
+                return "\x1b"
+            
+            # Read any buffered bytes immediately to support copy/paste
+            seq = [ch]
+            while True:
+                r, _, _ = sys_select.select([fd], [], [], 0.005)
+                if r:
+                    next_bytes = os.read(fd, 1)
+                    if next_bytes:
+                        seq.append(next_bytes.decode("utf-8", errors="ignore"))
+                    else:
+                        break
+                else:
+                    break
+            return "".join(seq)
         finally:
             termios.tcsetattr(fd, termios.TCSANOW, old_settings)
-        return ch
         
     def kbhit() -> bool:
         fd = sys.stdin.fileno()
@@ -178,13 +192,17 @@ def get_text_input(prompt_text: str, default_val: str = "", is_masked: bool = Fa
             getch()
             
         else:  # Append standard characters
-            if ord(ch) >= 32:
-                chars.append(ch)
-                if is_masked:
-                    sys.stdout.write("*")
-                else:
-                    sys.stdout.write(ch)
-                sys.stdout.flush()
+            for char in ch:
+                try:
+                    if ord(char) >= 32:
+                        chars.append(char)
+                        if is_masked:
+                            sys.stdout.write("*")
+                        else:
+                            sys.stdout.write(char)
+                except Exception:
+                    pass
+            sys.stdout.flush()
 
 def prompt_input(label: str, default: str = "", is_masked: bool = False) -> str:
     """Styled interface prompt with safe fallback to prevent Rich parsing syntax breaks."""
@@ -221,16 +239,17 @@ def get_inline_input(is_masked: bool = False) -> str:
                 sys.stdout.write("\b \b")
                 sys.stdout.flush()
         else:
-            try:
-                if ord(ch) >= 32:
-                    val += ch
-                    if is_masked:
-                        sys.stdout.write("*")
-                    else:
-                        sys.stdout.write(ch)
-                    sys.stdout.flush()
-            except Exception:
-                pass
+            for char in ch:
+                try:
+                    if ord(char) >= 32:
+                        val += char
+                        if is_masked:
+                            sys.stdout.write("*")
+                        else:
+                            sys.stdout.write(char)
+                except Exception:
+                    pass
+            sys.stdout.flush()
     
     if val != "ESC":
         sys.stdout.write(" ]\n")
