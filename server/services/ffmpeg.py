@@ -87,69 +87,79 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[boo
                 pass
         current_speed_str = "0 Mbps"
 
-        # Logları anlık olarak satır satır okuyup metrikleri güncelliyoruz
-        for line in process.stderr:
-            line = line.strip()
-            if line:
+        # Read carriage-return (\r) and newline (\n) delimited progress logs in real-time
+        buffer = ""
+        while True:
+            char = process.stderr.read(1)
+            if not char:
+                break
+            if char in ("\r", "\n"):
+                line = buffer.strip()
+                buffer = ""
+                if not line:
+                    continue
+                
                 stderr_lines.append(line)
                 if len(stderr_lines) > 15:
                     stderr_lines.pop(0)
-            
-            time_match = time_regex.search(line)
-            if time_match:
-                hours_str, minutes_str, seconds_str = time_match.groups()
-                current_time = float(hours_str) * 3600 + float(minutes_str) * 60 + float(seconds_str)
                 
-                base_duration = duration_secs if duration_secs > 0 else 3600.0
-                progress = min((current_time / base_duration) * 100.0, 99.9)
-                
-                speed_match = speed_regex.search(line)
-                speed_val_mult = float(speed_match.group(1)) if speed_match else 1.0
-                
-                eta = "00:00:00"
-                try:
-                    if speed_val_mult > 0:
-                        remaining_secs = (base_duration - current_time) / speed_val_mult
-                        if remaining_secs > 0:
-                            h = int(remaining_secs // 3600)
-                            m = int((remaining_secs % 3600) // 60)
-                            s = int(remaining_secs % 60)
-                            eta = f"{h:02d}:{m:02d}:{s:02d}"
-                except Exception:
-                    pass
-                
-                # Calculate real download speed from file size changes
-                now = time.time()
-                elapsed = now - last_size_check
-                current_size = 0
-                if os.path.exists(output_file):
+                time_match = time_regex.search(line)
+                if time_match:
+                    hours_str, minutes_str, seconds_str = time_match.groups()
+                    current_time = float(hours_str) * 3600 + float(minutes_str) * 60 + float(seconds_str)
+                    
+                    base_duration = duration_secs if duration_secs > 0 else 3600.0
+                    progress = min((current_time / base_duration) * 100.0, 99.9)
+                    
+                    speed_match = speed_regex.search(line)
+                    speed_val_mult = float(speed_match.group(1)) if speed_match else 1.0
+                    
+                    eta = "00:00:00"
                     try:
-                        current_size = os.path.getsize(output_file)
+                        if speed_val_mult > 0:
+                            remaining_secs = (base_duration - current_time) / speed_val_mult
+                            if remaining_secs > 0:
+                                h = int(remaining_secs // 3600)
+                                m = int((remaining_secs % 3600) // 60)
+                                s = int(remaining_secs % 60)
+                                eta = f"{h:02d}:{m:02d}:{s:02d}"
                     except Exception:
                         pass
-                
-                if elapsed >= 0.5:
-                    size_diff = max(0, current_size - last_size)
-                    speed_bps = size_diff / elapsed if elapsed > 0 else 0
-                    speed_mbps = (speed_bps * 8) / (1000**2)
-                    speed_mbs = speed_bps / (1024**2)
                     
-                    if speed_mbps >= 1000:
-                        current_speed_str = f"{speed_mbps/1000:.1f} Gbps ({speed_mbs:.1f} MB/s)"
-                    else:
-                        current_speed_str = f"{speed_mbps:.1f} Mbps ({speed_mbs:.1f} MB/s)"
+                    # Calculate real download speed from file size changes
+                    now = time.time()
+                    elapsed = now - last_size_check
+                    current_size = 0
+                    if os.path.exists(output_file):
+                        try:
+                            current_size = os.path.getsize(output_file)
+                        except Exception:
+                            pass
+                    
+                    if elapsed >= 0.5:
+                        size_diff = max(0, current_size - last_size)
+                        speed_bps = size_diff / elapsed if elapsed > 0 else 0
+                        speed_mbps = (speed_bps * 8) / (1000**2)
+                        speed_mbs = speed_bps / (1024**2)
                         
-                    last_size = current_size
-                    last_size_check = now
-                
-                total_mb = current_size / (1024**2)
-                total_gb = current_size / (1024**3)
-                if total_gb >= 1.0:
-                    size_str = f"{total_gb:.2f} GB"
-                else:
-                    size_str = f"{total_mb:.1f} MB"
-                
-                update_task_metrics(task_id, progress, speed=current_speed_str, eta=eta, size=size_str)
+                        if speed_mbps >= 1000:
+                            current_speed_str = f"{speed_mbps/1000:.1f} Gbps ({speed_mbs:.1f} MB/s)"
+                        else:
+                            current_speed_str = f"{speed_mbps:.1f} Mbps ({speed_mbs:.1f} MB/s)"
+                            
+                        last_size = current_size
+                        last_size_check = now
+                    
+                    total_mb = current_size / (1024**2)
+                    total_gb = current_size / (1024**3)
+                    if total_gb >= 1.0:
+                        size_str = f"{total_gb:.2f} GB"
+                    else:
+                        size_str = f"{total_mb:.1f} MB"
+                    
+                    update_task_metrics(task_id, progress, speed=current_speed_str, eta=eta, size=size_str)
+            else:
+                buffer += char
                 
         process.wait()
         unregister_process(task_id)
