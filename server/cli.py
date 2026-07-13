@@ -76,27 +76,36 @@ else:
     import select as sys_select
     
     def getch() -> str:
+        import os
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
             tty.setraw(fd)
-            ch = sys.stdin.read(1)
+            ch_bytes = os.read(fd, 1)
+            if not ch_bytes:
+                return ""
+            ch = ch_bytes.decode("utf-8", errors="ignore")
             if ch == "\x1b":
-                dr, _, _ = sys_select.select([sys.stdin], [], [], 0.05)
+                dr, _, _ = sys_select.select([fd], [], [], 0.05)
                 if dr:
-                    ch2 = sys.stdin.read(1)
-                    if ch2 in ("[", "O"):
-                        dr2, _, _ = sys_select.select([sys.stdin], [], [], 0.05)
-                        if dr2:
-                            ch3 = sys.stdin.read(1)
-                            return f"\x1b{ch2}{ch3}"
-                    return f"\x1b{ch2}"
+                    ch2_bytes = os.read(fd, 1)
+                    if ch2_bytes:
+                        ch2 = ch2_bytes.decode("utf-8", errors="ignore")
+                        if ch2 in ("[", "O"):
+                            dr2, _, _ = sys_select.select([fd], [], [], 0.05)
+                            if dr2:
+                                ch3_bytes = os.read(fd, 1)
+                                if ch3_bytes:
+                                    ch3 = ch3_bytes.decode("utf-8", errors="ignore")
+                                    return f"\x1b{ch2}{ch3}"
+                        return f"\x1b{ch2}"
         finally:
             termios.tcsetattr(fd, termios.TCSANOW, old_settings)
         return ch
         
     def kbhit() -> bool:
-        dr, dw, de = sys_select.select([sys.stdin], [], [], 0)
+        fd = sys.stdin.fileno()
+        dr, dw, de = sys_select.select([fd], [], [], 0)
         return len(dr) > 0
 
 def clear_screen():

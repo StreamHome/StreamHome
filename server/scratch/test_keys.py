@@ -3,17 +3,24 @@ import termios
 import tty
 import select
 
+import os
+
 def getch():
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        ch = sys.stdin.read(1)
+        ch_bytes = os.read(fd, 1)
+        if not ch_bytes:
+            return ""
+        ch = ch_bytes.decode("utf-8", errors="ignore")
         seq = [ch]
         while True:
-            r, _, _ = select.select([sys.stdin], [], [], 0.05)
+            r, _, _ = select.select([fd], [], [], 0.05)
             if r:
-                seq.append(sys.stdin.read(1))
+                next_bytes = os.read(fd, 1)
+                if next_bytes:
+                    seq.append(next_bytes.decode("utf-8", errors="ignore"))
             else:
                 break
         return "".join(seq)
