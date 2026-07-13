@@ -4,7 +4,11 @@ echo Starting StreamHome in Background (Hidden Windows)
 echo ====================================================
 echo.
 echo Launching FastAPI Server in background...
-powershell -Command "Start-Process -FilePath python -ArgumentList 'main.py' -WorkingDirectory 'server' -WindowStyle Hidden"
+if exist "venv\Scripts\activate.bat" (
+    powershell -Command "Start-Process -FilePath cmd.exe -ArgumentList '/c call ..\venv\Scripts\activate && python main.py' -WorkingDirectory 'server' -WindowStyle Hidden"
+) else (
+    powershell -Command "Start-Process -FilePath python -ArgumentList 'main.py' -WorkingDirectory 'server' -WindowStyle Hidden"
+)
 echo Launching Vite Dev Server in background...
 powershell -Command "Start-Process -FilePath npm -ArgumentList 'run dev' -WorkingDirectory 'web' -WindowStyle Hidden"
 echo.

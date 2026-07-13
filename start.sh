@@ -3,6 +3,13 @@ echo "===================================================="
 echo "Starting StreamHome Media Server (Interactive Mode)"
 echo "===================================================="
 echo ""
+
+# Activate virtual environment if present
+if [ -d "venv" ]; then
+    echo "Activating virtual environment..."
+    source venv/bin/activate
+fi
+
 echo "Starting FastAPI Server..."
 cd server && python3 main.py &
 SERVER_PID=$!
