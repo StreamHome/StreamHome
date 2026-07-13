@@ -283,13 +283,7 @@ def update_env_file(key: str, value: str):
         f.writelines(new_lines)
     
     # Update current runtime settings as well
-    if key == "SMTP_PORT":
-        try:
-            setattr(settings, key, int(value))
-        except ValueError:
-            setattr(settings, key, value)
-    else:
-        setattr(settings, key, value)
+    setattr(settings, key, value)
 
 # ─────────────────────────── Arrow-Key Menu ───────────────────────────
 

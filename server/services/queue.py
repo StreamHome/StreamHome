@@ -261,28 +261,34 @@ class DownloadQueueManager:
                 update_task_metrics(task_id, 99.9, speed="Uploading", eta="00:00:00")
                 
                 local_dir = os.path.dirname(output_abs_path)
-                remote_subpath = os.path.join("Movies" if media_type == "movie" else "Series", folder_name)
+                if media_type == "movie":
+                    remote_subpath = os.path.join("Movies", folder_name)
+                else:
+                    remote_subpath = os.path.join("Series", folder_name, f"Season_{season}", f"Episode_{episode}")
                 
-                rclone_success = await self.run_rclone_move_dir(local_dir, remote_subpath)
-                
-                if not rclone_success:
-                    logger.warning(f"[Queue Manager] Cloud upload failed for task {task_id}! Falling back to local storage.")
-                    temp_abs = os.path.normpath(os.path.abspath(settings.TEMP_DIR))
-                    media_abs = os.path.normpath(os.path.abspath(settings.MEDIA_DIR))
-                    local_dir_norm = os.path.normpath(local_dir)
-                    dest_dir = local_dir_norm.replace(temp_abs, media_abs)
+                if settings.STORAGE_ENGINE == "CLOUD":
+                    rclone_success = await self.run_rclone_move_dir(local_dir, remote_subpath)
                     
-                    try:
-                        os.makedirs(os.path.dirname(dest_dir), exist_ok=True)
-                        if os.path.exists(local_dir):
-                            if os.path.exists(dest_dir):
-                                shutil.rmtree(dest_dir, ignore_errors=True)
-                            shutil.move(local_dir, dest_dir)
-                            logger.info(f"[Queue Manager] Local fallback copy completed for task {task_id}. Files moved to {dest_dir}")
-                            # Treat fallback success as completion
-                            rclone_success = True
-                    except Exception as fallback_err:
-                        logger.error(f"[Queue Manager] Local fallback copy failed for task {task_id}: {fallback_err}")
+                    if not rclone_success:
+                        logger.warning(f"[Queue Manager] Cloud upload failed for task {task_id}! Falling back to local storage.")
+                        temp_abs = os.path.normpath(os.path.abspath(settings.TEMP_DIR))
+                        media_abs = os.path.normpath(os.path.abspath(settings.MEDIA_DIR))
+                        local_dir_norm = os.path.normpath(local_dir)
+                        dest_dir = local_dir_norm.replace(temp_abs, media_abs)
+                        
+                        try:
+                            os.makedirs(os.path.dirname(dest_dir), exist_ok=True)
+                            if os.path.exists(local_dir):
+                                if os.path.exists(dest_dir):
+                                    shutil.rmtree(dest_dir, ignore_errors=True)
+                                shutil.move(local_dir, dest_dir)
+                                logger.info(f"[Queue Manager] Local fallback copy completed for task {task_id}. Files moved to {dest_dir}")
+                                # Treat fallback success as completion
+                                rclone_success = True
+                        except Exception as fallback_err:
+                            logger.error(f"[Queue Manager] Local fallback copy failed for task {task_id}: {fallback_err}")
+                else:
+                    rclone_success = True
 
             async with AsyncSession(engine) as db:
                 task = await db.get(DownloadTask, task_id)
@@ -299,7 +305,7 @@ class DownloadQueueManager:
                     await db.commit()
                     
                     try:
-                        await self._catalog_media(db, tmdb_id, media_type, season, episode, meta, output_rel_path, language, subtitles_list, quality)
+                        await self._catalog_media(db, tmdb_id, media_type, season, episode, meta, output_rel_path, extracted_languages, language, subtitles_list, quality)
                     except Exception as cat_err:
                         logger.error(f"[Queue Manager] Error cataloging media: {cat_err}")
                 else:
@@ -323,14 +329,14 @@ class DownloadQueueManager:
                 
         finally:
             self.active_tasks.discard(task_id)
-        from services.state import remove_task_metrics
-        remove_task_metrics(task_id)
+            from services.state import remove_task_metrics
+            remove_task_metrics(task_id)
 
     async def _catalog_media(
         self, db: AsyncSession, tmdb_id: int, media_type: str, season: Optional[int], 
         episode: Optional[int], meta: Dict[str, Any], file_path: str, 
-        language: Optional[str] = None, subtitles_list: Optional[List[Dict[str, str]]] = None,
-        quality: Optional[str] = None
+        extracted_languages: Optional[List[str]] = None, language: Optional[str] = None, 
+        subtitles_list: Optional[List[Dict[str, str]]] = None, quality: Optional[str] = None
     ):
         server_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         

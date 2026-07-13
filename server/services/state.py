@@ -74,12 +74,14 @@ async def cancel_and_kill_process(task_id: str) -> bool:
         process.terminate()
         try:
             # Give the process 2 seconds to clean up and exit gracefully
-            await asyncio.wait_for(process.wait(), timeout=2.0)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, process.wait, 2.0)
             print(f"[Process Registry] Process for task {task_id} exited gracefully.")
-        except asyncio.TimeoutError:
+        except Exception:
             print(f"[Process Registry] Process did not respond to SIGTERM. Killing task {task_id}...")
             process.kill()
-            await process.wait()
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, process.wait)
             print(f"[Process Registry] Process for task {task_id} killed successfully.")
         return True
     except Exception as e:

@@ -129,9 +129,9 @@ async def download_progress_generator():
             now = time.time()
             active_task_ids = list(ACTIVE_DOWNLOAD_METRICS.keys())
             
-            # Fetch completed/failed tasks from DB every 10 seconds, OR if active tasks list is empty
+            # Fetch completed/failed tasks from DB every 10 seconds
             # This drastically reduces SQLite read pressure
-            if now - last_db_query_time > 10.0 or active_task_ids:
+            if now - last_db_query_time > 10.0:
                 async with AsyncSession(engine) as db:
                     if active_task_ids:
                         # Query active tasks + recently completed tasks (e.g. last 10 minutes)

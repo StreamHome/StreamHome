@@ -94,7 +94,7 @@ async def cloud_stream_generator(target_remote: str, start: int, count: Optional
     except Exception as e:
         logger.error(f"[Cloud Streaming] Error in stream generator: {e}")
 
-async def transcode_generator(input_path: str, height: int, start_sec: float, media_id: str, quality: str, audio_track_idx: int = 0):
+async def transcode_generator(input_path: str, height: int, start_sec: float, media_id: str, quality: str, audio_track_idx: int = 0, should_cache: bool = True):
     import aiofiles
     # Resolve ffmpeg binary path dynamically
     ffmpeg_path = shutil.which("ffmpeg") or r"C:\ffmpeg\bin\ffmpeg.exe"

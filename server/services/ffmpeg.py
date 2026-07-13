@@ -193,8 +193,6 @@ async def download_and_merge(
     
     if audio_url:
         is_audio_http = audio_url.lower().startswith(("http://", "https://"))
-        if headers_str.strip() and is_audio_http:
-            cmd.extend(["-headers", headers_str])
         if is_audio_http:
             cmd.extend(["-protocol_whitelist", "http,https,tcp,tls,crypto,dns", "-allowed_extensions", "ALL", "-extension_picky", "0"])
         # faststart eklendi

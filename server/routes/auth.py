@@ -7,7 +7,7 @@ from typing import Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Depends, status, Security, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
