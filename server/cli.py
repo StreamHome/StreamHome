@@ -726,7 +726,7 @@ async def monitor_downloads():
             console.print(f"[bright_cyan]{'═' * 70}[/bright_cyan]")
             console.print(Panel(
                 "[bold white]📊   ACTIVE DOWNLOAD QUEUE & WORKERS (Auto-refreshing...)[/bold white]\n"
-                "[dim italic]Press ESC or Enter at any time to return to Main Menu[/dim italic]",
+                "[dim italic]Press ESC, Q or Enter at any time to return to Main Menu[/dim italic]",
                 border_style="bright_blue",
                 width=68,
                 padding=(0, 2)
@@ -838,7 +838,7 @@ async def monitor_downloads():
                 )
             
             console.print()
-            console.print("   [dim]Press ESC or Enter to return to Main Menu...[/dim]", end="")
+            console.print("   [dim]Press ESC, Q or Enter to return to Main Menu...[/dim]", end="")
             sys.stdout.flush()
             
             # Poll kbhit every 50ms up to 20 times (1 second cooldown) to remain responsive to exits
@@ -846,7 +846,7 @@ async def monitor_downloads():
             for _ in range(20):
                 if kbhit():
                     k = get_key()
-                    if k in ("ENTER", "ESC"):
+                    if k in ("ENTER", "ESC") or (isinstance(k, str) and k.lower() in ("q", "x")):
                         user_exited = True
                         break
                 await asyncio.sleep(0.05)
