@@ -73,7 +73,7 @@ if sys.platform == "win32":
 else:
     import termios
     import tty
-    import select
+    import select as sys_select
     
     def getch() -> str:
         fd = sys.stdin.fileno()
@@ -86,7 +86,7 @@ else:
         return ch
         
     def kbhit() -> bool:
-        dr, dw, de = select.select([sys.stdin], [], [], 0)
+        dr, dw, de = sys_select.select([sys.stdin], [], [], 0)
         return len(dr) > 0
 
 def clear_screen():
