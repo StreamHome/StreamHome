@@ -274,7 +274,6 @@ class DownloadQueueManager:
                     
                     try:
                         os.makedirs(os.path.dirname(dest_dir), exist_ok=True)
-                        import shutil
                         if os.path.exists(local_dir):
                             if os.path.exists(dest_dir):
                                 shutil.rmtree(dest_dir, ignore_errors=True)
