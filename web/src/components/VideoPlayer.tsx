@@ -493,9 +493,35 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
     }
   };
 
+  const getDatabaseDurationSeconds = (): number => {
+    if (!movie || !movie.duration) return 0;
+    const durStr = movie.duration.toLowerCase();
+    let total = 0;
+    if (durStr.includes("h")) {
+      const parts = durStr.split("h");
+      total += parseInt(parts[0] || "0") * 3600;
+      if (parts[1] && parts[1].includes("m")) {
+        total += parseInt(parts[1].replace("m", "").trim() || "0") * 60;
+      }
+    } else if (durStr.includes("m")) {
+      total += parseInt(durStr.replace("m", "").trim() || "0") * 60;
+    } else {
+      total = parseInt(durStr || "0") * 60;
+    }
+    return isNaN(total) ? 0 : total;
+  };
+
   const handleLoadedMetadata = async () => {
     if (videoRef.current) {
-      setDuration(videoRef.current.duration);
+      let rawDuration = videoRef.current.duration;
+      const dbDuration = getDatabaseDurationSeconds();
+      
+      // If browser duration is broken (Infinity/NaN) or wildly miscalculated compared to our DB metadata, trust the DB.
+      if (!rawDuration || isNaN(rawDuration) || rawDuration === Infinity || (dbDuration > 0 && Math.abs(rawDuration - dbDuration) > 300)) {
+        rawDuration = dbDuration > 0 ? dbDuration : rawDuration;
+      }
+      
+      setDuration(rawDuration);
 
       if (!seekedOnLoad.current) {
         seekedOnLoad.current = true;
