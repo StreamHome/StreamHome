@@ -210,6 +210,7 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
   // Handle Dynamic Downscale Source switching
   const prevQuality = useRef(selectedQuality);
   const prevAudio = useRef(selectedAudioTrack);
+  const transcodeOffsetRef = useRef(0);
 
   // Auto-Adaptive Buffer Engine
   const waitingCountRef = useRef<number>(0);
@@ -280,13 +281,19 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
       const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : "";
       
       if (prevQuality.current !== selectedQuality || prevAudio.current !== selectedAudioTrack) {
-        const newSrc = selectedQuality === "Source" || selectedQuality === sourceQualityLabel
+        const isTranscoded = selectedQuality !== "Source" && selectedQuality !== sourceQualityLabel;
+        const newSrc = !isTranscoded
           ? `${serverRoot}${movie.videoUrl}`
           : `${apiBaseUrl}/stream/${mediaId}?quality=${selectedQuality}&audio_track=${selectedAudioTrack}&start=${currentPos}${tokenQuery}`;
           
+        if (isTranscoded) transcodeOffsetRef.current = currentPos;
+          
         videoRef.current.src = newSrc;
         videoRef.current.load();
-        videoRef.current.currentTime = currentPos;
+        
+        if (!isTranscoded) {
+           videoRef.current.currentTime = currentPos;
+        }
         
         if (!isPaused && movie.videoUrl) {
           videoRef.current.play().catch(e => {
@@ -518,10 +525,24 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
     seekTimeoutRef.current = setTimeout(() => {
       if (videoRef.current && targetSeekTimeRef.current !== null) {
         const t = targetSeekTimeRef.current;
-        videoRef.current.currentTime = t;
         const sourceQualityLabel = movie.quality || "Source";
-        if ((selectedQuality === "Source" || selectedQuality === sourceQualityLabel) && audioRef.current) {
-          audioRef.current.currentTime = t;
+        const isTranscoded = selectedQuality !== "Source" && selectedQuality !== sourceQualityLabel;
+        
+        if (!isTranscoded) {
+            videoRef.current.currentTime = t;
+            if (audioRef.current) audioRef.current.currentTime = t;
+        } else {
+            transcodeOffsetRef.current = t;
+            const serverRoot = apiBaseUrl.replace(/\/api\/?$/, "");
+            const mediaId = movie.activeEpisodeId || movie.id;
+            const token = localStorage.getItem("stream_access_token");
+            const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : "";
+            const newSrc = `${apiBaseUrl}/stream/${mediaId}?quality=${selectedQuality}&audio_track=${selectedAudioTrack}&start=${t}${tokenQuery}`;
+            videoRef.current.src = newSrc;
+            videoRef.current.load();
+            videoRef.current.play().catch(e => {
+              if (e.name !== 'AbortError') console.warn(e);
+            });
         }
         targetSeekTimeRef.current = null;
       }
@@ -530,7 +551,14 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
 
   const handleTimeUpdate = () => {
     if (videoRef.current && targetSeekTimeRef.current === null) {
-      setCurrentTime(videoRef.current.currentTime);
+      const sourceQualityLabel = movie.quality || "Source";
+      const isTranscoded = selectedQuality !== "Source" && selectedQuality !== sourceQualityLabel;
+      
+      let actualTime = videoRef.current.currentTime;
+      if (isTranscoded) {
+         actualTime += transcodeOffsetRef.current;
+      }
+      setCurrentTime(actualTime);
     }
   };
 
@@ -540,11 +568,27 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
       const videoDuration = videoElement.duration;
       if (isNaN(videoDuration) || videoDuration === Infinity || initialTimestamp < videoDuration - 10) {
         console.log(`[VideoPlayer] Seeking to initial position: ${initialTimestamp}s`);
-        videoElement.currentTime = initialTimestamp;
+        
         const sourceQualityLabel = movie.quality || "Source";
-        if ((selectedQuality === "Source" || selectedQuality === sourceQualityLabel) && audioRef.current) {
-          audioRef.current.currentTime = initialTimestamp;
+        const isTranscoded = selectedQuality !== "Source" && selectedQuality !== sourceQualityLabel;
+        
+        if (!isTranscoded) {
+            videoElement.currentTime = initialTimestamp;
+            if (audioRef.current) audioRef.current.currentTime = initialTimestamp;
+        } else {
+            transcodeOffsetRef.current = initialTimestamp;
+            const serverRoot = apiBaseUrl.replace(/\/api\/?$/, "");
+            const mediaId = movie.activeEpisodeId || movie.id;
+            const token = localStorage.getItem("stream_access_token");
+            const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : "";
+            const newSrc = `${apiBaseUrl}/stream/${mediaId}?quality=${selectedQuality}&audio_track=${selectedAudioTrack}&start=${initialTimestamp}${tokenQuery}`;
+            videoElement.src = newSrc;
+            videoElement.load();
+            videoElement.play().catch(e => {
+              if (e.name !== 'AbortError') console.warn(e);
+            });
         }
+        
         setCurrentTime(initialTimestamp);
         seekedRef.current = true;
       }
