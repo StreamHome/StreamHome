@@ -44,14 +44,37 @@ export default function App() {
     }
   });
 
+
+
+  const handleLogout = () => {
+    setActiveProfile(null);
+    setAccessToken(null);
+    setActiveMovie(null);
+    setSelectedMovieForDetails(null);
+    localStorage.removeItem("stream_active_profile");
+    localStorage.removeItem("stream_access_token");
+    setProfiles([]);
+    setAllMovies([]);
+
+    const url = new URL(window.location.href);
+    url.searchParams.delete("profile");
+    url.searchParams.delete("view");
+    url.searchParams.delete("watch");
+    url.searchParams.delete("movie");
+    window.history.pushState({}, "", url.pathname + url.search);
+  };
+
   // Load profiles from backend database
   useEffect(() => {
     const fetchProfiles = async () => {
+      if (!accessToken) return;
       try {
-        const token = localStorage.getItem("stream_access_token");
-        const headers: Record<string, string> = {};
-        if (token) headers["Authorization"] = `Bearer ${token}`;
+        const headers: Record<string, string> = { "Authorization": `Bearer ${accessToken}` };
         const res = await fetch(`${apiBaseUrl}/profiles`, { headers });
+        if (res.status === 401) {
+          handleLogout();
+          return;
+        }
         if (res.ok) {
           const data = await res.json();
           if (Array.isArray(data)) {
@@ -92,11 +115,14 @@ export default function App() {
   // Fetch all movies at the top level to share across VideoPlayer, Details Modal, and Rows
   useEffect(() => {
     const fetchMovies = async () => {
+      if (!accessToken) return;
       try {
-        const token = localStorage.getItem("stream_access_token");
-        const headers: Record<string, string> = {};
-        if (token) headers["Authorization"] = `Bearer ${token}`;
+        const headers: Record<string, string> = { "Authorization": `Bearer ${accessToken}` };
         const res = await fetch(`${apiBaseUrl}/movies`, { headers });
+        if (res.status === 401) {
+          handleLogout();
+          return;
+        }
         if (res.ok) {
           const data = await res.json();
           if (Array.isArray(data)) {
@@ -217,19 +243,7 @@ export default function App() {
     window.history.pushState({}, "", url.pathname + url.search);
   };
 
-  const handleLogout = () => {
-    setActiveProfile(null);
-    setActiveMovie(null);
-    setSelectedMovieForDetails(null);
-    localStorage.removeItem("stream_active_profile");
 
-    const url = new URL(window.location.href);
-    url.searchParams.delete("profile");
-    url.searchParams.delete("view");
-    url.searchParams.delete("watch");
-    url.searchParams.delete("movie");
-    window.history.pushState({}, "", url.pathname + url.search);
-  };
 
   const handleAccountLogout = () => {
     setAccessToken(null);

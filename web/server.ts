@@ -25,7 +25,9 @@ async function startServer() {
 
 
   // Vite middleware setup
-  if (process.env.NODE_ENV !== "production") {
+  const isProd = process.env.NODE_ENV === "production" || process.argv[1]?.endsWith("server.cjs");
+  
+  if (!isProd) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",

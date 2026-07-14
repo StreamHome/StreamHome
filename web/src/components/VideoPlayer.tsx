@@ -188,10 +188,12 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
       saveProgress();
     }, intervalTime);
 
-    if (videoRef.current) {
+    if (videoRef.current && movie.videoUrl) {
       videoRef.current.play()
         .then(() => setIsPlaying(true))
-        .catch((err) => console.warn("[Video Player] Autoplay blocked:", err));
+        .catch((err) => {
+          if (err.name !== 'AbortError') console.warn("[Video Player] Autoplay blocked:", err);
+        });
     }
 
     return () => {
@@ -228,8 +230,10 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
         videoRef.current.load();
         videoRef.current.currentTime = currentPos;
         
-        if (!isPaused) {
-          videoRef.current.play().catch(e => console.warn(e));
+        if (!isPaused && movie.videoUrl) {
+          videoRef.current.play().catch(e => {
+            if (e.name !== 'AbortError') console.warn(e);
+          });
         }
       }
 
@@ -244,12 +248,14 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
           audioRef.current.load();
           audioRef.current.currentTime = currentPos;
           if (!isPaused) {
-            audioRef.current.play().catch(e => console.warn(e));
+            audioRef.current.play().catch(e => {
+              if (e.name !== 'AbortError') console.warn(e);
+            });
           }
         }
       } else {
-        if (audioRef.current && audioRef.current.src !== "") {
-          audioRef.current.src = "";
+        if (audioRef.current && audioRef.current.getAttribute("src")) {
+          audioRef.current.removeAttribute("src");
           audioRef.current.load();
         }
       }
@@ -293,7 +299,9 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
     if ((selectedQuality === "Source" || selectedQuality === sourceQualityLabel) && audioRef.current && videoRef.current) {
       if (isPlaying) {
         audioRef.current.currentTime = videoRef.current.currentTime;
-        audioRef.current.play().catch(e => console.warn(e));
+        audioRef.current.play().catch(e => {
+          if (e.name !== 'AbortError') console.warn(e);
+        });
       } else {
         audioRef.current.pause();
       }
@@ -405,7 +413,9 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
     const sourceQualityLabel = movie.quality || "Source";
     if ((selectedQuality === "Source" || selectedQuality === sourceQualityLabel) && audioRef.current) {
       audioRef.current.currentTime = videoRef.current?.currentTime || 0;
-      audioRef.current.play().catch(e => console.warn(e));
+      audioRef.current.play().catch(e => {
+        if (e.name !== 'AbortError') console.warn(e);
+      });
     }
   };
 
@@ -429,7 +439,9 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
   const handlePlayPause = () => {
     if (!videoRef.current) return;
     if (videoRef.current.paused) {
-      videoRef.current.play();
+      videoRef.current.play().catch(e => {
+        if (e.name !== 'AbortError') console.warn(e);
+      });
       setIsPlaying(true);
     } else {
       videoRef.current.pause();
@@ -629,7 +641,7 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
       {/* HTML5 VIDEO STREAM PLAYER */}
       <video
         ref={videoRef}
-        src={selectedQuality === "Source" ? `${apiBaseUrl.replace(/\/api\/?$/, "")}${movie.videoUrl}` : undefined}
+        src={selectedQuality === "Source" && movie.videoUrl ? `${apiBaseUrl.replace(/\/api\/?$/, "")}${movie.videoUrl}` : undefined}
         className="w-full h-full object-contain"
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
