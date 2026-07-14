@@ -1690,11 +1690,32 @@ export default function Dashboard({
                   const seed = getSeedFromDate();
                   const recommendedMovies = seededShuffle(unconsumedMovies, seed) as Movie[];
 
+                  // Deduplicate TV Series sessions so only the most recent episode appears in the Continue Watching row.
+                  // Also strips out "ghost sessions" where a series was played without an active episode selected.
+                  const deduplicatedContinueWatching = (() => {
+                    const uniqueMap = new Map<string, PlaybackSession>();
+                    for (const s of continueWatching) {
+                      const mId = s.movieId || (s as any).movie_id;
+                      const movie = currentMovies.find(m => m.id === mId);
+                      
+                      // Skip buggy ghost sessions (Series played without an episode)
+                      if (movie && movie.type === "series" && !s.episodeId) {
+                        continue;
+                      }
+                      
+                      // Keep the first (most recently updated) session for each movie/series
+                      if (!uniqueMap.has(mId)) {
+                        uniqueMap.set(mId, s);
+                      }
+                    }
+                    return Array.from(uniqueMap.values());
+                  })();
+
                   return (
                     <>
                       {/* Continue Watching Row */}
                       <ContinueWatchingRow
-                        sessions={continueWatching}
+                        sessions={deduplicatedContinueWatching}
                         movies={currentMovies}
                         onPlay={onPlayMovie}
                         parseDurationToSeconds={parseDurationToSeconds}
