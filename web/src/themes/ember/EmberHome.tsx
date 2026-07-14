@@ -1,26 +1,26 @@
 import React from 'react';
 
-export default function EmberHome({ tab }: { tab: string }) {
+export default function EmberHome({ tab, profileId }: { tab: string, profileId: string }) {
   return (
-    <div className="w-full min-h-screen text-white font-sans pt-24 pb-12 px-12">
+    <div className="w-full min-h-screen text-[var(--text-color)] font-sans pt-24 pb-12 px-12">
       {/* Top Glass Navbar */}
-      <nav className="fixed top-0 left-0 right-0 h-20 glass-pane !border-t-0 !border-l-0 !border-r-0 !rounded-none z-50 flex items-center px-12 justify-between">
+      <nav className="fixed top-0 left-0 right-0 h-20 glass-pane !border-t-0 !border-l-0 !border-r-0 !rounded-none z-50 flex items-center px-12 justify-between bg-black/50">
         <div className="text-2xl font-heading tracking-widest">STREAM<span className="text-[var(--accent-color)]">HOME</span></div>
         <div className="flex gap-8 font-mono text-sm tracking-widest">
-          <a href="/" className={tab === 'home' ? 'text-[var(--accent-color)]' : 'hover:text-white/80'}>HOME</a>
-          <a href="/movies" className={tab === 'movies' ? 'text-[var(--accent-color)]' : 'hover:text-white/80'}>MOVIES</a>
-          <a href="/series" className={tab === 'series' ? 'text-[var(--accent-color)]' : 'hover:text-white/80'}>SERIES</a>
-          <a href="/downloads" className={tab === 'downloads' ? 'text-[var(--accent-color)]' : 'hover:text-white/80'}>DOWNLOADS</a>
+          <a href={`/?profile=${profileId}&view=home`} className={tab === 'home' ? 'text-[var(--accent-color)]' : 'hover:text-white/80'}>HOME</a>
+          <a href={`/?profile=${profileId}&view=movies`} className={tab === 'movies' ? 'text-[var(--accent-color)]' : 'hover:text-white/80'}>MOVIES</a>
+          <a href={`/?profile=${profileId}&view=series`} className={tab === 'series' ? 'text-[var(--accent-color)]' : 'hover:text-white/80'}>SERIES</a>
+          <a href={`/?profile=${profileId}&view=downloads`} className={tab === 'downloads' ? 'text-[var(--accent-color)]' : 'hover:text-white/80'}>DOWNLOADS</a>
         </div>
-        <div className="w-10 h-10 border border-[var(--accent-color)] flex items-center justify-center font-mono cursor-pointer hover:bg-[var(--accent-color)] hover:text-black transition-colors">
+        <a href="/admin" className="w-10 h-10 border border-[var(--accent-color)] flex items-center justify-center font-mono cursor-pointer hover:bg-[var(--accent-color)] hover:text-black transition-colors">
           E
-        </div>
+        </a>
       </nav>
 
       {/* Cinematic Hero Billboard */}
-      <div className="w-full h-[60vh] glass-pane relative overflow-hidden mb-12 flex flex-col justify-end p-12 hover-glow group">
+      <div className="w-full h-[65vh] glass-pane relative overflow-hidden mb-16 flex flex-col justify-end p-16 hover-glow group bg-gradient-to-tr from-gray-900 to-gray-800">
         <div className="absolute inset-0 bg-gradient-to-t from-black via-black/50 to-transparent z-10" />
-        <div className="absolute inset-0 bg-[url('https://image.tmdb.org/t/p/original/8rpDcsfLJypbO6vtec8OQ3NuKc.jpg')] bg-cover bg-center opacity-40 group-hover:opacity-60 transition-opacity duration-700" />
+        <div className="absolute inset-0 bg-[url('https://image.tmdb.org/t/p/original/8rpDcsfLJypbO6vtec8OQ3NuKc.jpg')] bg-cover bg-center opacity-40 group-hover:opacity-70 transition-opacity duration-700" />
         
         <div className="relative z-20 max-w-2xl">
           <h2 className="text-6xl font-heading mb-4 text-white drop-shadow-lg">FIGHT CLUB</h2>

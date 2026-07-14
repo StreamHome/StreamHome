@@ -1,21 +1,21 @@
 import React from 'react';
 
-export default function CinemaHome({ tab }: { tab: string }) {
+export default function CinemaHome({ tab, profileId }: { tab: string, profileId: string }) {
   return (
-    <div className="w-full min-h-screen text-white font-sans bg-[var(--bg-color)]">
+    <div className="w-full min-h-screen text-[var(--text-color)] font-sans bg-[var(--bg-color)]">
       {/* Solid Navbar */}
-      <nav className="fixed top-0 left-0 right-0 h-16 bg-gradient-to-b from-black/90 to-transparent z-50 flex items-center px-12 gap-12 transition-colors duration-300">
+      <nav className="fixed top-0 left-0 right-0 h-20 bg-gradient-to-b from-black/95 to-transparent z-50 flex items-center px-16 gap-12 transition-colors duration-300">
         <div className="text-3xl font-heading text-[var(--accent-color)]">STREAMHOME</div>
-        <div className="flex gap-6 font-bold text-sm">
-          <a href="/" className={tab === 'home' ? 'text-white font-bold' : 'text-gray-300 hover:text-gray-400'}>Home</a>
-          <a href="/movies" className={tab === 'movies' ? 'text-white font-bold' : 'text-gray-300 hover:text-gray-400'}>Movies</a>
-          <a href="/series" className={tab === 'series' ? 'text-white font-bold' : 'text-gray-300 hover:text-gray-400'}>Series</a>
+        <div className="flex gap-8 font-sans font-bold text-sm tracking-wide uppercase">
+          <a href={`/?profile=${profileId}&view=home`} className={tab === 'home' ? 'text-white' : 'text-gray-400 hover:text-white'}>Home</a>
+          <a href={`/?profile=${profileId}&view=movies`} className={tab === 'movies' ? 'text-white' : 'text-gray-400 hover:text-white'}>Movies</a>
+          <a href={`/?profile=${profileId}&view=series`} className={tab === 'series' ? 'text-white' : 'text-gray-400 hover:text-white'}>Series</a>
         </div>
       </nav>
 
       {/* Auto-playing Trailer Hero */}
-      <div className="w-full h-[85vh] relative mb-8">
-        <div className="absolute inset-0 bg-[url('https://image.tmdb.org/t/p/original/8rpDcsfLJypbO6vtec8OQ3NuKc.jpg')] bg-cover bg-center" />
+      <div className="w-full h-[85vh] relative mb-12 bg-gradient-to-tr from-gray-900 to-gray-800">
+        <div className="absolute inset-0 bg-[url('https://image.tmdb.org/t/p/original/8rpDcsfLJypbO6vtec8OQ3NuKc.jpg')] bg-cover bg-center mix-blend-lighten" />
         <div className="absolute inset-0 bg-gradient-to-t from-[var(--bg-color)] via-[var(--bg-color)]/20 to-transparent" />
         <div className="absolute inset-0 bg-gradient-to-r from-[var(--bg-color)] via-transparent to-transparent" />
         

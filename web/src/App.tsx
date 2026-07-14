@@ -16,12 +16,9 @@ function App() {
           <Route path="/profiles" element={<ProfileSelect />} />
           <Route path="/admin" element={<AdminCenter />} />
           
-          {/* Main Layout containing the Dashboard */}
+          {/* Main Layout containing the Dashboard with query parameters */}
           <Route path="/" element={<MainLayout />}>
             <Route index element={<DashboardRouter />} />
-            <Route path="movies" element={<DashboardRouter tab="movies" />} />
-            <Route path="series" element={<DashboardRouter tab="series" />} />
-            <Route path="downloads" element={<DashboardRouter tab="downloads" />} />
           </Route>
           
           <Route path="*" element={<Navigate to="/profiles" replace />} />

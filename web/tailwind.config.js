@@ -7,12 +7,9 @@ export default {
   theme: {
     extend: {
       fontFamily: {
-        playfair: ['"Playfair Display"', 'serif'],
-        mono: ['"JetBrains Mono"', 'monospace'],
-        inter: ['"Inter"', 'sans-serif'],
-        bebas: ['"Bebas Neue"', 'sans-serif'],
-        montserrat: ['"Montserrat"', 'sans-serif'],
-        outfit: ['"Outfit"', 'sans-serif'],
+        heading: ['var(--font-heading)'],
+        mono: ['var(--font-mono)'],
+        sans: ['var(--font-sans)'],
       },
       colors: {
         ember: {

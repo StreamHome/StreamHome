@@ -3,16 +3,114 @@
 @tailwind utilities;
 
 @layer base {
-  :root {
+  :root, [data-theme="ember"] {
     --bg-color: #000000;
     --text-color: #ffffff;
+    --accent-color: #FF5F1F;
+    --accent-color-dark: #8B310E;
+    --border-radius: 0px;
+    --font-heading: 'Playfair Display', serif;
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-sans: 'Inter', sans-serif;
+  }
+
+  [data-theme="aurora"] {
+    --bg-color: #050505;
+    --text-color: #ffffff;
+    --accent-color: #ffffff;
+    --accent-color-dark: #888888;
+    --border-radius: 16px;
+    --font-heading: 'Inter', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-sans: 'Inter', sans-serif;
+  }
+
+  [data-theme="cinema"] {
+    --bg-color: #141414;
+    --text-color: #ffffff;
+    --accent-color: #E50914;
+    --accent-color-dark: #b81d24;
+    --border-radius: 4px;
+    --font-heading: 'Bebas Neue', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-sans: 'Montserrat', sans-serif;
+  }
+
+  [data-theme="gemini"] {
+    --bg-color: #09090b;
+    --text-color: #ffffff;
+    --accent-color: #4285F4;
+    --accent-color-dark: #9b72cb;
+    --border-radius: 12px;
+    --font-heading: 'Outfit', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-sans: 'Outfit', sans-serif;
   }
   
   body {
     background-color: var(--bg-color);
     color: var(--text-color);
     margin: 0;
-    font-family: 'Inter', sans-serif;
+    font-family: var(--font-sans);
     overflow-x: hidden;
   }
+}
+
+/* Base Theme Specific Overrides */
+
+/* EMBER CLASSES */
+[data-theme="ember"] .glass-pane {
+  background: rgba(20, 20, 20, 0.4);
+  backdrop-filter: blur(24px) saturate(150%);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: var(--border-radius);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+[data-theme="ember"] .hover-glow:hover {
+  border-color: var(--accent-color);
+  border-style: dashed;
+  box-shadow: 0 0 25px rgba(255, 95, 31, 0.4), inset 0 0 15px rgba(255, 95, 31, 0.2);
+}
+
+/* AURORA CLASSES */
+[data-theme="aurora"] .glass-pane {
+  background: rgba(10, 10, 10, 0.3);
+  backdrop-filter: blur(50px) saturate(200%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: var(--border-radius);
+  box-shadow: 0 15px 35px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+[data-theme="aurora"] .hover-glow:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 15px 40px rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* CINEMA CLASSES */
+[data-theme="cinema"] .glass-pane {
+  background: rgba(20, 20, 20, 0.8);
+  border-radius: var(--border-radius);
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+}
+[data-theme="cinema"] .hover-glow:hover {
+  transform: scale(1.05);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8);
+  z-index: 10;
+}
+
+/* GEMINI CLASSES */
+[data-theme="gemini"] .glass-pane {
+  background: rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--border-radius);
+}
+[data-theme="gemini"] .hover-glow:hover {
+  border: 1px solid transparent;
+  background-clip: padding-box, border-box;
+  background-origin: padding-box, border-box;
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.05)),
+    linear-gradient(45deg, #4285F4, #9b72cb, #d96570, #f4b400);
+  box-shadow: 0 0 20px rgba(66, 133, 244, 0.2);
 }
