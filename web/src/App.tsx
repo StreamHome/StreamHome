@@ -1,4 +1,7 @@
 import { useState, useEffect } from "react";
+import { useIsMobile } from "./hooks/useIsMobile";
+import MobileDashboard from "./components/MobileDashboard";
+import MobileVideoPlayer from "./components/MobileVideoPlayer";
 import ProfileSelector from "./components/ProfileSelector";
 import Dashboard from "./components/Dashboard";
 import VideoPlayer from "./components/VideoPlayer";
@@ -383,6 +386,7 @@ export default function App() {
 
   const activeTheme = activeProfile?.theme || "netflix";
   const themeConfig = getThemeConfig(activeTheme);
+  const isMobile = useIsMobile();
 
   return (
     <div 
@@ -400,35 +404,68 @@ export default function App() {
         />
       ) : activeProfile && activeMovie ? (
         /* 1. Playing Active Movie View */
-        <VideoPlayer
-          movie={activeMovie}
-          activeProfile={activeProfile}
-          onBack={handleBackToDashboard}
-          apiBaseUrl={apiBaseUrl}
-        />
+        isMobile ? (
+          <MobileVideoPlayer
+            movie={activeMovie}
+            activeProfile={activeProfile}
+            onBack={handleBackToDashboard}
+            apiBaseUrl={apiBaseUrl}
+          />
+        ) : (
+          <VideoPlayer
+            movie={activeMovie}
+            activeProfile={activeProfile}
+            onBack={handleBackToDashboard}
+            apiBaseUrl={apiBaseUrl}
+          />
+        )
       ) : activeProfile ? (
         /* 2. Main Browse Dashboard (Supports Home, Movies, Series, MyList, Downloads, Settings tabs) */
-        <Dashboard
-          activeProfile={activeProfile}
-          setActiveProfile={setActiveProfile}
-          onLogout={handleLogout}
-          onPlayMovie={handlePlayMovie}
-          apiBaseUrl={apiBaseUrl}
-          onChangeApiBaseUrl={handleChangeApiBaseUrl}
-          apiBearerToken={apiBearerToken}
-          onChangeApiBearerToken={handleChangeApiBearerToken}
-          
-          profiles={profiles}
-          setProfiles={setProfiles}
-          
-          activeTab={activeTab}
-          onTabChange={handleTabChange}
-          
-          selectedMovieForDetails={selectedMovieForDetails}
-          setSelectedMovieForDetails={handleSelectMovieForDetails}
-          accessToken={accessToken}
-          onAccountLogout={handleAccountLogout}
-        />
+        isMobile ? (
+          <MobileDashboard
+            activeProfile={activeProfile}
+            setActiveProfile={setActiveProfile}
+            onLogout={handleLogout}
+            onPlayMovie={handlePlayMovie}
+            apiBaseUrl={apiBaseUrl}
+            onChangeApiBaseUrl={handleChangeApiBaseUrl}
+            apiBearerToken={apiBearerToken}
+            onChangeApiBearerToken={handleChangeApiBearerToken}
+            
+            profiles={profiles}
+            setProfiles={setProfiles}
+            
+            activeTab={activeTab}
+            onTabChange={handleTabChange}
+            
+            selectedMovieForDetails={selectedMovieForDetails}
+            setSelectedMovieForDetails={handleSelectMovieForDetails}
+            accessToken={accessToken}
+            onAccountLogout={handleAccountLogout}
+          />
+        ) : (
+          <Dashboard
+            activeProfile={activeProfile}
+            setActiveProfile={setActiveProfile}
+            onLogout={handleLogout}
+            onPlayMovie={handlePlayMovie}
+            apiBaseUrl={apiBaseUrl}
+            onChangeApiBaseUrl={handleChangeApiBaseUrl}
+            apiBearerToken={apiBearerToken}
+            onChangeApiBearerToken={handleChangeApiBearerToken}
+            
+            profiles={profiles}
+            setProfiles={setProfiles}
+            
+            activeTab={activeTab}
+            onTabChange={handleTabChange}
+            
+            selectedMovieForDetails={selectedMovieForDetails}
+            setSelectedMovieForDetails={handleSelectMovieForDetails}
+            accessToken={accessToken}
+            onAccountLogout={handleAccountLogout}
+          />
+        )
       ) : (
         /* 3. Initial Profile Selection Screen */
         <ProfileSelector 
