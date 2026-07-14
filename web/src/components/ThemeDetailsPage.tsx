@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { motion } from "motion/react";
 import { 
-  Play, Plus, Check, Clock, ThumbsUp, ThumbsDown, Share2, Download, Trash2,
+  Play, Plus, Check, Clock, ThumbsUp, ThumbsDown, Share2, Download, Trash2, Database,
   ArrowLeft, Tv, Star, User, Calendar, Sparkles, Cpu, Layers, Activity 
 } from "lucide-react";
 import { Movie, Profile, PlaybackSession, Episode } from "../types";
@@ -655,45 +655,14 @@ export default function ThemeDetailsPage({
                           Episode {episode.episodeNumber}: {episode.title}
                         </h4>
                         {/* Episode PWA local download control */}
-                        {episode.videoUrl && (() => {
-                          const isCached = browserCachedItems.includes(episode.id);
-                          const progress = browserDownloadingProgress[episode.id];
-                          
-                          if (progress !== undefined) {
-                            return (
-                              <span className="flex items-center gap-1 text-[10px] text-red-500 font-mono">
-                                <span className="w-3 h-3 rounded-full border border-t-transparent border-red-500 animate-spin inline-block" />
-                                <span>{progress}%</span>
-                              </span>
-                            );
-                          }
-                          
-                          if (isCached) {
-                            return (
-                              <button
-                                onClick={() => {
-                                  if (confirm("Remove this offline download from your browser?")) {
-                                    handleRemoveFromBrowser(episode.id, episode.videoUrl);
-                                  }
-                                }}
-                                className="p-1 text-red-500 hover:text-red-400 active:scale-90 transition cursor-pointer"
-                                title="Remove offline copy from browser"
-                              >
-                                <Check className="w-4 h-4 text-emerald-400" />
-                              </button>
-                            );
-                          }
-                          
-                          return (
-                            <button
-                              onClick={() => handleDownloadToBrowser(episode.id, episode.videoUrl, `${selectedMovieForDetails.title} S${episode.seasonNumber}E${episode.episodeNumber}`)}
-                              className="p-1 text-zinc-500 hover:text-white active:scale-90 transition cursor-pointer"
-                              title="Download episode to browser for offline viewing"
-                            >
-                              <Download className="w-4 h-4" />
-                            </button>
-                          );
-                        })()}
+                        {episode.videoUrl && (
+                          <div
+                            className="p-1.5 bg-black/60 rounded border border-zinc-800 flex items-center justify-center"
+                            title="Available on server"
+                          >
+                            <Database className="w-3.5 h-3.5 text-emerald-400" />
+                          </div>
+                        )}
                       </div>
                       <p className="text-xs text-zinc-400 font-normal leading-relaxed line-clamp-3">
                         {episode.description}
