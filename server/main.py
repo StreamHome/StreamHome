@@ -90,9 +90,10 @@ async def lifespan(app: FastAPI):
         logger.error(f"[Lifespan Startup] Error seeding default profile: {seed_err}")
             
     try:
-        await queue_manager.sync_media_from_disk()
+        # Run sync in the background so Uvicorn startup can complete instantly (prevents 504 gateway timeout)
+        asyncio.create_task(queue_manager.sync_media_from_disk())
     except Exception as sync_err:
-        logger.error(f"[Lifespan Startup] Error syncing media from disk: {sync_err}")
+        logger.error(f"[Lifespan Startup] Error scheduling media sync from disk: {sync_err}")
 
     try:
         queue_manager.start()
