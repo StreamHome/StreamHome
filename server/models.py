@@ -70,7 +70,10 @@ class Movie(SQLModel, table=True):
     @property
     def languages(self) -> List[str]:
         try:
-            return json.loads(self.languages_str or '["en"]')
+            val = json.loads(self.languages_str or '["en"]')
+            if isinstance(val, str):
+                return [val]
+            return val if isinstance(val, list) else ["en"]
         except Exception:
             return ["en"]
 
@@ -106,7 +109,10 @@ class Episode(SQLModel, table=True):
     @property
     def languages(self) -> List[str]:
         try:
-            return json.loads(self.languages_str or '["en"]')
+            val = json.loads(self.languages_str or '["en"]')
+            if isinstance(val, str):
+                return [val]
+            return val if isinstance(val, list) else ["en"]
         except Exception:
             return ["en"]
 

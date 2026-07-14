@@ -787,7 +787,7 @@ class DownloadQueueManager:
                                         meta = await tmdb_client.fetch_show_metadata(tmdb_id)
                                 
                                 # Re-run cataloging (which will map original files and cache settings correctly)
-                                await self._catalog_media(db, tmdb_id, media_type, season, episode, meta, file_path, language)
+                                await self._catalog_media(db, tmdb_id, media_type, season, episode, meta, file_path, language=language)
                                 count += 1
                                 
                             except Exception as e:
