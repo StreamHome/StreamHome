@@ -3021,9 +3021,9 @@ export default function Dashboard({
                                       {/* Episode on-server indicator */}
                                       <div
                                         className="p-1.5 bg-black/60 rounded border border-zinc-800 flex items-center justify-center"
-                                        title={episode.videoUrl ? "Available on server" : "Missing from server"}
+                                        title="Available on server"
                                       >
-                                        <Database className={`w-3.5 h-3.5 ${episode.videoUrl ? 'text-emerald-400' : 'text-zinc-600'}`} />
+                                        <Database className="w-3.5 h-3.5 text-emerald-400" />
                                       </div>
                                     </div>
                                     <p className="text-[11px] text-zinc-400 font-normal leading-relaxed line-clamp-2">
