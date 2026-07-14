@@ -352,39 +352,42 @@ class DownloadQueueManager:
             correct_folder_name = f"{clean_title}_TMDB_{tmdb_id}"
             parent_dir_rel = "media/Series"
             
-        # Parse current folder name from file_path
-        parts = file_path.replace("\\", "/").split("/")
+        # Parse current folder name from file_path if provided
         current_folder_name = None
-        if media_type == "movie" and len(parts) >= 2:
-            current_folder_name = parts[-2]
-        elif (media_type == "series" or media_type == "tv") and len(parts) >= 4:
-            current_folder_name = parts[-4]
-            
-        if current_folder_name and current_folder_name != correct_folder_name:
-            old_folder_abs = os.path.abspath(os.path.join(server_root, parent_dir_rel, current_folder_name))
-            new_folder_abs = os.path.abspath(os.path.join(server_root, parent_dir_rel, correct_folder_name))
-            
-            if os.path.exists(old_folder_abs) and not os.path.exists(new_folder_abs):
-                print(f"[Queue Manager] Renaming placeholder folder on disk: {current_folder_name} -> {correct_folder_name}")
-                try:
-                    os.rename(old_folder_abs, new_folder_abs)
-                    file_path = file_path.replace(current_folder_name, correct_folder_name)
-                    # For movies, also rename the filename to match the corrected title
-                    if media_type == "movie":
-                        old_file_name = parts[-1]
-                        new_file_name = f"{clean_title}_{release_year}.mp4"
-                        old_file_abs = os.path.join(new_folder_abs, old_file_name)
-                        new_file_abs = os.path.join(new_folder_abs, new_file_name)
-                        if os.path.exists(old_file_abs) and not os.path.exists(new_file_abs):
-                            os.rename(old_file_abs, new_file_abs)
-                            file_path = os.path.join(parent_dir_rel, correct_folder_name, new_file_name).replace("\\", "/")
-                except Exception as e:
-                    print(f"[Queue Manager] Error renaming folder: {e}")
+        served_url = ""
+        virtual_path = ""
+        if file_path:
+            parts = file_path.replace("\\", "/").split("/")
+            if media_type == "movie" and len(parts) >= 2:
+                current_folder_name = parts[-2]
+            elif (media_type == "series" or media_type == "tv") and len(parts) >= 4:
+                current_folder_name = parts[-4]
+                
+            if current_folder_name and current_folder_name != correct_folder_name:
+                old_folder_abs = os.path.abspath(os.path.join(server_root, parent_dir_rel, current_folder_name))
+                new_folder_abs = os.path.abspath(os.path.join(server_root, parent_dir_rel, correct_folder_name))
+                
+                if os.path.exists(old_folder_abs) and not os.path.exists(new_folder_abs):
+                    print(f"[Queue Manager] Renaming placeholder folder on disk: {current_folder_name} -> {correct_folder_name}")
+                    try:
+                        os.rename(old_folder_abs, new_folder_abs)
+                        file_path = file_path.replace(current_folder_name, correct_folder_name)
+                        # For movies, also rename the filename to match the corrected title
+                        if media_type == "movie":
+                            old_file_name = parts[-1]
+                            new_file_name = f"{clean_title}_{release_year}.mp4"
+                            old_file_abs = os.path.abspath(os.path.join(new_folder_abs, old_file_name))
+                            new_file_abs = os.path.abspath(os.path.join(new_folder_abs, new_file_name))
+                            if os.path.exists(old_file_abs):
+                                os.rename(old_file_abs, new_file_abs)
+                                file_path = os.path.join(parent_dir_rel, correct_folder_name, new_file_name).replace("\\", "/")
+                    except Exception as e:
+                        logger.error(f"[Queue Manager] Failed to rename folder/file {current_folder_name}: {e}")
 
-        virtual_path = file_path
-        if virtual_path.startswith("temp/"):
-            virtual_path = "media/" + virtual_path[5:]
-        served_url = "/" + virtual_path.replace("\\", "/")
+            virtual_path = file_path
+            if virtual_path.startswith("temp/"):
+                virtual_path = "media/" + virtual_path[5:]
+            served_url = "/" + virtual_path.replace("\\", "/")
         
         abs_file_path = os.path.abspath(os.path.join(server_root, virtual_path))
         
@@ -806,8 +809,8 @@ class DownloadQueueManager:
                                                     db.add(ep_obj)
                                                     await db.commit()
                                 else:
-                                    # If no physical video file exists on disk, do not restore this placeholder/discovery cache
-                                    continue
+                                    # Restore placeholder metadata even if the video file hasn't finished downloading yet
+                                    file_path = None
                                         
                                 language = data.get("language") or data.get("original_language")
                                 

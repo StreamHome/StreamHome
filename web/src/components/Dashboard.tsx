@@ -1305,7 +1305,7 @@ export default function Dashboard({
           </div>
 
           {/* Navigation Links (Desktop) */}
-          <nav className={`hidden md:flex items-center space-x-6 text-sm font-medium ${
+          <nav className={`flex items-center space-x-6 text-sm font-medium ${
             activeProfileTheme === "gemini" ? "text-xs" : ""
           }`}>
             <button
