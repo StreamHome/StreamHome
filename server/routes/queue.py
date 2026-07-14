@@ -101,6 +101,7 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
             subtitles_str=json.dumps(subtitles_list),
             quality=payload.quality,
             language=payload.language,
+            skip_markers_str=json.dumps(payload.skip_markers or {}),
             created_at=datetime.utcnow().isoformat()
         )
         db.add(new_task)
@@ -129,9 +130,12 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
                 )
                 movie.genres = meta.get("genres", [])
                 movie.cast = meta.get("cast", [])
+                movie.skip_markers = payload.skip_markers or {}
                 db.add(movie)
             else:
                 movie.video_url = payload.video_url
+                if payload.skip_markers:
+                    movie.skip_markers = payload.skip_markers
                 db.add(movie)
         else:
             show_id = f"tv_{payload.tmdb_id}"
@@ -176,9 +180,12 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
                         duration=ep_meta.get("duration", "45m"),
                         quality=payload.quality or "Source"
                     )
+                    ep_entry.skip_markers = payload.skip_markers or {}
                     db.add(ep_entry)
                 else:
                     ep_entry.video_url = payload.video_url
+                    if payload.skip_markers:
+                        ep_entry.skip_markers = payload.skip_markers
                     db.add(ep_entry)
 
         await db.commit()

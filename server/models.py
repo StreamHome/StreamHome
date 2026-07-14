@@ -195,6 +195,7 @@ class DownloadTask(SQLModel, table=True):
     has_video: Optional[bool] = Field(default=None)
     has_audio: Optional[bool] = Field(default=None)
     scan_quality: Optional[str] = Field(default=None)
+    skip_markers_str: Optional[str] = Field(default="{}")  # Serialized JSON Dict
     created_at: str
 
     @property
@@ -218,6 +219,17 @@ class DownloadTask(SQLModel, table=True):
     @subtitles.setter
     def subtitles(self, val: List[Dict[str, str]]):
         self.subtitles_str = json.dumps(val or [])
+
+    @property
+    def skip_markers(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self.skip_markers_str or "{}")
+        except Exception:
+            return {}
+
+    @skip_markers.setter
+    def skip_markers(self, val: Dict[str, Any]):
+        self.skip_markers_str = json.dumps(val or {})
 
 class WatchlistItem(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -355,3 +367,4 @@ class DownloadAddRequest(BaseModel):
     subtitles: Optional[List[SubtitleInput]] = None
     quality: Optional[str] = None
     language: Optional[str] = None
+    skip_markers: Optional[Dict[str, Any]] = None

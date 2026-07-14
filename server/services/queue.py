@@ -429,8 +429,7 @@ class DownloadQueueManager:
                             break
 
             duration_str = meta.get("duration", "1h 30m")
-            dur_ms = int(self._parse_duration_to_seconds(duration_str) * 1000)
-            skip_data = await self._fetch_tidb_markers(tmdb_id, False, dur_ms)
+            skip_data = task.skip_markers
             
             movie = await db.get(Movie, movie_id)
             if not movie:
@@ -593,8 +592,7 @@ class DownloadQueueManager:
                 await download_and_cache_metadata_image(meta.get("bannerUrl"), ep_backdrop_abs)
                 
             ep_dur_str = ep_meta.get("duration", "45m")
-            ep_dur_ms = int(self._parse_duration_to_seconds(ep_dur_str) * 1000)
-            ep_skip_data = await self._fetch_tidb_markers(tmdb_id, True, ep_dur_ms, season_num, episode_num)
+            ep_skip_data = task.skip_markers
             
             if not ep_entry:
                 ep_entry = Episode(
@@ -652,28 +650,7 @@ class DownloadQueueManager:
             with open(sync_compatible_metadata_file, "w", encoding="utf-8") as f:
                 json.dump(ep_metadata_content, f, indent=2, ensure_ascii=False)
 
-    async def _fetch_tidb_markers(self, tmdb_id: int, is_tv: bool, duration_ms: int, season: Optional[int] = None, episode: Optional[int] = None) -> Dict[str, Any]:
-        url = "https://api.theintrodb.org/v3/media"
-        params = {"tmdb_id": tmdb_id, "duration_ms": duration_ms}
-        if is_tv and season is not None and episode is not None:
-            params["season"] = season
-            params["episode"] = episode
-            
-        try:
-            import httpx
-            async with httpx.AsyncClient() as client:
-                res = await client.get(url, params=params, timeout=10.0)
-                if res.status_code == 200:
-                    data = res.json()
-                    return {
-                        "intro": data.get("intro", []),
-                        "recap": data.get("recap", []),
-                        "credits": data.get("credits", []),
-                        "preview": data.get("preview", [])
-                    }
-        except Exception as e:
-            print(f"[Queue Manager] TIDB fetch failed for TMDB {tmdb_id}: {e}")
-        return {}
+
 
     def _parse_duration_to_seconds(self, duration_str: str) -> float:
         total_seconds = 0.0

@@ -46,6 +46,9 @@ async def init_db():
                 if "scan_quality" not in columns:
                     logger.info("[Database] Migrating: Adding 'scan_quality' column to 'downloadtask' table...")
                     sync_conn.exec_driver_sql("ALTER TABLE downloadtask ADD COLUMN scan_quality TEXT")
+                if "skip_markers_str" not in columns:
+                    logger.info("[Database] Migrating: Adding 'skip_markers_str' column to 'downloadtask' table...")
+                    sync_conn.exec_driver_sql("ALTER TABLE downloadtask ADD COLUMN skip_markers_str TEXT DEFAULT '{}'")
             
             if "user" in inspector.get_table_names():
                 user_cols = [col["name"] for col in inspector.get_columns("user")]
