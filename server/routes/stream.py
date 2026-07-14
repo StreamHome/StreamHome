@@ -181,6 +181,33 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
             except Exception:
                 pass
 
+    # Set dynamic bitrate ceilings based on requested quality
+    maxrate = "1500k"
+    bufsize = "3000k"
+    crf = "26"
+    audio_bitrate = "128k"
+    
+    if quality == "1080p":
+        maxrate = "2500k"
+        bufsize = "5000k"
+        audio_bitrate = "96k"
+    elif quality == "720p":
+        maxrate = "1500k"
+        bufsize = "3000k"
+        audio_bitrate = "96k"
+    elif quality == "480p":
+        maxrate = "800k"
+        bufsize = "1600k"
+        audio_bitrate = "96k"
+    elif quality == "360p":
+        maxrate = "400k"
+        bufsize = "800k"
+        audio_bitrate = "64k"
+    elif quality == "240p":
+        maxrate = "250k"
+        bufsize = "500k"
+        audio_bitrate = "64k"
+
     # Build transcoding command
     if audio_file_path and os.path.exists(audio_file_path):
         if input_path == "pipe:0":
@@ -194,8 +221,11 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
                 "-tune", "zerolatency",
+                "-crf", crf,
+                "-maxrate", maxrate,
+                "-bufsize", bufsize,
                 "-c:a", "aac",
-                "-b:a", "128k",
+                "-b:a", audio_bitrate,
                 "-map", "0:v:0",
                 "-map", "1:a:0",
                 "-f", "mp4",
@@ -214,8 +244,11 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
                 "-tune", "zerolatency",
+                "-crf", crf,
+                "-maxrate", maxrate,
+                "-bufsize", bufsize,
                 "-c:a", "aac",
-                "-b:a", "128k",
+                "-b:a", audio_bitrate,
                 "-map", "0:v:0",
                 "-map", "1:a:0",
                 "-f", "mp4",
@@ -233,8 +266,11 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
                 "-tune", "zerolatency",
+                "-crf", crf,
+                "-maxrate", maxrate,
+                "-bufsize", bufsize,
                 "-c:a", "aac",
-                "-b:a", "128k",
+                "-b:a", audio_bitrate,
                 "-f", "mp4",
                 "-movflags", "frag_keyframe+empty_moov+faststart",
                 "pipe:1"
@@ -249,8 +285,11 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
                 "-tune", "zerolatency",
+                "-crf", crf,
+                "-maxrate", maxrate,
+                "-bufsize", bufsize,
                 "-c:a", "aac",
-                "-b:a", "128k",
+                "-b:a", audio_bitrate,
                 "-f", "mp4",
                 "-movflags", "frag_keyframe+empty_moov+faststart",
                 "pipe:1"
@@ -465,7 +504,12 @@ async def stream_media(
         logger.info(f"[Streaming Router] Serving cached transcode file: {cache_file}")
         return FileResponse(cache_file, media_type="video/mp4")
         
-    height = 720 if quality == "720p" else 480
+    height = 720
+    if quality == "1080p": height = 1080
+    elif quality == "720p": height = 720
+    elif quality == "480p": height = 480
+    elif quality == "360p": height = 360
+    elif quality == "240p": height = 240
     
     return StreamingResponse(
         transcode_generator(abs_path, height, start, media_id, quality, audio_track),

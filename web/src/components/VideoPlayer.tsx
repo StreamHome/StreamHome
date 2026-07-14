@@ -68,7 +68,8 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
   const [showAudioMenu, setShowAudioMenu] = useState<boolean>(false);
 
   // Dynamic stream settings
-  const [selectedQuality, setSelectedQuality] = useState<string>("Source");
+  const [selectedQuality, setSelectedQuality] = useState<string>("1080p");
+  const [isAutoMode, setIsAutoMode] = useState<boolean>(true);
   const [selectedAudioTrack, setSelectedAudioTrack] = useState<number>(0);
   const [selectedSubtitle, setSelectedSubtitle] = useState<string>("none");
 
@@ -209,6 +210,63 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
   // Handle Dynamic Downscale Source switching
   const prevQuality = useRef(selectedQuality);
   const prevAudio = useRef(selectedAudioTrack);
+
+  // Auto-Adaptive Buffer Engine
+  const waitingCountRef = useRef<number>(0);
+
+  useEffect(() => {
+    if (!isAutoMode || !videoRef.current) return;
+    
+    const interval = setInterval(() => {
+      if (!videoRef.current || videoRef.current.paused) return;
+      
+      try {
+        const vid = videoRef.current;
+        let bufferedEnd = 0;
+        for (let i = 0; i < vid.buffered.length; i++) {
+          if (vid.buffered.start(i) <= vid.currentTime && vid.buffered.end(i) >= vid.currentTime) {
+            bufferedEnd = vid.buffered.end(i);
+            break;
+          }
+        }
+        
+        const bufferRemaining = bufferedEnd - vid.currentTime;
+        
+        // If buffer is critically low and we are playing, increment waiting count
+        if (bufferRemaining < 2.0 && vid.readyState < 3) {
+           waitingCountRef.current += 1;
+        } else if (bufferRemaining > 10.0) {
+           waitingCountRef.current = Math.max(0, waitingCountRef.current - 1); // decay if healthy
+        }
+
+        if (waitingCountRef.current >= 3) {
+          // Trigger downshift
+          const qualities = ["Source", "1080p", "720p", "480p", "360p", "240p"];
+          let currentTarget = selectedQuality === "Source" ? "Source" : selectedQuality;
+          
+          // Special case: If Source is requested but metadata quality is 1080p, we might already be at 1080p source. 
+          // So just map it cleanly.
+          const currentIdx = qualities.indexOf(currentTarget);
+          
+          if (currentIdx !== -1 && currentIdx < qualities.length - 1) {
+             const nextQuality = qualities[currentIdx + 1];
+             console.log(`[Auto Engine] Buffer struggling (Remaining: ${bufferRemaining.toFixed(1)}s). Downshifting quality: ${selectedQuality} -> ${nextQuality}`);
+             setSelectedQuality(nextQuality);
+             waitingCountRef.current = 0; // Reset after shift
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+    }, 2000); // Check every 2 seconds
+
+    return () => clearInterval(interval);
+  }, [isAutoMode, selectedQuality]);
+
+  const handleWaiting = () => {
+    if (!isAutoMode) return;
+    waitingCountRef.current += 2; // A raw waiting event is a strong indicator of stutter
+  };
 
   useEffect(() => {
     if (videoRef.current) {
@@ -650,8 +708,8 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
 
   // Dynamic settings resolved from metadata or fallback defaults
   const sourceQualityLabel = movie.quality || "Source";
-  const displayedQuality = selectedQuality === "Source" ? sourceQualityLabel : selectedQuality;
-  const qualityOptions = [sourceQualityLabel, "720p", "480p"];
+  const displayedQuality = isAutoMode ? "Auto" : (selectedQuality === "Source" ? sourceQualityLabel : selectedQuality);
+  const qualityOptions = ["Auto", sourceQualityLabel, "1080p", "720p", "480p", "360p", "240p"];
 
   const audioTracks = movie.languages || ["en"];
   const displayedAudioTrack = audioTracks[selectedAudioTrack]?.toUpperCase() || `CH-${selectedAudioTrack}`;
@@ -674,6 +732,7 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
         onClick={handlePlayPause}
         onPlay={handlePlay}
         onPause={handlePause}
+        onWaiting={handleWaiting}
         onSeeking={syncAudioTime}
         onSeeked={syncAudioTime}
         onRateChange={() => {
@@ -862,12 +921,21 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
                           <button
                             key={q}
                             onClick={() => {
-                              setSelectedQuality(q === sourceQualityLabel ? "Source" : q);
+                              if (q === "Auto") {
+                                setIsAutoMode(true);
+                                setSelectedQuality("1080p"); // Default start for Auto
+                              } else {
+                                setIsAutoMode(false);
+                                setSelectedQuality(q === sourceQualityLabel ? "Source" : q);
+                              }
                               setShowQualityMenu(false);
                             }}
-                            className={`w-full text-left px-3 py-1.5 text-xs font-semibold hover:bg-zinc-800 transition cursor-pointer ${
-                              (selectedQuality === "Source" ? sourceQualityLabel : selectedQuality) === q ? "text-red-500 bg-zinc-800/40" : "text-zinc-300"
-                            }`}
+                            className={`w-full text-left px-4 py-2 hover:bg-zinc-800 transition duration-200 text-sm font-medium
+                              ${
+                                (isAutoMode && q === "Auto") || (!isAutoMode && (selectedQuality === "Source" ? sourceQualityLabel : selectedQuality) === q) 
+                                  ? "text-red-500 bg-zinc-800/40" 
+                                  : "text-zinc-300"
+                              }`}
                           >
                             {q}
                           </button>
