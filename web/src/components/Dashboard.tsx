@@ -1774,7 +1774,7 @@ export default function Dashboard({
                       {/* Row for All Movies first */}
                       <MovieRow 
                         title={activeTab === "series" ? "All Series" : activeTab === "movies" ? "All Movies" : "All Releases"} 
-                        movies={currentMovies.filter(m => !finishedMovieIds.includes(m.id))} 
+                        movies={currentMovies} 
                         onPlay={setSelectedMovieForDetails}
                         moviesOnServer={movies}
                         onAddDownload={handlePreFillDownload}
@@ -1783,7 +1783,7 @@ export default function Dashboard({
 
                       {/* Rows per Genre */}
                       {currentGenres.map((genre) => {
-                        const genreMovies = currentMovies.filter((m) => m.genres?.includes(genre) && !finishedMovieIds.includes(m.id));
+                        const genreMovies = currentMovies.filter((m) => m.genres?.includes(genre));
                         if (genreMovies.length === 0) return null;
                         return (
                           <MovieRow
