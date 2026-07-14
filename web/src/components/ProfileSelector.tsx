@@ -303,7 +303,7 @@ export default function ProfileSelector({ profiles, setProfiles, onSelectProfile
       </motion.div>
 
       <div 
-        className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-8 max-w-5xl w-full px-4 justify-items-center z-10" 
+        className="flex flex-wrap justify-center gap-6 sm:gap-8 max-w-5xl w-full px-4 z-10" 
         id="profile-list"
       >
         {profiles.map((profile, idx) => {

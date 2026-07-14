@@ -82,6 +82,7 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
 
   // Control overlay visibility state (hide when idle)
   const [controlsVisible, setControlsVisible] = useState<boolean>(true);
+  const [seekIndicator, setSeekIndicator] = useState<{ type: 'forward' | 'backward', id: number, accumulated: number } | null>(null);
   const idleTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // Format seconds to hh:mm:ss
@@ -748,6 +749,40 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
     return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
   }, []);
 
+  const handleDoubleClick = (e: React.MouseEvent<HTMLVideoElement>) => {
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const isLeft = e.clientX - rect.left < rect.width / 2;
+    const baseAmount = isLeft ? -10 : 10;
+    
+    setSeekIndicator(prev => {
+      const accumulated = (prev && prev.type === (isLeft ? 'backward' : 'forward') && Date.now() - prev.id < 800) 
+        ? prev.accumulated + baseAmount 
+        : baseAmount;
+      return { type: isLeft ? 'backward' : 'forward', id: Date.now(), accumulated };
+    });
+
+    // We get actual current time directly from the video if available
+    let actualTime = currentTime;
+    if (videoRef.current) actualTime = videoRef.current.currentTime;
+    
+    // We must account for transcoded offset
+    const sourceQualityLabel = movie.quality || "Source";
+    const isTranscoded = selectedQuality !== "Source" && selectedQuality !== sourceQualityLabel;
+    if (isTranscoded) actualTime += transcodeOffsetRef.current;
+
+    const newTime = Math.max(0, Math.min(duration || Infinity, actualTime + baseAmount));
+    performSeek(newTime);
+  };
+
+  useEffect(() => {
+    if (!seekIndicator) return;
+    const timer = setTimeout(() => {
+      setSeekIndicator(null);
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [seekIndicator]);
+
   // Dynamic settings resolved from metadata or fallback defaults
   const sourceQualityLabel = movie.quality || "Source";
   const displayedQuality = isAutoMode ? "Auto" : (selectedQuality === "Source" ? sourceQualityLabel : selectedQuality);
@@ -772,6 +807,7 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
         onClick={handlePlayPause}
+        onDoubleClick={handleDoubleClick}
         onPlay={handlePlay}
         onPause={handlePause}
         onWaiting={handleWaiting}
@@ -803,6 +839,27 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
         })}
         Your browser does not support the video tag.
       </video>
+
+      {/* DOUBLE CLICK SEEK INDICATOR */}
+      <AnimatePresence>
+        {seekIndicator && (
+          <motion.div
+            key={seekIndicator.id}
+            initial={{ opacity: 0, scale: 0.8 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0 }}
+            className={`absolute top-0 bottom-0 w-[40%] pointer-events-none flex items-center justify-center bg-white/5 ${
+              seekIndicator.type === 'backward' ? 'left-0 rounded-r-full' : 'right-0 rounded-l-full'
+            }`}
+          >
+            <div className="flex flex-col items-center justify-center bg-black/40 rounded-full w-24 h-24 backdrop-blur-sm">
+              <span className="text-white font-bold text-lg font-mono">
+                {seekIndicator.accumulated > 0 ? '+' : ''}{seekIndicator.accumulated}s
+              </span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* SYNCHRONIZED MULTI-TRACK AUDIO PLAYER */}
       <audio
@@ -883,7 +940,7 @@ export default function VideoPlayer({ movie: originalMovie, activeProfile, onBac
               </div>
 
               {/* MEDIA HUD CONTROL BUTTONS */}
-              <div className="flex items-center justify-between w-full">
+              <div className="flex flex-wrap items-center justify-between w-full gap-y-4 pb-safe">
                 
                 {/* Left Side Buttons */}
                 <div className="flex items-center space-x-4 md:space-x-6">

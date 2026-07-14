@@ -692,7 +692,7 @@ export default function ThemeDetailsPage({
               {relatedTitles.length === 0 ? (
                 <div className="text-center py-12 text-zinc-500 text-xs sm:text-sm">No related titles found.</div>
               ) : (
-                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(110px,1fr))] sm:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-3 sm:gap-4 md:gap-5 pb-20 md:pb-0">
                   {relatedTitles.map((movie) => (
                     <div 
                       key={movie.id}
@@ -1027,7 +1027,7 @@ export default function ThemeDetailsPage({
               {relatedTitles.length === 0 ? (
                 <div className="text-center py-12 text-zinc-500 text-xs sm:text-sm">No related original releases found.</div>
               ) : (
-                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-6">
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(110px,1fr))] sm:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-3 sm:gap-4 md:gap-5 pb-20 md:pb-0">
                   {relatedTitles.map((movie) => (
                     <div 
                       key={movie.id}
@@ -1357,7 +1357,7 @@ export default function ThemeDetailsPage({
             {relatedTitles.length === 0 ? (
               <div className="text-center py-12 text-zinc-600 text-xs sm:text-sm">NO DIRECT CLUSTERS CONVERGING.</div>
             ) : (
-              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(110px,1fr))] sm:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-3 sm:gap-4 md:gap-5 pb-20 md:pb-0">
                 {relatedTitles.map((movie) => (
                   <div 
                     key={movie.id}

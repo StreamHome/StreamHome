@@ -1280,16 +1280,17 @@ export default function Dashboard({
       {/* HEADER NAVBAR */}
       <header
         id="navbar-header"
-        className={`fixed z-50 flex items-center justify-between transition-all duration-150 ${
+        className={`fixed z-50 flex flex-col justify-center transition-all duration-150 ${
           activeProfileTheme === "apple" 
-            ? "mx-auto my-3 left-1/2 -translate-x-1/2 w-[90%] max-w-5xl rounded-full bg-black/45 backdrop-blur-xl border border-white/10 px-6 py-2.5 shadow-2xl" 
-            : `top-0 left-0 right-0 px-6 md:px-12 py-3.5 md:py-4 ${
+            ? "mx-auto my-3 left-1/2 -translate-x-1/2 w-[95%] max-w-5xl rounded-2xl bg-black/45 backdrop-blur-xl border border-white/10 px-4 py-2.5 shadow-2xl" 
+            : `top-0 left-0 right-0 px-4 md:px-12 py-3 md:py-4 ${
                 isScrolled 
                   ? "bg-[var(--theme-bg)] border-b border-zinc-800/80 shadow-2xl" 
                   : "bg-gradient-to-b from-black/90 to-transparent border-b-0 border-transparent"
               }`
         }`}
       >
+        <div className="flex items-center justify-between w-full">
         <div className="flex items-center space-x-8 md:space-x-10">
           {/* Logo / Brand */}
           <div className="flex items-center space-x-2 cursor-pointer animate-fade-in" onClick={() => { setSearchQuery(""); onTabChange("home"); }}>
@@ -1314,7 +1315,7 @@ export default function Dashboard({
           </div>
 
           {/* Navigation Links (Desktop) */}
-          <nav className={`hidden lg:flex items-center space-x-6 text-sm font-medium ${
+          <nav className={`hidden md:flex items-center space-x-6 text-sm font-medium ${
             activeProfileTheme === "gemini" ? "text-xs" : ""
           }`}>
             <button
@@ -1436,7 +1437,37 @@ export default function Dashboard({
             </div>
           </div>
         </div>
+        </div>
+        
+        {/* Navigation Links (Mobile Top Text) */}
+        <nav className="flex md:hidden items-center justify-center space-x-6 w-full mt-3 text-xs font-light text-white/80">
+          <button onClick={() => { setSearchQuery(""); onTabChange("home"); }} className={`cursor-pointer pb-1 ${activeTab === "home" && !searchQuery ? "text-white font-medium border-b border-white" : ""}`}>
+            Home
+          </button>
+          <button onClick={() => { setSearchQuery(""); onTabChange("movies"); }} className={`cursor-pointer pb-1 ${activeTab === "movies" && !searchQuery ? "text-white font-medium border-b border-white" : ""}`}>
+            Movies
+          </button>
+          <button onClick={() => { setSearchQuery(""); onTabChange("series"); }} className={`cursor-pointer pb-1 ${activeTab === "series" && !searchQuery ? "text-white font-medium border-b border-white" : ""}`}>
+            TV Series
+          </button>
+        </nav>
       </header>
+
+      {/* Bottom Navigation Bar (Mobile) */}
+      <div className="md:hidden fixed bottom-0 left-0 right-0 z-50 bg-black/90 backdrop-blur-xl border-t border-white/10 pb-safe pt-2 px-6 flex items-center justify-between shadow-2xl">
+        <button onClick={() => { setSearchQuery(""); onTabChange("home"); }} className={`flex flex-col items-center justify-center p-2 transition ${activeTab === "home" && !searchQuery ? "text-white scale-110" : "text-white/50"}`}>
+          <Database className="w-6 h-6" />
+        </button>
+        <button onClick={() => { setSearchQuery(""); onTabChange("mylist"); }} className={`flex flex-col items-center justify-center p-2 transition ${activeTab === "mylist" && !searchQuery ? "text-white scale-110" : "text-white/50"}`}>
+          <Plus className="w-6 h-6" />
+        </button>
+        <button onClick={() => { setSearchQuery(""); onTabChange("downloads"); }} className={`flex flex-col items-center justify-center p-2 transition ${activeTab === "downloads" && !searchQuery ? "text-white scale-110" : "text-white/50"}`}>
+          <Download className="w-6 h-6" />
+        </button>
+        <button onClick={() => { setSearchQuery(""); onTabChange("settings"); }} className={`flex flex-col items-center justify-center p-2 transition ${activeTab === "settings" && !searchQuery ? "text-white scale-110" : "text-white/50"}`}>
+          <Settings className="w-6 h-6" />
+        </button>
+      </div>
 
       {selectedMovieForDetails && activeProfile.theme && activeProfile.theme !== "netflix" ? (
         <ThemeDetailsPage
@@ -1488,10 +1519,12 @@ export default function Dashboard({
                     <p className="text-sm mt-1">Try searching another genre, title, or director.</p>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
-                    {combinedResults.map((movie) => (
-                      <MovieCard key={movie.id} movie={movie} onPlay={setSelectedMovieForDetails} moviesOnServer={movies} />
-                    ))}
+                  <div className="relative group/row pb-20 md:pb-0">
+                    <div className="grid grid-cols-[repeat(auto-fill,minmax(110px,1fr))] sm:grid-cols-[repeat(auto-fill,minmax(150px,1fr))] md:grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-3 sm:gap-4 md:gap-5">
+                      {combinedResults.map((movie) => (
+                        <MovieCard key={movie.id} movie={movie} onPlay={setSelectedMovieForDetails} moviesOnServer={movies} />
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>
