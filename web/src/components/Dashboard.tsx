@@ -1975,87 +1975,7 @@ export default function Dashboard({
                 </form>
               </div>
 
-              {/* Progress List */}
-              <div className="space-y-4">
-                {downloads.length === 0 ? (
-                  <div className="text-center py-20 bg-zinc-950 rounded-xl border border-zinc-800">
-                    <Clock className="w-12 h-12 text-zinc-600 mx-auto mb-4" />
-                    <h3 className="text-sm font-bold text-zinc-400 uppercase tracking-widest text-center">No Active Ingestions</h3>
-                    <p className="text-xs text-zinc-500 mt-1 max-w-sm mx-auto text-center">
-                      Scrape files with the companion browser extension or trigger a manual ingestion above to seed the media pipeline.
-                    </p>
-                  </div>
-                ) : (
-                  downloads.map((item) => (
-                    <div 
-                      key={item.id} 
-                      className="bg-[#121212] border border-zinc-800/80 rounded-lg p-4 md:p-5 flex flex-col md:flex-row md:items-center justify-between gap-4 hover:border-zinc-700 transition"
-                    >
-                      <div className="space-y-2 flex-1 text-left">
-                        <div className="flex items-center flex-wrap gap-2 justify-start">
-                          <h4 className="text-sm font-extrabold text-white uppercase tracking-tight truncate max-w-md text-left">
-                            {item.title}
-                          </h4>
-                          <span className={`text-[10px] font-extrabold uppercase px-2.5 py-0.5 rounded border ${
-                            item.status === "Completed"
-                              ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
-                              : item.status === "Uploading to Google Drive"
-                              ? "bg-blue-500/10 border-blue-500/20 text-blue-400 animate-pulse"
-                              : item.status === "Compressing with FFmpeg (H.265)"
-                              ? "bg-purple-500/10 border-purple-500/20 text-purple-400"
-                              : "bg-amber-500/10 border-amber-500/20 text-amber-400"
-                          }`}>
-                            {item.status}
-                          </span>
-                        </div>
-                        
-                        <p className="text-[10px] font-mono text-zinc-500 truncate max-w-lg text-left">
-                          Source: <span className="text-zinc-400 select-all">{item.sourceUrl}</span>
-                        </p>
-
-                        {/* Progress Bar Container */}
-                        <div className="space-y-1">
-                          <div className="flex justify-between text-[10px] text-zinc-400 font-mono">
-                            <span>Pipeline Progress</span>
-                            <span className="font-bold text-zinc-300">{item.progress}%</span>
-                          </div>
-                          <div className="w-full bg-zinc-950 h-2 rounded overflow-hidden border border-zinc-900">
-                            <div 
-                              className={`h-full transition-all duration-1000 ${
-                                item.status === "Completed"
-                                  ? "bg-emerald-500"
-                                  : item.status === "Uploading to Google Drive"
-                                  ? "bg-blue-500"
-                                  : item.status === "Compressing with FFmpeg (H.265)"
-                                  ? "bg-purple-500"
-                                  : "bg-amber-500"
-                              }`}
-                              style={{ width: `${item.progress}%` }}
-                            />
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center space-x-3 shrink-0 self-end md:self-auto">
-                        {item.status !== "Completed" && item.status !== "Failed" && (
-                          <div className="text-right text-[10px] font-mono text-zinc-500 space-y-0.5 mr-2">
-                            <div>Speed: <span className="text-zinc-300 font-bold">{item.speed || "0.00x"}</span></div>
-                            <div>ETA: <span className="text-zinc-300 font-bold">{item.eta || "00:00:00"}</span></div>
-                          </div>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteDownload(item.id)}
-                          className="p-2 bg-zinc-900 hover:bg-red-950/40 text-zinc-400 hover:text-red-500 rounded border border-zinc-800 hover:border-red-900/40 transition cursor-pointer"
-                          title="Remove or Cancel Job"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
+              {/* Progress List removed as per user request */}
 
               {/* Browser Offline Library (PWA Caches) */}
               <div className="mt-12 pt-8 border-t border-zinc-800 space-y-4">
@@ -3026,7 +2946,7 @@ export default function Dashboard({
                               <span className="text-zinc-500 text-[10px] uppercase font-extrabold tracking-wider">{displayEpisodes.length} Episodes</span>
                             </div>
 
-                            <div className="space-y-3.5 max-h-[280px] overflow-y-auto pr-1" id="episodes-container">
+                            <div className="space-y-3.5" id="episodes-container">
                               {displayEpisodes.map((episode) => (
                                 <div
                                   key={episode.id}
