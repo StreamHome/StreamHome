@@ -1,13 +1,14 @@
 import asyncio
-from typing import Dict, Any
+import subprocess
+from typing import Dict, Any, Union
 
 # In-memory dictionary storing active download transient metrics:
 # task_id -> {"progress": float, "speed": str, "eta": str}
 ACTIVE_DOWNLOAD_METRICS: Dict[str, Dict[str, Any]] = {}
 
 # In-memory process registry tracking active FFmpeg subprocesses:
-# task_id -> asyncio.subprocess.Process object reference
-ACTIVE_PROCESSES: Dict[str, asyncio.subprocess.Process] = {}
+# task_id -> asyncio.subprocess.Process or subprocess.Popen object reference
+ACTIVE_PROCESSES: Dict[str, Union[asyncio.subprocess.Process, subprocess.Popen]] = {}
 
 # Active HTTP traffic metrics for update idle detection
 ACTIVE_HTTP_REQUESTS: int = 0

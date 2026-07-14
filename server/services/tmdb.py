@@ -383,8 +383,8 @@ class TMDBClient:
                                     "episode": episode_num,
                                     "video_url": ep_served_url,
                                     "thumbnailUrl": ep_thumb_url,
-                                    "language": "en",
-                                    "original_language": "en"
+                                    "language": item_dict.get("original_language", "en"),
+                                    "original_language": item_dict.get("original_language", "en")
                                 }
                                 
                                 with open(ep_metadata_file, "w", encoding="utf-8") as f:

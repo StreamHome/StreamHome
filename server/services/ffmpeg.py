@@ -86,15 +86,14 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[boo
         current_speed_str = "0 Mbps"
 
         # Read from raw binary stream buffer unbuffered
-        buffer = ""
+        buffer_bytes = bytearray()
         while True:
             char_bytes = process.stderr.read(1)
             if not char_bytes:
                 break
-            char = char_bytes.decode("utf-8", errors="ignore")
-            if char in ("\r", "\n"):
-                line = buffer.strip()
-                buffer = ""
+            if char_bytes in (b"\r", b"\n"):
+                line = buffer_bytes.decode("utf-8", errors="ignore").strip()
+                buffer_bytes.clear()
                 if not line:
                     continue
                 
@@ -158,7 +157,7 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[boo
                     
                     update_task_metrics(task_id, progress, speed=current_speed_str, eta=eta, size=size_str)
             else:
-                buffer += char
+                buffer_bytes.extend(char_bytes)
                 
         process.wait()
         unregister_process(task_id)
@@ -204,6 +203,8 @@ async def download_and_merge(
         is_audio_http = audio_url.lower().startswith(("http://", "https://"))
         if is_audio_http:
             cmd.extend(["-protocol_whitelist", "http,https,tcp,tls,crypto,dns", "-allowed_extensions", "ALL", "-extension_picky", "0"])
+        if headers_str.strip() and is_audio_http:
+            cmd.extend(["-headers", headers_str])
         # faststart eklendi
         cmd.extend(["-i", audio_url, "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", "-map", "0:v:0", "-map", "1:a:0", "-shortest"])
     else:

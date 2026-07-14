@@ -126,6 +126,8 @@ async def lifespan(app: FastAPI):
                             logger.info(f"[Backup Worker] Daily database backup successfully completed: {backup_path}")
                         else:
                             logger.info("[Backup Worker] Daily backup is due, but database is currently in use. Deferring check...")
+                            await asyncio.sleep(300)
+                            continue
             except Exception as e:
                 logger.error(f"[Backup Worker] Error in daily backup scheduler: {e}")
             await asyncio.sleep(3600)  # Check hourly
