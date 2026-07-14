@@ -70,6 +70,7 @@ export default function Dashboard({
   const [discoverScifi, setDiscoverScifi] = useState<any[]>([]);
   const [tmdbSearchResults, setTmdbSearchResults] = useState<any[]>([]);
   const [isSearchingTmdb, setIsSearchingTmdb] = useState<boolean>(false);
+  const [isFetchingEpisodes, setIsFetchingEpisodes] = useState<boolean>(false);
 
   const [browserCachedItems, setBrowserCachedItems] = useState<string[]>([]);
   const [browserDownloadingProgress, setBrowserDownloadingProgress] = useState<Record<string, number>>({});
@@ -284,15 +285,8 @@ export default function Dashboard({
                      
       if (!tmdbId) return;
 
-      // Clear existing episodes to prevent the "partial episodes first, then all episodes" glitch
-      if (selectedMovieForDetails.episodes && selectedMovieForDetails.episodes.length > 0) {
-        setSelectedMovieForDetails({
-          ...selectedMovieForDetails,
-          episodes: []
-        });
-      }
-      
       try {
+        setIsFetchingEpisodes(true);
         console.log(`[Frontend] Fetching episodes for series TMDB ID: ${tmdbId}`);
         const token = localStorage.getItem("stream_access_token");
         const headers: Record<string, string> = {};
@@ -308,6 +302,8 @@ export default function Dashboard({
         }
       } catch (err) {
         console.error("Failed to fetch series episodes:", err);
+      } finally {
+        setIsFetchingEpisodes(false);
       }
     };
     
@@ -1458,6 +1454,7 @@ export default function Dashboard({
           setSelectedSeason={setSelectedSeason}
           onAddDownload={handlePreFillDownload}
           apiBaseUrl={apiBaseUrl}
+          isFetchingEpisodes={isFetchingEpisodes}
         />
       ) : (
         <>
@@ -2959,7 +2956,20 @@ export default function Dashboard({
                             </div>
 
                             <div className="space-y-3.5" id="episodes-container">
-                              {displayEpisodes.map((episode) => (
+                              {isFetchingEpisodes ? (
+                                <div className="space-y-4 py-6">
+                                  {[1, 2, 3].map(i => (
+                                    <div key={`skel-${i}`} className="flex flex-col sm:flex-row items-start gap-4 p-3 rounded-lg bg-zinc-900/40 border border-zinc-800/50 animate-pulse">
+                                      <div className="relative w-full sm:w-32 aspect-video rounded-md bg-zinc-800/50 flex-none" />
+                                      <div className="flex-1 space-y-2 w-full pt-1">
+                                        <div className="h-3 w-1/3 bg-zinc-800/50 rounded" />
+                                        <div className="h-2 w-full bg-zinc-800/30 rounded mt-2" />
+                                        <div className="h-2 w-4/5 bg-zinc-800/30 rounded" />
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : displayEpisodes.map((episode) => (
                                 <div
                                   key={episode.id}
                                   className="group/episode flex flex-col sm:flex-row items-start gap-4 p-3 rounded-lg bg-zinc-900/40 hover:bg-zinc-900/80 border border-zinc-800/50 hover:border-zinc-700/60 transition-all duration-200"

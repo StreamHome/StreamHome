@@ -21,6 +21,7 @@ interface ThemeDetailsPageProps {
   setSelectedSeason: (season: number) => void;
   onAddDownload?: (tmdbId: string, mediaType: string) => void;
   apiBaseUrl: string;
+  isFetchingEpisodes?: boolean;
 }
 
 export default function ThemeDetailsPage({
@@ -38,6 +39,7 @@ export default function ThemeDetailsPage({
   setSelectedSeason,
   onAddDownload,
   apiBaseUrl,
+  isFetchingEpisodes = false,
 }: ThemeDetailsPageProps) {
   const [activeTab, setActiveTab] = useState<"related" | "details" | "episodes">("episodes");
   const [likeStatus, setLikeStatus] = useState<"liked" | "disliked" | null>(null);
@@ -629,7 +631,20 @@ export default function ThemeDetailsPage({
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {currentEpisodes.map((episode) => (
+                {isFetchingEpisodes ? (
+                  <>
+                    {[1, 2, 3, 4].map(i => (
+                      <div key={`skel-def-${i}`} className="flex flex-col sm:flex-row gap-4 p-4 rounded-lg bg-zinc-950 border border-zinc-900 animate-pulse">
+                        <div className="relative w-full sm:w-36 aspect-video rounded bg-zinc-900 flex-none" />
+                        <div className="flex-1 space-y-2 pt-1">
+                          <div className="h-4 w-1/3 bg-zinc-900 rounded" />
+                          <div className="h-3 w-full bg-zinc-900 rounded mt-3" />
+                          <div className="h-3 w-4/5 bg-zinc-900 rounded" />
+                        </div>
+                      </div>
+                    ))}
+                  </>
+                ) : currentEpisodes.map((episode) => (
                   <div 
                     key={episode.id}
                     className="group/ep flex flex-col sm:flex-row gap-4 p-4 rounded-lg bg-zinc-950 border border-zinc-900 hover:border-zinc-800 transition duration-150"
@@ -951,7 +966,22 @@ export default function ThemeDetailsPage({
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {currentEpisodes.map((episode) => (
+                {isFetchingEpisodes ? (
+                  <>
+                    {[1, 2, 3, 4, 5, 6].map(i => (
+                      <div key={`skel-app-${i}`} className="flex flex-col rounded-2xl bg-white/5 border border-white/10 overflow-hidden animate-pulse">
+                        <div className="relative aspect-video bg-zinc-900" />
+                        <div className="p-4 space-y-3">
+                          <div className="h-4 w-1/2 bg-white/10 rounded" />
+                          <div className="space-y-2">
+                            <div className="h-3 w-full bg-white/5 rounded" />
+                            <div className="h-3 w-3/4 bg-white/5 rounded" />
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </>
+                ) : currentEpisodes.map((episode) => (
                   <div 
                     key={episode.id}
                     className="group/ep flex flex-col rounded-2xl bg-white/5 border border-white/10 overflow-hidden hover:bg-white/10 transition duration-300"
@@ -977,45 +1007,14 @@ export default function ThemeDetailsPage({
                           S{episode.seasonNumber} E{episode.episodeNumber} • {episode.title}
                         </h4>
                         {/* Episode PWA local download control */}
-                        {episode.videoUrl && (() => {
-                          const isCached = browserCachedItems.includes(episode.id);
-                          const progress = browserDownloadingProgress[episode.id];
-                          
-                          if (progress !== undefined) {
-                            return (
-                              <span className="flex items-center gap-1 text-[10px] text-red-500 font-mono">
-                                <span className="w-3 h-3 rounded-full border border-t-transparent border-red-500 animate-spin inline-block" />
-                                <span>{progress}%</span>
-                              </span>
-                            );
-                          }
-                          
-                          if (isCached) {
-                            return (
-                              <button
-                                onClick={() => {
-                                  if (confirm("Remove this offline download from your browser?")) {
-                                    handleRemoveFromBrowser(episode.id, episode.videoUrl);
-                                  }
-                                }}
-                                className="p-1 text-red-500 hover:text-red-400 active:scale-90 transition cursor-pointer"
-                                title="Remove offline copy from browser"
-                              >
-                                <Check className="w-4 h-4 text-emerald-400" />
-                              </button>
-                            );
-                          }
-                          
-                          return (
-                            <button
-                              onClick={() => handleDownloadToBrowser(episode.id, episode.videoUrl, `${selectedMovieForDetails.title} S${episode.seasonNumber}E${episode.episodeNumber}`)}
-                              className="p-1 text-zinc-500 hover:text-white active:scale-90 transition cursor-pointer"
-                              title="Download episode to browser for offline viewing"
-                            >
-                              <Download className="w-4 h-4" />
-                            </button>
-                          );
-                        })()}
+                        {episode.videoUrl && (
+                          <div
+                            className="p-1.5 bg-black/60 rounded border border-zinc-800 flex items-center justify-center"
+                            title="Available on server"
+                          >
+                            <Database className="w-3.5 h-3.5 text-emerald-400" />
+                          </div>
+                        )}
                       </div>
                       <p className="text-xs text-zinc-400 font-light leading-relaxed line-clamp-2">
                         {episode.description}
@@ -1298,8 +1297,23 @@ export default function ThemeDetailsPage({
               <span className="text-zinc-600 text-xs font-mono">{currentEpisodes.length} TRACKS_LOADED</span>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {currentEpisodes.map((episode) => (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {isFetchingEpisodes ? (
+                <>
+                  {[1, 2, 3, 4, 5, 6].map(i => (
+                    <div key={`skel-gem-${i}`} className="group/ep flex flex-col rounded-xl bg-zinc-900/30 border border-zinc-800/50 overflow-hidden animate-pulse">
+                      <div className="relative aspect-video bg-zinc-800/50" />
+                      <div className="p-5 space-y-3">
+                        <div className="h-4 w-2/3 bg-zinc-800/50 rounded" />
+                        <div className="space-y-2">
+                          <div className="h-3 w-full bg-zinc-800/30 rounded" />
+                          <div className="h-3 w-5/6 bg-zinc-800/30 rounded" />
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </>
+              ) : currentEpisodes.map((episode) => (
                 <div 
                   key={episode.id}
                   className="group/ep flex flex-col sm:flex-row gap-4 p-4 rounded bg-black/60 border border-purple-500/10 hover:border-cyan-500/40 transition duration-300"
@@ -1325,45 +1339,14 @@ export default function ThemeDetailsPage({
                         TRK_0{episode.episodeNumber}: {episode.title}
                       </h4>
                       {/* Episode PWA local download control */}
-                      {episode.videoUrl && (() => {
-                        const isCached = browserCachedItems.includes(episode.id);
-                        const progress = browserDownloadingProgress[episode.id];
-                        
-                        if (progress !== undefined) {
-                          return (
-                            <span className="flex items-center gap-1 text-[10px] text-red-500 font-mono">
-                              <span className="w-3 h-3 rounded-full border border-t-transparent border-red-500 animate-spin inline-block" />
-                              <span>{progress}%</span>
-                            </span>
-                          );
-                        }
-                        
-                        if (isCached) {
-                          return (
-                            <button
-                              onClick={() => {
-                                if (confirm("Remove this offline download from your browser?")) {
-                                  handleRemoveFromBrowser(episode.id, episode.videoUrl);
-                                }
-                              }}
-                              className="p-1 text-red-500 hover:text-red-400 active:scale-90 transition cursor-pointer"
-                              title="Remove offline copy from browser"
-                            >
-                              <Check className="w-4 h-4 text-emerald-400" />
-                            </button>
-                          );
-                        }
-                        
-                        return (
-                          <button
-                            onClick={() => handleDownloadToBrowser(episode.id, episode.videoUrl, `${selectedMovieForDetails.title} S${episode.seasonNumber}E${episode.episodeNumber}`)}
-                            className="p-1 text-zinc-500 hover:text-white active:scale-90 transition cursor-pointer"
-                            title="Download episode to browser for offline viewing"
-                          >
-                            <Download className="w-4 h-4" />
-                          </button>
-                        );
-                      })()}
+                      {episode.videoUrl && (
+                        <div
+                          className="p-1.5 bg-black/60 rounded border border-zinc-800 flex items-center justify-center"
+                          title="Available on server"
+                        >
+                          <Database className="w-3.5 h-3.5 text-emerald-400" />
+                        </div>
+                      )}
                     </div>
                     <p className="text-xs text-zinc-500 font-light leading-relaxed line-clamp-3">
                       {episode.description}
