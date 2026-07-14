@@ -431,27 +431,42 @@ class TMDBClient:
         import asyncio
         is_tv = media_type.lower() in ("series", "tv")
         
-        if is_tv:
-            genre_id = 10759 if "action" in category.lower() else 10765  # Action & Adventure, Sci-Fi & Fantasy
-            path = "/discover/tv"
-            local_prefix = "Series"
-        else:
-            genre_id = 28 if "action" in category.lower() else 878      # Action, Sci-Fi
-            path = "/discover/movie"
-            local_prefix = "Movies"
-            
         params = {
-            "with_genres": str(genre_id),
             "sort_by": "popularity.desc"
         }
-        data = await self._get(path, params=params)
+        
+        is_trending = category.lower() == "trending"
+        
+        if is_tv:
+            path = "/discover/tv"
+            local_prefix = "Series"
+            if not is_trending:
+                genre_id = 10759 if "action" in category.lower() else 10765
+                params["with_genres"] = str(genre_id)
+        else:
+            path = "/discover/movie"
+            local_prefix = "Movies"
+            if not is_trending:
+                genre_id = 28 if "action" in category.lower() else 878
+                params["with_genres"] = str(genre_id)
+                
+        # Fetch multiple pages if trending to ensure diverse genres
+        pages_to_fetch = 3 if is_trending else 1
+        all_results = []
+        
+        for page in range(1, pages_to_fetch + 1):
+            page_params = {**params, "page": page}
+            data = await self._get(path, params=page_params)
+            if data and data.get("results"):
+                all_results.extend(data.get("results", []))
+
         
         raw_results = []
-        if not data or not data.get("results"):
+        if not all_results:
             return []
             
         # Parse output from TMDB results
-        for item in data.get("results", []):
+        for item in all_results:
             poster_path = item.get("poster_path")
             backdrop_path = item.get("backdrop_path")
             raw_poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else ""
@@ -484,7 +499,7 @@ class TMDBClient:
             genre_ids = item.get("genre_ids", [])
             genres = [GENRES_MAP.get(gid) for gid in genre_ids if gid in GENRES_MAP]
             if not genres:
-                genres = ["Action" if "action" in category.lower() else "Sci-Fi"]
+                genres = ["Trending"]
                 
             result_item = {
                 "id": f"discover_{tmdb_id}",

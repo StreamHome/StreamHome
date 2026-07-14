@@ -66,8 +66,7 @@ export default function Dashboard({
   const [continueWatching, setContinueWatching] = useState<PlaybackSession[]>([]);
   const [tmdbJson, setTmdbJson] = useState<any>(null);
   const [selectedSeason, setSelectedSeason] = useState<number>(1);
-  const [discoverAction, setDiscoverAction] = useState<any[]>([]);
-  const [discoverScifi, setDiscoverScifi] = useState<any[]>([]);
+  const [discoverMedia, setDiscoverMedia] = useState<any[]>([]);
   const [tmdbSearchResults, setTmdbSearchResults] = useState<any[]>([]);
   const [isSearchingTmdb, setIsSearchingTmdb] = useState<boolean>(false);
   const [isFetchingEpisodes, setIsFetchingEpisodes] = useState<boolean>(false);
@@ -1141,26 +1140,13 @@ export default function Dashboard({
       const token = localStorage.getItem("stream_access_token");
       const headers: Record<string, string> = {};
       if (token) headers["Authorization"] = `Bearer ${token}`;
-      const discActionRes = await fetch(`${apiBaseUrl}/discover?category=action&type=${typeParam}`, { headers });
-      if (discActionRes.ok) {
-        const discActionData = await discActionRes.json();
-        setDiscoverAction(discActionData);
+      const discRes = await fetch(`${apiBaseUrl}/discover?category=trending&type=${typeParam}`, { headers });
+      if (discRes.ok) {
+        const discData = await discRes.json();
+        setDiscoverMedia(discData);
       }
     } catch (err) {
-      console.warn("[Frontend] Failed to fetch Action discover list:", err);
-    }
-
-    try {
-      const token = localStorage.getItem("stream_access_token");
-      const headers: Record<string, string> = {};
-      if (token) headers["Authorization"] = `Bearer ${token}`;
-      const discScifiRes = await fetch(`${apiBaseUrl}/discover?category=scifi&type=${typeParam}`, { headers });
-      if (discScifiRes.ok) {
-        const discScifiData = await discScifiRes.json();
-        setDiscoverScifi(discScifiData);
-      }
-    } catch (err) {
-      console.warn("[Frontend] Failed to fetch Sci-Fi discover list:", err);
+      console.warn("[Frontend] Failed to fetch Trending discover list:", err);
     }
   };
 
@@ -1215,19 +1201,19 @@ export default function Dashboard({
   })();
 
   const currentFeaturedMovie = (() => {
-    const mainFeatured = featuredMovie || discoverAction[0] || discoverScifi[0] || null;
+    const mainFeatured = featuredMovie || discoverMedia[0] || null;
     if (!mainFeatured) return null;
     if (activeTab === "movies") {
       if (mainFeatured.type === "movie" || !mainFeatured.type) {
         return mainFeatured;
       }
-      return currentMovies[0] || discoverAction[0] || discoverScifi[0] || null;
+      return currentMovies[0] || discoverMedia[0] || null;
     }
     if (activeTab === "series") {
       if (mainFeatured.type === "series") {
         return mainFeatured;
       }
-      return currentMovies[0] || discoverAction.find(m => m.type === "series") || discoverScifi.find(m => m.type === "series") || null;
+      return currentMovies[0] || discoverMedia.find(m => m.type === "series") || null;
     }
     return mainFeatured;
   })();
@@ -1677,7 +1663,7 @@ export default function Dashboard({
                 )}
 
                 {/* Real Genre Rows */}
-                {!isLoading && (currentMovies.length > 0 || discoverAction.length > 0 || discoverScifi.length > 0) && (() => {
+                {!isLoading && (currentMovies.length > 0 || discoverMedia.length > 0) && (() => {
                   const getSeedFromDate = () => {
                     const d = new Date();
                     return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
@@ -1747,29 +1733,22 @@ export default function Dashboard({
                         />
                       )}
 
-                      {/* Discovery Row: Action */}
-                      {discoverAction.length > 0 && (
-                        <MovieRow
-                          title="Trending Action (Global Discover)"
-                          movies={discoverAction}
-                          onPlay={setSelectedMovieForDetails}
-                          moviesOnServer={movies}
-                          onAddDownload={handlePreFillDownload}
-                          activeProfileTheme={activeProfileTheme}
-                        />
-                      )}
-
-                      {/* Discovery Row: Sci-Fi */}
-                      {discoverScifi.length > 0 && (
-                        <MovieRow
-                          title="Popular Sci-Fi (Global Discover)"
-                          movies={discoverScifi}
-                          onPlay={setSelectedMovieForDetails}
-                          moviesOnServer={movies}
-                          onAddDownload={handlePreFillDownload}
-                          activeProfileTheme={activeProfileTheme}
-                        />
-                      )}
+                      {/* Dynamically grouped Discovery Rows */}
+                      {Array.from(new Set(discoverMedia.flatMap(m => m.genres || []))).map(genre => {
+                        const genreDiscover = discoverMedia.filter(m => m.genres?.includes(genre));
+                        if (genreDiscover.length === 0) return null;
+                        return (
+                          <MovieRow
+                            key={`discover-${genre}`}
+                            title={`Trending ${genre} (Global Discover)`}
+                            movies={genreDiscover}
+                            onPlay={setSelectedMovieForDetails}
+                            moviesOnServer={movies}
+                            onAddDownload={handlePreFillDownload}
+                            activeProfileTheme={activeProfileTheme}
+                          />
+                        );
+                      })}
 
                       {/* Row for All Movies first */}
                       <MovieRow 
