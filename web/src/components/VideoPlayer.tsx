@@ -33,7 +33,19 @@ const TRANSLATIONS: Record<string, Record<string, string>> = {
   }
 };
 
-export default function VideoPlayer({ movie, activeProfile, onBack, apiBaseUrl }: VideoPlayerProps) {
+export default function VideoPlayer({ movie: originalMovie, activeProfile, onBack, apiBaseUrl }: VideoPlayerProps) {
+  const activeEpisode = originalMovie.type === "series" && originalMovie.activeEpisodeId
+    ? originalMovie.episodes?.find(e => e.id === originalMovie.activeEpisodeId)
+    : null;
+
+  const movie = {
+    ...originalMovie,
+    videoUrl: activeEpisode?.videoUrl || originalMovie.videoUrl || "",
+    quality: activeEpisode?.quality || originalMovie.quality || "Source",
+    languages: activeEpisode?.languages || originalMovie.languages || ["en"],
+    subtitles: activeEpisode?.subtitles || originalMovie.subtitles || [],
+  };
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
