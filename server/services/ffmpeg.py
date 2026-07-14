@@ -12,7 +12,7 @@ from services.state import update_task_metrics, remove_task_metrics, register_pr
 from services.logger import logger
 
 # Regular expressions for parsing FFmpeg stderr progress
-time_regex = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)")
+time_regex = re.compile(r"time=\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)")
 speed_regex = re.compile(r"speed=\s*(\d+\.?\d*)x")
 bitrate_regex = re.compile(r"bitrate=\s*(\d+\.?\d*)\s*kbits/s")
 
@@ -69,7 +69,7 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[boo
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            bufsize=1, # Line buffering (Fix for Linux stdout/stderr buffering)
+            bufsize=0, # Unbuffered binary stream (Fix for Linux stdout/stderr buffering)
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
         register_process(task_id, process)

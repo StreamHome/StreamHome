@@ -247,7 +247,7 @@ class DownloadQueueManager:
             if success:
                 # Run audio extraction and video stripping
                 from services.audio_extractor import extract_audio_and_strip_video
-                extracted_languages = await extract_audio_and_strip_video(output_abs_path)
+                extracted_languages = await extract_audio_and_strip_video(output_abs_path, default_lang=language or "en")
                 
                 if settings.STORAGE_ENGINE == "CLOUD":
                     async with AsyncSession(engine) as db:
@@ -727,7 +727,8 @@ class DownloadQueueManager:
                                     # Always check and extract audio if not yet done
                                     abs_video_path = os.path.abspath(os.path.join(server_root, file_path))
                                     from services.audio_extractor import extract_audio_and_strip_video
-                                    extracted_langs = await extract_audio_and_strip_video(abs_video_path)
+                                    default_language = data.get("language") or data.get("original_language") or "en"
+                                    extracted_langs = await extract_audio_and_strip_video(abs_video_path, default_lang=default_language)
                                     if extracted_langs:
                                         data["languages"] = extracted_langs
                                         try:

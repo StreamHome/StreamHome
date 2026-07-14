@@ -12,7 +12,7 @@ def get_ffmpeg_path() -> str:
 def get_ffprobe_path() -> str:
     return shutil.which("ffprobe") or r"C:\ffmpeg\bin\ffprobe.exe"
 
-async def extract_audio_and_strip_video(video_path: str) -> List[str]:
+async def extract_audio_and_strip_video(video_path: str, default_lang: str = "en") -> List[str]:
     """
     Probes the video file for audio streams. Extracts each stream to a separate MP3 file
     inside an 'audio' folder next to the video file. Removes all audio from the original
@@ -65,11 +65,11 @@ async def extract_audio_and_strip_video(video_path: str) -> List[str]:
     # 3. Extract each audio stream
     for idx, stream in enumerate(streams):
         tags = stream.get("tags", {})
-        lang = tags.get("language", f"track_{idx}").lower()
+        lang = tags.get("language", "").lower()
         # Clean language name (should be short code like 'en', 'tr', etc.)
         lang = "".join(c for c in lang if c.isalnum())
-        if not lang:
-            lang = f"track_{idx}"
+        if not lang or lang == "und":
+            lang = default_lang if idx == 0 else f"track_{idx}"
             
         # Avoid file conflicts (e.g. two english tracks)
         base_lang = lang

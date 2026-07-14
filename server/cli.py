@@ -742,8 +742,8 @@ async def monitor_downloads():
             current_state = []
             for t in tasks[:20]:
                 task_metrics = None
-                if t.status in ("DOWNLOADING", "MERGING", "MOVING_CLOUD") and t.id in metrics:
-                    m = metrics[t.id]
+                if t.status in ("DOWNLOADING", "MERGING", "MOVING_CLOUD") and str(t.id) in metrics:
+                    m = metrics[str(t.id)]
                     task_metrics = (m.get("progress"), m.get("speed"), m.get("eta"), m.get("size"))
                 current_state.append((
                     t.id, t.status, t.error_message, t.title, t.media_type, t.quality, t.created_at, task_metrics
@@ -793,8 +793,8 @@ async def monitor_downloads():
                         label = status_labels.get(t.status, f"[dim]{t.status}[/dim]")
                         
                         # Enhance status label dynamically if active metrics exist
-                        if t.status in ("DOWNLOADING", "MERGING", "MOVING_CLOUD") and t.id in metrics:
-                            task_metrics = metrics[t.id]
+                        if t.status in ("DOWNLOADING", "MERGING", "MOVING_CLOUD") and str(t.id) in metrics:
+                            task_metrics = metrics[str(t.id)]
                             progress_val = task_metrics.get("progress", 0.0)
                             speed_val = task_metrics.get("speed", "0 Mbps")
                             eta_val = task_metrics.get("eta", "00:00:00")
