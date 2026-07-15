@@ -1,81 +1,38 @@
-import React, { useState } from 'react';
-import { GlassPane } from '../../../components/ui/GlassPane';
-import { Button } from '../../../components/ui/Button';
-import { Input } from '../../../components/ui/Input';
-import { SudoModal } from '../SudoModal';
+import React, { useEffect, useState } from "react";
+import { getSettings, updateSettings } from "../../../api/system";
+import { Button } from "../../../components/ui/Button";
+import { GlassPane } from "../../../components/ui/GlassPane";
+import { Input } from "../../../components/ui/Input";
+import type { SystemSettings } from "../../../types/api";
+import { SudoModal } from "../SudoModal";
 
 export function StoragePanel() {
-  const [engine, setEngine] = useState<'LOCAL' | 'CLOUD'>('LOCAL');
-  const [rclonePath, setRclonePath] = useState('gdrive:Media');
-  
+  const [settings, setSettings] = useState<SystemSettings | null>(null);
+  const [draft, setDraft] = useState<SystemSettings | null>(null);
   const [sudoOpen, setSudoOpen] = useState(false);
-  const [pendingEngine, setPendingEngine] = useState<'LOCAL' | 'CLOUD' | null>(null);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
 
-  const handleEngineToggle = (newEngine: 'LOCAL' | 'CLOUD') => {
-    if (newEngine === engine) return;
-    setPendingEngine(newEngine);
-    setSudoOpen(true);
+  useEffect(() => { getSettings().then((data) => { setSettings(data); setDraft(data); }).catch((requestError: unknown) => setError(requestError instanceof Error ? requestError.message : "Settings could not be loaded.")); }, []);
+
+  const save = async () => {
+    if (!draft) return;
+    const saved = await updateSettings(draft);
+    setSettings(saved); setDraft(saved); setMessage("Server settings saved."); setSudoOpen(false);
   };
 
-  const executeEngineChange = () => {
-    if (pendingEngine) setEngine(pendingEngine);
-    setSudoOpen(false);
-    setPendingEngine(null);
-  };
-
+  if (!draft) return <section className="p-8"><h1 className="text-3xl font-semibold">Storage and HEVC</h1><p className="mt-6 text-[var(--text-error)]">{error || "Loading server settings…"}</p></section>;
+  const dirty = JSON.stringify(settings) !== JSON.stringify(draft);
   return (
-    <div className="p-8 max-w-5xl mx-auto">
-      <div className="mb-8">
-        <h2 className="font-[family-name:var(--font-headline)] text-2xl font-semibold">Storage & Rclone</h2>
-        <p className="font-[family-name:var(--font-mono)] text-[var(--text-muted)] text-sm mt-1 uppercase">Manage underlying storage engine</p>
-      </div>
-
-      <GlassPane className="p-8 mb-8" spotlight={false}>
-        <h3 className="font-[family-name:var(--font-mono)] text-lg mb-4 uppercase tracking-widest border-b border-[var(--border-subtle)] pb-2">Active Engine</h3>
-        
-        <div className="flex gap-4 mb-6">
-          <Button 
-            variant={engine === 'LOCAL' ? 'primary' : 'ghost'} 
-            onClick={() => handleEngineToggle('LOCAL')}
-            className={engine === 'LOCAL' ? 'ring-2 ring-[var(--accent-container)]' : ''}
-          >
-            LOCAL DISK
-          </Button>
-          <Button 
-            variant={engine === 'CLOUD' ? 'primary' : 'ghost'} 
-            onClick={() => handleEngineToggle('CLOUD')}
-            className={engine === 'CLOUD' ? 'ring-2 ring-[var(--accent-container)]' : ''}
-          >
-            RCLONE CLOUD
-          </Button>
-        </div>
-
-        {engine === 'CLOUD' && (
-          <div className="flex flex-col gap-4 mt-6 p-4 border border-[var(--border-subtle)] rounded-lg bg-[rgba(0,0,0,0.2)]">
-            <h4 className="font-[family-name:var(--font-mono)] text-sm text-[var(--text-secondary)] uppercase">Cloud Configuration</h4>
-            <div className="flex gap-4 items-end">
-              <div className="flex-1">
-                <Input 
-                  label="Rclone Remote Path" 
-                  value={rclonePath} 
-                  onChange={(e) => setRclonePath(e.target.value)} 
-                />
-              </div>
-              <Button variant="secondary" className="mb-1">Save Path</Button>
-            </div>
-            <p className="font-[family-name:var(--font-body)] text-xs text-[var(--text-muted)]">
-              Ensure rclone is configured correctly on the host system before saving.
-            </p>
-          </div>
-        )}
+    <section className="mx-auto max-w-4xl p-8"><h1 className="text-3xl font-semibold">Storage and HEVC</h1><p className="mt-2 text-[var(--text-muted)]">Settings loaded directly from the server.</p>
+      <GlassPane className="mt-8 flex flex-col gap-6 p-7" spotlight={false}>
+        <label className="flex flex-col gap-2"><span>Storage engine</span><select className="rounded border border-[var(--glass-border)] bg-[#1e100b] px-4 py-3" value={draft.storageEngine} onChange={(event) => setDraft({ ...draft, storageEngine: event.target.value as SystemSettings["storageEngine"] })}><option value="LOCAL">Local</option><option value="CLOUD">Cloud</option></select></label>
+        <Input label="Rclone remote path" value={draft.rcloneRemotePath} onChange={(event) => setDraft({ ...draft, rcloneRemotePath: event.target.value })} disabled={draft.storageEngine !== "CLOUD"} />
+        <label className="flex flex-col gap-2"><span>HEVC compression</span><select className="rounded border border-[var(--glass-border)] bg-[#1e100b] px-4 py-3" value={draft.hevcCompressionMode} onChange={(event) => setDraft({ ...draft, hevcCompressionMode: event.target.value as SystemSettings["hevcCompressionMode"] })}><option value="auto">Automatic</option><option value="on">On</option><option value="off">Off</option></select></label>
+        <div><Button disabled={!dirty} onClick={() => { setMessage(""); setSudoOpen(true); }}>Save changes</Button></div>
+        {message && <p className="text-sm text-green-400">{message}</p>}{error && <p className="text-sm text-[var(--text-error)]">{error}</p>}
       </GlassPane>
-
-      <SudoModal 
-        isOpen={sudoOpen}
-        actionLabel={`Switch storage engine to ${pendingEngine}`}
-        onSuccess={executeEngineChange}
-        onCancel={() => setSudoOpen(false)}
-      />
-    </div>
+      <SudoModal isOpen={sudoOpen} actionLabel="Save server settings" onCancel={() => setSudoOpen(false)} onSuccess={save} />
+    </section>
   );
 }

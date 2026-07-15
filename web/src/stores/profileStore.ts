@@ -1,5 +1,5 @@
-import { create } from 'zustand';
-import type { Profile } from '../types/api';
+import { create } from "zustand";
+import type { Profile } from "../types/api";
 
 interface ProfileState {
   profiles: Profile[];
@@ -8,7 +8,7 @@ interface ProfileState {
   setProfiles: (profiles: Profile[]) => void;
   selectProfile: (profile: Profile) => void;
   clearProfile: () => void;
-  loadFromStorage: (profiles: Profile[]) => void;
+  restoreProfile: (profiles: Profile[]) => Profile | null;
 }
 
 export const useProfileStore = create<ProfileState>((set) => ({
@@ -16,16 +16,11 @@ export const useProfileStore = create<ProfileState>((set) => ({
   activeProfile: null,
   isAdmin: false,
 
-  setProfiles: (profiles) => {
-    set({ profiles });
-  },
+  setProfiles: (profiles) => set({ profiles }),
 
   selectProfile: (profile) => {
     localStorage.setItem("streamhome_profile", profile.id);
-    set({ 
-      activeProfile: profile, 
-      isAdmin: profile.id === "1" 
-    });
+    set({ activeProfile: profile, isAdmin: profile.id === "1" });
   },
 
   clearProfile: () => {
@@ -33,19 +28,10 @@ export const useProfileStore = create<ProfileState>((set) => ({
     set({ activeProfile: null, isAdmin: false });
   },
 
-  loadFromStorage: (profiles) => {
+  restoreProfile: (profiles) => {
     const savedId = localStorage.getItem("streamhome_profile");
-    if (savedId) {
-      const match = profiles.find(p => p.id === savedId);
-      if (match) {
-        set({ 
-          profiles,
-          activeProfile: match,
-          isAdmin: match.id === "1"
-        });
-        return;
-      }
-    }
-    set({ profiles });
-  }
+    const profile = profiles.find((item) => item.id === savedId) ?? null;
+    set({ profiles, activeProfile: profile, isAdmin: profile?.id === "1" });
+    return profile;
+  },
 }));

@@ -1,137 +1,141 @@
-import React, { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { useProfileStore } from '../stores/profileStore';
-import { useThemeStore } from '../stores/themeStore';
-import { getProfiles } from '../api/profiles';
-import { Profile } from '../types/api';
-import { ThemeId } from '../types/theme';
-import { cn } from '../utils/cn';
-import { GlassPane } from '../components/ui/GlassPane';
-import { EmberBackground } from '../themes/ember/EmberBackground';
-import { AuroraBackground } from '../themes/aurora/AuroraBackground';
-import { CinemaBackground } from '../themes/cinema/CinemaBackground';
-import { GeminiBackground } from '../themes/gemini/GeminiBackground';
-import { ScanLines } from '../themes/ember/ScanLines';
+import React, { useCallback, useEffect, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { createProfile, getProfiles } from "../api/profiles";
+import { Button } from "../components/ui/Button";
+import { GlassPane } from "../components/ui/GlassPane";
+import { useProfileStore } from "../stores/profileStore";
+import { useThemeStore } from "../stores/themeStore";
+import type { Profile } from "../types/api";
+import type { ThemeId } from "../types/theme";
+import { avatarBackground, normalizeTheme } from "../utils/media";
+
+const THEMES: ThemeId[] = ["ember", "aurora", "cinema", "gemini"];
 
 export function ProfileSelectPage() {
   const navigate = useNavigate();
-  const { profiles, setProfiles, selectProfile } = useProfileStore();
-  const { setTheme } = useThemeStore();
-  
-  const [hoveredProfile, setHoveredProfile] = useState<Profile | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  const location = useLocation();
+  const profiles = useProfileStore((state) => state.profiles);
+  const restoreProfile = useProfileStore((state) => state.restoreProfile);
+  const selectProfile = useProfileStore((state) => state.selectProfile);
+  const setTheme = useThemeStore((state) => state.setTheme);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [showCreate, setShowCreate] = useState(false);
+  const [name, setName] = useState("");
+  const [theme, setNewTheme] = useState<ThemeId>("ember");
+  const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    let mounted = true;
-    const fetchProfiles = async () => {
-      try {
-        const data = await getProfiles();
-        if (mounted) {
-          setProfiles(data);
-          setIsLoading(false);
-        }
-      } catch (err) {
-        console.error('Failed to fetch profiles', err);
-        if (mounted) setIsLoading(false);
+  const loadProfiles = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const data = await getProfiles();
+      const restored = restoreProfile(data);
+      const redirectedFromGuard = Boolean((location.state as { from?: unknown } | null)?.from);
+      if (restored && redirectedFromGuard) {
+        setTheme(restored.theme);
+        navigate("/", { replace: true });
       }
-    };
-    fetchProfiles();
-    return () => { mounted = false; };
-  }, [setProfiles]);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Profiles could not be loaded.");
+    } finally {
+      setLoading(false);
+    }
+  }, [location.state, navigate, restoreProfile, setTheme]);
 
-  const hoveredTheme: ThemeId = (hoveredProfile?.theme as ThemeId) || 'ember';
+  useEffect(() => { void loadProfiles(); }, [loadProfiles]);
 
-  const handleSelect = (profile: Profile) => {
+  const chooseProfile = (profile: Profile) => {
     selectProfile(profile);
-    setTheme(profile.theme as ThemeId || 'ember');
-    navigate('/');
+    setTheme(profile.theme);
+    navigate("/");
+  };
+
+  const submitProfile = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!name.trim()) return;
+    setSaving(true);
+    setError("");
+    try {
+      const created = await createProfile({
+        id: crypto.randomUUID(),
+        name: name.trim(),
+        theme,
+        avatarColor: "#2563eb",
+        pinEnabled: false,
+      });
+      const next = [...profiles, created];
+      restoreProfile(next);
+      setShowCreate(false);
+      setName("");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Profile could not be created.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
-    <div 
-      className="relative w-full min-h-screen flex flex-col items-center justify-center overflow-hidden transition-all duration-600 ease-[cubic-bezier(0.16,1,0.3,1)] bg-[var(--bg-body)]"
-      data-theme={hoveredTheme}
-    >
-      {hoveredTheme === 'ember' && <EmberBackground />}
-      {hoveredTheme === 'aurora' && <AuroraBackground />}
-      {hoveredTheme === 'cinema' && <CinemaBackground />}
-      {hoveredTheme === 'gemini' && <GeminiBackground />}
-      {hoveredTheme === 'ember' && <ScanLines />}
+    <main className="min-h-screen bg-[var(--bg-body)] text-[var(--text-primary)] px-6 py-16" data-theme="ember">
+      <div className="mx-auto flex max-w-6xl flex-col items-center gap-10">
+        <div className="text-center">
+          <h1 className="font-[family-name:var(--font-headline)] text-4xl">Choose a profile</h1>
+          <p className="mt-3 text-[var(--text-muted)]">Profiles and preferences are loaded from the server.</p>
+        </div>
 
-      <div className="relative z-10 w-full max-w-6xl mx-auto px-8 flex flex-col items-center gap-16">
-        <h1 className="font-[family-name:var(--font-headline)] text-[var(--text-primary)] text-4xl md:text-5xl font-light tracking-wide text-center">
-          Select Identity
-        </h1>
+        {loading && <p className="font-[family-name:var(--font-mono)] text-sm">Loading profiles…</p>}
+        {error && (
+          <div className="text-center text-[var(--text-error)]">
+            <p>{error}</p>
+            <Button className="mt-4" variant="secondary" onClick={() => void loadProfiles()}>Retry</Button>
+          </div>
+        )}
 
-        {isLoading ? (
-          <div className="text-[var(--text-muted)] font-[family-name:var(--font-mono)]">LOADING DATA...</div>
-        ) : (
-          <div className="flex flex-wrap items-center justify-center gap-8">
-            {profiles.map((profile: Profile) => (
-              <GlassPane
-                key={profile.id}
-                as="button"
-                onClick={() => handleSelect(profile)}
-                onMouseEnter={() => setHoveredProfile(profile)}
-                onMouseLeave={() => setHoveredProfile(null)}
-                spotlight={true}
-                className={cn(
-                  "w-[180px] h-[300px] flex flex-col items-center justify-center relative group",
-                  "transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]",
-                  "hover:scale-105 hover:border-[var(--glass-border-hover)]"
-                )}
-              >
-                {profile.id === "1" && (
-                  <div className="absolute top-4 left-4 flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-[var(--accent-container)] animate-pulse" />
-                    <span className="font-[family-name:var(--font-mono)] text-[10px] tracking-widest text-[var(--text-muted)] group-hover:text-[var(--accent-container)] transition-colors">
-                      [ADMIN]
-                    </span>
+        {!loading && !error && (
+          <div className="flex flex-wrap justify-center gap-6">
+            {profiles.map((profile) => (
+              <button key={profile.id} className="group w-48 text-left" onClick={() => chooseProfile(profile)}>
+                <GlassPane className="p-5" spotlight={false}>
+                  <div className="aspect-square rounded-[var(--radius)]" style={{ background: avatarBackground(profile) }} />
+                  <div className="mt-4 font-semibold">{profile.name}</div>
+                  <div className="mt-1 text-xs uppercase tracking-wider text-[var(--text-muted)]">
+                    {normalizeTheme(profile.theme)}{profile.id === "1" ? " · Admin" : ""}
                   </div>
-                )}
-                
-                <svg width="100" height="100" viewBox="0 0 100 100" className="opacity-50 group-hover:opacity-100 transition-opacity duration-300">
-                  <text 
-                    x="50%" y="50%" 
-                    textAnchor="middle" dominantBaseline="central" 
-                    fontSize="72px" 
-                    fontFamily="var(--font-headline)"
-                    fill="transparent" 
-                    stroke="var(--text-primary)" 
-                    strokeWidth="1px"
-                  >
-                    {profile.name.charAt(0).toUpperCase()}
-                  </text>
-                </svg>
-
-                <div className="absolute bottom-6 w-full text-center px-4">
-                  <div className="font-[family-name:var(--font-mono)] text-[12px] tracking-[0.1em] text-[var(--text-secondary)] group-hover:text-[var(--text-primary)] transition-colors truncate uppercase">
-                    {profile.name}
-                  </div>
-                </div>
-              </GlassPane>
+                </GlassPane>
+              </button>
             ))}
-
-            {/* Add Profile Card */}
-            <button
-              className={cn(
-                "w-[180px] h-[300px] flex flex-col items-center justify-center relative group",
-                "rounded-[var(--radius)] border border-dashed border-[var(--glass-border)] bg-transparent",
-                "transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]",
-                "hover:scale-105 hover:bg-[var(--glass-fill)] hover:border-solid hover:border-[var(--glass-border-hover)]"
-              )}
-            >
-              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" className="text-[var(--text-muted)] group-hover:text-[var(--text-primary)] transition-colors">
-                <line x1="12" y1="5" x2="12" y2="19"></line>
-                <line x1="5" y1="12" x2="19" y2="12"></line>
-              </svg>
-              <div className="absolute bottom-6 w-full text-center font-[family-name:var(--font-mono)] text-[12px] tracking-[0.1em] text-[var(--text-muted)] group-hover:text-[var(--text-primary)] transition-colors uppercase">
-                Add New
-              </div>
+            <button className="w-48" onClick={() => setShowCreate(true)}>
+              <GlassPane className="grid aspect-[4/5] place-items-center border-dashed p-5" spotlight={false}>
+                <span className="text-center text-[var(--text-muted)]">+ Create profile</span>
+              </GlassPane>
             </button>
           </div>
         )}
+
+        {showCreate && (
+          <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-6">
+            <GlassPane className="w-full max-w-md p-8" spotlight={false}>
+              <form className="flex flex-col gap-5" onSubmit={submitProfile}>
+                <h2 className="text-2xl font-semibold">Create profile</h2>
+                <label className="flex flex-col gap-2">
+                  <span className="text-sm text-[var(--text-muted)]">Name</span>
+                  <input className="rounded border border-[var(--glass-border)] bg-black/20 px-4 py-3" value={name} onChange={(event) => setName(event.target.value)} maxLength={40} required />
+                </label>
+                <label className="flex flex-col gap-2">
+                  <span className="text-sm text-[var(--text-muted)]">Theme</span>
+                  <select className="rounded border border-[var(--glass-border)] bg-[#1e100b] px-4 py-3" value={theme} onChange={(event) => setNewTheme(event.target.value as ThemeId)}>
+                    {THEMES.map((item) => <option key={item} value={item}>{item}</option>)}
+                  </select>
+                </label>
+                <div className="flex gap-3">
+                  <Button type="submit" disabled={saving}>{saving ? "Creating…" : "Create"}</Button>
+                  <Button type="button" variant="ghost" onClick={() => setShowCreate(false)}>Cancel</Button>
+                </div>
+              </form>
+            </GlassPane>
+          </div>
+        )}
       </div>
-    </div>
+    </main>
   );
 }

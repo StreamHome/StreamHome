@@ -24,7 +24,7 @@ export function Button({
   };
   
   const variantClasses = {
-    primary: "bg-[var(--glass-fill)] border border-[var(--glass-border-hover)] text-[var(--text-accent)] hover:bg-[#f97316] hover:text-[#1e100b] hover:shadow-[var(--glow-intense)] duration-[var(--duration-fast)] ease-[var(--easing-smooth)]",
+    primary: "bg-[var(--glass-fill)] border border-[var(--glass-border-hover)] text-[var(--text-accent)] hover:bg-[var(--accent-container)] hover:text-[var(--accent-on-primary)] hover:shadow-[var(--glow-intense)] duration-[var(--duration-fast)] ease-[var(--easing-smooth)]",
     secondary: "bg-transparent border border-[var(--glass-border)] text-white hover:border-[var(--glass-border-hover)] duration-[var(--duration-fast)] ease-[var(--easing-smooth)]",
     ghost: "bg-transparent text-[var(--text-secondary)] hover:text-white hover:bg-[var(--glass-fill)] border border-transparent duration-[var(--duration-fast)] ease-[var(--easing-smooth)]"
   };

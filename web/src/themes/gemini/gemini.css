@@ -1,6 +1,11 @@
 [data-theme="gemini"] {
   --bg-body: #09090b;
+  --bg-surface-dim: #09090b;
+  --bg-surface-container-lowest: #050506;
+  --bg-surface-container-low: #0d0d10;
   --bg-surface-container: #111113;
+  --bg-surface-container-high: #18181b;
+  --bg-surface-container-highest: #27272a;
 
   --glass-fill: rgba(255, 255, 255, 0.05);
   --glass-border: rgba(255, 255, 255, 0.1);
@@ -8,6 +13,9 @@
   --glass-blur: 16px;
 
   --accent-primary: #4285F4;
+  --accent-container: #4285F4;
+  --accent-muted: #244a89;
+  --accent-on-primary: #ffffff;
   --accent-secondary: #9b72cb;
   --accent-tertiary: #d96570;
   --accent-quaternary: #f4b400;
@@ -15,13 +23,17 @@
 
   --glow-active: 0 0 20px rgba(66, 133, 244, 0.3);
   --glow-intense: 0 0 30px rgba(155, 114, 203, 0.4);
+  --glow-subtle: 0 0 14px rgba(66, 133, 244, 0.18);
+  --spotlight-gradient: radial-gradient(circle, rgba(66,133,244,0.22) 0%, transparent 70%);
 
   --text-primary: #ffffff;
   --text-secondary: #a1a1aa;
   --text-muted: #71717a;
   --text-accent: #4285F4;
+  --text-error: #ffb4ab;
 
   --border-subtle: rgba(255, 255, 255, 0.06);
+  --border-surface: rgba(255, 255, 255, 0.05);
 
   --font-headline: 'Outfit', sans-serif;
   --font-body: 'Outfit', sans-serif;
@@ -37,4 +49,8 @@
   --easing-standard: cubic-bezier(0.4, 0, 0.2, 1);
 
   --spacing-glass-padding: 28px;
+  --spacing-unit: 4px;
+  --spacing-gutter: 24px;
+  --spacing-margin-desktop: 64px;
+  --spacing-margin-mobile: 20px;
 }

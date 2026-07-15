@@ -42,14 +42,14 @@ export function LoginPage() {
     try {
       const res = await login({ email, password });
       
-      if ((res as any).requires2fa) {
+      if ("requires2fa" in res) {
         setRequires2FA(true);
-      } else if ((res as any).accessToken) {
-        setToken((res as any).accessToken, email);
+      } else {
+        setToken(res.accessToken, res.email);
         navigate('/profiles');
       }
-    } catch (err: any) {
-      setError(err.message || 'Login failed');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Login failed');
     } finally {
       setIsLoading(false);
     }
@@ -74,12 +74,10 @@ export function LoginPage() {
       try {
         const code = newCode.join('');
         const res = await verify2FA({ email, code });
-        if ((res as any).accessToken) {
-          setToken((res as any).accessToken, email);
-          navigate('/profiles');
-        }
-      } catch (err: any) {
-        setError(err.message || 'Invalid 2FA code');
+        setToken(res.accessToken, res.email);
+        navigate('/profiles');
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : 'Invalid 2FA code');
         setTotpCode(Array(6).fill(''));
         inputRefs.current[0]?.focus();
       } finally {

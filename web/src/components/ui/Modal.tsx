@@ -28,6 +28,8 @@ export function Modal({ isOpen, onClose, children, className }: ModalProps) {
         <div className="fixed inset-0 z-[100] flex items-center justify-center">
           {/* Backdrop */}
           <motion.div
+            role="dialog"
+            aria-modal="true"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -42,7 +44,7 @@ export function Modal({ isOpen, onClose, children, className }: ModalProps) {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 20 }}
             transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
-            className="relative z-10 w-full max-w-lg mx-4"
+            className="relative z-10 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto"
           >
             <GlassPane className={cn("p-6", className)}>
               {children}

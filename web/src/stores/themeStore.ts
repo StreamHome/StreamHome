@@ -1,26 +1,22 @@
-import { create } from 'zustand';
-import type { ThemeId } from '../types/theme';
-import type { Profile } from '../types/api';
+import { create } from "zustand";
+import type { Profile } from "../types/api";
+import type { ThemeId } from "../types/theme";
+import { normalizeTheme } from "../utils/media";
 
 interface ThemeState {
   activeTheme: ThemeId;
-  setTheme: (themeId: ThemeId) => void;
+  setTheme: (themeId: string | null | undefined) => void;
   syncFromProfile: (profile: Profile | null) => void;
+}
+
+function applyTheme(theme: string | null | undefined): ThemeId {
+  const normalized = normalizeTheme(theme);
+  document.documentElement.setAttribute("data-theme", normalized);
+  return normalized;
 }
 
 export const useThemeStore = create<ThemeState>((set) => ({
   activeTheme: "ember",
-
-  setTheme: (themeId) => {
-    document.documentElement.setAttribute("data-theme", themeId);
-    set({ activeTheme: themeId });
-  },
-
-  syncFromProfile: (profile) => {
-    const fallbackTheme: ThemeId = "ember";
-    const newTheme = (profile?.theme as ThemeId) || fallbackTheme;
-    
-    document.documentElement.setAttribute("data-theme", newTheme);
-    set({ activeTheme: newTheme });
-  }
+  setTheme: (theme) => set({ activeTheme: applyTheme(theme) }),
+  syncFromProfile: (profile) => set({ activeTheme: applyTheme(profile?.theme) }),
 }));

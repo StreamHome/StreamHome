@@ -19,6 +19,24 @@ body {
   color: #ffffff;
 }
 
+button, input, select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+@media (max-width: 767px) {
+  [data-theme] {
+    --spacing-margin-desktop: var(--spacing-margin-mobile, 20px);
+  }
+}
+
 ::selection {
   background: rgba(255, 95, 31, 0.4);
   color: #ffffff;

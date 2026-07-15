@@ -1,38 +1,49 @@
 # System Patterns
 
-## System Architecture
-- **API Layer:** FastAPI provides high-performance asynchronous endpoints (`routes/queue.py`, `routes/auth.py`, `routes/stream.py`).
-- **Data Persistence:** `SQLModel` handles the SQLite ORM (Object Relational Mapping). Models are defined in `models.py`.
-- **Background Processing:** A custom queue manager (`services/queue.py`) runs as a background task. It maintains a set of active tasks and processes them sequentially or concurrently.
-- **Media Processing:** `services/ffmpeg.py` handles FFmpeg interactions via subprocesses to merge separate video and audio streams seamlessly.
-- **External APIs:** `services/tmdb.py` interacts with The Movie Database API to enrich the application with comprehensive metadata.
+## System architecture
 
-## Key Technical Decisions
-1. **Disk-to-Database Recovery Mechanism:**
-   - **Decision:** The backend reads `.metadata/metadata.json` (or `metadata_sX_eY.json`) files inside media directories.
-   - **Rationale:** Acts as a hard-disk registry written by the media sender system. If the SQLite database is deleted, the `lifespan` event on server startup scans the `media/` tree, parses these JSON files, and automatically rebuilds the database entries.
-2. **Direct Image Caching:**
-   - **Decision:** Images (`poster.jpg`, `backdrop.jpg`, `thumbnail.jpg`) are saved directly inside the respective media folder (e.g., `media/Movies/Movie_Name/poster.jpg`) instead of a centralized cache directory.
-   - **Rationale:** Keeps media assets entirely portable and self-contained. If you move a movie folder, its poster moves with it.
-3. **Dynamic Folder & File Renaming:**
-   - **Decision:** When cataloging or recovering media, if the folder name on disk is a placeholder (starts with `Captured ` or matches default names) but rich TMDB metadata is successfully retrieved, the backend physically renames the directory on disk to match the corrected TMDB title (`Fight Club_1999_TMDB_550`) and renames the inner video file accordingly.
-   - **Rationale:** Keeps folder layouts clean and readable, resolving anonymous capture names into human-readable directory structures.
-4. **Sender-Provided Language Injection:**
-   - **Decision:** The API allows the sender to specify the `language` of the media stream.
-   - **Rationale:** This overrides TMDB's default `original_language`, accurately reflecting the dubbed or native language of the captured video file.
-5. **Throttled Transient IPC Channel:**
-   - **Decision:** Active download metrics (speeds, progress, ETA, and sizes) are shared between the background Uvicorn server and the CLI process via a throttled JSON file (`temp/download_metrics.json`) resolved relative to config.
-   - **Rationale:** Prevents SQLite database write contention and lockups that would occur from high-frequency progress writes, while allowing a completely decoupled CLI process to read the stats.
-6. **Frontend Multi-Tier Route Guarding:**
-   - **Decision:** React Router paths are protected by a cascading chain of Context-aware wrappers (`AuthGuard`, `ProfileGuard`, `AdminGuard`).
-   - **Rationale:** Ensures strict, highly predictable rendering blockades. An unauthenticated user cannot load the profile selector; a user without an active profile cannot load the dashboard; non-admins cannot load the CLI center.
-7. **Design System Matrix (Theming):**
-   - **Decision:** The web UI supports 4 core themes (Ember, Aurora, Cinema, Gemini) managed globally via Zustand (`themeStore.ts`) triggering `data-theme` HTML attributes.
-   - **Rationale:** Keeps CSS entirely modular via mapped CSS variables instead of messy inline logic, while enabling users to fully customize their own profile aesthetics without interfering with backend configurations.
-8. **PWA Offline Resilience:**
-   - **Decision:** Integrated Vite Workbox with `StaleWhileRevalidate` caching strategies.
-   - **Rationale:** Ensures the dashboard and static JS/CSS assets boot instantly on cellular networks or spotty Wi-Fi, while excluding `/media/` caching to prevent browser local storage limits from being exhausted.
+- **API layer:** FastAPI provides asynchronous auth, catalog, profile, playback, queue, stream, settings, and ingestion endpoints.
+- **Persistence:** SQLModel uses the absolute SQLite database at `server/database.db`, resolved from `server/config.py`.
+- **Media ownership:** All physical media, artwork, subtitles, and recovery metadata belong under `server/media`. FastAPI mounts media at `/media` for range-capable delivery.
+- **Background work:** The singleton queue manager coordinates ingestion, FFmpeg processing, catalog updates, and optional cloud movement.
+- **Recovery:** Server-side `.metadata/metadata.json` records allow disk-to-database catalog recovery.
+- **External enrichment:** The server, not the web client, owns TMDB enrichment and local artwork caching.
 
-## Design Patterns
-- **Singleton Queue Manager:** `QueueManager` is instantiated once and injected/imported where needed.
-- **Async Context Managers:** FastAPI's `lifespan` handles startup and teardown gracefully, ensuring the database is initialized and the queue manager is cleanly started and stopped.
+## Web patterns
+
+1. **Server-authoritative media**
+   - The web client never ships media assets or invents media metadata.
+   - Artwork components accept `/media/...` or absolute HTTP(S) URLs and otherwise render a CSS placeholder.
+
+2. **Normalize at the API boundary**
+   - Server snake_case and mixed wire keys are converted once in `web/src/api`.
+   - Components consume stable camelCase TypeScript models.
+
+3. **Hydrated route guarding**
+   - `AuthGuard` waits for persisted auth hydration before redirecting.
+   - `ProfileGuard` restores or requests the active server profile before protected catalog/player rendering.
+
+4. **Shared behavior, themed presentation**
+   - Ember, Aurora, Cinema, and Gemini use one dashboard and detail behavior layer.
+   - Theme selection is applied through CSS variables and a normalized `data-theme` value.
+
+5. **Playable-state honesty**
+   - Catalog records may exist before physical media is available.
+   - Details and player routes visibly disable or reject playback when the server provides no usable media URL.
+
+6. **Supported admin surface only**
+   - Web admin controls map to real server endpoints.
+   - Unsupported backup/update/user mutation and download cancellation UI is omitted.
+   - Sensitive settings changes require password and optional TOTP reauthentication.
+
+7. **Authenticated streaming and progress**
+   - Stream URLs include the current auth token and selected playback options.
+   - Playback progress is periodically reported using the server's expected payload keys.
+   - Download progress is consumed as a read-only authenticated SSE stream.
+
+## Server invariants
+
+- Movie ingestion payloads omit `season` and `episode` entirely.
+- SMTP and email OTP libraries/configuration must not return.
+- Media metadata files store quality, languages, and subtitles alongside server media.
+- `/media` is excluded from large client-side caching strategies.

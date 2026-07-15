@@ -26,7 +26,7 @@ export const Input = React.forwardRef<HTMLInputElement, InputProps>(({
           "text-[var(--text-primary)] font-[family-name:var(--font-mono)]",
           "px-4 py-3 outline-none",
           "transition-all duration-[var(--duration-fast)] ease-[var(--easing-smooth)]",
-          "focus:border-b-2 focus:border-[var(--glass-border-hover)] focus:shadow-[0_4px_10px_rgba(255,95,31,0.2)]",
+          "focus:border-b-2 focus:border-[var(--glass-border-hover)] focus:shadow-[var(--glow-subtle)]",
           error && "border-[var(--text-error)] focus:border-[var(--text-error)]"
         )}
         {...props}

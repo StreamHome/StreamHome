@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { useAuthStore } from './stores/authStore';
 import './themes/index';
 
@@ -12,15 +12,17 @@ import { AdminGate } from './pages/admin/AdminGate';
 import { AuthGuard } from './components/guards/AuthGuard';
 import { ProfileGuard } from './components/guards/ProfileGuard';
 import { AdminGuard } from './components/guards/AdminGuard';
+import { ErrorBoundary } from './components/ui/ErrorBoundary';
 
 export default function App() {
-  const loadAuth = useAuthStore((state) => state.loadFromStorage);
+  const hydrate = useAuthStore((state) => state.hydrate);
 
   useEffect(() => {
-    loadAuth();
-  }, [loadAuth]);
+    hydrate();
+  }, [hydrate]);
 
   return (
+    <ErrorBoundary>
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
@@ -28,14 +30,6 @@ export default function App() {
         <Route path="/profiles" element={
           <AuthGuard>
             <ProfileSelectPage />
-          </AuthGuard>
-        } />
-        
-        <Route path="/*" element={
-          <AuthGuard>
-            <ProfileGuard>
-              <DashboardRouter />
-            </ProfileGuard>
           </AuthGuard>
         } />
         
@@ -54,8 +48,17 @@ export default function App() {
             </AdminGuard>
           </AuthGuard>
         } />
+
+        <Route path="/*" element={
+          <AuthGuard>
+            <ProfileGuard>
+              <DashboardRouter />
+            </ProfileGuard>
+          </AuthGuard>
+        } />
         
       </Routes>
     </BrowserRouter>
+    </ErrorBoundary>
   );
 }

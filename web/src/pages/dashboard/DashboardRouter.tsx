@@ -1,22 +1,11 @@
-import React from 'react';
-import { useThemeStore } from '../../stores/themeStore';
-import { EmberDashboard } from './ember/EmberDashboard';
-import { AuroraDashboard } from './aurora/AuroraDashboard';
-import { CinemaDashboard } from './cinema/CinemaDashboard';
-import { GeminiDashboard } from './gemini/GeminiDashboard';
+import React, { useEffect } from "react";
+import { useProfileStore } from "../../stores/profileStore";
+import { useThemeStore } from "../../stores/themeStore";
+import { DashboardShell } from "./DashboardShell";
 
 export function DashboardRouter() {
-  const { activeTheme } = useThemeStore();
-
-  switch (activeTheme) {
-    case 'aurora':
-      return <AuroraDashboard />;
-    case 'cinema':
-      return <CinemaDashboard />;
-    case 'gemini':
-      return <GeminiDashboard />;
-    case 'ember':
-    default:
-      return <EmberDashboard />;
-  }
+  const activeProfile = useProfileStore((state) => state.activeProfile);
+  const syncFromProfile = useThemeStore((state) => state.syncFromProfile);
+  useEffect(() => syncFromProfile(activeProfile), [activeProfile, syncFromProfile]);
+  return <DashboardShell />;
 }

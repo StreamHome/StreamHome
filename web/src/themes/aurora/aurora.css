@@ -1,6 +1,11 @@
 [data-theme="aurora"] {
   --bg-body: #050505;
+  --bg-surface-dim: #050505;
+  --bg-surface-container-lowest: #020202;
+  --bg-surface-container-low: #080808;
   --bg-surface-container: #0a0a0a;
+  --bg-surface-container-high: #121212;
+  --bg-surface-container-highest: #1a1a1a;
 
   --glass-fill: rgba(255, 255, 255, 0.03);
   --glass-border: rgba(255, 255, 255, 0.08);
@@ -10,16 +15,21 @@
   --accent-primary: #ffffff;
   --accent-container: #888888;
   --accent-muted: #444444;
+  --accent-on-primary: #050505;
 
   --glow-active: 0 0 20px rgba(255, 255, 255, 0.1);
   --glow-intense: 0 0 30px rgba(255, 255, 255, 0.15);
+  --glow-subtle: 0 0 12px rgba(255, 255, 255, 0.08);
+  --spotlight-gradient: radial-gradient(circle, rgba(255,255,255,0.18) 0%, transparent 70%);
 
   --text-primary: #ffffff;
   --text-secondary: #cccccc;
   --text-muted: #888888;
   --text-accent: #ffffff;
+  --text-error: #ffb4ab;
 
   --border-subtle: rgba(255, 255, 255, 0.06);
+  --border-surface: rgba(255, 255, 255, 0.05);
 
   --font-headline: 'Inter', sans-serif;
   --font-body: 'Inter', sans-serif;
@@ -35,4 +45,8 @@
   --easing-standard: cubic-bezier(0.4, 0, 0.2, 1);
 
   --spacing-glass-padding: 32px;
+  --spacing-unit: 4px;
+  --spacing-gutter: 24px;
+  --spacing-margin-desktop: 64px;
+  --spacing-margin-mobile: 20px;
 }

@@ -1,90 +1,56 @@
-import React, { useState } from 'react';
-import { Modal } from '../../components/ui/Modal';
-import { Input } from '../../components/ui/Input';
-import { Button } from '../../components/ui/Button';
-import { useAuthStore } from '../../stores/authStore';
-import { verify2FA } from '../../api/auth';
+import React, { useState } from "react";
+import { login, verify2FA } from "../../api/auth";
+import { Button } from "../../components/ui/Button";
+import { Input } from "../../components/ui/Input";
+import { Modal } from "../../components/ui/Modal";
+import { useAuthStore } from "../../stores/authStore";
 
 interface SudoModalProps {
   isOpen: boolean;
-  onSuccess: () => void;
+  onSuccess: () => void | Promise<void>;
   onCancel: () => void;
   actionLabel: string;
 }
 
 export function SudoModal({ isOpen, onSuccess, onCancel, actionLabel }: SudoModalProps) {
-  const [code, setCode] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const email = useAuthStore(state => state.email); // Need email to verify
+  const storedEmail = useAuthStore((state) => state.email);
+  const [email, setEmail] = useState(storedEmail ?? "");
+  const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError('');
-    setIsLoading(true);
-
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setLoading(true);
+    setError("");
     try {
-      if (email && code) {
-        // Mocking sudo auth behavior for now, usually an endpoint like /api/admin/sudo
+      const response = await login({ email, password });
+      if ("requires2fa" in response) {
+        if (code.length !== 6) throw new Error("A six-digit TOTP code is required for this account.");
         await verify2FA({ email, code });
       }
-      // If we didn't throw, assume success
-      onSuccess();
-    } catch (err: any) {
-      setError(err.message || 'Authentication failed');
+      await onSuccess();
+      setPassword("");
+      setCode("");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Reauthentication failed.");
     } finally {
-      setIsLoading(false);
+      setLoading(false);
     }
   };
 
   return (
     <Modal isOpen={isOpen} onClose={onCancel}>
-      <div 
-        className="p-6 md:p-8 flex flex-col gap-6"
-        style={{ border: '1px solid var(--text-error)', borderRadius: 'inherit' }}
-      >
-        <div>
-          <h2 className="font-[family-name:var(--font-headline)] text-2xl font-bold text-[var(--text-error)] mb-2 tracking-wide uppercase">
-            Authorization Required
-          </h2>
-          <p className="font-[family-name:var(--font-body)] text-[var(--text-secondary)] text-sm">
-            Please authenticate to perform: <strong className="text-[var(--text-primary)]">{actionLabel}</strong>
-          </p>
-        </div>
-
-        <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-          <Input 
-            label="Master Password" 
-            type="password" 
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
-          <Input 
-            label="6-Digit TOTP Code" 
-            type="text" 
-            maxLength={6}
-            value={code}
-            onChange={(e) => setCode(e.target.value)}
-            required
-          />
-
-          {error && (
-            <div className="font-[family-name:var(--font-mono)] text-[var(--text-error)] text-xs">
-              {error}
-            </div>
-          )}
-
-          <div className="flex gap-4 mt-4">
-            <Button type="submit" variant="primary" disabled={isLoading || code.length !== 6}>
-              {isLoading ? 'Verifying...' : 'Authorize Action'}
-            </Button>
-            <Button type="button" variant="ghost" onClick={onCancel} disabled={isLoading}>
-              Cancel
-            </Button>
-          </div>
-        </form>
-      </div>
+      <form className="flex flex-col gap-4 p-7" onSubmit={submit}>
+        <h2 className="text-2xl font-semibold">Authorization required</h2>
+        <p className="text-sm text-[var(--text-muted)]">Confirm the server account to {actionLabel.toLowerCase()}.</p>
+        <Input label="Account email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} required />
+        <Input label="Password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} required />
+        <Input label="TOTP code (when enabled)" inputMode="numeric" maxLength={6} value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ""))} />
+        {error && <p className="text-sm text-[var(--text-error)]">{error}</p>}
+        <div className="flex gap-3"><Button type="submit" disabled={loading}>{loading ? "Verifying…" : "Authorize"}</Button><Button type="button" variant="ghost" onClick={onCancel}>Cancel</Button></div>
+      </form>
     </Modal>
   );
 }
