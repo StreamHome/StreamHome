@@ -2,6 +2,7 @@ import { apiGet } from "./client";
 import type { Movie, DiscoverMovie, Episode } from "../types/api";
 
 export const getMovies = () => apiGet<Movie[]>("/api/movies");
+export const getMovie = (id: string) => apiGet<Movie>(`/api/movies/${id}`);
 export const getFeatured = () => apiGet<Movie | null>("/api/movies/featured");
 export const search = (query: string) => apiGet<DiscoverMovie[]>(`/api/search?query=${encodeURIComponent(query)}`);
 export const discover = (category: string, type: string) => apiGet<DiscoverMovie[]>(`/api/discover?category=${encodeURIComponent(category)}&type=${encodeURIComponent(type)}`);
