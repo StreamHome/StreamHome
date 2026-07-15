@@ -19,13 +19,15 @@
    - Server snake_case and mixed wire keys are converted once in `web/src/api`.
    - Components consume stable camelCase TypeScript models.
 
-3. **Hydrated route guarding**
+3. **Hydrated query-state guarding**
    - `AuthGuard` waits for persisted auth hydration before redirecting.
-   - `ProfileGuard` restores or requests the active server profile before protected catalog/player rendering.
+   - `QueryProfileGuard` resolves the `profile` query parameter against server profiles; the URL overrides stale local state.
+   - The root application URL carries validated `view`, `media`, `genre`, `season`, `q`, and `section` state. Unsupported parameters are discarded during canonicalization.
 
 4. **Shared behavior, themed presentation**
-   - Ember, Aurora, Cinema, and Gemini use one dashboard and detail behavior layer.
-   - Theme selection is applied through CSS variables and a normalized `data-theme` value.
+   - Shared controller hooks own catalog/search/watchlist/playback API behavior.
+   - A typed registry selects distinct navigation, hero, card, details, and player variants for Ember, Aurora, Cinema, and Gemini.
+   - Theme styles are scoped to authenticated application roots so the login screen remains unchanged.
 
 5. **Playable-state honesty**
    - Catalog records may exist before physical media is available.

@@ -1,11 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { getEpisodes, getMovies } from "../../api/movies";
 import { trackPlayback } from "../../api/playback";
 import { Button } from "../../components/ui/Button";
 import { useAuthStore } from "../../stores/authStore";
 import { useProfileStore } from "../../stores/profileStore";
 import { useThemeStore } from "../../stores/themeStore";
+import { appUrl, parseAppQuery } from "../../navigation/queryState";
+import { getThemeDefinition } from "../../themes/application/themeRegistry";
 import type { Episode, Movie, SubtitleInfo } from "../../types/api";
 import { formatDuration } from "../../utils/format";
 import { isServerArtworkUrl } from "../../utils/media";
@@ -78,11 +80,14 @@ function activeSkipMarker(markers: Record<string, unknown>, time: number): { lab
 }
 
 export function PlayerPage() {
-  const { mediaId = "" } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const query = useMemo(() => parseAppQuery(location.search), [location.search]);
+  const mediaId = query.media ?? "";
   const token = useAuthStore((state) => state.token);
   const profile = useProfileStore((state) => state.activeProfile)!;
   const theme = useThemeStore((state) => state.activeTheme);
+  const definition = getThemeDefinition(theme);
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const seekTimerRef = useRef<number | null>(null);
@@ -165,6 +170,11 @@ export function PlayerPage() {
     if (operation) void operation.catch(() => undefined);
   }, []);
 
+  const exitPlayer = useCallback(() => {
+    if ((location.state as { fromApp?: boolean } | null)?.fromApp) navigate(-1);
+    else navigate(appUrl(profile.id, "home"), { replace: true });
+  }, [location.state, navigate, profile.id]);
+
   const reportProgress = useCallback((finished = false) => {
     if (!asset || !profile) return;
     const watched = videoRef.current?.currentTime ?? currentTime;
@@ -197,11 +207,11 @@ export function PlayerPage() {
       if (event.key === "ArrowRight") seek(currentTime + 10);
       if (event.key.toLowerCase() === "m" && videoRef.current) videoRef.current.muted = !videoRef.current.muted;
       if (event.key.toLowerCase() === "f") toggleFullscreen();
-      if (event.key === "Escape" && !document.fullscreenElement) navigate(-1);
+      if (event.key === "Escape" && !document.fullscreenElement) exitPlayer();
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [currentTime, isPlaying, navigate, safePlay, seek, toggleFullscreen]);
+  }, [currentTime, exitPlayer, isPlaying, safePlay, seek, toggleFullscreen]);
 
   useEffect(() => {
     let timeout: number | undefined;
@@ -222,12 +232,12 @@ export function PlayerPage() {
   };
 
   if (loading) return <div className="grid min-h-screen place-items-center bg-black text-white">Loading media from the server…</div>;
-  if (error || !asset) return <div className="grid min-h-screen place-items-center bg-black p-6 text-white"><div className="max-w-lg text-center"><h1 className="text-2xl font-semibold">Playback unavailable</h1><p className="mt-3 text-white/60">{error}</p><Button className="mt-6" onClick={() => navigate(-1)}>Go back</Button></div></div>;
+  if (error || !asset) return <div className="grid min-h-screen place-items-center bg-black p-6 text-white"><div className="max-w-lg text-center"><h1 className="text-2xl font-semibold">Playback unavailable</h1><p className="mt-3 text-white/60">{error}</p><Button className="mt-6" onClick={exitPlayer}>Go back</Button></div></div>;
 
   const usableSubtitles = asset.subtitles.filter((subtitle) => isServerArtworkUrl(subtitle.url ?? subtitle.path));
 
   return (
-    <div ref={containerRef} className="fixed inset-0 z-[200] bg-black text-white" data-theme={theme} onClick={() => setShowControls(true)}>
+    <div ref={containerRef} className="player-view fixed inset-0 z-[200] bg-black text-white" data-theme={theme} data-player-theme={definition.playerVariant} onClick={() => setShowControls(true)}>
       <video
         ref={videoRef}
         src={videoSrc}
@@ -247,11 +257,11 @@ export function PlayerPage() {
 
       {skipMarker && <Button className="absolute bottom-32 right-8 z-30" onClick={() => seek(skipMarker.end)}>{skipMarker.label}</Button>}
 
-      <div className={`absolute inset-x-0 bottom-0 bg-gradient-to-t from-black via-black/80 to-transparent px-5 pb-6 pt-24 transition-opacity md:px-10 ${showControls || !isPlaying ? "opacity-100" : "pointer-events-none opacity-0"}`}>
+      <div className={`player-controls absolute inset-x-0 bottom-0 bg-gradient-to-t from-black via-black/80 to-transparent px-5 pb-6 pt-24 transition-opacity md:px-10 ${showControls || !isPlaying ? "opacity-100" : "pointer-events-none opacity-0"}`}>
         <div className="mx-auto max-w-7xl">
           <div className="mb-5 flex items-start justify-between gap-5">
             <div><h1 className="text-xl font-semibold md:text-2xl">{asset.title}</h1>{asset.subtitle && <p className="mt-1 text-sm text-white/60">{asset.subtitle}</p>}</div>
-            <button onClick={() => navigate(-1)} className="text-sm text-white/70">Exit</button>
+            <button onClick={exitPlayer} className="text-sm text-white/70">Exit</button>
           </div>
           <input aria-label="Playback position" type="range" min={0} max={duration || 0} step={0.1} value={Math.min(currentTime, duration || currentTime)} onChange={(event) => seek(Number(event.target.value))} className="w-full accent-[var(--accent-container)]" />
           <div className="mt-4 flex flex-wrap items-center gap-4">

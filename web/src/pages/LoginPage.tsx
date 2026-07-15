@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../stores/authStore';
 import { login, verify2FA } from '../api/auth';
 import { EmberBackground } from '../themes/ember/EmberBackground';
@@ -8,6 +8,7 @@ import { ScanLines } from '../themes/ember/ScanLines';
 
 export function LoginPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const setToken = useAuthStore((state) => state.setToken);
 
   const [email, setEmail] = useState('');
@@ -46,7 +47,7 @@ export function LoginPage() {
         setRequires2FA(true);
       } else {
         setToken(res.accessToken, res.email);
-        navigate('/profiles');
+        navigate('/profiles', { state: location.state });
       }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Login failed');
@@ -75,7 +76,7 @@ export function LoginPage() {
         const code = newCode.join('');
         const res = await verify2FA({ email, code });
         setToken(res.accessToken, res.email);
-        navigate('/profiles');
+        navigate('/profiles', { state: location.state });
       } catch (err: unknown) {
         setError(err instanceof Error ? err.message : 'Invalid 2FA code');
         setTotpCode(Array(6).fill(''));

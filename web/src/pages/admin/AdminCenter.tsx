@@ -1,19 +1,27 @@
-import React, { useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { Button } from "../../components/ui/Button";
+import React, { useMemo } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { appUrl, parseAppQuery, type AdminSection } from "../../navigation/queryState";
+import { useProfileStore } from "../../stores/profileStore";
+import { useThemeStore } from "../../stores/themeStore";
+import { getThemeDefinition } from "../../themes/application/themeRegistry";
 import { AccountPanel } from "./panels/AccountPanel";
 import { DownloadsPanel } from "./panels/DownloadsPanel";
 import { StoragePanel } from "./panels/StoragePanel";
 
-type Panel = "account" | "storage" | "downloads";
+const PANELS: Array<{ id: AdminSection; label: string }> = [
+  { id: "account", label: "Account & TOTP" }, { id: "storage", label: "Storage & HEVC" }, { id: "downloads", label: "Downloads" },
+];
 
 export function AdminCenter() {
   const navigate = useNavigate();
-  const [panel, setPanel] = useState<Panel>("account");
-  return (
-    <div className="min-h-screen bg-[var(--bg-body)] text-[var(--text-primary)]" data-theme="ember">
-      <header className="sticky top-0 z-30 border-b border-[var(--glass-border)] bg-[var(--bg-body)]/90 px-6 backdrop-blur-xl"><div className="mx-auto flex min-h-18 max-w-7xl flex-wrap items-center gap-3 py-3"><h1 className="mr-auto text-xl font-semibold">Admin center</h1>{(["account", "storage", "downloads"] as Panel[]).map((item) => <Button key={item} size="sm" variant={panel === item ? "primary" : "ghost"} onClick={() => setPanel(item)}>{item === "account" ? "Account & TOTP" : item === "storage" ? "Storage & HEVC" : "Downloads"}</Button>)}<Button size="sm" variant="secondary" onClick={() => navigate("/")}>Exit</Button></div></header>
-      {panel === "account" && <AccountPanel />}{panel === "storage" && <StoragePanel />}{panel === "downloads" && <DownloadsPanel />}
-    </div>
-  );
+  const location = useLocation();
+  const profile = useProfileStore((state) => state.activeProfile)!;
+  const theme = useThemeStore((state) => state.activeTheme);
+  const definition = getThemeDefinition(theme);
+  const query = useMemo(() => parseAppQuery(location.search), [location.search]);
+  const section = query.section ?? "account";
+  const Background = definition.Background;
+  const select = (next: AdminSection) => navigate(appUrl(profile.id, "admin", { section: next }));
+
+  return <div className={`theme-app admin-shell ${definition.shellClass}`} data-theme={theme}><Background /><header className="admin-nav"><div><p>STREAMHOME / CONTROL PLANE</p><h1>Admin center</h1></div><nav aria-label="Admin sections">{PANELS.map((panel) => <button key={panel.id} data-active={section === panel.id} onClick={() => select(panel.id)}>{panel.label}</button>)}</nav><div className="admin-nav__profile"><span>{profile.name}</span><button onClick={() => navigate(appUrl(profile.id, "home"))}>Exit admin</button></div></header><main className="admin-content">{section === "account" && <AccountPanel />}{section === "storage" && <StoragePanel />}{section === "downloads" && <DownloadsPanel />}</main></div>;
 }

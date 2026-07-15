@@ -6,10 +6,12 @@ The current work is a web-only reliability repair. The server is the source of t
 
 ## Current web architecture
 
-- React routes are protected by hydrated auth and profile guards.
+- React routes are protected by hydrated auth and a query-aware profile guard that resolves `profile` against server profiles.
 - API modules normalize the server's wire format into stable TypeScript models.
 - The selected profile controls one of four themes: Ember, Aurora, Cinema, or Gemini. Legacy `netflix` profile values migrate to `cinema`.
-- A shared `DashboardShell` provides catalog, search, watchlist, profiles, details, and downloads behavior for every theme.
+- The authenticated application uses canonical query state such as `/?profile=1&view=series`; search, genres, details, seasons, playback, downloads, and admin sections are deep-linkable.
+- Shared catalog controller hooks own API behavior while a typed theme registry selects distinct Ember, Aurora, Cinema, and Gemini navigation, heroes, cards, details, and player presentation.
+- Ember follows the Obsidian Frost reference: sharp obsidian glass, restrained orange glow, scanlines, serif display type, and technical mono labels. Aurora, Cinema, and Gemini retain separate editorial, cinematic, and workspace identities.
 - `MediaArtwork` accepts only server media paths or absolute HTTP(S) URLs. It never substitutes a bundled media image.
 - The player resolves its movie or episode from authenticated server APIs and refuses playback when no physical media URL exists.
 - Admin exposes only implemented server capabilities: current-account TOTP, storage/HEVC settings, and read-only download events.
@@ -23,4 +25,4 @@ The current work is a web-only reliability repair. The server is the source of t
 
 ## Next step
 
-Complete the required validation and commit the web repair. Future web features must first be backed by an existing server endpoint or a separately approved server change.
+Complete final validation and commit the query-navigation/theme restoration. Future web features must first be backed by an existing server endpoint or a separately approved server change.

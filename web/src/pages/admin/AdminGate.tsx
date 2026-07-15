@@ -4,6 +4,8 @@ import { Button } from "../../components/ui/Button";
 import { GlassPane } from "../../components/ui/GlassPane";
 import { Input } from "../../components/ui/Input";
 import { useAuthStore } from "../../stores/authStore";
+import { useThemeStore } from "../../stores/themeStore";
+import { getThemeDefinition } from "../../themes/application/themeRegistry";
 import { AdminCenter } from "./AdminCenter";
 
 const SESSION_KEY = "streamhome_admin_session";
@@ -11,6 +13,9 @@ const SESSION_TTL = 24 * 60 * 60 * 1000;
 
 export function AdminGate() {
   const storedEmail = useAuthStore((state) => state.email);
+  const theme = useThemeStore((state) => state.activeTheme);
+  const definition = getThemeDefinition(theme);
+  const Background = definition.Background;
   const [email, setEmail] = useState(storedEmail ?? "");
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
@@ -59,8 +64,9 @@ export function AdminGate() {
   if (authenticated) return <AdminCenter />;
 
   return (
-    <main className="grid min-h-screen place-items-center bg-[var(--bg-body)] p-6" data-theme="ember">
-      <GlassPane className="w-full max-w-md p-8" spotlight={false}>
+    <main className={`theme-app admin-auth-screen ${definition.shellClass}`} data-theme={theme}>
+      <Background />
+      <GlassPane className="admin-auth-panel" spotlight={false}>
         <h1 className="text-2xl font-semibold">Admin reauthentication</h1>
         <p className="mt-2 text-sm text-[var(--text-muted)]">Confirm the server account before opening administrative controls.</p>
         <form className="mt-7 flex flex-col gap-4" onSubmit={submit}>

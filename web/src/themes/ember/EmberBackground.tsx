@@ -8,7 +8,7 @@ interface Particle {
   speed: number;
 }
 
-export function EmberBackground() {
+export function EmberBackground({ suspendWhenHidden = false, respectReducedMotion = false }: { suspendWhenHidden?: boolean; respectReducedMotion?: boolean } = {}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -41,7 +41,12 @@ export function EmberBackground() {
       }
     };
 
+    const reducedMotion = respectReducedMotion && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const draw = () => {
+      if (suspendWhenHidden && document.hidden) {
+        animationFrameId = requestAnimationFrame(draw);
+        return;
+      }
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       particles.forEach(p => {
@@ -58,7 +63,7 @@ export function EmberBackground() {
         }
       });
 
-      animationFrameId = requestAnimationFrame(draw);
+      if (!reducedMotion) animationFrameId = requestAnimationFrame(draw);
     };
 
     window.addEventListener('resize', resize);
@@ -67,9 +72,9 @@ export function EmberBackground() {
 
     return () => {
       window.removeEventListener('resize', resize);
-      cancelAnimationFrame(animationFrameId);
+      if (animationFrameId) cancelAnimationFrame(animationFrameId);
     };
-  }, []);
+  }, [respectReducedMotion, suspendWhenHidden]);
 
   return (
     <canvas

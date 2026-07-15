@@ -27,7 +27,7 @@ export function ServerDownloads() {
   }, [token]);
 
   return (
-    <section className="mx-auto max-w-5xl px-6 py-10">
+    <section className="server-downloads mx-auto max-w-5xl px-6 py-10">
       <div className="mb-8 flex items-end justify-between gap-4">
         <div>
           <h1 className="text-3xl font-semibold">Server downloads</h1>

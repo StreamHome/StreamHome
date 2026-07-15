@@ -5,14 +5,12 @@ import './themes/index';
 
 import { LoginPage } from './pages/LoginPage';
 import { ProfileSelectPage } from './pages/ProfileSelectPage';
-import { DashboardRouter } from './pages/dashboard/DashboardRouter';
-import { PlayerPage } from './pages/player/PlayerPage';
-import { AdminGate } from './pages/admin/AdminGate';
+import { AuthenticatedApp } from './pages/AuthenticatedApp';
 
 import { AuthGuard } from './components/guards/AuthGuard';
-import { ProfileGuard } from './components/guards/ProfileGuard';
-import { AdminGuard } from './components/guards/AdminGuard';
+import { QueryProfileGuard } from './components/guards/QueryProfileGuard';
 import { ErrorBoundary } from './components/ui/ErrorBoundary';
+import { AppFallbackRedirect, LegacyAdminRedirect, LegacyWatchRedirect } from './navigation/LegacyRedirects';
 
 export default function App() {
   const hydrate = useAuthStore((state) => state.hydrate);
@@ -35,27 +33,25 @@ export default function App() {
         
         <Route path="/watch/:mediaId" element={
           <AuthGuard>
-            <ProfileGuard>
-              <PlayerPage />
-            </ProfileGuard>
+            <LegacyWatchRedirect />
           </AuthGuard>
         } />
         
         <Route path="/admin/*" element={
           <AuthGuard>
-            <AdminGuard>
-              <AdminGate />
-            </AdminGuard>
+            <LegacyAdminRedirect />
           </AuthGuard>
         } />
 
-        <Route path="/*" element={
+        <Route path="/" element={
           <AuthGuard>
-            <ProfileGuard>
-              <DashboardRouter />
-            </ProfileGuard>
+            <QueryProfileGuard>
+              <AuthenticatedApp />
+            </QueryProfileGuard>
           </AuthGuard>
         } />
+
+        <Route path="*" element={<AuthGuard><AppFallbackRedirect /></AuthGuard>} />
         
       </Routes>
     </BrowserRouter>
