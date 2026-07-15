@@ -1,0 +1,38 @@
+[data-theme="aurora"] {
+  --bg-body: #050505;
+  --bg-surface-container: #0a0a0a;
+
+  --glass-fill: rgba(255, 255, 255, 0.03);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-border-hover: rgba(255, 255, 255, 0.3);
+  --glass-blur: 40px;
+
+  --accent-primary: #ffffff;
+  --accent-container: #888888;
+  --accent-muted: #444444;
+
+  --glow-active: 0 0 20px rgba(255, 255, 255, 0.1);
+  --glow-intense: 0 0 30px rgba(255, 255, 255, 0.15);
+
+  --text-primary: #ffffff;
+  --text-secondary: #cccccc;
+  --text-muted: #888888;
+  --text-accent: #ffffff;
+
+  --border-subtle: rgba(255, 255, 255, 0.06);
+
+  --font-headline: 'Inter', sans-serif;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --radius: 16px;
+  --radius-none: 16px;
+
+  --duration-slow: 600ms;
+  --duration-medium: 400ms;
+  --duration-fast: 250ms;
+  --easing-smooth: cubic-bezier(0.25, 1, 0.5, 1);
+  --easing-standard: cubic-bezier(0.4, 0, 0.2, 1);
+
+  --spacing-glass-padding: 32px;
+}

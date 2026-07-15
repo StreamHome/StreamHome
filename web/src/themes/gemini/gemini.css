@@ -1,0 +1,40 @@
+[data-theme="gemini"] {
+  --bg-body: #09090b;
+  --bg-surface-container: #111113;
+
+  --glass-fill: rgba(255, 255, 255, 0.05);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-border-hover: transparent;         /* Gradient border via pseudo-element */
+  --glass-blur: 16px;
+
+  --accent-primary: #4285F4;
+  --accent-secondary: #9b72cb;
+  --accent-tertiary: #d96570;
+  --accent-quaternary: #f4b400;
+  --accent-gradient: linear-gradient(135deg, #4285F4, #9b72cb, #d96570, #f4b400);
+
+  --glow-active: 0 0 20px rgba(66, 133, 244, 0.3);
+  --glow-intense: 0 0 30px rgba(155, 114, 203, 0.4);
+
+  --text-primary: #ffffff;
+  --text-secondary: #a1a1aa;
+  --text-muted: #71717a;
+  --text-accent: #4285F4;
+
+  --border-subtle: rgba(255, 255, 255, 0.06);
+
+  --font-headline: 'Outfit', sans-serif;
+  --font-body: 'Outfit', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --radius: 12px;
+  --radius-none: 8px;
+
+  --duration-slow: 700ms;
+  --duration-medium: 500ms;
+  --duration-fast: 300ms;
+  --easing-smooth: cubic-bezier(0.16, 1, 0.3, 1);
+  --easing-standard: cubic-bezier(0.4, 0, 0.2, 1);
+
+  --spacing-glass-padding: 28px;
+}

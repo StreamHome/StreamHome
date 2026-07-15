@@ -1,0 +1,64 @@
+[data-theme="ember"] {
+  /* Backgrounds */
+  --bg-body: #1e100b;
+  --bg-surface-dim: #1e100b;
+  --bg-surface-container-lowest: #180b07;
+  --bg-surface-container-low: #271813;
+  --bg-surface-container: #2b1c17;
+  --bg-surface-container-high: #372621;
+  --bg-surface-container-highest: #42312b;
+
+  /* Glass */
+  --glass-fill: rgba(30, 16, 11, 0.4);
+  --glass-border: rgba(255, 95, 31, 0.15);
+  --glass-border-hover: #f97316;
+  --glass-blur: 12px;
+
+  /* Accents */
+  --accent-primary: #ffb59c;
+  --accent-container: #ff5f1f;
+  --accent-muted: #8B310E;
+  --accent-on-primary: #5c1900;
+
+  /* Glows */
+  --glow-active: 0 0 10px rgba(255, 95, 31, 0.5);
+  --glow-intense: 0 0 15px rgba(255, 95, 31, 0.8);
+  --glow-subtle: 0 0 15px rgba(255, 95, 31, 0.3);
+
+  /* Spotlight */
+  --spotlight-gradient: radial-gradient(circle, rgba(255, 95, 31, 0.4) 0%, transparent 70%);
+
+  /* Text */
+  --text-primary: #ffffff;
+  --text-secondary: #f9dcd4;
+  --text-muted: #e3bfb3;
+  --text-accent: #ffb59c;
+  --text-error: #ffb4ab;
+
+  /* Borders */
+  --border-subtle: rgba(255, 255, 255, 0.1);
+  --border-surface: rgba(255, 255, 255, 0.05);
+
+  /* Typography */
+  --font-headline: 'Playfair Display', serif;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  /* Geometry */
+  --radius: 0.25rem;
+  --radius-none: 0px;
+
+  /* Animation */
+  --duration-slow: 800ms;
+  --duration-medium: 500ms;
+  --duration-fast: 300ms;
+  --easing-smooth: cubic-bezier(0.16, 1, 0.3, 1);
+  --easing-standard: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Spacing */
+  --spacing-unit: 4px;
+  --spacing-gutter: 24px;
+  --spacing-margin-desktop: 64px;
+  --spacing-margin-mobile: 20px;
+  --spacing-glass-padding: 32px;
+}

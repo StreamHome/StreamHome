@@ -1,0 +1,38 @@
+[data-theme="cinema"] {
+  --bg-body: #141414;
+  --bg-surface-container: #1f1f1f;
+
+  --glass-fill: rgba(31, 31, 31, 0.95);   /* Solid, no glass blur */
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-border-hover: #E50914;
+  --glass-blur: 0px;                       /* No blur — solid surfaces */
+
+  --accent-primary: #E50914;
+  --accent-container: #b20710;
+  --accent-muted: #831010;
+
+  --glow-active: 0 14px 28px rgba(0,0,0,0.25), 0 10px 10px rgba(0,0,0,0.22);
+  --glow-intense: 0 19px 38px rgba(0,0,0,0.30), 0 15px 12px rgba(0,0,0,0.22);
+
+  --text-primary: #ffffff;
+  --text-secondary: #b3b3b3;
+  --text-muted: #808080;
+  --text-accent: #E50914;
+
+  --border-subtle: rgba(255, 255, 255, 0.08);
+
+  --font-headline: 'Bebas Neue', sans-serif;
+  --font-body: 'Montserrat', sans-serif;
+  --font-mono: 'Montserrat', sans-serif;
+
+  --radius: 6px;
+  --radius-none: 4px;
+
+  --duration-slow: 400ms;
+  --duration-medium: 300ms;
+  --duration-fast: 200ms;
+  --easing-smooth: cubic-bezier(0.4, 0, 0.2, 1);
+  --easing-standard: ease-in-out;
+
+  --spacing-glass-padding: 24px;
+}
