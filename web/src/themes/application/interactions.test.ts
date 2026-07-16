@@ -48,6 +48,7 @@ describe("semantic hover interaction system", () => {
     expect(application).toContain("background-color: rgba(12,12,14,.96)");
     expect(application).toContain("padding: 6px 4vw 2px");
     expect(application).toContain(".theme-nav--cinema .theme-brand { height: 100%; display: flex; align-items: center");
+    expect(application).not.toContain(".theme-nav--cinema[data-scrolled=\"true\"] { border-bottom");
   });
 
   it("covers every major interactive surface", () => {
