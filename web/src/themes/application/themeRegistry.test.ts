@@ -39,4 +39,12 @@ describe("theme definition registry", () => {
     fireEvent.click(screen.getAllByLabelText("Open settings for Admin")[1]);
     expect(screen.getByRole("menu").getAttribute("data-placement")).toBe("bottom-end");
   });
+
+  it("omits the profile-menu caret decoration from every theme", () => {
+    for (const definition of Object.values(THEME_DEFINITIONS)) {
+      const { container, unmount } = render(React.createElement(definition.Navigation, navigationProps));
+      expect(container.querySelectorAll(".theme-profile-control > i")).toHaveLength(0);
+      unmount();
+    }
+  });
 });

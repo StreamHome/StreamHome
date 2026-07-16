@@ -37,8 +37,6 @@
 .theme-profile-control { display: flex; align-items: center; gap: 9px; border: 0; background: transparent; color: var(--text-primary); }
 .theme-profile-control > span { width: 30px; height: 30px; flex: 0 0 30px; border: 1px solid var(--glass-border); }
 .theme-profile-control b { max-width: 105px; overflow: hidden; text-overflow: ellipsis; font-size: 12px; white-space: nowrap; }
-.theme-profile-control > i { color: var(--text-muted); font-size: 12px; font-style: normal; transition: transform var(--duration-medium) var(--easing-smooth); }
-.theme-profile-control[aria-expanded="true"] > i { transform: rotate(180deg); }
 .theme-profile-menu { position: relative; }
 .theme-profile-menu__panel { position: absolute; z-index: 90; width: min(210px,calc(100vw - 24px)); max-height: calc(100vh - 24px); display: grid; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--glass-border); border-radius: var(--radius); padding: 14px; background: color-mix(in srgb,var(--bg-surface-container-high) 94%,transparent); box-shadow: 0 24px 70px rgba(0,0,0,.48),var(--glow-subtle); backdrop-filter: blur(26px); }
 .theme-profile-menu__panel[data-placement="bottom-end"] { top: calc(100% + 14px); right: 0; bottom: auto; left: auto; max-height: calc(100vh - 104px); transform-origin: right top; }

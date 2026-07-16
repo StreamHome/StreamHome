@@ -2,6 +2,8 @@
 
 ## Active comprehensive motion rebuild
 
+- [x] Removed the shared profile-control caret `<i>` decoration and its obsolete CSS from Ember, Aurora, Cinema, and Gemini navigation.
+
 - [x] Audited route, component-state, data-mutation, navigation, artwork, details, playback, profile, authentication, and admin transitions across all four themes.
 - [x] Replaced the globally overextended timing scale with semantic interaction, overlay, page, billboard, list, artwork, and player-control timings.
 - [x] Added application-wide Framer Motion reduced-motion configuration, directional page variants, shared content reveal variants, and a reusable animated state boundary.
