@@ -6,6 +6,7 @@ import { login, verify2FA } from '../api/auth';
 import { EmberBackground } from '../themes/ember/EmberBackground';
 import { ScanLines } from '../themes/ember/ScanLines';
 import { MOTION_EASE, MOTION_TIMINGS, useAppMotion } from '../motion/motionSystem';
+import { BrandLogo } from '../components/brand/BrandLogo';
 
 export function LoginPage() {
   const navigate = useNavigate();
@@ -126,7 +127,7 @@ export function LoginPage() {
             AUTH REQUIRED
           </div>
           <h1 className="font-[family-name:var(--font-headline)] text-white text-5xl md:text-6xl tracking-[0.02em] font-bold select-none min-h-[60px]">
-            STREAMHOME
+            <BrandLogo className="brand-logo--login" />
           </h1>
           <p className="font-[family-name:var(--font-mono)] text-[var(--text-muted)] text-[12px] tracking-[0.2em] uppercase mt-2 opacity-80">
             Secure Terminal Access

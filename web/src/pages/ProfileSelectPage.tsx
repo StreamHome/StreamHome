@@ -15,6 +15,7 @@ import { GeminiBackground } from "../themes/gemini/GeminiBackground";
 import { MOTION_EASE, MOTION_TIMINGS, useAppMotion } from "../motion/motionSystem";
 import { ScanLines } from "../themes/ember/ScanLines";
 import { useHoverIntent } from "../motion/useHoverIntent";
+import { BrandLogo } from "../components/brand/BrandLogo";
 
 const THEMES: ThemeId[] = ["ember", "aurora", "cinema", "gemini"];
 const THEME_LABELS: Record<ThemeId, string> = { ember: "Ember", aurora: "Aurora", cinema: "Cinema", gemini: "Gemini" };
@@ -173,7 +174,7 @@ export function ProfileSelectPage() {
     <motion.main className={`profile-gallery profile-gallery--${ambientTheme}`} data-entering={Boolean(enteringProfile)} animate={enteringProfile ? { opacity: 0, scale: 1.025, filter: "blur(10px)" } : { opacity: 1, scale: 1, filter: "blur(0px)" }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileEntry, ease: MOTION_EASE }}>
       <ProfileAmbient theme={ambientTheme} />
       <section className="profile-gallery__content">
-        <motion.header className="profile-gallery__header" initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileEntry, ease: MOTION_EASE }}><p>STREAMHOME / PROFILE MATRIX</p><h1>Who is watching?</h1><span>Select a server profile. Its theme shapes the complete workspace.</span></motion.header>
+        <motion.header className="profile-gallery__header" initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileEntry, ease: MOTION_EASE }}><BrandLogo className="brand-logo--profiles" showWordmark={false} /><p>STREAMHOME / PROFILE MATRIX</p><h1>Who is watching?</h1><span>Select a server profile. Its theme shapes the complete workspace.</span></motion.header>
         {state?.error && <p className="profile-gallery__notice" role="status">{state.error}</p>}
         {loading && <div className="profile-gallery__state">Loading profiles from the server...</div>}
         {error && <div className="profile-gallery__state profile-gallery__state--error"><p>{error}</p><button onClick={() => void loadProfiles()}>Retry</button></div>}

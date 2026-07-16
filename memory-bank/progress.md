@@ -79,7 +79,7 @@ The server was deliberately not changed during the current web repair. Existing 
 ## Validation
 
 - [x] `npm run lint`
-- [x] `npm test` (16 files, 36 tests)
+- [x] `npm test` (17 files, 38 tests)
 - [x] `npm run build`
 - [x] Live browser validation of Ember, Aurora, Cinema, and Gemini billboards, genre rails, My List, profile settings menu/dialog, server artwork, query navigation, root/document scroll restoration, desktop/mobile overflow, and console output.
 - [x] Live browser validation against the local server: Ember desktop/mobile home, movies, details, series-empty, downloads-empty, profile gallery/settings, safe create/delete, query navigation, and scroll restoration.
@@ -89,6 +89,14 @@ The server was deliberately not changed during the current web repair. Existing 
 - [x] Artwork coverage check resolved all 66 poster/backdrop files for all 33 current catalog records; every file hash is distinct and none are missing.
 - [x] The earlier artwork pass visually confirmed that the resolved server artwork files are valid and distinct; the current rebuild additionally rendered those server files in live browser QA.
 - [ ] The required `server/scratch/check_db.py` could not run in this environment because both installed Python interpreters are missing `sqlmodel`; no server code or database files were changed.
+
+## StreamHome logo integration
+
+- [x] Added the supplied 1024px PNG as the production brand asset at `web/public/logo.png` and configured it as the browser favicon.
+- [x] Added a reusable, accessible `BrandLogo` component with full-wordmark and compact-mark modes.
+- [x] Integrated the logo into login, profile selection, Ember, Aurora, Cinema, Gemini desktop/mobile navigation, Gemini collapsed navigation, and the admin header.
+- [x] Added responsive logo sizing and retained existing text wordmarks where space allows.
+- [x] Added focused component tests for the public asset path and compact-mark accessible name.
 
 ## Remaining server backlog
 

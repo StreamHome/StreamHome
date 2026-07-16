@@ -19,6 +19,7 @@ The current web-only rebuild adds a shared cinematic motion contract to Ember, A
 - Buttons preserve their existing colors on hover and use transform/shadow feedback. Reduced-motion mode uses short opacity fades and disables spatial motion and decorative animation.
 - Movies and Series use rotating server-catalog billboards followed by per-genre horizontal rails. Rail controls are attached to the left/right edges and native horizontal scrollbars are hidden.
 - The active-profile control opens Edit Profile, Switch Profile, and Sign Out actions. Its placement is surface-aware: the bottom Gemini desktop sidebar opens upward, while top and mobile navigation opens downward, with viewport-safe menu bounds. Editing can change the name or canonical theme without leaving the application; switching profiles remains explicit.
+- The supplied StreamHome neon mark is a production web brand asset at `web/public/logo.png`. A shared `BrandLogo` component renders it on login, profile selection, all four theme navigation systems, Gemini compact/mobile navigation, and the admin header; the same asset is the browser favicon.
 - `MediaArtwork` accepts direct server media paths and absolute HTTP(S) URLs. Compact server artwork filenames are resolved against the server-returned movie or episode identity into `/media/...` candidates; it never substitutes a bundled media image.
 - The player resolves its movie or episode from authenticated server APIs and refuses playback when no physical media URL exists.
 - Admin exposes only implemented server capabilities: current-account TOTP, storage/HEVC settings, and read-only download events.
@@ -32,4 +33,4 @@ The current web-only rebuild adds a shared cinematic motion contract to Ember, A
 
 ## Next step
 
-The final lint, 36-test suite, and production build pass. No code implementation follow-up is pending for the menu placement and extended timing repair. Full authenticated browser QA and the required database checker remain unavailable because the existing local Python environment cannot start the server without `sqlmodel`.
+The final lint, 38-test suite, and production build pass. No code implementation follow-up is pending for the brand integration, menu placement, or extended timing repair. Full authenticated browser QA and the required database checker remain unavailable because the existing local Python environment cannot start the server without `sqlmodel`.
