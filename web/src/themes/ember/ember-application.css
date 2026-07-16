@@ -7,9 +7,13 @@
 .ember-app .theme-nav--ember button:focus-visible,.ember-app a:focus-visible { outline: 1px solid #f97316; outline-offset: 3px; }
 
 .ember-home { position: relative; padding-bottom: 110px; }
+.ember-billboard { position: relative; overflow: hidden; }
+.ember-billboard__pagination { position: absolute; z-index: 8; right: max(24px,4vw); bottom: 25px; display: flex; gap: 7px; }
+.ember-billboard__pagination button { width: 22px; height: 3px; border: 0; background: rgba(216,139,112,.36); transition: width .8s cubic-bezier(.16,1,.3,1),background .8s cubic-bezier(.16,1,.3,1),box-shadow .8s cubic-bezier(.16,1,.3,1); }
+.ember-billboard__pagination button[data-active="true"] { width: 50px; background: #ff5f1f; box-shadow: 0 0 12px rgba(255,95,31,.62); }
 .ember-hero { min-height: max(560px,70vh); position: relative; display: flex; align-items: center; overflow: hidden; isolation: isolate; }
 .ember-hero__art { position: absolute; z-index: -3; inset: 0 0 0 34%; opacity: .7; }
-.ember-hero__art > img { filter: saturate(.78) contrast(1.05); }
+.ember-hero__art > img { filter: saturate(.78) contrast(1.05); animation: ember-hero-drift 22s ease-in-out infinite alternate; }
 .ember-hero__art > [role="img"] { background: radial-gradient(circle at 62% 45%,rgba(255,95,31,.13),transparent 24%),linear-gradient(135deg,rgba(255,95,31,.04),transparent 45%),repeating-linear-gradient(90deg,rgba(255,95,31,.04) 0 1px,transparent 1px 80px),#22120d; color: #9e6d5e; }
 .ember-hero__shade { position: absolute; z-index: -2; inset: 0; background: linear-gradient(90deg,#1e100b 0%,rgba(30,16,11,.9) 35%,rgba(30,16,11,.28) 70%),linear-gradient(to top,#1e100b 0%,transparent 42%),linear-gradient(to bottom,rgba(20,8,5,.45),transparent 28%); }
 .ember-hero__copy { width: min(580px,calc(100% - 48px)); margin-left: max(24px,5vw); border: 1px solid rgba(255,95,31,.22); border-radius: 2px; padding: clamp(30px,4vw,52px); background: rgba(30,16,11,.54); box-shadow: 0 0 34px rgba(255,95,31,.08); backdrop-filter: blur(16px); }
@@ -33,20 +37,23 @@
 .ember-rail header h2 { font: 700 31px/1.05 var(--font-headline); }
 .ember-rail header > span,.ember-page-heading > span { color: #c18d7e; font: 500 8px/1 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; }
 .ember-rail__frame { position: relative; }
-.ember-rail__track { display: flex; gap: 16px; overflow-x: auto; overflow-y: hidden; padding: 7px 4px 22px; scroll-snap-type: x proximity; scrollbar-color: rgba(255,95,31,.24) transparent; }
-.ember-rail__blade { position: absolute; z-index: 8; top: 7px; bottom: 22px; width: 52px; border: 1px solid rgba(255,95,31,.22); border-radius: 0; background: rgba(30,16,11,.68); color: #ff5f1f; font: 300 34px/1 var(--font-body); opacity: 0; backdrop-filter: blur(14px); transition: opacity .25s ease,background .25s ease; }
+.ember-rail__track { display: flex; gap: 16px; overflow-x: auto; overflow-y: hidden; padding: 7px 4px 22px; scroll-snap-type: x proximity; scrollbar-width: none; -ms-overflow-style: none; }
+.ember-rail__track::-webkit-scrollbar { display: none; }
+.ember-rail__blade { position: absolute; z-index: 8; top: 7px; bottom: 22px; width: 52px; border: 1px solid rgba(255,95,31,.22); border-radius: 0; background: linear-gradient(90deg,rgba(30,16,11,.97),rgba(30,16,11,.68)); color: #ff5f1f; font: 300 34px/1 var(--font-body); opacity: .24; backdrop-filter: blur(14px); transition: opacity .65s cubic-bezier(.16,1,.3,1),background .65s cubic-bezier(.16,1,.3,1),box-shadow .65s cubic-bezier(.16,1,.3,1); }
 .ember-rail__frame:hover .ember-rail__blade,.ember-rail__blade:focus-visible { opacity: 1; }
 .ember-rail__blade:hover { background: rgba(255,95,31,.14); }
 .ember-rail__blade--previous { left: 0; }
 .ember-rail__blade--next { right: 0; }
 
-.ember-media-card { --tilt-x: 0deg; --tilt-y: 0deg; --spot-x: 50%; --spot-y: 50%; width: 200px; flex: 0 0 200px; position: relative; overflow: hidden; scroll-snap-align: start; border: 1px solid rgba(255,95,31,.16); border-radius: 0; background: rgba(29,13,9,.65); color: white; text-align: left; transform: perspective(900px) rotateX(var(--tilt-x)) rotateY(var(--tilt-y)); transform-style: preserve-3d; transition: transform .22s ease,border-color .22s ease,box-shadow .22s ease; }
-.ember-media-card::before { content: ""; position: absolute; z-index: 4; inset: -45%; pointer-events: none; background: radial-gradient(circle at var(--spot-x) var(--spot-y),rgba(255,95,31,.34),transparent 32%); opacity: 0; transition: opacity .22s ease; }
-.ember-media-card::after { content: ""; position: absolute; z-index: 5; inset: 0; pointer-events: none; background: linear-gradient(115deg,transparent 25%,rgba(255,255,255,.14) 48%,transparent 68%); transform: translateX(-130%); transition: transform .45s ease; }
+.ember-media-card { --tilt-x: 0deg; --tilt-y: 0deg; --spot-x: 50%; --spot-y: 50%; width: 200px; flex: 0 0 200px; position: relative; overflow: hidden; scroll-snap-align: start; border: 1px solid rgba(255,95,31,.16); border-radius: 0; background: rgba(29,13,9,.65); color: white; text-align: left; transform: perspective(1000px) rotateX(var(--tilt-x)) rotateY(var(--tilt-y)) translateY(0); transform-style: preserve-3d; transition: transform .7s cubic-bezier(.16,1,.3,1),border-color .7s cubic-bezier(.16,1,.3,1),box-shadow .7s cubic-bezier(.16,1,.3,1); }
+.ember-media-card::before { content: ""; position: absolute; z-index: 4; inset: -45%; pointer-events: none; background: radial-gradient(circle at var(--spot-x) var(--spot-y),rgba(255,95,31,.34),transparent 32%); opacity: 0; transition: opacity .7s cubic-bezier(.16,1,.3,1); }
+.ember-media-card::after { content: ""; position: absolute; z-index: 5; inset: 0; pointer-events: none; background: linear-gradient(115deg,transparent 25%,rgba(255,255,255,.14) 48%,transparent 68%); transform: translateX(-130%); transition: transform 1.2s cubic-bezier(.16,1,.3,1); }
 .ember-media-card:hover,.ember-media-card:focus-visible { border-color: #f97316; box-shadow: 0 0 16px rgba(255,95,31,.36); }
 .ember-media-card:hover::before,.ember-media-card:focus-visible::before { opacity: 1; }
 .ember-media-card:hover::after { transform: translateX(130%); }
 .ember-media-card__art { height: 300px; position: relative; display: block; overflow: hidden; background: #26150f; }
+.ember-media-card__art > img { transition: transform 1.2s cubic-bezier(.16,1,.3,1),filter 1.2s cubic-bezier(.16,1,.3,1); }
+.ember-media-card:hover .ember-media-card__art > img,.ember-media-card:focus-visible .ember-media-card__art > img { transform: scale(1.055); filter: saturate(1.08) contrast(1.04); }
 .ember-media-card__art > [role="img"] { background: radial-gradient(circle at 60% 20%,rgba(255,95,31,.13),transparent 30%),repeating-linear-gradient(90deg,rgba(255,95,31,.035) 0 1px,transparent 1px 42px),#26150f; color: #a87767; font-size: 9px; }
 .ember-media-card__art > i { position: absolute; inset: 0; background: linear-gradient(to top,rgba(24,11,7,.9),transparent 45%); }
 .ember-media-card__copy { min-height: 92px; display: flex; flex-direction: column; justify-content: center; padding: 13px 14px; font-family: var(--font-mono); }
@@ -64,6 +71,11 @@
 .ember-filters button[data-active="true"] { border-color: #f97316; background: rgba(255,95,31,.15); color: #fff; box-shadow: 0 0 12px rgba(255,95,31,.25); }
 .ember-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(200px,1fr)); gap: 24px 18px; }
 .ember-grid .ember-media-card { width: 100%; }
+.ember-discovery { min-height: calc(100vh - 64px); padding-bottom: 115px; }
+.ember-genre-collections { display: flex; flex-direction: column; gap: 58px; padding-top: 48px; }
+.ember-watchlist { width: min(1540px,100%); min-height: calc(100vh - 64px); margin: 0 auto; padding: 72px 0 110px; }
+.ember-watchlist > .ember-page-heading { margin-inline: max(24px,4vw); }
+.ember-watchlist .ember-collections { margin-top: 48px; }
 
 .ember-state-panel { width: min(620px,calc(100% - 38px)); min-height: 330px; position: relative; z-index: 8; display: flex; align-items: center; justify-content: center; flex-direction: column; margin: 70px auto; border: 1px solid rgba(255,95,31,.2); padding: 50px 35px; background: rgba(30,16,11,.5); text-align: center; backdrop-filter: blur(16px); box-shadow: 0 0 30px rgba(255,95,31,.07); }
 .ember-state-panel > i { width: 34px; height: 34px; margin-bottom: 22px; border: 1px solid rgba(255,95,31,.18); border-top-color: #ff5f1f; border-radius: 50%; animation: ember-spin .8s linear infinite; }
@@ -108,15 +120,20 @@
 
 @keyframes ember-spin { to { transform: rotate(360deg); } }
 @keyframes ember-status-pulse { 50% { opacity: .35; } }
+@keyframes ember-hero-drift { from { transform: scale(1.015) translate3d(-.5%,0,0); } to { transform: scale(1.075) translate3d(1.5%,-1%,0); } }
 
 @media (max-width: 1100px) {
   .ember-hero__art { left: 26%; }
-  .ember-app .theme-nav--ember .theme-nav__tools { display: none; }
+  .ember-app .theme-nav--ember { grid-template-columns: 180px 1fr auto; }
+  .ember-app .theme-nav--ember .theme-nav__tools { display: flex; }
+  .ember-app .theme-nav--ember .theme-nav__tools > :not(.theme-profile-menu) { display: none; }
 }
 
 @media (max-width: 760px) {
   .ember-app .theme-main.ember-main { padding-top: 64px; padding-bottom: 70px; }
   .ember-app .theme-nav--ember { grid-template-columns: 1fr auto; padding-inline: 17px; }
+  .ember-app .theme-nav--ember .theme-nav__tools { display: flex; }
+  .ember-app .theme-nav--ember .theme-nav__tools > :not(.theme-profile-menu) { display: none; }
   .ember-hero { min-height: 650px; align-items: end; padding: 100px 0 48px; }
   .ember-hero__art { inset: 0; opacity: .45; }
   .ember-hero__shade { background: linear-gradient(to top,#1e100b 4%,rgba(30,16,11,.76) 55%,rgba(30,16,11,.3)),linear-gradient(to bottom,rgba(20,8,5,.56),transparent 28%); }
@@ -124,6 +141,8 @@
   .ember-hero__copy h1 { font-size: clamp(44px,14vw,64px); }
   .ember-collections { margin-top: 0; gap: 45px; }
   .ember-rail,.ember-browse,.ember-downloads { padding-inline: 18px; }
+  .ember-watchlist { padding-top: 45px; }
+  .ember-watchlist > .ember-page-heading { margin-inline: 18px; }
   .ember-rail > header,.ember-page-heading { align-items: flex-start; flex-direction: column; }
   .ember-rail__blade { display: none; }
   .ember-media-card { width: 158px; flex-basis: 158px; }
@@ -144,4 +163,5 @@
   .ember-media-card { transform: none !important; }
   .ember-media-card::after { display: none; }
   .ember-status i { animation: none; }
+  .ember-hero__art > img { animation: none; }
 }

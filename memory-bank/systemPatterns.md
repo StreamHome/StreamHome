@@ -22,12 +22,15 @@
 3. **Hydrated query-state guarding**
    - `AuthGuard` waits for persisted auth hydration before redirecting.
    - `QueryProfileGuard` resolves the `profile` query parameter against server profiles; the URL overrides stale local state.
-   - The root application URL carries validated `view`, `media`, `genre`, `season`, `q`, and `section` state. Unsupported parameters are discarded during canonicalization.
+   - The root application URL carries validated `view`, `media`, `genre`, `season`, `q`, and `section` state. `watchlist` is a first-class view. Unsupported parameters are discarded during canonicalization.
+   - View changes reset both the document and application-root scroll positions so restoration remains correct if global layout overflow rules change.
 
 4. **Shared behavior, themed presentation**
    - Shared controller hooks own catalog/search/watchlist/playback API behavior.
    - A typed registry selects distinct navigation, hero, card, details, and player variants for Ember, Aurora, Cinema, and Gemini.
    - Theme styles are scoped to authenticated application roots so the login screen remains unchanged.
+   - Movies and Series share server-driven rotating billboard and genre-grouping behavior, but every theme renders those structures through its own visual variant.
+   - My List preserves server watchlist order and divides saved movies and series without inventing client-side media records.
 
 5. **Playable-state honesty**
    - Catalog records may exist before physical media is available.

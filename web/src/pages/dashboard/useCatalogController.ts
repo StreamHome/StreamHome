@@ -15,6 +15,7 @@ export interface CatalogController {
   featured: Movie | null;
   sessions: PlaybackSession[];
   watchlist: string[];
+  watchlistItems: Movie[];
   setWatchlist: React.Dispatch<React.SetStateAction<string[]>>;
   genres: string[];
   results: DiscoverMovie[];
@@ -70,7 +71,8 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
     return query.genre ? source.filter((movie) => movie.genres.some((genre) => genre.toLocaleLowerCase() === query.genre?.toLocaleLowerCase())) : source;
   }, [movieItems, query.genre, query.view, seriesItems]);
   const continueWatching = useMemo(() => sessions.map((session) => movies.find((movie) => movie.id === session.movieId)).filter((movie): movie is Movie => Boolean(movie)), [movies, sessions]);
+  const watchlistItems = useMemo(() => watchlist.map((id) => movies.find((movie) => movie.id === id)).filter((movie): movie is Movie => Boolean(movie)), [movies, watchlist]);
   const featured = useMemo(() => movies.find(isPlayableMovie) ?? movies[0] ?? null, [movies]);
 
-  return { movies, movieItems, seriesItems, continueWatching, browseItems, featured, sessions, watchlist, setWatchlist, genres, results, loading, searching, error, setError };
+  return { movies, movieItems, seriesItems, continueWatching, browseItems, featured, sessions, watchlist, watchlistItems, setWatchlist, genres, results, loading, searching, error, setError };
 }

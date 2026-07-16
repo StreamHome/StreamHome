@@ -1,4 +1,4 @@
-export const APP_VIEWS = ["home", "movies", "series", "downloads", "search", "details", "watch", "admin"] as const;
+export const APP_VIEWS = ["home", "movies", "series", "watchlist", "downloads", "search", "details", "watch", "admin"] as const;
 export const ADMIN_SECTIONS = ["account", "storage", "downloads"] as const;
 
 export type AppView = (typeof APP_VIEWS)[number];

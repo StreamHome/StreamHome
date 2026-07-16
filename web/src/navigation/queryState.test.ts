@@ -21,6 +21,7 @@ describe("query-state navigation", () => {
 
   it("generates deterministic app URLs", () => {
     expect(appUrl("profile one", "search", { q: "dark city" })).toBe("/?profile=profile+one&view=search&q=dark+city");
+    expect(appUrl("1", "watchlist")).toBe("/?profile=1&view=watchlist");
     expect(canonicalAppUrl("?junk=1&view=admin&profile=1&section=invalid")).toBe("/?profile=1&view=admin&section=account");
   });
 });
