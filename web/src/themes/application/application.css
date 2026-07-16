@@ -110,7 +110,9 @@
 .theme-nav--gemini nav button i { width: 10px; height: 10px; flex: 0 0 10px; border-radius: 50%; background: #52525b; }
 .theme-nav--gemini nav button[data-active="true"] { background: linear-gradient(90deg,rgba(66,133,244,.18),rgba(155,114,203,.08)); box-shadow: inset 2px 0 #8ab4f8; }
 .theme-nav--gemini nav button[data-active="true"] i { background: #8ab4f8; box-shadow: 0 0 14px #4285f4; }
-.theme-nav--gemini .theme-search { margin: 0 14px 18px; border-radius: 12px; }
+.theme-nav--gemini .theme-search { width: calc(100% - 28px); min-width: 0; max-width: none; height: 42px; min-height: 42px; flex: 0 0 42px; margin: 0 14px 18px; border-radius: 12px; }
+.theme-nav--gemini .theme-search input { min-width: 0; padding-inline: 12px 8px; }
+.theme-nav--gemini .theme-search button { min-width: 64px; padding-inline: 10px; }
 .gemini-profile { padding: 18px 14px; border-top: 1px solid rgba(255,255,255,.07); }
 .gemini-profile .theme-profile-control { width: 100%; padding: 8px; }
 .gemini-profile .theme-profile-control > span { border-radius: 50%; }

@@ -39,6 +39,8 @@ describe("semantic hover interaction system", () => {
   it("uses fluid search sizing and compact centered rail controls", () => {
     expect(application).toContain("width: clamp(150px,18vw,260px)");
     expect(application).toContain("font-size: clamp(10px,.76vw,13px)");
+    expect(application).toContain(".theme-nav--gemini .theme-search { width: calc(100% - 28px); min-width: 0; max-width: none; height: 42px; min-height: 42px; flex: 0 0 42px");
+    expect(application).toContain(".theme-nav--gemini .theme-search button { min-width: 64px");
     expect(application).toContain("top: 50%; bottom: auto; width: 42px; height: 42px");
     expect(ember).toContain("top: 50%; bottom: auto; width: 40px; height: 40px");
   });
