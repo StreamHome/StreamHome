@@ -1,5 +1,14 @@
 # Progress Status
 
+## Active hover interaction rebuild
+
+- [x] Removed the universal 4% button scale, slow shared hover utilities, competing Framer card transforms, and Ember pointer-tilt/glare implementation.
+- [x] Added a dedicated fine-pointer interaction layer with responsive enter/exit/press timing, keyboard focus parity, and reduced-motion safeguards.
+- [x] Added distinct Ember, Aurora, Cinema, and Gemini navigation/card behavior plus coverage for actions, search, rails, profiles, admin, player, dialogs, and state controls.
+- [x] Added regression contracts for old-hover removal, theme-specific card/navigation states, control-family coverage, fine-pointer scoping, and reduced-motion behavior.
+- [x] TypeScript lint, 55 frontend tests, the production build, diff checks, and available reduced-motion browser/console QA pass.
+- [x] Completed implementation and validation for the required `web:` commit; normal-motion authenticated browser QA and the database checker remain environment-blocked.
+
 ## Active full-page profile editor
 
 - [x] Added the authenticated profile-edit route, safe return-target contract, navigation callback contract, and allowlisted avatar-preset model.

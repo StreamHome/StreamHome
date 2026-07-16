@@ -18,7 +18,7 @@ export class ErrorBoundary extends React.Component<React.PropsWithChildren, Stat
           <div className="max-w-md text-center">
             <h1 className="text-2xl font-semibold">The web client could not render this screen.</h1>
             <p className="mt-3 text-white/60">Reload the page. If the problem continues, check the server connection.</p>
-            <button className="mt-6 rounded border border-white/30 px-5 py-3" onClick={() => window.location.reload()}>
+            <button className="interaction-button mt-6 rounded border border-white/30 px-5 py-3" onClick={() => window.location.reload()}>
               Reload
             </button>
           </div>

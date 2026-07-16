@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useLocation, useNavigate } from "react-router-dom";
 import { MediaArtwork } from "../../../components/media/MediaArtwork";
@@ -23,19 +23,7 @@ function EmberStatePanel({ code, title, body, loading = false }: { code: string;
 }
 
 function EmberMediaCard({ movie, session, onOpen }: { movie: Movie; session?: PlaybackSession; onOpen: (movie: Movie) => void }) {
-  const card = useRef<HTMLButtonElement>(null);
-  const updateTilt = (event: React.PointerEvent<HTMLButtonElement>) => {
-    if (event.pointerType !== "mouse" || window.matchMedia("(prefers-reduced-motion: reduce)").matches || !card.current) return;
-    const rect = card.current.getBoundingClientRect();
-    const x = (event.clientX - rect.left) / rect.width;
-    const y = (event.clientY - rect.top) / rect.height;
-    card.current.style.setProperty("--tilt-x", `${(0.5 - y) * 8}deg`);
-    card.current.style.setProperty("--tilt-y", `${(x - 0.5) * 8}deg`);
-    card.current.style.setProperty("--spot-x", `${x * 100}%`);
-    card.current.style.setProperty("--spot-y", `${y * 100}%`);
-  };
-  const resetTilt = () => { card.current?.style.setProperty("--tilt-x", "0deg"); card.current?.style.setProperty("--tilt-y", "0deg"); };
-  return <button ref={card} className="ember-media-card" onPointerMove={updateTilt} onPointerLeave={resetTilt} onBlur={resetTilt} onClick={() => onOpen(movie)}><span className="ember-media-card__tilt"><span className="ember-media-card__art"><MediaArtwork src={movie.thumbnailUrl} alt={movie.title} media={movie} className="h-full w-full object-cover" /><i aria-hidden="true" /></span><span className="ember-media-card__copy"><strong>{movie.title}</strong><small>{movie.type} / {movie.releaseYear || "year n/a"}</small>{!isPlayableMovie(movie) && movie.type === "movie" && <em>Playback unavailable</em>}</span></span>{session && <ProgressBar className="ember-media-card__progress" progress={completionFraction(session.completionRate)} />}</button>;
+  return <button className="ember-media-card" onClick={() => onOpen(movie)}><span className="ember-media-card__tilt"><span className="ember-media-card__art"><MediaArtwork src={movie.thumbnailUrl} alt={movie.title} media={movie} className="h-full w-full object-cover" /><i aria-hidden="true" /></span><span className="ember-media-card__copy"><strong>{movie.title}</strong><small>{movie.type} / {movie.releaseYear || "year n/a"}</small>{!isPlayableMovie(movie) && movie.type === "movie" && <em>Playback unavailable</em>}</span></span>{session && <ProgressBar className="ember-media-card__progress" progress={completionFraction(session.completionRate)} />}</button>;
 }
 
 function EmberRail({ label, title, items, sessions, onOpen }: { label: string; title: string; items: Movie[]; sessions: PlaybackSession[]; onOpen: (movie: Movie) => void }) {

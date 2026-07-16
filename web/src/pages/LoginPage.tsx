@@ -215,7 +215,7 @@ export function LoginPage() {
                     <button 
                       type="submit" 
                       disabled={isLoading} 
-                      className="w-full relative z-10 h-[64px] mt-4 bg-[rgba(30,16,11,0.4)] backdrop-blur-[12px] border border-[#f97316] shadow-[0_0_10px_rgba(255,95,31,0.5)] text-white font-[family-name:var(--font-mono)] text-[16px] tracking-[0.1em] font-medium rounded hover:shadow-[0_0_15px_rgba(255,95,31,0.8)] hover:scale-[1.02] active:scale-[0.98] transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed uppercase"
+                      className="login-primary-action w-full relative z-10 h-[64px] mt-4 bg-[rgba(30,16,11,0.4)] backdrop-blur-[12px] border border-[#f97316] shadow-[0_0_10px_rgba(255,95,31,0.5)] text-white font-[family-name:var(--font-mono)] text-[16px] tracking-[0.1em] font-medium rounded disabled:opacity-50 disabled:cursor-not-allowed uppercase"
                     >
                       <span className="relative z-10 font-bold">
                         {isLoading ? 'Authenticating...' : 'Initialize Connection'}
@@ -265,7 +265,7 @@ export function LoginPage() {
                   <button 
                     onClick={() => { setRequires2FA(false); setTotpCode(Array(6).fill('')); setError(''); }}
                     disabled={isLoading}
-                    className="mt-4 font-[family-name:var(--font-mono)] text-[11px] tracking-[0.1em] uppercase text-[var(--text-muted)] hover:text-white transition-colors duration-[var(--duration-fast)] border-b border-transparent hover:border-white pb-1"
+                    className="login-secondary-action mt-4 font-[family-name:var(--font-mono)] text-[11px] tracking-[0.1em] uppercase text-[var(--text-muted)] border-b border-transparent pb-1"
                   >
                     Abort Connection
                   </button>

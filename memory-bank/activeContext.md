@@ -2,7 +2,7 @@
 
 ## Current focus
 
-The full-page themed profile editor and approved web-only motion rebuild are implemented. Profile editing now uses an authenticated, return-aware `/profiles/:profileId/edit` route with live Ember, Aurora, Cinema, or Gemini previews, allowlisted avatar presets, dirty-state protection, and protected deletion. Generated artwork paths are resolved through a shared cached probe before an image mounts, preventing repeated wrong-year 404 errors such as The Furious reporting 2026 while its physical folder is 2025. The server remains unchanged and is the source of truth for all media information.
+The semantic hover interaction rebuild, full-page themed profile editor, and web motion system are implemented. The previous universal scale effect and competing card transforms are gone; fine-pointer hover now uses responsive enter/exit timing, theme-specific card and navigation behavior, explicit coverage for all major controls, keyboard focus parity, and reduced-motion fallbacks. Profile editing remains on the authenticated, return-aware `/profiles/:profileId/edit` route. The server remains unchanged and is the source of truth for all media information.
 
 ## Current web architecture
 
@@ -16,7 +16,8 @@ The full-page themed profile editor and approved web-only motion rebuild are imp
 - Query-backed dashboard content uses a 280ms directional exit and 520ms theme-specific entrance with coordinated scroll reset. Search, watchlist, episode, artwork, player, profile, and admin state changes animate locally instead of remounting the full page.
 - Profile hover/focus uses an intent delay and crossfades the complete ambient background to the profile theme. Ember particles are frame-rate-independent, rise slowly, and all decorative backgrounds pause while hidden.
 - Billboards track automatic/manual source and direction and transition over 1.05 seconds. Category arrows use an interruptible 760ms requestAnimationFrame controller with edge clamping and cancel on direct pointer, touch, or wheel input.
-- Buttons preserve their existing colors on hover and use transform/shadow feedback. Reduced-motion mode uses short opacity fades and disables spatial motion and decorative animation.
+- A dedicated interaction stylesheet owns hover behavior instead of scattered utility classes or blanket transforms. Actions use restrained lift/light feedback; cards coordinate surface elevation, artwork parallax, edge illumination, and copy motion without full-card scaling. Ember uses technical edge glow, Aurora glass bloom, Cinema poster depth/red accents, and Gemini modular elevation/gradient accents.
+- Navigation, profile menus, search, filters, rails, pagination, details, episodes, profile selection/editor, admin, dialogs, login, player, and recovery controls all have explicit hover contracts. Spatial hover runs only on fine pointers; keyboard focus keeps equivalent clarity without movement, and reduced-motion mode disables spatial/sheens while retaining short visual feedback.
 - Movies and Series use rotating server-catalog billboards followed by per-genre horizontal rails. Rail controls are attached to the left/right edges and native horizontal scrollbars are hidden.
 - The active-profile control opens Edit Profile, Switch Profile, and Sign Out actions. Its placement is surface-aware: the bottom Gemini desktop sidebar opens upward, while top and mobile navigation opens downward, with viewport-safe menu bounds. Every Edit Profile entry point opens the dedicated editor and preserves its exact originating URL for Save, Cancel, and deletion return behavior.
 - The profile editor owns draft name, theme, and avatar state. Theme changes preview only inside the editor until Save; saving the active profile then synchronizes the global theme while preserving existing PIN fields. Unknown legacy avatar values render a deterministic allowlisted fallback, so arbitrary stored CSS is never applied.
@@ -35,4 +36,4 @@ The full-page themed profile editor and approved web-only motion rebuild are imp
 
 ## Next step
 
-TypeScript lint, all 51 frontend tests, the production build, and diff checks pass. Browser QA confirmed the authenticated editor route reaches its themed loading state, then safely returns to login when the local session is rejected; full authenticated interaction QA and the required database checker remain unavailable because the existing local Python environment cannot start the server without `sqlmodel`.
+TypeScript lint, all 55 frontend tests, the production build, and diff checks pass. Browser QA confirms the interaction stylesheet loads without application errors, fine-pointer detection is active, and reduced-motion disables spatial hover as designed. Normal-motion and authenticated four-theme live hover QA remain unavailable in the current saved browser/session; the required database checker remains blocked because the local Python environment lacks `sqlmodel`.

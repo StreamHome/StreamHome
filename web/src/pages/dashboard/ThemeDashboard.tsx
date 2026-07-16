@@ -22,9 +22,7 @@ import { useAnimatedRail } from "../../motion/useAnimatedRail";
 function MediaCard({ movie, session, theme, onOpen }: { movie: Movie; session?: PlaybackSession; theme: string; onOpen: (movie: Movie) => void }) {
   const playable = isPlayableMovie(movie);
   const available = movie.type === "series" || playable;
-  const activeTheme = useThemeStore((state) => state.activeTheme);
-  const { reduced: reduceMotion } = useAppMotion();
-  return <motion.button layout="position" whileHover={reduceMotion ? undefined : THEME_MOTION[activeTheme].cardHover} whileTap={reduceMotion ? undefined : { scale: .98 }} whileFocus={reduceMotion ? undefined : { y: -5, scale: 1.02 }} transition={{ duration: MOTION_TIMINGS.hover, ease: MOTION_EASE }} className="catalog-card" data-card-theme={theme} onClick={() => onOpen(movie)}><span className="catalog-card__art"><MediaArtwork src={movie.thumbnailUrl} alt={movie.title} media={movie} className="h-full w-full object-cover" /><i aria-hidden="true" /></span><span className="catalog-card__copy"><strong>{movie.title}</strong><small>{available ? `${movie.type} / ${movie.releaseYear || "catalogued"}` : "Unavailable on server"}</small></span>{session && <ProgressBar className="catalog-card__progress" progress={completionFraction(session.completionRate)} />}</motion.button>;
+  return <motion.button layout="position" className="catalog-card" data-card-theme={theme} onClick={() => onOpen(movie)}><span className="catalog-card__art"><MediaArtwork src={movie.thumbnailUrl} alt={movie.title} media={movie} className="h-full w-full object-cover" /><i aria-hidden="true" /></span><span className="catalog-card__copy"><strong>{movie.title}</strong><small>{available ? `${movie.type} / ${movie.releaseYear || "catalogued"}` : "Unavailable on server"}</small></span>{session && <ProgressBar className="catalog-card__progress" progress={completionFraction(session.completionRate)} />}</motion.button>;
 }
 
 function MediaCollection({ title, label, items, sessions, theme, onOpen }: { title: string; label?: string; items: Movie[]; sessions: PlaybackSession[]; theme: string; onOpen: (movie: Movie) => void }) {

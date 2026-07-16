@@ -50,7 +50,7 @@ export function GlassPane({
     <Component
       ref={containerRef}
       className={cn(
-        'relative overflow-hidden',
+        'interactive-glass-pane group relative overflow-hidden',
         'bg-[var(--glass-fill)] backdrop-blur-[var(--glass-blur)] border border-[var(--glass-border)]',
         'rounded-[var(--radius)]',
         'shadow-[var(--glow-subtle)]',
@@ -62,7 +62,7 @@ export function GlassPane({
       {...props}
     >
       {/* Gemini Gradient Border (Pseudo-element equivalent handled via absolute inset div) */}
-      <div className="absolute inset-0 rounded-[var(--radius)] pointer-events-none transition-opacity duration-[480ms] opacity-0 group-hover:opacity-100" style={{
+      <div className="interaction-pane-border absolute inset-0 rounded-[var(--radius)] pointer-events-none opacity-0" style={{
          boxShadow: 'inset 0 0 0 1px var(--glass-border-hover)'
       }} />
 

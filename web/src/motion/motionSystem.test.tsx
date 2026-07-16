@@ -20,7 +20,6 @@ describe("cinematic motion system", () => {
   beforeEach(() => Object.defineProperty(window, "matchMedia", { configurable: true, value: () => matchMedia(false) }));
 
   it("keeps interactions responsive and cinematic transitions deliberate", () => {
-    expect(MOTION_TIMINGS.hover).toBe(.32);
     expect(MOTION_TIMINGS.menu).toBe(.26);
     expect(MOTION_TIMINGS.menuItem).toBe(.22);
     expect(MOTION_TIMINGS.dialog).toBe(.42);
@@ -43,7 +42,7 @@ describe("cinematic motion system", () => {
     const resolve = (variant: unknown) => typeof variant === "function" ? variant(1) : variant;
     expect(definitions).toHaveLength(4);
     expect(new Set(definitions.map((definition) => JSON.stringify(resolve(definition.view.initial)))).size).toBe(4);
-    expect(definitions.every((definition) => resolve(definition.billboard.initial) && definition.cardHover.scale > 1)).toBe(true);
+    expect(definitions.every((definition) => resolve(definition.billboard.initial))).toBe(true);
   });
 
   it("exposes normal and reduced preferences through one provider", () => {

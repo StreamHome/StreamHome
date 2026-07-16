@@ -79,7 +79,7 @@ export function Dropdown({ options, selected, onChange, label, className }: Drop
                     setIsOpen(false);
                   }}
                   className={cn(
-                    "px-3 py-2 cursor-pointer font-[family-name:var(--font-mono)] text-sm transition-transform duration-300 ease-[cubic-bezier(.16,1,.3,1)] hover:scale-[1.02]",
+                    "interaction-option px-3 py-2 cursor-pointer font-[family-name:var(--font-mono)] text-sm",
                     "text-[var(--text-primary)] border-l-[2px] border-transparent",
                     selected === option.value && "border-[var(--glass-border-hover)] bg-[rgba(255,95,31,0.05)] text-[var(--text-accent)]"
                   )}

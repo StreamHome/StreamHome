@@ -5,7 +5,6 @@ import type { ThemeId } from "../types/theme";
 export const MOTION_TIMINGS = {
   instant: 0.12,
   press: 0.14,
-  hover: 0.32,
   focus: 0.28,
   menu: 0.26,
   menuEnter: 0.26,
@@ -36,7 +35,6 @@ export const MOTION_EASE = [0.16, 1, 0.3, 1] as const;
 export interface ThemeMotionDefinition {
   view: Variants;
   billboard: Variants;
-  cardHover: { y: number; scale: number };
 }
 
 function directional(values: Record<string, string | number>, direction: number) {
@@ -69,22 +67,18 @@ export const THEME_MOTION: Record<ThemeId, ThemeMotionDefinition> = {
   ember: {
     view: viewVariants({ opacity: 0, y: 26, scale: 1.012, filter: "blur(9px)" }, { opacity: 0, y: -16, scale: .992, filter: "blur(7px)" }),
     billboard: billboardVariants({ opacity: 0, x: 34, scale: 1.022, filter: "blur(11px)" }, { opacity: 0, x: -26, scale: .99, filter: "blur(8px)" }),
-    cardHover: { y: -8, scale: 1.035 },
   },
   aurora: {
     view: viewVariants({ opacity: 0, y: 34, scale: .985, filter: "blur(14px)" }, { opacity: 0, y: -22, scale: 1.008, filter: "blur(12px)" }),
     billboard: billboardVariants({ opacity: 0, x: 18, y: 28, scale: .985, filter: "blur(16px)" }, { opacity: 0, x: -14, y: -20, scale: 1.012, filter: "blur(13px)" }),
-    cardHover: { y: -10, scale: 1.035 },
   },
   cinema: {
     view: viewVariants({ opacity: 0, x: 24, scale: 1.018, filter: "blur(8px)" }, { opacity: 0, x: -20, scale: 1.026, filter: "blur(7px)" }),
     billboard: billboardVariants({ opacity: 0, x: 42, scale: 1.028, filter: "blur(8px)" }, { opacity: 0, x: -34, scale: 1.012, filter: "blur(6px)" }),
-    cardHover: { y: -7, scale: 1.04 },
   },
   gemini: {
     view: viewVariants({ opacity: 0, x: 30, y: 12, scale: .982, filter: "blur(10px)" }, { opacity: 0, x: -22, y: -8, scale: .99, filter: "blur(8px)" }),
     billboard: billboardVariants({ opacity: 0, x: 36, y: 16, scale: .98, filter: "blur(12px)" }, { opacity: 0, x: -28, y: -10, scale: .99, filter: "blur(9px)" }),
-    cardHover: { y: -8, scale: 1.03 },
   },
 };
 
