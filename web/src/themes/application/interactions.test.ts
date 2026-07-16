@@ -60,6 +60,19 @@ describe("semantic hover interaction system", () => {
     expect(interactions).not.toContain('button[data-active="true"]::after { animation: none');
   });
 
+  it("gives every theme a distinct billboard selector palette", () => {
+    for (const gradient of [
+      "linear-gradient(90deg,#ffb59c,#ff5f1f)",
+      "linear-gradient(90deg,#fff,#d8c7ff)",
+      "linear-gradient(90deg,#e50914,#ff4d57)",
+      "linear-gradient(90deg,#4285f4,#9b72cb,#d96570,#f4b400)",
+    ]) expect(application).toContain(`--billboard-progress-fill: ${gradient}`);
+    expect(application).toContain("background: var(--billboard-marker");
+    expect(application).toContain("background: var(--billboard-progress-fill");
+    expect(ember).toContain("background: var(--billboard-progress-fill");
+    expect(interactions).toContain("background: var(--billboard-progress-fill");
+  });
+
   it("covers every major interactive surface", () => {
     for (const selector of [
       ".theme-profile-control", ".feature-action", ".catalog-rail-blade",

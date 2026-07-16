@@ -5,10 +5,10 @@
 .app-guard-state button { border: 1px solid #52525b; padding: 10px 18px; background: #18181b; color: white; }
 
 .theme-app { min-height: 100vh; position: relative; isolation: isolate; overflow-x: clip; background: var(--bg-body); color: var(--text-primary); font-family: var(--font-body); }
-.theme-app[data-theme="ember"] { --duration-slow: 900ms; --duration-medium: 420ms; --duration-fast: 220ms; }
-.theme-app[data-theme="aurora"] { --duration-slow: 1050ms; --duration-medium: 460ms; --duration-fast: 240ms; }
-.theme-app[data-theme="cinema"] { --duration-slow: 800ms; --duration-medium: 360ms; --duration-fast: 200ms; }
-.theme-app[data-theme="gemini"] { --duration-slow: 900ms; --duration-medium: 400ms; --duration-fast: 220ms; }
+.theme-app[data-theme="ember"] { --duration-slow: 900ms; --duration-medium: 420ms; --duration-fast: 220ms; --billboard-marker: rgba(255,181,156,.34); --billboard-progress-track: rgba(255,95,31,.18); --billboard-progress-fill: linear-gradient(90deg,#ffb59c,#ff5f1f); --billboard-progress-outline: rgba(255,126,78,.38); --billboard-progress-shadow: 0 0 16px rgba(255,95,31,.48); }
+.theme-app[data-theme="aurora"] { --duration-slow: 1050ms; --duration-medium: 460ms; --duration-fast: 240ms; --billboard-marker: rgba(216,199,255,.34); --billboard-progress-track: rgba(216,199,255,.16); --billboard-progress-fill: linear-gradient(90deg,#fff,#d8c7ff); --billboard-progress-outline: rgba(255,255,255,.4); --billboard-progress-shadow: 0 0 18px rgba(216,199,255,.28); }
+.theme-app[data-theme="cinema"] { --duration-slow: 800ms; --duration-medium: 360ms; --duration-fast: 200ms; --billboard-marker: rgba(255,77,87,.34); --billboard-progress-track: rgba(229,9,20,.18); --billboard-progress-fill: linear-gradient(90deg,#e50914,#ff4d57); --billboard-progress-outline: rgba(229,9,20,.48); --billboard-progress-shadow: 0 0 16px rgba(229,9,20,.45); }
+.theme-app[data-theme="gemini"] { --duration-slow: 900ms; --duration-medium: 400ms; --duration-fast: 220ms; --billboard-marker: rgba(138,180,248,.34); --billboard-progress-track: rgba(66,133,244,.17); --billboard-progress-fill: linear-gradient(90deg,#4285f4,#9b72cb,#d96570,#f4b400); --billboard-progress-outline: rgba(138,180,248,.4); --billboard-progress-shadow: 0 0 18px rgba(66,133,244,.36); }
 .theme-app button, .theme-app input, .theme-app select { font: inherit; }
 .theme-main { position: relative; z-index: 10; min-height: 100vh; }
 .motion-view { min-height: inherit; will-change: opacity,transform,filter; }
@@ -180,9 +180,9 @@
 .billboard-rotator .feature-meta { animation-delay: .16s; }
 .billboard-rotator .feature-actions { animation-delay: .24s; }
 .billboard-pagination { position: absolute; z-index: 5; right: max(34px,4vw); bottom: 20px; display: flex; align-items: center; gap: 8px; }
-.billboard-pagination button { position: relative; width: 20px; height: 6px; overflow: hidden; border: 0; border-radius: 999px; padding: 0; background: color-mix(in srgb,var(--text-muted) 48%,transparent); opacity: .74; transition: width .7s var(--easing-smooth),background .7s var(--easing-smooth),box-shadow .7s var(--easing-smooth),opacity .32s var(--easing-smooth); }
-.billboard-pagination button[data-active="true"] { width: clamp(76px,7vw,104px); background: color-mix(in srgb,var(--accent-primary) 24%,rgba(255,255,255,.12)); box-shadow: 0 0 0 1px color-mix(in srgb,var(--accent-primary) 28%,transparent),var(--glow-subtle); opacity: 1; }
-.billboard-pagination button[data-active="true"]::after { content: ""; position: absolute; inset: 0; border-radius: inherit; background: var(--accent-primary); box-shadow: 0 0 12px color-mix(in srgb,var(--accent-primary) 64%,transparent); transform: scaleX(0); transform-origin: left; animation: billboard-progress var(--billboard-rotation-duration,10s) linear forwards; }
+.billboard-pagination button { position: relative; width: 20px; height: 6px; overflow: hidden; border: 0; border-radius: 999px; padding: 0; background: var(--billboard-marker,color-mix(in srgb,var(--text-muted) 48%,transparent)); opacity: .74; transition: width .7s var(--easing-smooth),background .7s var(--easing-smooth),box-shadow .7s var(--easing-smooth),opacity .32s var(--easing-smooth); }
+.billboard-pagination button[data-active="true"] { width: clamp(76px,7vw,104px); background: var(--billboard-progress-track,color-mix(in srgb,var(--accent-primary) 24%,rgba(255,255,255,.12))); box-shadow: 0 0 0 1px var(--billboard-progress-outline,color-mix(in srgb,var(--accent-primary) 28%,transparent)),var(--billboard-progress-shadow,var(--glow-subtle)); opacity: 1; }
+.billboard-pagination button[data-active="true"]::after { content: ""; position: absolute; inset: 0; border-radius: inherit; background: var(--billboard-progress-fill,var(--accent-primary)); box-shadow: var(--billboard-progress-shadow,var(--glow-subtle)); transform: scaleX(0); transform-origin: left; animation: billboard-progress var(--billboard-rotation-duration,10s) linear forwards; }
 .billboard-rotator[data-rotation-paused="true"] .billboard-pagination button[data-active="true"]::after { animation-play-state: paused; }
 .feature-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
 .feature-action { min-height: 44px; border: 1px solid var(--glass-border); padding: 0 19px; background: var(--glass-fill); color: var(--text-primary); }

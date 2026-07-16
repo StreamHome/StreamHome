@@ -180,7 +180,7 @@
   .catalog-rail-blade:not(:disabled):hover,.ember-rail__blade:not(:disabled):hover { opacity: .96; color: var(--accent-primary); box-shadow: 0 12px 30px rgba(0,0,0,.36),inset 0 0 18px var(--interaction-fill); }
   .catalog-rail-blade--previous:hover,.ember-rail__blade--previous:hover { transform: translate3d(-3px,-50%,0) scale(1.04); }
   .catalog-rail-blade--next:hover,.ember-rail__blade--next:hover { transform: translate3d(3px,-50%,0) scale(1.04); }
-  .billboard-pagination button:hover,.ember-billboard__pagination button:hover { transform: scaleX(1.35); background: var(--accent-primary); box-shadow: var(--glow-subtle); opacity: 1; }
+  .billboard-pagination button:hover,.ember-billboard__pagination button:hover { transform: scaleX(1.35); background: var(--billboard-progress-fill,var(--accent-primary)); box-shadow: var(--billboard-progress-shadow,var(--glow-subtle)); opacity: 1; }
 
   .profile-tile:hover,.profile-tile:focus-within { transform: translate3d(0,-6px,0); border-color: rgba(255,126,78,.78); background: rgba(42,20,13,.62); box-shadow: 0 18px 45px rgba(12,4,2,.48),0 0 26px rgba(255,95,31,.18); }
   .profile-tile:hover::before,.profile-tile:focus-within::before { opacity: 1; box-shadow: inset 0 0 28px rgba(255,95,31,.1); }
