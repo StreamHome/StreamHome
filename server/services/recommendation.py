@@ -45,6 +45,9 @@ async def process_telemetry_event(profile_id: str, request: TelemetryRequest):
             delta = 5.0
         elif completion_rate >= 0.5:
             delta = 2.0
+        elif completion_rate < 0.05:
+            # Strong negative signal for "bounce" or early abandonment
+            delta = -5.0
         elif completion_rate <= 0.2:
             delta = -2.0
         else:
