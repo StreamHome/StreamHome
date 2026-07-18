@@ -193,6 +193,48 @@ class User(SQLModel, table=True):
     two_factor_enabled: bool = Field(default=False)
     failed_login_attempts: int = Field(default=0)
     lockout_until: Optional[float] = Field(default=None)
+    last_login_at: Optional[float] = Field(default=None)
+    last_login_ip: Optional[str] = Field(default=None)
+    last_login_device: Optional[str] = Field(default=None)
+
+class AuthSession(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    created_at: float = Field(index=True)
+    last_seen_at: float
+    expires_at: float = Field(index=True)
+    revoked_at: Optional[float] = Field(default=None, index=True)
+    reauthenticated_at: Optional[float] = Field(default=None)
+    ip_address: str = Field(default="Unknown")
+    device_label: str = Field(default="Unknown device")
+
+class AuthChallenge(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    token_hash: str = Field(unique=True, index=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    purpose: str
+    created_at: float
+    expires_at: float = Field(index=True)
+    attempts: int = Field(default=0)
+    used_at: Optional[float] = Field(default=None)
+
+class RecoveryCode(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    code_hash: str = Field(unique=True, index=True)
+    created_at: float
+    used_at: Optional[float] = Field(default=None, index=True)
+
+class SecurityEvent(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
+    event_type: str = Field(index=True)
+    outcome: str
+    created_at: float = Field(index=True)
+    ip_address: str = Field(default="Unknown")
+    device_label: str = Field(default="Unknown device")
+    session_id: Optional[str] = Field(default=None, index=True)
+    details: Optional[str] = Field(default=None)
 
 class PlaybackSession(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)

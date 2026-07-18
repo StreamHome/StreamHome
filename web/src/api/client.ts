@@ -1,3 +1,10 @@
+export class ApiError extends Error {
+  constructor(message: string, public status = 0, public code = "request_failed", public retryAfterSeconds?: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 export async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = localStorage.getItem("streamhome_token");
   const headers = new Headers(options.headers || {});
@@ -10,25 +17,39 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
     headers.set("Content-Type", "application/json");
   }
 
-  const response = await fetch(path, { ...options, headers });
+  let response: Response;
+  try {
+    response = await fetch(path, { ...options, headers });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw new ApiError("The server took too long to respond.", 0, "request_timeout");
+    throw new ApiError(navigator.onLine ? "StreamHome could not reach the server." : "This device is offline.", 0, navigator.onLine ? "server_unreachable" : "offline");
+  }
   
   if (!response.ok) {
     let errorMessage = "API request failed";
+    let errorCode = "request_failed";
+    let retryAfterSeconds: number | undefined;
     try {
       const errorData = await response.json();
-      errorMessage = errorData.detail || errorData.message || errorMessage;
+      const detail = errorData.detail;
+      if (typeof detail === "string") errorMessage = detail;
+      else if (detail && typeof detail === "object") {
+        errorMessage = detail.message || errorMessage;
+        errorCode = detail.code || errorCode;
+        retryAfterSeconds = detail.retryAfterSeconds;
+      } else errorMessage = errorData.message || errorMessage;
     } catch {
       // Ignore if not JSON
     }
     
-    if (response.status === 401) {
+    if (response.status === 401 && token && !["invalid_credentials", "invalid_factor", "challenge_expired"].includes(errorCode)) {
       localStorage.removeItem("streamhome_token");
       if (window.location.pathname !== "/login") {
         window.location.href = "/login";
       }
     }
     
-    throw new Error(errorMessage);
+    throw new ApiError(errorMessage, response.status, errorCode, retryAfterSeconds);
   }
   
   // Some endpoints might return empty body on 204 or DELETE

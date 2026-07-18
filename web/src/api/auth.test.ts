@@ -10,7 +10,7 @@ function respond(body: unknown) {
 describe("authentication response normalization", () => {
   it("normalizes the server requires_2fa response", async () => {
     respond({ requires_2fa: true, email: "admin@example.test", message: "TOTP required" });
-    await expect(login({ email: "admin@example.test", password: "secret" })).resolves.toEqual({ requires2fa: true, email: "admin@example.test", message: "TOTP required" });
+    await expect(login({ email: "admin@example.test", password: "secret" })).resolves.toEqual({ requires2fa: true, email: "admin@example.test", challengeToken: "", expiresInSeconds: 300, message: "TOTP required" });
   });
 
   it("normalizes TOTP status and setup keys", async () => {

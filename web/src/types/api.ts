@@ -7,20 +7,33 @@ export interface LoginResponse {
   accessToken: string;
   tokenType: string;
   email: string;
+  session?: { id: string; expiresAt: number };
+  previousLogin?: LoginRecord | null;
 }
 
 export interface TwoFARequiredResponse {
   requires2fa: true;
   email: string;
+  challengeToken: string;
+  expiresInSeconds: number;
   message: string;
 }
 
 export type AuthResponse = LoginResponse | TwoFARequiredResponse;
 
 export interface VerifyRequest {
-  email: string;
+  challengeToken: string;
+  method: "totp" | "recovery";
   code: string;
 }
+
+export interface LoginRecord { at: number; ipAddress?: string | null; deviceLabel?: string | null }
+export interface HealthResponse { status: "ready"; version: string; serverTime: number }
+export interface ReauthResponse { reauthenticated: true; validForSeconds: number }
+export interface SecuritySummary { email: string; twoFactorEnabled: boolean; recoveryCodesRemaining: number; previousLogin: LoginRecord | null }
+export interface AuthSessionInfo { id: string; createdAt: number; lastSeenAt: number; expiresAt: number; ipAddress: string; deviceLabel: string; current: boolean }
+export interface SecurityEventInfo { id: string; type: string; outcome: string; createdAt: number; ipAddress: string; deviceLabel: string; details?: Record<string, unknown> | null }
+export interface SecurityEventsResponse { events: SecurityEventInfo[]; nextCursor: number | null }
 
 export interface TwoFAStatusResponse {
   twoFactorEnabled: boolean;

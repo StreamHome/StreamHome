@@ -7,6 +7,7 @@ import { LoginPage } from './pages/LoginPage';
 import { ProfileSelectPage } from './pages/ProfileSelectPage';
 import { ProfileEditPage } from './pages/ProfileEditPage';
 import { AuthenticatedApp } from './pages/AuthenticatedApp';
+import { AccountSecurityPage } from './pages/AccountSecurityPage';
 
 import { AuthGuard } from './components/guards/AuthGuard';
 import { QueryProfileGuard } from './components/guards/QueryProfileGuard';
@@ -37,6 +38,8 @@ export default function App() {
             <ProfileEditPage />
           </AuthGuard>
         } />
+
+        <Route path="/account/security" element={<AuthGuard><AccountSecurityPage /></AuthGuard>} />
         
         <Route path="/watch/:mediaId" element={
           <AuthGuard>

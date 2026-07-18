@@ -36,7 +36,10 @@ class Settings:
         os.environ["JWT_SECRET"] = generated_secret
         JWT_SECRET = generated_secret
     JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRATION_MINUTES: int = 60 * 24  # 1 day session
+    JWT_EXPIRATION_MINUTES: int = 60 * 24 * 60  # 60 day absolute session
+    AUTH_CHALLENGE_MINUTES: int = 5
+    REAUTHENTICATION_MINUTES: int = 10
+    APP_VERSION: str = os.getenv("STREAMHOME_VERSION", "1.0.0")
 
     # Storage engine configuration: "LOCAL" or "CLOUD"
     STORAGE_ENGINE: str = os.getenv("STORAGE_ENGINE", "LOCAL")

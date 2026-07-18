@@ -4,6 +4,10 @@ import tailwindcss from '@tailwindcss/vite';
 import path from 'path';
 
 export default defineConfig({
+  define: {
+    'import.meta.env.VITE_APP_VERSION': JSON.stringify(process.env.npm_package_version ?? '0.0.0'),
+    'import.meta.env.VITE_BUILD_ID': JSON.stringify(process.env.VITE_BUILD_ID ?? 'dev'),
+  },
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {

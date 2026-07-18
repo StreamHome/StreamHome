@@ -12,7 +12,7 @@ import { BrandLogo } from "../../components/brand/BrandLogo";
 import { CONTENT_REVEAL, MOTION_EASE, MOTION_TIMINGS, useAppMotion } from "../../motion/motionSystem";
 
 const PANELS: Array<{ id: AdminSection; label: string }> = [
-  { id: "account", label: "Account & TOTP" }, { id: "storage", label: "Storage & HEVC" }, { id: "downloads", label: "Downloads" },
+  { id: "account", label: "Account & Security" }, { id: "storage", label: "Storage & HEVC" }, { id: "downloads", label: "Downloads" },
 ];
 
 export function AdminCenter() {

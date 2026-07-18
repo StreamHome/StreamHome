@@ -1,231 +1,482 @@
+import hashlib
+import hmac
+import json
+import secrets
 import time
-import jwt
-import bcrypt
-import pyotp
+import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Depends, status, Security, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import bcrypt
+import jwt
+import pyotp
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+from sqlalchemy import delete, text
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from db import get_session
-from models import User
 from config import settings
+from db import get_session
+from models import AuthChallenge, AuthSession, RecoveryCode, SecurityEvent, User
 from services.logger import logger
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+health_router = APIRouter(tags=["System"])
 security = HTTPBearer(auto_error=False)
+
+LOCKOUT_ATTEMPTS = 5
+LOCKOUT_SECONDS = 15 * 60
+SESSION_ACTIVITY_WRITE_INTERVAL = 5 * 60
+AUDIT_RETENTION_SECONDS = 180 * 24 * 60 * 60
+RECOVERY_CODE_COUNT = 10
+
 
 class LoginRequest(BaseModel):
     email: str
     password: str
 
+
 class VerifyRequest(BaseModel):
-    email: str
+    challenge_token: str
+    method: str = "totp"
     code: str
+
+
+class ReauthenticateRequest(BaseModel):
+    password: str
+
 
 class TOTPVerifySetupRequest(BaseModel):
     code: str
 
+
 class TOTPDisableRequest(BaseModel):
     code: str
 
-# Helper dependency to authenticate JWT requests
-async def get_current_user(
+
+def now() -> float:
+    return time.time()
+
+
+def token_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def recovery_hash(value: str) -> str:
+    normalized = value.replace("-", "").replace(" ", "").upper()
+    return hmac.new(settings.JWT_SECRET.encode("utf-8"), normalized.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if forwarded:
+        return forwarded[:64]
+    return request.client.host[:64] if request.client else "Unknown"
+
+
+def device_label(request: Request) -> str:
+    ua = request.headers.get("user-agent", "").lower()
+    if not ua:
+        return "Unknown device"
+    browser = "Firefox" if "firefox" in ua else "Edge" if "edg/" in ua else "Chrome" if "chrome" in ua else "Safari" if "safari" in ua else "Browser"
+    os_name = "Windows" if "windows" in ua else "iPhone" if "iphone" in ua else "iPad" if "ipad" in ua else "Android" if "android" in ua else "macOS" if "mac os" in ua else "Linux" if "linux" in ua else "Unknown OS"
+    return f"{browser} on {os_name}"[:120]
+
+
+async def add_event(
+    db: AsyncSession,
     request: Request,
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-    db: AsyncSession = Depends(get_session)
-) -> User:
-    token = None
-    if credentials:
-        token = credentials.credentials
-    else:
-        token = request.query_params.get("token")
+    event_type: str,
+    outcome: str,
+    user_id: Optional[int] = None,
+    session_id: Optional[str] = None,
+    details: Optional[dict] = None,
+) -> None:
+    timestamp = now()
+    await db.execute(delete(SecurityEvent).where(SecurityEvent.created_at < timestamp - AUDIT_RETENTION_SECONDS))
+    db.add(SecurityEvent(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        event_type=event_type,
+        outcome=outcome,
+        created_at=timestamp,
+        ip_address=client_ip(request),
+        device_label=device_label(request),
+        session_id=session_id,
+        details=json.dumps(details, separators=(",", ":")) if details else None,
+    ))
 
+
+def lockout_exception(user: User) -> HTTPException:
+    remaining = max(1, int((user.lockout_until or now()) - now()))
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail={"code": "account_locked", "message": "Too many failed attempts. Try again when the lock expires.", "retryAfterSeconds": remaining},
+        headers={"Retry-After": str(remaining)},
+    )
+
+
+def check_lockout(user: User) -> None:
+    if user.lockout_until and now() < user.lockout_until:
+        raise lockout_exception(user)
+
+
+async def register_failure(user: User, db: AsyncSession, request: Request, event_type: str) -> None:
+    user.failed_login_attempts += 1
+    if user.failed_login_attempts >= LOCKOUT_ATTEMPTS:
+        user.lockout_until = now() + LOCKOUT_SECONDS
+        logger.warning(f"[Security] Account {user.email} locked for {LOCKOUT_SECONDS} seconds")
+    db.add(user)
+    await add_event(db, request, event_type, "failure", user.id, details={"locked": bool(user.lockout_until)})
+    await db.commit()
+
+
+async def create_challenge(user: User, purpose: str, db: AsyncSession) -> str:
+    raw = secrets.token_urlsafe(32)
+    timestamp = now()
+    await db.execute(delete(AuthChallenge).where(AuthChallenge.expires_at < timestamp))
+    db.add(AuthChallenge(
+        id=str(uuid.uuid4()),
+        token_hash=token_hash(raw),
+        user_id=user.id,
+        purpose=purpose,
+        created_at=timestamp,
+        expires_at=timestamp + settings.AUTH_CHALLENGE_MINUTES * 60,
+    ))
+    await db.commit()
+    return raw
+
+
+async def issue_session(user: User, db: AsyncSession, request: Request) -> dict:
+    timestamp = now()
+    session_id = str(uuid.uuid4())
+    expires_at = timestamp + settings.JWT_EXPIRATION_MINUTES * 60
+    session = AuthSession(
+        id=session_id,
+        user_id=user.id,
+        created_at=timestamp,
+        last_seen_at=timestamp,
+        expires_at=expires_at,
+        ip_address=client_ip(request),
+        device_label=device_label(request),
+    )
+    previous = None
+    if user.last_login_at:
+        previous = {"at": user.last_login_at, "ipAddress": user.last_login_ip, "deviceLabel": user.last_login_device}
+    user.last_login_at = timestamp
+    user.last_login_ip = session.ip_address
+    user.last_login_device = session.device_label
+    user.failed_login_attempts = 0
+    user.lockout_until = None
+    db.add(user)
+    db.add(session)
+    await add_event(db, request, "login_success", "success", user.id, session_id)
+    await db.commit()
+    payload = {"sub": user.email, "jti": session_id, "iat": datetime.utcnow(), "exp": datetime.utcnow() + timedelta(minutes=settings.JWT_EXPIRATION_MINUTES)}
+    access_token = jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+    return {
+        "accessToken": access_token,
+        "tokenType": "bearer",
+        "email": user.email,
+        "session": {"id": session_id, "expiresAt": expires_at},
+        "previousLogin": previous,
+    }
+
+
+async def resolve_auth(request: Request, credentials: Optional[HTTPAuthorizationCredentials], db: AsyncSession) -> tuple[User, AuthSession]:
+    token = credentials.credentials if credentials else request.query_params.get("token")
     if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated. Missing token.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     try:
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
         email = payload.get("sub")
-        if not email:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
-        
-        statement = select(User).where(User.email == email)
-        res = await db.execute(statement)
-        user = res.scalars().first()
-        if not user:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-        return user
+        session_id = payload.get("jti")
+        if not email or not session_id:
+            raise ValueError("Legacy or incomplete token")
+        user_result = await db.execute(select(User).where(User.email == email))
+        user = user_result.scalars().first()
+        session_result = await db.execute(select(AuthSession).where(AuthSession.id == session_id))
+        auth_session = session_result.scalars().first()
+        if not user or not auth_session or auth_session.user_id != user.id or auth_session.revoked_at or auth_session.expires_at <= now():
+            raise ValueError("Inactive session")
+        if now() - auth_session.last_seen_at >= SESSION_ACTIVITY_WRITE_INTERVAL:
+            auth_session.last_seen_at = now()
+            db.add(auth_session)
+            await db.commit()
+        request.state.auth_session = auth_session
+        return user, auth_session
+    except HTTPException:
+        raise
     except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials", headers={"WWW-Authenticate": "Bearer"})
 
-def check_lockout(user: User):
-    if user.lockout_until and time.time() < user.lockout_until:
-        remaining = int(user.lockout_until - time.time())
-        minutes = remaining // 60
-        seconds = remaining % 60
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Account is temporarily locked due to too many failed attempts. Try again in {minutes}m {seconds}s."
-        )
 
-async def handle_failed_attempt(user: User, db: AsyncSession):
-    user.failed_login_attempts += 1
-    if user.failed_login_attempts >= 5:
-        user.lockout_until = time.time() + 900  # 15 minutes lockout
-        logger.warning(f"[Security] Account {user.email} locked out until {datetime.fromtimestamp(user.lockout_until)}")
-    db.add(user)
-    await db.commit()
+async def get_current_user(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    db: AsyncSession = Depends(get_session),
+) -> User:
+    user, _ = await resolve_auth(request, credentials, db)
+    return user
+
+
+async def get_current_session(request: Request, user: User = Depends(get_current_user)) -> AuthSession:
+    del user
+    return request.state.auth_session
+
+
+async def require_recent_reauth(session: AuthSession = Depends(get_current_session)) -> AuthSession:
+    if not session.reauthenticated_at or now() - session.reauthenticated_at > settings.REAUTHENTICATION_MINUTES * 60:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"code": "reauthentication_required", "message": "Confirm your password and authenticator code to continue."})
+    return session
+
+
+@health_router.get("/api/health")
+async def health(db: AsyncSession = Depends(get_session)):
+    try:
+        await db.execute(text("SELECT 1"))
+        return {"status": "ready", "version": settings.APP_VERSION, "serverTime": now()}
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail={"code": "server_unavailable", "message": "The server database is not ready."})
+
 
 @router.post("/login")
-async def login(req: LoginRequest, db: AsyncSession = Depends(get_session)):
-    statement = select(User).where(User.email == req.email)
-    res = await db.execute(statement)
-    user = res.scalars().first()
+async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(get_session)):
+    result = await db.execute(select(User).where(User.email == req.email.strip()))
+    user = result.scalars().first()
     if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
-        
+        await add_event(db, request, "login_failure", "failure")
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "invalid_credentials", "message": "Invalid email or password."})
     check_lockout(user)
-    
     if not bcrypt.checkpw(req.password.encode("utf-8"), user.password_hash.encode("utf-8")):
-        await handle_failed_attempt(user, db)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
-        
-    # Reset attempts on correct password (user has to pass 2FA too, but password is correct)
-    user.failed_login_attempts = 0
-    user.lockout_until = None
-    db.add(user)
-    await db.commit()
-    
+        await register_failure(user, db, request, "login_failure")
+        if user.lockout_until:
+            raise lockout_exception(user)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "invalid_credentials", "message": "Invalid email or password."})
     if user.two_factor_enabled:
-        return {
-            "requires_2fa": True,
-            "email": user.email,
-            "message": "TOTP code required to complete login."
-        }
-        
-    # Generate JWT
-    payload = {
-        "sub": user.email,
-        "exp": datetime.utcnow() + timedelta(minutes=settings.JWT_EXPIRATION_MINUTES)
-    }
-    token = jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
-    
-    return {
-        "accessToken": token,
-        "tokenType": "bearer",
-        "email": user.email
-    }
+        challenge = await create_challenge(user, "login", db)
+        return {"requires2fa": True, "challengeToken": challenge, "email": user.email, "expiresInSeconds": settings.AUTH_CHALLENGE_MINUTES * 60, "message": "Authenticator or recovery code required."}
+    return await issue_session(user, db, request)
+
 
 @router.post("/verify")
-async def verify(req: VerifyRequest, db: AsyncSession = Depends(get_session)):
-    statement = select(User).where(User.email == req.email)
-    res = await db.execute(statement)
-    user = res.scalars().first()
+async def verify(req: VerifyRequest, request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security), db: AsyncSession = Depends(get_session)):
+    challenge_result = await db.execute(select(AuthChallenge).where(AuthChallenge.token_hash == token_hash(req.challenge_token)))
+    challenge = challenge_result.scalars().first()
+    if not challenge or challenge.used_at or challenge.expires_at <= now() or challenge.attempts >= LOCKOUT_ATTEMPTS:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "challenge_expired", "message": "This verification request expired. Sign in again."})
+    user_result = await db.execute(select(User).where(User.id == challenge.user_id))
+    user = user_result.scalars().first()
     if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-        
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "challenge_expired", "message": "This verification request expired. Sign in again."})
     check_lockout(user)
-    
-    if not user.two_factor_enabled or not user.totp_secret:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="2FA is not enabled for this user")
-        
-    totp = pyotp.TOTP(user.totp_secret)
-    if not totp.verify(req.code):
-        await handle_failed_attempt(user, db)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid verification code")
-        
-    # Success: reset attempts
+    method = req.method.lower()
+    valid = False
+    used_recovery: Optional[RecoveryCode] = None
+    if method == "totp" and user.two_factor_enabled and user.totp_secret:
+        valid = pyotp.TOTP(user.totp_secret).verify(req.code, valid_window=1)
+    elif method == "recovery" and user.two_factor_enabled:
+        code_result = await db.execute(select(RecoveryCode).where(RecoveryCode.user_id == user.id, RecoveryCode.code_hash == recovery_hash(req.code), RecoveryCode.used_at == None))
+        used_recovery = code_result.scalars().first()
+        valid = used_recovery is not None
+    if not valid:
+        challenge.attempts += 1
+        db.add(challenge)
+        await register_failure(user, db, request, "factor_failure")
+        if user.lockout_until:
+            raise lockout_exception(user)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "invalid_factor", "message": "The verification code was not accepted."})
+    challenge.used_at = now()
+    if used_recovery:
+        used_recovery.used_at = now()
+        db.add(used_recovery)
+        await add_event(db, request, "recovery_code_used", "success", user.id)
     user.failed_login_attempts = 0
     user.lockout_until = None
+    db.add(challenge)
     db.add(user)
+    if challenge.purpose == "login":
+        return await issue_session(user, db, request)
+    if challenge.purpose == "reauthentication":
+        _, auth_session = await resolve_auth(request, credentials, db)
+        if auth_session.user_id != user.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Challenge does not belong to this session")
+        auth_session.reauthenticated_at = now()
+        db.add(auth_session)
+        await add_event(db, request, "reauthentication", "success", user.id, auth_session.id)
+        await db.commit()
+        return {"reauthenticated": True, "validForSeconds": settings.REAUTHENTICATION_MINUTES * 60}
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported challenge purpose")
+
+
+@router.post("/reauthenticate")
+async def reauthenticate(req: ReauthenticateRequest, request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(get_current_session), db: AsyncSession = Depends(get_session)):
+    check_lockout(user)
+    if not bcrypt.checkpw(req.password.encode("utf-8"), user.password_hash.encode("utf-8")):
+        await register_failure(user, db, request, "reauthentication_failure")
+        if user.lockout_until:
+            raise lockout_exception(user)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "invalid_credentials", "message": "The password was not accepted."})
+    if user.two_factor_enabled:
+        challenge = await create_challenge(user, "reauthentication", db)
+        return {"requires2fa": True, "challengeToken": challenge, "email": user.email, "expiresInSeconds": settings.AUTH_CHALLENGE_MINUTES * 60}
+    session.reauthenticated_at = now()
+    db.add(session)
+    await add_event(db, request, "reauthentication", "success", user.id, session.id)
     await db.commit()
-    
-    payload = {
-        "sub": user.email,
-        "exp": datetime.utcnow() + timedelta(minutes=settings.JWT_EXPIRATION_MINUTES)
-    }
-    token = jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
-    
+    return {"reauthenticated": True, "validForSeconds": settings.REAUTHENTICATION_MINUTES * 60}
+
+
+@router.get("/reauthenticate/status")
+async def reauthentication_status(session: AuthSession = Depends(get_current_session)):
+    remaining = max(0, int(settings.REAUTHENTICATION_MINUTES * 60 - (now() - (session.reauthenticated_at or 0))))
+    return {"reauthenticated": remaining > 0, "remainingSeconds": remaining}
+
+
+@router.post("/logout", status_code=204)
+async def logout(request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(get_current_session), db: AsyncSession = Depends(get_session)):
+    session.revoked_at = now()
+    db.add(session)
+    await add_event(db, request, "logout", "success", user.id, session.id)
+    await db.commit()
+
+
+@router.get("/security/summary")
+async def security_summary(user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    del session
+    recovery_result = await db.execute(select(RecoveryCode).where(RecoveryCode.user_id == user.id, RecoveryCode.used_at == None))
+    events_result = await db.execute(select(SecurityEvent).where(SecurityEvent.user_id == user.id, SecurityEvent.event_type == "login_success").order_by(SecurityEvent.created_at.desc()).limit(2))
+    logins = events_result.scalars().all()
+    previous = logins[1] if len(logins) > 1 else None
     return {
-        "accessToken": token,
-        "tokenType": "bearer",
-        "email": user.email
+        "email": user.email,
+        "twoFactorEnabled": user.two_factor_enabled,
+        "recoveryCodesRemaining": len(recovery_result.scalars().all()),
+        "previousLogin": None if not previous else {"at": previous.created_at, "ipAddress": previous.ip_address, "deviceLabel": previous.device_label},
     }
 
-# ----------------- 2FA TOTP Control Endpoints -----------------
+
+@router.get("/sessions")
+async def list_sessions(user: User = Depends(get_current_user), current: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    result = await db.execute(select(AuthSession).where(AuthSession.user_id == user.id, AuthSession.revoked_at == None, AuthSession.expires_at > now()).order_by(AuthSession.last_seen_at.desc()))
+    return [{"id": item.id, "createdAt": item.created_at, "lastSeenAt": item.last_seen_at, "expiresAt": item.expires_at, "ipAddress": item.ip_address, "deviceLabel": item.device_label, "current": item.id == current.id} for item in result.scalars().all()]
+
+
+@router.delete("/sessions/{session_id}")
+async def revoke_session(session_id: str, request: Request, user: User = Depends(get_current_user), current: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    result = await db.execute(select(AuthSession).where(AuthSession.id == session_id, AuthSession.user_id == user.id))
+    target = result.scalars().first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Session not found")
+    target.revoked_at = now()
+    db.add(target)
+    await add_event(db, request, "session_revoked", "success", user.id, current.id, {"currentSession": target.id == current.id})
+    await db.commit()
+    return {"revoked": True, "currentSession": target.id == current.id}
+
+
+@router.post("/sessions/revoke-others")
+async def revoke_other_sessions(request: Request, user: User = Depends(get_current_user), current: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    result = await db.execute(select(AuthSession).where(AuthSession.user_id == user.id, AuthSession.id != current.id, AuthSession.revoked_at == None))
+    revoked = 0
+    for item in result.scalars().all():
+        item.revoked_at = now()
+        db.add(item)
+        revoked += 1
+    await add_event(db, request, "sessions_revoked", "success", user.id, current.id, {"count": revoked})
+    await db.commit()
+    return {"revokedCount": revoked}
+
+
+@router.get("/security/events")
+async def security_events(before: Optional[float] = None, limit: int = 25, user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    del session
+    safe_limit = max(1, min(limit, 50))
+    statement = select(SecurityEvent).where(SecurityEvent.user_id == user.id)
+    if before:
+        statement = statement.where(SecurityEvent.created_at < before)
+    result = await db.execute(statement.order_by(SecurityEvent.created_at.desc()).limit(safe_limit + 1))
+    rows = result.scalars().all()
+    has_more = len(rows) > safe_limit
+    rows = rows[:safe_limit]
+    return {"events": [{"id": item.id, "type": item.event_type, "outcome": item.outcome, "createdAt": item.created_at, "ipAddress": item.ip_address, "deviceLabel": item.device_label, "details": json.loads(item.details) if item.details else None} for item in rows], "nextCursor": rows[-1].created_at if has_more and rows else None}
+
+
+async def replace_recovery_codes(user: User, db: AsyncSession) -> list[str]:
+    existing = await db.execute(select(RecoveryCode).where(RecoveryCode.user_id == user.id))
+    for item in existing.scalars().all():
+        await db.delete(item)
+    codes: list[str] = []
+    timestamp = now()
+    for _ in range(RECOVERY_CODE_COUNT):
+        compact = secrets.token_hex(8).upper()
+        display = f"{compact[:4]}-{compact[4:8]}-{compact[8:12]}-{compact[12:]}"
+        codes.append(display)
+        db.add(RecoveryCode(id=str(uuid.uuid4()), user_id=user.id, code_hash=recovery_hash(display), created_at=timestamp))
+    return codes
+
+
+@router.post("/recovery-codes/regenerate")
+async def regenerate_recovery_codes(request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    if not user.two_factor_enabled:
+        raise HTTPException(status_code=400, detail="Enable TOTP before generating recovery codes")
+    codes = await replace_recovery_codes(user, db)
+    await add_event(db, request, "recovery_codes_regenerated", "success", user.id, session.id)
+    await db.commit()
+    return {"recoveryCodes": codes, "remaining": len(codes)}
+
 
 @router.post("/2fa/setup")
-async def setup_totp(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_session)):
+async def setup_totp(user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    del session
     if user.two_factor_enabled:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="2FA is already enabled. Disable it first to reconfigure.")
-        
-    # Generate TOTP secret and keep in draft on user object
+        raise HTTPException(status_code=400, detail="TOTP is already enabled")
     secret = pyotp.random_base32()
     user.totp_secret = secret
-    user.two_factor_enabled = False  # Set to false until verified
+    user.two_factor_enabled = False
     db.add(user)
     await db.commit()
-    
-    totp = pyotp.TOTP(secret)
-    provisioning_uri = totp.provisioning_uri(name=user.email, issuer_name="StreamHome")
-    
-    return {
-        "secret": secret,
-        "provisioning_uri": provisioning_uri
-    }
+    return {"secret": secret, "provisioning_uri": pyotp.TOTP(secret).provisioning_uri(name=user.email, issuer_name="StreamHome")}
+
 
 @router.post("/2fa/verify-setup")
-async def verify_totp_setup(req: TOTPVerifySetupRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_session)):
-    if not user.totp_secret:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="2FA setup has not been initialized.")
-        
-    totp = pyotp.TOTP(user.totp_secret)
-    if not totp.verify(req.code):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid verification code. Setup verification failed.")
-        
+async def verify_totp_setup(req: TOTPVerifySetupRequest, request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    if not user.totp_secret or not pyotp.TOTP(user.totp_secret).verify(req.code, valid_window=1):
+        raise HTTPException(status_code=400, detail="Invalid verification code")
     user.two_factor_enabled = True
     user.failed_login_attempts = 0
     user.lockout_until = None
+    codes = await replace_recovery_codes(user, db)
     db.add(user)
+    await add_event(db, request, "totp_enabled", "success", user.id, session.id)
     await db.commit()
-    
-    logger.info(f"[Security] User {user.email} enabled TOTP 2FA.")
-    return {"message": "2FA successfully enabled."}
+    return {"message": "TOTP successfully enabled.", "recoveryCodes": codes}
+
 
 @router.post("/2fa/disable")
-async def disable_totp(req: TOTPDisableRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_session)):
+async def disable_totp(req: TOTPDisableRequest, request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
     if not user.two_factor_enabled or not user.totp_secret:
-        # Already disabled, return success
-        return {"message": "2FA is already disabled."}
-        
-    totp = pyotp.TOTP(user.totp_secret)
-    if not totp.verify(req.code):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid verification code. Unable to disable 2FA.")
-        
+        return {"message": "TOTP is already disabled."}
+    if not pyotp.TOTP(user.totp_secret).verify(req.code, valid_window=1):
+        raise HTTPException(status_code=400, detail="Invalid verification code")
     user.two_factor_enabled = False
     user.totp_secret = None
     db.add(user)
+    codes = await db.execute(select(RecoveryCode).where(RecoveryCode.user_id == user.id))
+    for item in codes.scalars().all():
+        await db.delete(item)
+    others = await db.execute(select(AuthSession).where(AuthSession.user_id == user.id, AuthSession.id != session.id, AuthSession.revoked_at == None))
+    for item in others.scalars().all():
+        item.revoked_at = now()
+        db.add(item)
+    await add_event(db, request, "totp_disabled", "success", user.id, session.id)
     await db.commit()
-    
-    logger.info(f"[Security] User {user.email} disabled TOTP 2FA.")
-    return {"message": "2FA successfully disabled."}
+    return {"message": "TOTP successfully disabled."}
+
 
 @router.get("/2fa/status")
 async def get_totp_status(user: User = Depends(get_current_user)):
-    return {
-        "two_factor_enabled": user.two_factor_enabled,
-        "email": user.email
-    }
+    return {"two_factor_enabled": user.two_factor_enabled, "email": user.email}

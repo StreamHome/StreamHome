@@ -64,6 +64,12 @@ async def init_db():
                 if "lockout_until" not in user_cols:
                     logger.info("[Database] Migrating: Adding 'lockout_until' column to 'user' table...")
                     sync_conn.exec_driver_sql("ALTER TABLE user ADD COLUMN lockout_until FLOAT")
+                if "last_login_at" not in user_cols:
+                    sync_conn.exec_driver_sql("ALTER TABLE user ADD COLUMN last_login_at FLOAT")
+                if "last_login_ip" not in user_cols:
+                    sync_conn.exec_driver_sql("ALTER TABLE user ADD COLUMN last_login_ip TEXT")
+                if "last_login_device" not in user_cols:
+                    sync_conn.exec_driver_sql("ALTER TABLE user ADD COLUMN last_login_device TEXT")
 
             if "movie" in inspector.get_table_names():
                 movie_cols = [col["name"] for col in inspector.get_columns("movie")]

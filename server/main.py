@@ -28,7 +28,7 @@ from services.queue import queue_manager
 from services.hevc_compressor import hevc_compressor
 import services.state as state
 from routes.queue import router as queue_router
-from routes.auth import router as auth_router, get_current_user
+from routes.auth import router as auth_router, health_router, get_current_user
 from routes.stream import router as stream_router
 from routes.backup import router as backup_router
 from routes.update import router as update_router
@@ -208,7 +208,7 @@ class ActivityTrackingMiddleware(BaseHTTPMiddleware):
             state.LAST_HTTP_ACTIVITY_TIMESTAMP = time.time()
 
 # Initialize FastAPI application with modern lifespan
-app = FastAPI(title="StreamHome Media Server", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="StreamHome Media Server", version=settings.APP_VERSION, lifespan=lifespan)
 
 # Setup CORS and activity tracking middlewares
 app.add_middleware(ActivityTrackingMiddleware)
@@ -223,6 +223,7 @@ app.add_middleware(
 # Register routes
 app.include_router(queue_router)
 app.include_router(auth_router)
+app.include_router(health_router)
 app.include_router(stream_router)
 app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
 app.include_router(update_router, prefix="/api/update", tags=["update"])

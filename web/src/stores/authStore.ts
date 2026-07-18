@@ -26,6 +26,8 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   logout: () => {
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (token) void fetch("/api/auth/logout", { method: "POST", headers: { Authorization: `Bearer ${token}` } }).catch(() => undefined);
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(EMAIL_KEY);
     localStorage.removeItem("streamhome_profile");
