@@ -1,5 +1,5 @@
 import React from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { clearArtworkResolutionCache, MediaArtwork } from "./MediaArtwork";
 
@@ -40,5 +40,25 @@ describe("MediaArtwork", () => {
     render(<MediaArtwork src="/media/Movies/example/poster.jpg" alt="Example" />);
     fireEvent.error(screen.getByRole("img", { name: "Example" }));
     expect(screen.getByLabelText("Example artwork unavailable")).toBeTruthy();
+  });
+
+  it("shows the TMDB fallback immediately and switches to local artwork when caching finishes", async () => {
+    vi.useFakeTimers();
+    let localReady = false;
+    const fetchMock = vi.fn(async () => ({ ok: localReady, body: null }) as Response);
+    vi.stubGlobal("fetch", fetchMock);
+    const media = {
+      id: "m_42", title: "Cached title", type: "movie" as const, releaseYear: 2024,
+      localThumbnailUrl: "/media/Movies/Cached%20title_2024_TMDB_42/poster.jpg",
+      remoteThumbnailUrl: "https://image.tmdb.org/t/p/w500/poster.jpg",
+      cacheState: "queued" as const,
+    };
+    render(<MediaArtwork src={media.remoteThumbnailUrl} alt="Cached title" media={media} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByRole("img", { name: "Cached title" }).getAttribute("src")).toBe(media.remoteThumbnailUrl);
+    localReady = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(screen.getByRole("img", { name: "Cached title" }).getAttribute("src")).toBe(media.localThumbnailUrl);
+    vi.useRealTimers();
   });
 });

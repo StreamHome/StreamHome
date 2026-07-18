@@ -116,10 +116,16 @@ export interface Movie {
   availability?: MediaAvailability;
   recommendationScore?: number;
   recommendationReasons?: string[];
+  remoteThumbnailUrl?: string | null;
+  remoteBannerUrl?: string | null;
+  localThumbnailUrl?: string | null;
+  localBannerUrl?: string | null;
+  cacheState?: MediaCacheState | null;
 }
 
 export type MediaSource = "server" | "tmdb_cache" | string;
 export type MediaAvailability = "available" | "processing" | "cached" | string;
+export type MediaCacheState = "queued" | "caching" | "ready" | "error";
 
 export interface RecommendationCategory {
   value: string;
@@ -210,4 +216,9 @@ export interface DiscoverMovie {
   type: "movie" | "series";
   source?: MediaSource;
   availability?: MediaAvailability;
+  remoteThumbnailUrl?: string | null;
+  remoteBannerUrl?: string | null;
+  localThumbnailUrl?: string | null;
+  localBannerUrl?: string | null;
+  cacheState?: MediaCacheState | null;
 }

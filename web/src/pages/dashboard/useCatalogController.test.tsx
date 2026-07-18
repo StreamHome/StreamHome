@@ -5,10 +5,10 @@ import type { Movie, Profile, RecommendationFeed } from "../../types/api";
 import { useCatalogController } from "./useCatalogController";
 
 const mocks = vi.hoisted(() => ({
-  getMovies: vi.fn(), getPlaybackSessions: vi.fn(), getWatchlist: vi.fn(), getRecommendations: vi.fn(), search: vi.fn(),
+  getMovie: vi.fn(), getMovies: vi.fn(), getPlaybackSessions: vi.fn(), getWatchlist: vi.fn(), getRecommendations: vi.fn(), search: vi.fn(),
 }));
 
-vi.mock("../../api/movies", () => ({ getMovies: mocks.getMovies, search: mocks.search }));
+vi.mock("../../api/movies", () => ({ getMovie: mocks.getMovie, getMovies: mocks.getMovies, search: mocks.search }));
 vi.mock("../../api/playback", () => ({ getPlaybackSessions: mocks.getPlaybackSessions }));
 vi.mock("../../api/watchlist", () => ({ getWatchlist: mocks.getWatchlist }));
 vi.mock("../../api/recommendations", () => ({ getRecommendations: mocks.getRecommendations }));
@@ -38,6 +38,7 @@ beforeEach(() => {
   mocks.getPlaybackSessions.mockResolvedValue([]);
   mocks.getWatchlist.mockResolvedValue([]);
   mocks.search.mockResolvedValue([]);
+  mocks.getMovie.mockRejectedValue(new Error("Media not found"));
 });
 
 describe("useCatalogController recommendations", () => {
@@ -83,5 +84,25 @@ describe("useCatalogController recommendations", () => {
     rerender({ query: { profile: profile.id, view: "watch", media: "first" } });
     rerender({ query: initial });
     await waitFor(() => expect(mocks.getRecommendations).toHaveBeenCalledTimes(3));
+  });
+
+  it("retains a search-only title while navigating to details and refreshes its canonical record", async () => {
+    mocks.getRecommendations.mockResolvedValue(feed("recommended", []));
+    const searched = {
+      id: "m_42", tmdbId: 42, title: "Search Only", description: "Remote metadata",
+      thumbnailUrl: "https://image.tmdb.org/t/p/w500/poster.jpg", bannerUrl: null,
+      genres: ["Drama"], duration: "2h", releaseYear: 2024, rating: "PG-13",
+      voteAverage: 8, voteCount: 100, director: null, cast: [], type: "movie" as const,
+      source: "tmdb_cache", availability: "cached", cacheState: "queued" as const,
+    };
+    mocks.search.mockResolvedValue([searched]);
+    mocks.getMovie.mockResolvedValue({ ...movie("m_42"), title: "Search Only", videoUrl: "", availability: "cached", cacheState: "ready" });
+    const initial: AppQueryState = { profile: profile.id, view: "search", q: "search only" };
+    const { result, rerender } = renderHook(({ query }) => useCatalogController(profile, query), { initialProps: { query: initial } });
+    await waitFor(() => expect(result.current.resolveMovie("m_42")?.title).toBe("Search Only"));
+    rerender({ query: { profile: profile.id, view: "details", media: "m_42" } });
+    expect(result.current.resolveMovie("m_42")?.title).toBe("Search Only");
+    await waitFor(() => expect(mocks.getMovie).toHaveBeenCalledWith("m_42", expect.any(AbortSignal)));
+    await waitFor(() => expect(result.current.resolveMovie("m_42")?.cacheState).toBe("ready"));
   });
 });

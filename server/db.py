@@ -106,6 +106,11 @@ async def init_db():
                     "popularity": "FLOAT DEFAULT 0",
                     "cached_at": "FLOAT",
                     "metadata_refreshed_at": "FLOAT",
+                    "remote_thumbnail_url": "TEXT",
+                    "remote_banner_url": "TEXT",
+                    "local_thumbnail_url": "TEXT",
+                    "local_banner_url": "TEXT",
+                    "cache_state": "TEXT",
                 }
                 for column, sql_type in recommendation_columns.items():
                     if column not in movie_cols:
@@ -139,6 +144,12 @@ async def init_db():
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_tmdb_id ON movie (tmdb_id)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_catalog_source ON movie (catalog_source)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_availability ON movie (availability)")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_cache_state ON movie (cache_state)")
+                sync_conn.exec_driver_sql(
+                    "UPDATE movie SET cache_state = CASE "
+                    "WHEN catalog_source = 'tmdb_cache' THEN 'ready' ELSE NULL END "
+                    "WHERE cache_state IS NULL"
+                )
 
             if "telemetryevent" in inspector.get_table_names():
                 telemetry_cols = [col["name"] for col in inspector.get_columns("telemetryevent")]

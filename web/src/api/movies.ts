@@ -45,6 +45,11 @@ export function normalizeMovie(raw: Partial<Movie>): Movie {
     availability: raw.availability,
     recommendationScore: raw.recommendationScore,
     recommendationReasons: Array.isArray(raw.recommendationReasons) ? raw.recommendationReasons : [],
+    remoteThumbnailUrl: raw.remoteThumbnailUrl ?? null,
+    remoteBannerUrl: raw.remoteBannerUrl ?? null,
+    localThumbnailUrl: raw.localThumbnailUrl ?? null,
+    localBannerUrl: raw.localBannerUrl ?? null,
+    cacheState: raw.cacheState ?? null,
   };
 }
 
@@ -57,6 +62,10 @@ export async function getMovies(profileId?: string, signal?: AbortSignal): Promi
 export async function getFeatured(): Promise<Movie | null> {
   const response = await apiGet<Partial<Movie> | null>("/api/movies/featured");
   return response ? normalizeMovie(response) : null;
+}
+
+export async function getMovie(mediaId: string, signal?: AbortSignal): Promise<Movie> {
+  return normalizeMovie(await apiGet<Partial<Movie>>(`/api/movies/${encodeURIComponent(mediaId)}`, { signal }));
 }
 
 export const search = (query: string, signal?: AbortSignal) => apiGet<DiscoverMovie[]>(`/api/search?query=${encodeURIComponent(query)}`, { signal });

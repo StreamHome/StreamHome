@@ -120,6 +120,12 @@ async def lifespan(app: FastAPI):
         logger.error(f"[Lifespan Startup] Error starting queue manager: {q_start_err}")
 
     try:
+        from services.tmdb import tmdb_client
+        await tmdb_client.start_cache_workers()
+    except Exception as cache_start_err:
+        logger.error(f"[Lifespan Startup] Error starting TMDB cache workers: {cache_start_err}")
+
+    try:
         hevc_compressor.start()
     except Exception as h_start_err:
         logger.error(f"[Lifespan Startup] Error starting hevc compressor: {h_start_err}")
@@ -208,6 +214,7 @@ async def lifespan(app: FastAPI):
         recommendation_task.cancel()
     try:
         from services.tmdb import tmdb_client
+        await tmdb_client.stop_cache_workers()
         await tmdb_client.close()
     except Exception as tmdb_close_err:
         logger.error(f"[Lifespan Shutdown] Error closing TMDB client: {tmdb_close_err}")
@@ -411,6 +418,20 @@ async def get_featured_movie(user = Depends(get_current_user)):
             ep_result = await db.exec(ep_stmt)
             episodes = ep_result.all()
             
+        return MovieResponse.from_db(movie, episodes)
+
+
+@app.get("/api/movies/{media_id}", response_model=MovieResponse)
+async def get_movie(media_id: str, user = Depends(get_current_user)):
+    """Resolve one canonical playable or metadata-only catalog record."""
+    async with AsyncSession(engine) as db:
+        movie = await db.get(Movie, media_id)
+        if not movie:
+            raise HTTPException(status_code=404, detail="Media not found")
+        episodes = None
+        if movie.type == "series":
+            result = await db.exec(select(Episode).where(Episode.movie_id == movie.id).order_by(Episode.season_number, Episode.episode_number))
+            episodes = list(result.all())
         return MovieResponse.from_db(movie, episodes)
 
 

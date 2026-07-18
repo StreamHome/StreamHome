@@ -18,7 +18,7 @@ export function isServerArtworkUrl(value: string | null | undefined): boolean {
   }
 }
 
-export type ArtworkMediaIdentity = Pick<Movie, "id" | "title" | "type" | "releaseYear">;
+export type ArtworkMediaIdentity = Pick<Movie, "id" | "title" | "type" | "releaseYear"> & Partial<Pick<Movie, "bannerUrl" | "localThumbnailUrl" | "localBannerUrl" | "remoteThumbnailUrl" | "remoteBannerUrl" | "cacheState">>;
 export type ArtworkEpisodeIdentity = Pick<Episode, "seasonNumber" | "episodeNumber">;
 
 const COMPACT_ARTWORK_PATH = /^\/(poster|backdrop|thumbnail)\.(?:jpe?g|png|webp)$/i;

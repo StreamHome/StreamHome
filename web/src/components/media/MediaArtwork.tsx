@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { MOTION_EASE, MOTION_TIMINGS, useAppMotion } from "../../motion/motionSystem";
 import { cn } from "../../utils/cn";
@@ -25,6 +25,8 @@ export function resolveArtworkCandidates(candidates: string[]): Promise<string |
   const resolution = (async () => {
     for (const candidate of candidates) {
       try {
+        const url = new URL(candidate, window.location.origin);
+        if (url.origin !== window.location.origin) return candidate;
         const response = await fetch(candidate, { headers: { Range: "bytes=0-0" }, cache: "force-cache" });
         if (!response.ok) continue;
         await response.body?.cancel().catch(() => undefined);
@@ -40,28 +42,54 @@ export function resolveArtworkCandidates(candidates: string[]): Promise<string |
 }
 
 export function MediaArtwork({ src, alt, className, media, episode }: MediaArtworkProps) {
-  const candidates = useMemo(
-    () => serverArtworkCandidates(src, media, episode),
-    [episode?.episodeNumber, episode?.seasonNumber, media?.id, media?.releaseYear, media?.title, media?.type, src],
-  );
+  const candidates = useMemo(() => {
+    const backdrop = Boolean(media && src && (src === media.bannerUrl || src === media.localBannerUrl || src === media.remoteBannerUrl));
+    const local = backdrop ? media?.localBannerUrl : media?.localThumbnailUrl;
+    const remote = backdrop ? media?.remoteBannerUrl : media?.remoteThumbnailUrl;
+    return Array.from(new Set([
+      ...(local ? serverArtworkCandidates(local, media, episode) : []),
+      ...serverArtworkCandidates(src, media, episode),
+      ...(remote ? serverArtworkCandidates(remote, media, episode) : []),
+    ].filter(Boolean)));
+  }, [episode?.episodeNumber, episode?.seasonNumber, media, src]);
   const candidateKey = candidates.join("\n");
   const [candidateIndex, setCandidateIndex] = useState(0);
   const [resolvedSrc, setResolvedSrc] = useState<string | null | undefined>(() => candidates.length > 1 ? undefined : candidates[0] ?? null);
   const [loaded, setLoaded] = useState(false);
+  const [probeVersion, setProbeVersion] = useState(0);
+  const [probeAttempt, setProbeAttempt] = useState(0);
+  const previousCandidateKey = useRef("");
   const { reduced } = useAppMotion();
 
   useEffect(() => {
     let active = true;
+    let retryTimer: number | undefined;
+    const candidateChanged = previousCandidateKey.current !== candidateKey;
+    previousCandidateKey.current = candidateKey;
     setCandidateIndex(0);
-    setLoaded(false);
+    if (candidateChanged) setLoaded(false);
     if (candidates.length <= 1) {
       setResolvedSrc(candidates[0] ?? null);
       return () => { active = false; };
     }
-    setResolvedSrc(undefined);
-    void resolveArtworkCandidates(candidates).then((candidate) => { if (active) setResolvedSrc(candidate); });
-    return () => { active = false; };
-  }, [candidateKey]);
+    if (candidateChanged) setResolvedSrc(undefined);
+    void resolveArtworkCandidates(candidates).then((candidate) => {
+      if (!active) return;
+      setResolvedSrc(candidate);
+      const localPending = candidates[0]?.startsWith("/media/") && candidate !== candidates[0] && media?.cacheState !== "error";
+      if (localPending && probeAttempt < 7 && !document.hidden) {
+        const delays = [1000, 2000, 4000, 8000, 15000, 30000, 30000];
+        retryTimer = window.setTimeout(() => {
+          artworkResolutionCache.delete(candidateKey);
+          setProbeAttempt((value) => value + 1);
+          setProbeVersion((value) => value + 1);
+        }, delays[probeAttempt]);
+      }
+    });
+    return () => { active = false; if (retryTimer !== undefined) window.clearTimeout(retryTimer); };
+  }, [candidateKey, media?.cacheState, probeAttempt, probeVersion]);
+
+  useEffect(() => { setProbeAttempt(0); }, [candidateKey]);
 
   const selectedSrc = candidates.length > 1 ? resolvedSrc : candidates[candidateIndex] ?? null;
 

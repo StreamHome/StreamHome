@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getMovies, search as searchServer } from "../../api/movies";
+import { getMovie, getMovies, search as searchServer } from "../../api/movies";
 import { getPlaybackSessions } from "../../api/playback";
 import { getRecommendations } from "../../api/recommendations";
 import { getWatchlist } from "../../api/watchlist";
@@ -34,6 +34,9 @@ export interface CatalogController {
   searching: boolean;
   error: string;
   setError: React.Dispatch<React.SetStateAction<string>>;
+  detailsLoading: boolean;
+  detailsError: string;
+  retryDetails: () => void;
 }
 
 function discoverId(result: DiscoverMovie): string {
@@ -50,6 +53,11 @@ function discoverAsMovie(result: DiscoverMovie): Movie {
     voteCount: result.voteCount, skipMarkers: {}, episodes: null,
     source: result.source ?? "tmdb_cache", availability: result.availability ?? "cached",
     recommendationReasons: [],
+    remoteThumbnailUrl: result.remoteThumbnailUrl ?? null,
+    remoteBannerUrl: result.remoteBannerUrl ?? null,
+    localThumbnailUrl: result.localThumbnailUrl ?? null,
+    localBannerUrl: result.localBannerUrl ?? null,
+    cacheState: result.cacheState ?? null,
   };
 }
 
@@ -74,6 +82,7 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   const [sessions, setSessions] = useState<PlaybackSession[]>([]);
   const [watchlist, setWatchlist] = useState<string[]>([]);
   const [results, setResults] = useState<DiscoverMovie[]>([]);
+  const [retainedMovies, setRetainedMovies] = useState<Record<string, Movie>>({});
   const [recommendation, setRecommendation] = useState<RecommendationFeed | null>(null);
   const [recommendationKey, setRecommendationKey] = useState("");
   const [catalogLoading, setCatalogLoading] = useState(true);
@@ -82,6 +91,9 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState("");
   const [recommendationError, setRecommendationError] = useState("");
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [detailsError, setDetailsError] = useState("");
+  const [detailsVersion, setDetailsVersion] = useState(0);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const activeFeedKey = useRef("");
   const pageAbort = useRef<AbortController | null>(null);
@@ -104,6 +116,11 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
       })
       .finally(() => { if (!abort.signal.aborted) setCatalogLoading(false); });
     return () => abort.abort();
+  }, [profile.id]);
+
+  useEffect(() => {
+    setRetainedMovies({});
+    setDetailsError("");
   }, [profile.id]);
 
   useEffect(() => {
@@ -130,16 +147,52 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   }, [category, profile.id, refreshVersion, requestedKey, scope]);
 
   useEffect(() => {
-    if (query.view !== "search" || !query.q) { setResults([]); setSearching(false); return; }
+    if (query.view !== "search" || !query.q) { setSearching(false); return; }
     const abort = new AbortController();
     setSearching(true);
     setError("");
     searchServer(query.q, abort.signal)
-      .then((items) => { if (!abort.signal.aborted) setResults(items); })
+      .then((items) => {
+        if (abort.signal.aborted) return;
+        setResults(items);
+        setRetainedMovies((current) => {
+          const next = { ...current };
+          items.forEach((item) => { next[discoverId(item)] = discoverAsMovie(item); });
+          return next;
+        });
+      })
       .catch((requestError: unknown) => { if (!abort.signal.aborted) setError(requestError instanceof Error ? requestError.message : "Search failed."); })
       .finally(() => { if (!abort.signal.aborted) setSearching(false); });
     return () => abort.abort();
   }, [query.q, query.view]);
+
+  useEffect(() => {
+    if (query.view !== "details" || !query.media) { setDetailsLoading(false); setDetailsError(""); return; }
+    const abort = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let attempt = 0;
+    setDetailsLoading(true);
+    setDetailsError("");
+    const refresh = async () => {
+      try {
+        const movie = await getMovie(query.media!, abort.signal);
+        if (abort.signal.aborted) return;
+        setRetainedMovies((current) => ({ ...current, [movie.id]: movie }));
+        setDetailsLoading(false);
+        if (movie.cacheState === "queued" || movie.cacheState === "caching") {
+          const delays = [1000, 2000, 4000, 8000, 15000, 30000];
+          timer = setTimeout(() => { attempt += 1; void refresh(); }, delays[Math.min(attempt, delays.length - 1)]);
+        }
+      } catch (requestError) {
+        if (!abort.signal.aborted) {
+          setDetailsLoading(false);
+          setDetailsError(requestError instanceof Error ? requestError.message : "Media details could not be loaded.");
+        }
+      }
+    };
+    void refresh();
+    return () => { abort.abort(); if (timer) clearTimeout(timer); };
+  }, [detailsVersion, query.media, query.view]);
 
   const movies = useMemo(() => {
     const ordered: Movie[] = [];
@@ -156,8 +209,16 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
     recommendation?.items.forEach((item) => add(item.media));
     recommendation?.watchAgain.forEach((item) => add(item.media));
     results.forEach((result) => { if (!byId.has(discoverId(result))) add(discoverAsMovie(result)); });
+    Object.values(retainedMovies).forEach((movie) => {
+      const existing = byId.get(movie.id);
+      if (!existing) { byId.set(movie.id, movie); ordered.push(movie); return; }
+      const merged = { ...existing, ...movie };
+      byId.set(movie.id, merged);
+      const index = ordered.findIndex((item) => item.id === movie.id);
+      if (index >= 0) ordered[index] = merged;
+    });
     return ordered;
-  }, [baseMovies, recommendation, results]);
+  }, [baseMovies, recommendation, results, retainedMovies]);
 
   const mediaById = useMemo(() => new Map(movies.map((movie) => [movie.id, movie])), [movies]);
   const resolveMovie = useCallback((id: string) => mediaById.get(id) ?? null, [mediaById]);
@@ -179,6 +240,7 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   const recommendationRefreshing = recommendationLoading && Boolean(recommendation) && recommendationKey === requestedKey;
 
   const retryRecommendations = useCallback(() => setRefreshVersion((value) => value + 1), []);
+  const retryDetails = useCallback(() => setDetailsVersion((value) => value + 1), []);
   const refreshRecommendations = retryRecommendations;
   const loadMoreRecommendations = useCallback(async () => {
     if (!scope || !recommendation || recommendationLoadingMore || recommendation.items.length >= recommendation.total) return;
@@ -204,5 +266,6 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
     categories, genres, results, recommendation, recommendationLoading, recommendationRefreshing,
     recommendationLoadingMore, recommendationError, recommendationHasMore, retryRecommendations,
     refreshRecommendations, loadMoreRecommendations, resolveMovie, loading, searching, error, setError,
+    detailsLoading, detailsError, retryDetails,
   };
 }

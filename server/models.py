@@ -53,6 +53,11 @@ class Movie(SQLModel, table=True):
     popularity: float = Field(default=0.0)
     cached_at: Optional[float] = Field(default=None)
     metadata_refreshed_at: Optional[float] = Field(default=None)
+    remote_thumbnail_url: Optional[str] = Field(default=None)
+    remote_banner_url: Optional[str] = Field(default=None)
+    local_thumbnail_url: Optional[str] = Field(default=None)
+    local_banner_url: Optional[str] = Field(default=None)
+    cache_state: Optional[str] = Field(default=None, index=True)
 
     @property
     def genres(self) -> List[str]:
@@ -412,6 +417,13 @@ class MovieResponse(APIModel):
     vote_count: Optional[int] = 100
     skip_markers: Dict[str, Any] = {}
     episodes: Optional[List[EpisodeResponse]] = None
+    remote_thumbnail_url: Optional[str] = None
+    remote_banner_url: Optional[str] = None
+    local_thumbnail_url: Optional[str] = None
+    local_banner_url: Optional[str] = None
+    cache_state: Optional[str] = None
+    source: str = "server"
+    availability: str = "available"
 
     @classmethod
     def from_db(cls, movie: Movie, episodes: Optional[List[Episode]] = None) -> "MovieResponse":
@@ -451,7 +463,14 @@ class MovieResponse(APIModel):
                     skip_markers=e.skip_markers
                 )
                 for e in episodes
-            ] if episodes else None
+            ] if episodes else None,
+            remote_thumbnail_url=movie.remote_thumbnail_url,
+            remote_banner_url=movie.remote_banner_url,
+            local_thumbnail_url=movie.local_thumbnail_url,
+            local_banner_url=movie.local_banner_url,
+            cache_state=movie.cache_state,
+            source=movie.catalog_source,
+            availability=movie.availability,
         )
 
 class DiscoverMovieResponse(APIModel):
@@ -472,6 +491,11 @@ class DiscoverMovieResponse(APIModel):
     type: Optional[str] = "movie"
     source: str = "tmdb_cache"
     availability: str = "cached"
+    remote_thumbnail_url: Optional[str] = None
+    remote_banner_url: Optional[str] = None
+    local_thumbnail_url: Optional[str] = None
+    local_banner_url: Optional[str] = None
+    cache_state: Optional[str] = None
 
 class RecommendationCategoryResponse(APIModel):
     value: str

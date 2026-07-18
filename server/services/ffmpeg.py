@@ -6,6 +6,7 @@ import shutil
 import asyncio
 import aiofiles
 import traceback
+import uuid
 import subprocess
 from typing import Dict, Any, Optional
 from services.state import update_task_metrics, remove_task_metrics, register_process, unregister_process, ACTIVE_PROCESSES
@@ -40,8 +41,14 @@ async def download_and_cache_metadata_image(image_url: str, dest_path: str) -> O
         async with httpx.AsyncClient() as client:
             response = await client.get(image_url, timeout=15.0)
             if response.status_code == 200:
-                async with aiofiles.open(dest_path, "wb") as f:
-                    await f.write(response.content)
+                temp_path = f"{dest_path}.{uuid.uuid4().hex}.part"
+                try:
+                    async with aiofiles.open(temp_path, "wb") as f:
+                        await f.write(response.content)
+                    os.replace(temp_path, dest_path)
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
                 server_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
                 try:
                     rel_path = os.path.relpath(dest_path, server_root)

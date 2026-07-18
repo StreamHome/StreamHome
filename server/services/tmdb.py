@@ -24,11 +24,113 @@ class TMDBClient:
         self._img_semaphore = asyncio.Semaphore(4)
         self._request_semaphore = asyncio.Semaphore(4)
         self._client: Optional[httpx.AsyncClient] = None
+        self._cache_queue: Optional[asyncio.Queue] = None
+        self._cache_pending: set[str] = set()
+        self._cache_workers: List[asyncio.Task] = []
 
     async def close(self):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
         self._client = None
+
+    async def start_cache_workers(self):
+        if self._cache_workers:
+            return
+        from sqlmodel import select
+        from sqlmodel.ext.asyncio.session import AsyncSession
+        from db import engine
+        from models import Movie
+
+        self._cache_queue = asyncio.Queue()
+        async with AsyncSession(engine) as db:
+            result = await db.exec(select(Movie).where(Movie.catalog_source == "tmdb_cache"))
+            interrupted = [movie for movie in result.all() if movie.cache_state in {"queued", "caching"}]
+            for movie in interrupted:
+                movie.cache_state = "queued"
+                db.add(movie)
+            if interrupted:
+                await db.commit()
+        self._cache_workers = [asyncio.create_task(self._cache_worker(index)) for index in range(2)]
+        for movie in interrupted:
+            await self.enqueue_cache(movie.id)
+
+    async def stop_cache_workers(self):
+        workers, self._cache_workers = self._cache_workers, []
+        for worker in workers:
+            worker.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        self._cache_pending.clear()
+        self._cache_queue = None
+
+    async def enqueue_cache(self, movie_id: str):
+        if not self._cache_queue or movie_id in self._cache_pending:
+            return
+        self._cache_pending.add(movie_id)
+        await self._cache_queue.put(movie_id)
+
+    async def _cache_worker(self, worker_index: int):
+        assert self._cache_queue is not None
+        while True:
+            movie_id = await self._cache_queue.get()
+            try:
+                for attempt in range(3):
+                    try:
+                        await self._cache_movie_record(movie_id)
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        if attempt == 2:
+                            await self._mark_cache_error(movie_id)
+                            logger.error(f"[TMDB Cache Worker {worker_index}] {movie_id} failed: {error}")
+                        else:
+                            await asyncio.sleep(0.75 * (2 ** attempt))
+            finally:
+                self._cache_pending.discard(movie_id)
+                self._cache_queue.task_done()
+
+    async def _mark_cache_error(self, movie_id: str):
+        from sqlmodel.ext.asyncio.session import AsyncSession
+        from db import engine
+        from models import Movie
+        async with AsyncSession(engine) as db:
+            movie = await db.get(Movie, movie_id)
+            if movie and movie.catalog_source == "tmdb_cache":
+                movie.cache_state = "error"
+                db.add(movie)
+                await db.commit()
+
+    async def _cache_movie_record(self, movie_id: str):
+        from sqlmodel.ext.asyncio.session import AsyncSession
+        from db import engine
+        from models import Movie
+        async with AsyncSession(engine) as db:
+            movie = await db.get(Movie, movie_id)
+            if not movie or movie.catalog_source != "tmdb_cache":
+                return
+            movie.cache_state = "caching"
+            db.add(movie)
+            await db.commit()
+            item = {
+                "tmdb_id": movie.tmdb_id,
+                "title": movie.title,
+                "description": movie.description,
+                "genres": movie.genres,
+                "duration": movie.duration,
+                "release_year": movie.release_year,
+                "rating": movie.rating,
+                "cast": movie.cast,
+                "director": movie.director,
+                "type": movie.type,
+                "vote_average": movie.vote_average,
+                "vote_count": movie.vote_count,
+                "popularity": movie.popularity,
+                "original_language": movie.original_language,
+            }
+            poster = movie.remote_thumbnail_url or (movie.thumbnail_url if movie.thumbnail_url.startswith("http") else "")
+            backdrop = movie.remote_banner_url or (movie.banner_url if movie.banner_url and movie.banner_url.startswith("http") else "")
+        await self.cache_media_locally(item, poster, backdrop)
 
     async def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         if not self.api_key and not self.read_access_token:
@@ -273,8 +375,11 @@ class TMDBClient:
                         return movie_id
                 clean_title = "".join(c for c in title if c.isalnum() or c in " .-_")
                 server_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-                folder_name = f"{clean_title}_TMDB_{tmdb_id}" if media_type == "series" else f"{clean_title}_{release_year}_TMDB_{tmdb_id}"
                 library_name = "Series" if media_type == "series" else "Movies"
+                library_abs = os.path.join(server_root, settings.MEDIA_DIR, library_name)
+                suffix = f"_TMDB_{tmdb_id}"
+                matching = next((name for name in os.listdir(library_abs) if name.endswith(suffix) and os.path.isdir(os.path.join(library_abs, name))), None) if os.path.isdir(library_abs) else None
+                folder_name = matching or (f"{clean_title}_TMDB_{tmdb_id}" if media_type == "series" else f"{clean_title}_{release_year}_TMDB_{tmdb_id}")
                 folder_rel = os.path.join(settings.MEDIA_DIR, library_name, folder_name)
                 folder_abs = os.path.abspath(os.path.join(server_root, folder_rel))
                 metadata_dir = os.path.join(folder_abs, ".metadata")
@@ -293,6 +398,14 @@ class TMDBClient:
                     safe_download(raw_poster_url, poster_abs),
                     safe_download(raw_backdrop_url, backdrop_abs),
                 )
+                missing_assets = [
+                    label for label, url, path in (
+                        ("poster", raw_poster_url, poster_abs),
+                        ("backdrop", raw_backdrop_url, backdrop_abs),
+                    ) if url and not os.path.exists(path)
+                ]
+                if missing_assets:
+                    raise RuntimeError(f"TMDB artwork download failed: {', '.join(missing_assets)}")
 
                 metadata_content = {
                     "tmdb_id": tmdb_id,
@@ -307,6 +420,9 @@ class TMDBClient:
                     "catalog_source": "tmdb_cache",
                     "availability": "cached",
                     "video_url": "",
+                    "quality": item_dict.get("quality", "Source"),
+                    "languages": item_dict.get("languages", []),
+                    "subtitles": item_dict.get("subtitles", []),
                 }
                 metadata_file = os.path.join(metadata_dir, "metadata.json")
                 with open(metadata_file, "w", encoding="utf-8") as file:
@@ -338,6 +454,11 @@ class TMDBClient:
                             availability="cached",
                             cached_at=now,
                             metadata_refreshed_at=now,
+                            remote_thumbnail_url=raw_poster_url or None,
+                            remote_banner_url=raw_backdrop_url or None,
+                            local_thumbnail_url=f"/media/{library_name}/{folder_name}/poster.jpg" if raw_poster_url else None,
+                            local_banner_url=f"/media/{library_name}/{folder_name}/backdrop.jpg" if raw_backdrop_url else None,
+                            cache_state="ready",
                         )
                         movie.genres = item_dict.get("genres", [])
                         movie.cast = item_dict.get("cast", [])
@@ -356,6 +477,11 @@ class TMDBClient:
                         movie.availability = "cached"
                         movie.cached_at = movie.cached_at or now
                         movie.metadata_refreshed_at = now
+                        movie.remote_thumbnail_url = raw_poster_url or movie.remote_thumbnail_url
+                        movie.remote_banner_url = raw_backdrop_url or movie.remote_banner_url
+                        movie.local_thumbnail_url = f"/media/{library_name}/{folder_name}/poster.jpg" if raw_poster_url else movie.local_thumbnail_url
+                        movie.local_banner_url = f"/media/{library_name}/{folder_name}/backdrop.jpg" if raw_backdrop_url else movie.local_banner_url
+                        movie.cache_state = "ready"
                     db.add(movie)
                     await db.commit()
                 logger.info(f"[TMDB Client] In-place recommendation cache complete for: {title}")
@@ -487,30 +613,39 @@ class TMDBClient:
         return raw_results[:cache_limit] if cache_limit is not None else raw_results
 
     async def search_media(self, query: str) -> List[Dict[str, Any]]:
-        """Search movies from TMDB matching a text query."""
-        data = await self._get("/search/movie", params={"query": query, "include_adult": "false"})
+        """Return movie/series search results immediately and queue their metadata/artwork cache."""
+        data = await self._get("/search/multi", params={"query": query, "include_adult": "false", "page": 1})
         
         raw_results = []
         if not data or not data.get("results"):
             return []
             
         for item in data.get("results", []):
+            media_type = item.get("media_type")
+            if media_type not in {"movie", "tv"} or item.get("adult") is True:
+                continue
+            is_tv = media_type == "tv"
             poster_path = item.get("poster_path")
             backdrop_path = item.get("backdrop_path")
             raw_poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else ""
             raw_backdrop_url = f"https://image.tmdb.org/t/p/original{backdrop_path}" if backdrop_path else ""
             
             tmdb_id = item.get("id")
-            title = item.get("title") or item.get("name")
-            release_date = item.get("release_date")
-            release_year = int(release_date.split("-")[0]) if release_date else 2026
+            title = item.get("name") if is_tv else item.get("title")
+            title = title or item.get("title") or item.get("name") or "Unknown Title"
+            release_date = item.get("first_air_date") if is_tv else item.get("release_date")
+            try:
+                release_year = int(release_date.split("-")[0]) if release_date else 0
+            except (TypeError, ValueError):
+                release_year = 0
             clean_title = "".join(c for c in title if c.isalnum() or c in " .-_")
             
-            folder_name = f"{clean_title}_{release_year}_TMDB_{tmdb_id}"
+            folder_name = f"{clean_title}_TMDB_{tmdb_id}" if is_tv else f"{clean_title}_{release_year}_TMDB_{tmdb_id}"
+            library_name = "Series" if is_tv else "Movies"
             
             # Use TMDB URLs directly until local downloads complete
-            local_thumbnail_url = raw_poster_url if raw_poster_url else f"/media/Movies/{folder_name}/poster.jpg"
-            local_banner_url = raw_backdrop_url if raw_backdrop_url else f"/media/Movies/{folder_name}/backdrop.jpg"
+            expected_thumbnail_url = f"/media/{library_name}/{folder_name}/poster.jpg" if raw_poster_url else None
+            expected_banner_url = f"/media/{library_name}/{folder_name}/backdrop.jpg" if raw_backdrop_url else None
             
             genre_ids = item.get("genre_ids", [])
             genres = [GENRES_MAP.get(gid) for gid in genre_ids if gid in GENRES_MAP]
@@ -518,32 +653,110 @@ class TMDBClient:
                 genres = ["Action", "Sci-Fi"]
 
             result_item = {
-                "id": f"discover_{tmdb_id}",
+                "id": f"tv_{tmdb_id}" if is_tv else f"m_{tmdb_id}",
                 "tmdb_id": tmdb_id,
                 "title": title,
                 "description": item.get("overview", ""),
-                "thumbnail_url": local_thumbnail_url,
-                "banner_url": local_banner_url,
+                "thumbnail_url": raw_poster_url,
+                "banner_url": raw_backdrop_url,
                 "genres": genres,
-                "duration": "2h 10m",
+                "duration": "45m" if is_tv else "2h 10m",
                 "release_year": release_year,
-                "rating": "PG-13",
+                "rating": "TV-14" if is_tv else "PG-13",
                 "vote_average": item.get("vote_average", 7.5),
                 "vote_count": item.get("vote_count", 1000),
                 "director": "Various",
                 "cast": [],
-                "type": "movie",
+                "type": "series" if is_tv else "movie",
                 "popularity": item.get("popularity", 0.0),
                 "original_language": item.get("original_language", "en"),
                 "source": "tmdb_cache",
                 "availability": "cached",
+                "remote_thumbnail_url": raw_poster_url or None,
+                "remote_banner_url": raw_backdrop_url or None,
+                "local_thumbnail_url": expected_thumbnail_url,
+                "local_banner_url": expected_banner_url,
+                "cache_state": "queued",
             }
             
             raw_results.append(result_item)
-            
-            if len(raw_results) <= 10:
-                await self.cache_media_locally(result_item, raw_poster_url, raw_backdrop_url)
-            
-        return raw_results
+
+        return await self._upsert_search_results(raw_results)
+
+    async def _upsert_search_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        import time
+        from sqlmodel.ext.asyncio.session import AsyncSession
+        from db import engine
+        from models import Movie
+
+        queued: List[str] = []
+        response: List[Dict[str, Any]] = []
+        async with AsyncSession(engine) as db:
+            for item in results:
+                movie = await db.get(Movie, item["id"])
+                if movie and movie.catalog_source == "server":
+                    if movie.tmdb_id is None:
+                        movie.tmdb_id = item["tmdb_id"]
+                        db.add(movie)
+                    response.append(self._discover_from_movie(movie))
+                    continue
+                is_new = movie is None
+                if movie is None:
+                    movie = Movie(
+                        id=item["id"], tmdb_id=item["tmdb_id"], title=item["title"],
+                        description=item["description"], thumbnail_url=item["thumbnail_url"],
+                        banner_url=item["banner_url"], video_url="", duration=item["duration"],
+                        release_year=item["release_year"], rating=item["rating"], director=item["director"],
+                        type=item["type"], original_language=item["original_language"],
+                        vote_average=float(item["vote_average"] or 0), vote_count=int(item["vote_count"] or 0),
+                        popularity=float(item["popularity"] or 0), catalog_source="tmdb_cache",
+                        availability="cached", cached_at=time.time(), cache_state="queued",
+                    )
+                movie.tmdb_id = item["tmdb_id"]
+                movie.title = item["title"]
+                movie.description = item["description"] or movie.description
+                movie.genres = item["genres"]
+                movie.release_year = item["release_year"]
+                movie.type = item["type"]
+                movie.original_language = item["original_language"]
+                movie.vote_average = float(item["vote_average"] or 0)
+                movie.vote_count = int(item["vote_count"] or 0)
+                movie.popularity = float(item["popularity"] or 0)
+                movie.remote_thumbnail_url = item["remote_thumbnail_url"] or movie.remote_thumbnail_url
+                movie.remote_banner_url = item["remote_banner_url"] or movie.remote_banner_url
+                movie.local_thumbnail_url = movie.local_thumbnail_url or item["local_thumbnail_url"]
+                movie.local_banner_url = movie.local_banner_url or item["local_banner_url"]
+                if not movie.thumbnail_url or movie.thumbnail_url.startswith("http"):
+                    movie.thumbnail_url = item["thumbnail_url"] or movie.thumbnail_url
+                if not movie.banner_url or movie.banner_url.startswith("http"):
+                    movie.banner_url = item["banner_url"] or movie.banner_url
+                movie.catalog_source = "tmdb_cache"
+                movie.availability = "cached"
+                if is_new or movie.cache_state in {None, "queued", "caching", "error"}:
+                    movie.cache_state = "queued"
+                    queued.append(movie.id)
+                db.add(movie)
+                response.append(self._discover_from_movie(movie))
+            await db.commit()
+        for movie_id in queued:
+            await self.enqueue_cache(movie_id)
+        return response
+
+    @staticmethod
+    def _discover_from_movie(movie) -> Dict[str, Any]:
+        return {
+            "id": movie.id, "tmdb_id": movie.tmdb_id, "title": movie.title,
+            "description": movie.description, "thumbnail_url": movie.thumbnail_url,
+            "banner_url": movie.banner_url, "genres": movie.genres, "duration": movie.duration,
+            "release_year": movie.release_year, "rating": movie.rating,
+            "vote_average": movie.vote_average or 0, "vote_count": movie.vote_count or 0,
+            "director": movie.director, "cast": movie.cast, "type": movie.type,
+            "source": movie.catalog_source, "availability": movie.availability,
+            "remote_thumbnail_url": movie.remote_thumbnail_url,
+            "remote_banner_url": movie.remote_banner_url,
+            "local_thumbnail_url": movie.local_thumbnail_url,
+            "local_banner_url": movie.local_banner_url,
+            "cache_state": movie.cache_state,
+        }
 
 tmdb_client = TMDBClient()
