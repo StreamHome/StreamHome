@@ -4,6 +4,7 @@ import { useLocation } from "react-router-dom";
 import { parseAppQuery } from "../navigation/queryState";
 import { MOTION_EASE, MOTION_TIMINGS, resetApplicationScroll, THEME_MOTION, useAppMotion } from "../motion/motionSystem";
 import { useThemeStore } from "../stores/themeStore";
+import { AccountSecurityPage } from "./AccountSecurityPage";
 import { AdminGate } from "./admin/AdminGate";
 import { DashboardRouter } from "./dashboard/DashboardRouter";
 import { PlayerPage } from "./player/PlayerPage";
@@ -15,8 +16,8 @@ export function AuthenticatedApp() {
   const { reduced } = useAppMotion();
   useEffect(() => {
     if (query.view === "watch" || query.view === "admin") resetApplicationScroll();
-  }, [query.view]);
-  const surface = query.view === "watch" ? "watch" : query.view === "admin" ? "admin" : "dashboard";
+  }, [query.section, query.view]);
+  const surface = query.view === "watch" ? "watch" : query.view === "admin" && query.section === "security" ? "security" : query.view === "admin" ? "admin" : "dashboard";
   const reducedVariants = { initial: { opacity: 0 }, animate: { opacity: 1, transition: { duration: MOTION_TIMINGS.reduced } }, exit: { opacity: 0, transition: { duration: MOTION_TIMINGS.reduced } } };
   return <AnimatePresence mode="wait" onExitComplete={resetApplicationScroll}>
     <motion.div
@@ -28,7 +29,7 @@ export function AuthenticatedApp() {
       animate="animate"
       exit="exit"
     >
-      {surface === "watch" ? <PlayerPage /> : surface === "admin" ? <AdminGate /> : <DashboardRouter />}
+      {surface === "watch" ? <PlayerPage /> : surface === "security" ? <AccountSecurityPage /> : surface === "admin" ? <AdminGate /> : <DashboardRouter />}
     </motion.div>
   </AnimatePresence>;
 }

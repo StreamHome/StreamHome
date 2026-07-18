@@ -7,15 +7,12 @@ import {
   verifyReauthentication, verifySetup2FA,
 } from "../api/auth";
 import { BrandLogo } from "../components/brand/BrandLogo";
+import { appUrl, parseAppQuery } from "../navigation/queryState";
 import { useAuthStore } from "../stores/authStore";
 import type { AuthSessionInfo, SecurityEventInfo, SecuritySummary, TwoFASetupResponse } from "../types/api";
 import "./security.css";
 
 type GateState = "checking" | "locked" | "ready";
-
-function safeReturn(value: unknown): string {
-  return typeof value === "string" && value.startsWith("/") && !value.startsWith("//") && !value.startsWith("/account/security") ? value : "/profiles";
-}
 
 function formatTime(value?: number | null): string {
   return value ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value * 1000)) : "Not available";
@@ -29,7 +26,8 @@ export function AccountSecurityPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const logout = useAuthStore((state) => state.logout);
-  const returnTo = safeReturn((location.state as { returnTo?: unknown } | null)?.returnTo);
+  const query = parseAppQuery(location.search);
+  const returnTo = query.profile ? appUrl(query.profile, "admin", { section: "account" }) : "/profiles";
   const [gate, setGate] = useState<GateState>("checking");
   const [password, setPassword] = useState("");
   const [challengeToken, setChallengeToken] = useState("");
@@ -88,7 +86,7 @@ export function AccountSecurityPage() {
 
   return <main className="security-page" data-theme="ember">
     <div className="security-ambient" aria-hidden="true" />
-    <header className="security-nav"><BrandLogo showWordmark={false} /><div><p>StreamHome account</p><h1>Account Security</h1></div><button onClick={() => navigate(returnTo)}>Back</button></header>
+    <header className="security-nav"><BrandLogo showWordmark={false} /><div><p>StreamHome account</p><h1>Account Security</h1></div><button type="button" onClick={() => navigate(returnTo)}>Back</button></header>
     {gate !== "ready" ? <section className="security-gate">
       <p className="security-eyebrow">Sensitive controls</p><h2>{gate === "checking" ? "Checking authorization" : "Confirm your identity"}</h2><p>Security controls require a recent password and local second factor.</p>
       {gate === "locked" && <form onSubmit={authenticate}>

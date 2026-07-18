@@ -1,12 +1,16 @@
 import React from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { Button } from "../../../components/ui/Button";
 import { GlassPane } from "../../../components/ui/GlassPane";
+import { appUrl } from "../../../navigation/queryState";
 
-export function AccountPanel() {
+interface AccountPanelProps {
+  profileId: string;
+}
+
+export function AccountPanel({ profileId }: AccountPanelProps) {
   const navigate = useNavigate();
-  const location = useLocation();
-  const openSecurity = () => navigate("/account/security", { state: { returnTo: `${location.pathname}${location.search}${location.hash}` } });
+  const openSecurity = () => navigate(appUrl(profileId, "admin", { section: "security" }));
 
   return (
     <section className="admin-panel admin-panel--account">

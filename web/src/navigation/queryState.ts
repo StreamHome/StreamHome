@@ -1,5 +1,5 @@
 export const APP_VIEWS = ["home", "movies", "series", "watchlist", "downloads", "search", "details", "watch", "admin"] as const;
-export const ADMIN_SECTIONS = ["account", "storage", "downloads"] as const;
+export const ADMIN_SECTIONS = ["account", "security", "storage", "downloads"] as const;
 export const CATALOG_VIEWS = ["home", "movies", "series"] as const;
 export const VIRTUAL_CATEGORIES = ["recommended", "all"] as const;
 

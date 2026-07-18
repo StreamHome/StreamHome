@@ -7,12 +7,11 @@ import { LoginPage } from './pages/LoginPage';
 import { ProfileSelectPage } from './pages/ProfileSelectPage';
 import { ProfileEditPage } from './pages/ProfileEditPage';
 import { AuthenticatedApp } from './pages/AuthenticatedApp';
-import { AccountSecurityPage } from './pages/AccountSecurityPage';
 
 import { AuthGuard } from './components/guards/AuthGuard';
 import { QueryProfileGuard } from './components/guards/QueryProfileGuard';
 import { ErrorBoundary } from './components/ui/ErrorBoundary';
-import { AppFallbackRedirect, LegacyAdminRedirect, LegacyWatchRedirect } from './navigation/LegacyRedirects';
+import { AppFallbackRedirect, LegacyAccountSecurityRedirect, LegacyAdminRedirect, LegacyWatchRedirect } from './navigation/LegacyRedirects';
 
 export default function App() {
   const hydrate = useAuthStore((state) => state.hydrate);
@@ -39,7 +38,7 @@ export default function App() {
           </AuthGuard>
         } />
 
-        <Route path="/account/security" element={<AuthGuard><AccountSecurityPage /></AuthGuard>} />
+        <Route path="/account/security" element={<AuthGuard><LegacyAccountSecurityRedirect /></AuthGuard>} />
         
         <Route path="/watch/:mediaId" element={
           <AuthGuard>

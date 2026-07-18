@@ -1,6 +1,6 @@
 import React from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as auth from "../api/auth";
 import { AccountSecurityPage } from "./AccountSecurityPage";
@@ -14,8 +14,13 @@ vi.mock("../api/auth", () => ({
 
 const summary = { email: "admin@example.test", twoFactorEnabled: true, recoveryCodesRemaining: 8, previousLogin: { at: 1_720_000_000, ipAddress: "10.0.0.2", deviceLabel: "Chrome on Windows" } };
 
+function LocationProbe() {
+  const location = useLocation();
+  return <output data-testid="location">{`${location.pathname}${location.search}`}</output>;
+}
+
 function renderPage() {
-  return render(<MemoryRouter initialEntries={[{ pathname: "/account/security", state: { returnTo: "/profiles" } }]}><Routes><Route path="/account/security" element={<AccountSecurityPage />} /><Route path="/profiles" element={<p>Profiles</p>} /></Routes></MemoryRouter>);
+  return render(<MemoryRouter initialEntries={["/?profile=1&view=admin&section=security"]}><Routes><Route path="/" element={<><AccountSecurityPage /><LocationProbe /></>} /></Routes></MemoryRouter>);
 }
 
 describe("AccountSecurityPage", () => {
@@ -48,6 +53,6 @@ describe("AccountSecurityPage", () => {
     expect(screen.getAllByText("Chrome on Windows").length).toBeGreaterThan(0);
     expect(screen.getByText("Login Success")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
-    await waitFor(() => expect(screen.getByText("Profiles")).toBeTruthy());
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/?profile=1&view=admin&section=account"));
   });
 });

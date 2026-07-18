@@ -45,7 +45,7 @@ export function AdminCenter() {
       <main className="admin-content">
         <AnimatePresence mode="wait" initial={false}>
           <motion.div className="admin-content__transition" key={section} variants={CONTENT_REVEAL} initial="hidden" animate="shown" exit="exit">
-            {section === "account" && <AccountPanel />}
+            {section === "account" && <AccountPanel profileId={profile.id} />}
             {section === "storage" && <StoragePanel />}
             {section === "downloads" && <DownloadsPanel />}
           </motion.div>
