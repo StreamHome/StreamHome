@@ -1,34 +1,30 @@
-import React, { useEffect, useState, useRef } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { useLocation, useNavigate } from 'react-router-dom';
-import { useAuthStore } from '../stores/authStore';
-import { login, verify2FA } from '../api/auth';
-import { EmberBackground } from '../themes/ember/EmberBackground';
-import { ScanLines } from '../themes/ember/ScanLines';
-import { MOTION_EASE, MOTION_TIMINGS, useAppMotion } from '../motion/motionSystem';
-import { BrandLogo } from '../components/brand/BrandLogo';
+import React, { useEffect, useRef, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
+import { useLocation, useNavigate } from "react-router-dom";
+import { login, verify2FA } from "../api/auth";
+import { BrandLogo } from "../components/brand/BrandLogo";
+import { MOTION_EASE, MOTION_TIMINGS, useAppMotion } from "../motion/motionSystem";
+import { useAuthStore } from "../stores/authStore";
+import "./login.css";
+
+const EMPTY_TOTP = () => Array<string>(6).fill("");
 
 export function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const setToken = useAuthStore((state) => state.setToken);
   const { reduced } = useAppMotion();
-
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [isLeaving, setIsLeaving] = useState(false);
   const navigationTimer = useRef<number | null>(null);
-
-  const [requires2FA, setRequires2FA] = useState(false);
-  const [totpCode, setTotpCode] = useState<string[]>(Array(6).fill(''));
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
 
-  // Spotlight refs
-  const [isHovered, setIsHovered] = useState(false);
-  const spotlightRef = useRef<HTMLDivElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [error, setError] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [isLeaving, setIsLeaving] = useState(false);
+  const [requires2FA, setRequires2FA] = useState(false);
+  const [totpCode, setTotpCode] = useState<string[]>(EMPTY_TOTP);
 
   useEffect(() => () => {
     if (navigationTimer.current !== null) window.clearTimeout(navigationTimer.current);
@@ -37,244 +33,163 @@ export function LoginPage() {
   const completeLogin = (accessToken: string, accountEmail: string) => {
     setToken(accessToken, accountEmail);
     setIsLeaving(true);
-    navigationTimer.current = window.setTimeout(() => navigate('/profiles', { state: location.state }), reduced ? 180 : 680);
+    navigationTimer.current = window.setTimeout(() => navigate("/profiles", { state: location.state }), reduced ? 180 : 520);
   };
 
-  const handleMouseMove = (e: React.MouseEvent<HTMLElement>) => {
-    if (spotlightRef.current && containerRef.current) {
-      const rect = containerRef.current.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-      spotlightRef.current.style.left = `${x}px`;
-      spotlightRef.current.style.top = `${y}px`;
-    }
-  };
-
-  const handleLoginSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError('');
+  const handleLoginSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setError("");
     setIsLoading(true);
-
     try {
-      const res = await login({ email, password });
-      
-      if ("requires2fa" in res) {
+      const response = await login({ email, password });
+      if ("requires2fa" in response) {
+        setEmail(response.email);
         setRequires2FA(true);
-      } else {
-        completeLogin(res.accessToken, res.email);
-      }
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Login failed');
+        window.setTimeout(() => inputRefs.current[0]?.focus(), reduced ? 0 : 260);
+      } else completeLogin(response.accessToken, response.email);
+    } catch (requestError: unknown) {
+      setError(requestError instanceof Error ? requestError.message : "Login failed");
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleTotpChange = async (index: number, value: string) => {
-    if (!/^\d*$/.test(value)) return;
-    
-    const newCode = [...totpCode];
-    newCode[index] = value;
-    setTotpCode(newCode);
-    setError('');
-
-    // Auto focus next
-    if (value !== '' && index < 5) {
-      inputRefs.current[index + 1]?.focus();
-    }
-
-    // Auto submit on 6th digit
-    if (value !== '' && index === 5 && newCode.every(c => c !== '')) {
-      setIsLoading(true);
-      try {
-        const code = newCode.join('');
-        const res = await verify2FA({ email, code });
-        completeLogin(res.accessToken, res.email);
-      } catch (err: unknown) {
-        setError(err instanceof Error ? err.message : 'Invalid 2FA code');
-        setTotpCode(Array(6).fill(''));
-        inputRefs.current[0]?.focus();
-      } finally {
-        setIsLoading(false);
-      }
+  const submitTotp = async (digits: string[]) => {
+    if (isLoading || digits.some((digit) => digit === "")) return;
+    setError("");
+    setIsLoading(true);
+    try {
+      const response = await verify2FA({ email, code: digits.join("") });
+      completeLogin(response.accessToken, response.email);
+    } catch (requestError: unknown) {
+      setError(requestError instanceof Error ? requestError.message : "Invalid TOTP code");
+      setTotpCode(EMPTY_TOTP());
+      inputRefs.current[0]?.focus();
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  const handleTotpKeyDown = (index: number, e: React.KeyboardEvent) => {
-    if (e.key === 'Backspace' && totpCode[index] === '' && index > 0) {
-      inputRefs.current[index - 1]?.focus();
-    }
+  const handleTotpChange = (index: number, value: string) => {
+    const digit = value.replace(/\D/g, "").slice(-1);
+    const next = [...totpCode];
+    next[index] = digit;
+    setTotpCode(next);
+    setError("");
+    if (digit && index < 5) inputRefs.current[index + 1]?.focus();
+    if (digit && index === 5) void submitTotp(next);
   };
 
-  return (
-    <motion.div className="login-page relative w-full min-h-screen flex flex-col items-center justify-center overflow-hidden bg-[var(--bg-body)]" data-theme="ember" animate={isLeaving ? { opacity: 0, scale: 1.025, filter: 'blur(10px)' } : { opacity: 1, scale: 1, filter: 'blur(0px)' }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : .68, ease: MOTION_EASE }}>
-      <EmberBackground suspendWhenHidden respectReducedMotion />
-      <ScanLines />
+  const handleTotpPaste = (event: React.ClipboardEvent<HTMLDivElement>) => {
+    const digits = event.clipboardData.getData("text").replace(/\D/g, "").slice(0, 6).split("");
+    if (!digits.length) return;
+    event.preventDefault();
+    const next = EMPTY_TOTP();
+    digits.forEach((digit, index) => { next[index] = digit; });
+    setTotpCode(next);
+    setError("");
+    if (digits.length === 6) void submitTotp(next);
+    else inputRefs.current[digits.length]?.focus();
+  };
 
-      <motion.div
-        initial={reduced ? { opacity: 0 } : { opacity: 0, y: 30 }}
-        animate={error && !reduced ? { x: [-10, 10, -10, 10, 0], opacity: 1, y: 0 } : { opacity: 1, y: 0, x: 0 }}
-        transition={error && !reduced ? { duration: 0.4 } : { duration: reduced ? MOTION_TIMINGS.reduced : 0.8, ease: [0.16, 1, 0.3, 1] }}
-        className="relative z-10 w-[calc(100%-32px)] max-w-[500px] mx-auto"
-      >
-        {/* HERO SECTION - Extracted outside the box! */}
-        <section className="mb-8 flex flex-col items-start gap-4">
-          <div 
-            className="inline-flex items-center gap-2 border border-[#ffb59c] rounded-sm text-[#ffb59c] font-[family-name:var(--font-mono)] text-[12px] uppercase tracking-[0.1em] font-medium"
-            style={{ padding: '4px 12px' }}
-          >
-            <span className="w-2 h-2 rounded-full bg-[#ffb59c] animate-pulse shrink-0"></span>
-            AUTH REQUIRED
-          </div>
-          <h1 className="font-[family-name:var(--font-headline)] text-white text-5xl md:text-6xl tracking-[0.02em] font-bold select-none min-h-[60px]">
-            <BrandLogo className="brand-logo--login" />
-          </h1>
-          <p className="font-[family-name:var(--font-mono)] text-[var(--text-muted)] text-[12px] tracking-[0.2em] uppercase mt-2 opacity-80">
-            Secure Terminal Access
-          </p>
-        </section>
+  const returnToCredentials = () => {
+    setRequires2FA(false);
+    setTotpCode(EMPTY_TOTP());
+    setError("");
+  };
 
-        {/* GLASS PANE - Now only wraps the form! */}
-        <div 
-          ref={containerRef}
-          onMouseMove={handleMouseMove}
-          onMouseEnter={() => setIsHovered(true)}
-          onMouseLeave={() => setIsHovered(false)}
-          className="relative w-full rounded-lg border border-[rgba(255,95,31,0.15)] bg-[rgba(30,16,11,0.4)] backdrop-blur-[12px] overflow-hidden shadow-2xl"
-          style={{ padding: '40px' }}
+  const stageTransition = { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.dialogEnter, ease: MOTION_EASE };
+
+  return <motion.main
+    className="login-page linear-ember-login"
+    data-theme="ember"
+    data-interaction="terminal"
+    aria-busy={isLoading}
+    animate={isLeaving ? { opacity: 0, scale: reduced ? 1 : 1.012, filter: reduced ? "none" : "blur(8px)" } : { opacity: 1, scale: 1, filter: "blur(0px)" }}
+    transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.viewEnter, ease: MOTION_EASE }}
+  >
+    <div className="login-ambient" aria-hidden="true"><i /><i /><span /></div>
+    <div className="login-server-status" aria-label="Private server authentication"><i />Private server</div>
+
+    <motion.section
+      className="login-auth-card"
+      initial={reduced ? { opacity: 0 } : { opacity: 0, y: 22, scale: .985, filter: "blur(10px)" }}
+      animate={{ opacity: 1, y: 0, scale: 1, filter: "blur(0px)" }}
+      transition={{ duration: reduced ? MOTION_TIMINGS.reduced : .64, ease: MOTION_EASE }}
+      aria-labelledby="login-title"
+    >
+      <header className="login-auth-header">
+        <BrandLogo className="brand-logo--login" />
+        <p>Private media server</p>
+        <h1 id="login-title">{requires2FA ? "Verify your identity" : "Sign in to StreamHome"}</h1>
+        <span>{requires2FA ? `Enter the authenticator code for ${email}.` : "Use your local server account to continue."}</span>
+      </header>
+
+      <AnimatePresence mode="wait" initial={false}>
+        {!requires2FA ? <motion.form
+          key="credentials"
+          className="login-auth-form"
+          initial={reduced ? { opacity: 0 } : { opacity: 0, x: -14 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={reduced ? { opacity: 0 } : { opacity: 0, x: -14 }}
+          transition={stageTransition}
+          onSubmit={handleLoginSubmit}
         >
-          {/* Spotlight Effect */}
-          <div 
-            ref={spotlightRef}
-            className="absolute pointer-events-none w-[400px] h-[400px] -translate-x-1/2 -translate-y-1/2 rounded-full z-0"
-            style={{ 
-              background: 'radial-gradient(circle, rgba(255, 95, 31, 0.4) 0%, transparent 70%)',
-              opacity: isHovered ? 1 : 0,
-              transition: 'opacity 300ms ease'
-            }}
-          />
-
-          <div className="relative z-10 w-full h-full">
-            <AnimatePresence mode="wait">
-              {!requires2FA ? (
-                <motion.form
-                  key="login-form"
-                  exit={reduced ? { opacity: 0 } : { opacity: 0, x: -30 }}
-                  transition={{ duration: reduced ? MOTION_TIMINGS.reduced : 0.3 }}
-                  onSubmit={handleLoginSubmit}
-                  className="flex flex-col gap-8"
-                >
-                  <div className="flex flex-col gap-3">
-                    <label className="font-[family-name:var(--font-mono)] text-[12px] tracking-[0.1em] uppercase text-[var(--text-muted)] opacity-90 pl-1 font-medium">
-                      Email Address
-                    </label>
-                    <div className="relative group">
-                      <input
-                        type="email"
-                        value={email}
-                        onChange={(e) => setEmail(e.target.value)}
-                        required
-                        disabled={isLoading}
-                        className="w-full bg-[rgba(0,0,0,0.2)] border border-[rgba(255,255,255,0.05)] text-white font-[family-name:var(--font-mono)] text-[16px] h-[60px] outline-none transition-all duration-300 focus:bg-[rgba(255,95,31,0.03)] focus:border-[#f97316] focus:shadow-[0_0_15px_rgba(255,95,31,0.15)] rounded-sm"
-                        style={{ paddingLeft: '24px', paddingRight: '24px' }}
-                        placeholder="operator@streamhome.local"
-                      />
-                    </div>
-                  </div>
-                  
-                  <div className="flex flex-col gap-3">
-                    <label className="font-[family-name:var(--font-mono)] text-[12px] tracking-[0.1em] uppercase text-[var(--text-muted)] opacity-90 pl-1 font-medium">
-                      Master Password
-                    </label>
-                    <div className="relative group">
-                      <input
-                        type="password"
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                        required
-                        disabled={isLoading}
-                        className="w-full bg-[rgba(0,0,0,0.2)] border border-[rgba(255,255,255,0.05)] text-white font-[family-name:var(--font-mono)] text-[16px] h-[60px] outline-none transition-all duration-300 focus:bg-[rgba(255,95,31,0.03)] focus:border-[#f97316] focus:shadow-[0_0_15px_rgba(255,95,31,0.15)] rounded-sm"
-                        style={{ paddingLeft: '24px', paddingRight: '24px' }}
-                        placeholder="••••••••••••"
-                      />
-                    </div>
-                  </div>
-                  
-                  {error && (
-                    <motion.div 
-                      initial={reduced ? { opacity: 0 } : { opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }}
-                      className="inline-flex items-center gap-2 border border-[#ffb4ab] rounded-sm text-[#ffb4ab] font-[family-name:var(--font-mono)] text-[12px] tracking-[0.1em]"
-                      style={{ padding: '4px 12px' }}
-                    >
-                      <span className="w-2 h-2 rounded-full bg-[#ffb4ab] animate-pulse shrink-0"></span>
-                      <span>{error}</span>
-                    </motion.div>
-                  )}
-
-                  <div className="pt-2">
-                    <button 
-                      type="submit" 
-                      disabled={isLoading} 
-                      className="login-primary-action w-full relative z-10 h-[64px] mt-4 bg-[rgba(30,16,11,0.4)] backdrop-blur-[12px] border border-[#f97316] shadow-[0_0_10px_rgba(255,95,31,0.5)] text-white font-[family-name:var(--font-mono)] text-[16px] tracking-[0.1em] font-medium rounded disabled:opacity-50 disabled:cursor-not-allowed uppercase"
-                    >
-                      <span className="relative z-10 font-bold">
-                        {isLoading ? 'Authenticating...' : 'Initialize Connection'}
-                      </span>
-                    </button>
-                  </div>
-                </motion.form>
-              ) : (
-                <motion.div
-                  key="totp-form"
-                  initial={reduced ? { opacity: 0 } : { opacity: 0, x: 30 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ duration: reduced ? MOTION_TIMINGS.reduced : 0.4, ease: [0.16, 1, 0.3, 1] }}
-                  className="flex flex-col items-center justify-center gap-10 py-6"
-                >
-                  <div className="text-center space-y-2">
-                    <p className="font-[family-name:var(--font-mono)] text-[var(--text-accent)] text-sm uppercase tracking-widest animate-pulse">
-                      Identity Verification
-                    </p>
-                    <p className="font-[family-name:var(--font-mono)] text-[var(--text-secondary)] text-[12px] uppercase tracking-[0.1em] opacity-60">
-                      Enter 6-digit TOTP token
-                    </p>
-                  </div>
-                  
-                  <div className="flex gap-4">
-                    {totpCode.map((digit, i) => (
-                      <input
-                        key={i}
-                        ref={(el) => { inputRefs.current[i] = el; }}
-                        type="text"
-                        maxLength={1}
-                        value={digit}
-                        onChange={(e) => handleTotpChange(i, e.target.value)}
-                        onKeyDown={(e) => handleTotpKeyDown(i, e)}
-                        disabled={isLoading}
-                        className="w-12 h-16 md:w-14 md:h-16 text-center text-2xl font-[family-name:var(--font-mono)] bg-[rgba(0,0,0,0.4)] border border-[var(--border-surface)] text-white outline-none transition-all duration-[var(--duration-fast)] focus:border-[#f97316] focus:shadow-[0_0_15px_rgba(255,95,31,0.3)] focus:bg-[rgba(255,95,31,0.05)] rounded-sm"
-                      />
-                    ))}
-                  </div>
-
-                  {error && (
-                    <div className="text-[#ffb4ab] text-[13px] font-[family-name:var(--font-mono)] border border-[#ffb4ab] bg-[rgba(255,0,0,0.05)] px-4 py-3 rounded-sm w-full text-center">
-                      {error}
-                    </div>
-                  )}
-
-                  <button 
-                    onClick={() => { setRequires2FA(false); setTotpCode(Array(6).fill('')); setError(''); }}
-                    disabled={isLoading}
-                    className="login-secondary-action mt-4 font-[family-name:var(--font-mono)] text-[11px] tracking-[0.1em] uppercase text-[var(--text-muted)] border-b border-transparent pb-1"
-                  >
-                    Abort Connection
-                  </button>
-                </motion.div>
-              )}
-            </AnimatePresence>
+          <div className="login-field">
+            <label htmlFor="login-email">Email address</label>
+            <input id="login-email" type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="operator@streamhome.local" required disabled={isLoading} />
           </div>
-        </div>
-      </motion.div>
-    </motion.div>
-  );
+
+          <div className="login-field">
+            <label htmlFor="login-password">Password</label>
+            <div className="login-password-field">
+              <input id="login-password" type={showPassword ? "text" : "password"} autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Enter your password" required disabled={isLoading} />
+              <button type="button" className="login-password-toggle" aria-label={showPassword ? "Hide password" : "Show password"} aria-pressed={showPassword} onClick={() => setShowPassword((visible) => !visible)} disabled={isLoading}>{showPassword ? "Hide" : "Show"}</button>
+            </div>
+          </div>
+
+          <AnimatePresence initial={false}>{error && <motion.div className="login-error" role="alert" aria-live="polite" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={{ duration: MOTION_TIMINGS.notice }}><i aria-hidden="true" />{error}</motion.div>}</AnimatePresence>
+
+          <button type="submit" className="login-primary-action" disabled={isLoading}>
+            {isLoading && <i className="login-button-spinner" aria-hidden="true" />}
+            <span>{isLoading ? "Signing in…" : "Continue"}</span>
+            {!isLoading && <b aria-hidden="true">→</b>}
+          </button>
+        </motion.form> : <motion.div
+          key="totp"
+          className="login-totp-stage"
+          initial={reduced ? { opacity: 0 } : { opacity: 0, x: 14 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={reduced ? { opacity: 0 } : { opacity: 0, x: 14 }}
+          transition={stageTransition}
+        >
+          <div className="login-totp-inputs" onPaste={handleTotpPaste} aria-label="Six-digit TOTP code">
+            {totpCode.map((digit, index) => <input
+              key={index}
+              ref={(element) => { inputRefs.current[index] = element; }}
+              type="text"
+              inputMode="numeric"
+              autoComplete={index === 0 ? "one-time-code" : "off"}
+              maxLength={1}
+              aria-label={`TOTP digit ${index + 1}`}
+              data-filled={Boolean(digit)}
+              value={digit}
+              onChange={(event) => handleTotpChange(index, event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Backspace" && !totpCode[index] && index > 0) inputRefs.current[index - 1]?.focus();
+              }}
+              disabled={isLoading}
+            />)}
+          </div>
+
+          <div className="login-totp-progress" aria-live="polite"><span style={{ width: `${(totpCode.filter(Boolean).length / 6) * 100}%` }} /><small>{totpCode.filter(Boolean).length}/6 digits</small></div>
+          <AnimatePresence initial={false}>{error && <motion.div className="login-error" role="alert" aria-live="polite" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={{ duration: MOTION_TIMINGS.notice }}><i aria-hidden="true" />{error}</motion.div>}</AnimatePresence>
+          {isLoading && <div className="login-verifying"><i className="login-button-spinner" aria-hidden="true" />Verifying code…</div>}
+          <button type="button" className="login-secondary-action" aria-label="Back to sign in" onClick={returnToCredentials} disabled={isLoading}>← Back to sign in</button>
+        </motion.div>}
+      </AnimatePresence>
+
+      <footer className="login-auth-footer"><span><i />Local authentication</span><span>TOTP protected when enabled</span></footer>
+    </motion.section>
+  </motion.main>;
 }
