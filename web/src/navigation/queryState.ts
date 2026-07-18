@@ -1,8 +1,12 @@
 export const APP_VIEWS = ["home", "movies", "series", "watchlist", "downloads", "search", "details", "watch", "admin"] as const;
 export const ADMIN_SECTIONS = ["account", "storage", "downloads"] as const;
+export const CATALOG_VIEWS = ["home", "movies", "series"] as const;
+export const VIRTUAL_CATEGORIES = ["recommended", "all"] as const;
 
 export type AppView = (typeof APP_VIEWS)[number];
 export type AdminSection = (typeof ADMIN_SECTIONS)[number];
+export type CatalogView = (typeof CATALOG_VIEWS)[number];
+export type VirtualCategory = (typeof VIRTUAL_CATEGORIES)[number];
 
 export interface AppQueryState {
   profile: string;
@@ -16,6 +20,15 @@ export interface AppQueryState {
 
 const viewSet = new Set<string>(APP_VIEWS);
 const adminSectionSet = new Set<string>(ADMIN_SECTIONS);
+const catalogViewSet = new Set<string>(CATALOG_VIEWS);
+
+export function isCatalogView(view: AppView): view is CatalogView {
+  return catalogViewSet.has(view);
+}
+
+export function preservedCatalogCategory(state: AppQueryState, nextView: AppView): Pick<AppQueryState, "genre"> {
+  return isCatalogView(state.view) && isCatalogView(nextView) && state.genre ? { genre: state.genre } : {};
+}
 
 function clean(value: string | null): string | undefined {
   const result = value?.trim();
@@ -34,7 +47,7 @@ export function parseAppQuery(input: string | URLSearchParams): AppQueryState {
   const state: AppQueryState = { profile, view };
   if ((view === "details" || view === "watch") && media) state.media = media;
 
-  if (view === "movies" || view === "series") {
+  if (isCatalogView(view)) {
     const genre = clean(params.get("genre"));
     if (genre) state.genre = genre;
   }
@@ -62,7 +75,7 @@ export function appSearch(state: AppQueryState): string {
   if (state.profile) params.set("profile", state.profile);
   params.set("view", state.view);
   if ((state.view === "details" || state.view === "watch") && state.media) params.set("media", state.media);
-  if ((state.view === "movies" || state.view === "series") && state.genre) params.set("genre", state.genre);
+  if (isCatalogView(state.view) && state.genre) params.set("genre", state.genre);
   if (state.view === "details" && state.season) params.set("season", String(state.season));
   if (state.view === "search" && state.q) params.set("q", state.q);
   if (state.view === "admin") params.set("section", state.section ?? "account");

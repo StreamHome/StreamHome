@@ -44,8 +44,9 @@ function normalizeMovie(raw: Partial<Movie>): Movie {
   };
 }
 
-export async function getMovies(): Promise<Movie[]> {
-  const response = await apiGet<Partial<Movie>[]>("/api/movies");
+export async function getMovies(profileId?: string): Promise<Movie[]> {
+  const path = profileId ? `/api/movies?profile_id=${encodeURIComponent(profileId)}` : "/api/movies";
+  const response = await apiGet<Partial<Movie>[]>(path);
   return response.map(normalizeMovie);
 }
 

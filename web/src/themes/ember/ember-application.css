@@ -32,6 +32,18 @@
 .ember-action:disabled { opacity: .42; }
 
 .ember-collections { display: flex; flex-direction: column; gap: 58px; margin-top: 12px; }
+.ember-category-discovery > .category-filter { width: min(1540px,100%); margin: 28px auto 42px; padding: 0 max(24px,4vw); font-family: var(--font-mono); }
+.ember-category-discovery > .category-filter::before { left: max(24px,4vw); background: linear-gradient(90deg,#1e100b,transparent); }
+.ember-category-discovery > .category-filter::after { right: max(24px,4vw); background: linear-gradient(90deg,transparent,#1e100b); }
+.ember-category-discovery .category-filter button { min-height: 38px; border-color: rgba(255,95,31,.2); border-radius: 0; background: rgba(30,16,11,.58); color: #d0a093; padding-inline: 15px; font: 600 8px/1 var(--font-mono); letter-spacing: .11em; text-transform: uppercase; }
+.ember-category-discovery .category-filter button[data-kind="virtual"] { color: #f9dcd4; }
+.ember-category-discovery .category-filter button[data-active="true"] { border-color: #ff7e4e; background: rgba(255,95,31,.17); color: #fff; box-shadow: inset 3px 0 #ff5f1f,0 0 16px rgba(255,95,31,.22); }
+.ember-category-grid { width: min(1540px,100%); margin: 0 auto; padding: 0 max(24px,4vw) 110px; }
+.ember-category-grid > header { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 24px; border-bottom: 1px solid rgba(255,95,31,.16); padding-bottom: 20px; }
+.ember-category-grid > header p { margin-bottom: 8px; color: #ffb59c; font: 500 9px/1 var(--font-mono); letter-spacing: .16em; }
+.ember-category-grid > header h2 { font: 700 clamp(34px,5vw,56px)/1 var(--font-headline); }
+.ember-category-grid > header > span { color: #c18d7e; font: 500 8px/1 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; }
+.ember-category-discovery__empty { padding-bottom: 90px; }
 .ember-rail { width: min(1540px,100%); margin: 0 auto; padding: 0 max(24px,4vw); }
 .ember-rail > header { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
 .ember-rail header p,.ember-page-heading p { margin-bottom: 8px; color: #ffb59c; font: 500 9px/1 var(--font-mono); letter-spacing: .16em; }
@@ -134,6 +146,11 @@
   .ember-hero__copy { width: calc(100% - 28px); margin: 0 14px; padding: 26px 22px; }
   .ember-hero__copy h1 { font-size: clamp(44px,14vw,64px); }
   .ember-collections { margin-top: 0; gap: 45px; }
+  .ember-category-discovery > .category-filter { margin: 20px auto 32px; padding-inline: 18px; }
+  .ember-category-discovery > .category-filter::before { left: 18px; }
+  .ember-category-discovery > .category-filter::after { right: 18px; }
+  .ember-category-grid { padding: 0 18px 90px; }
+  .ember-category-grid > header { align-items: flex-start; flex-direction: column; }
   .ember-rail,.ember-browse,.ember-downloads { padding-inline: 18px; }
   .ember-watchlist { padding-top: 45px; }
   .ember-watchlist > .ember-page-heading { margin-inline: 18px; }

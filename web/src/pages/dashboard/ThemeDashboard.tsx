@@ -3,7 +3,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { useLocation, useNavigate } from "react-router-dom";
 import { MediaArtwork } from "../../components/media/MediaArtwork";
 import { ProgressBar } from "../../components/ui/ProgressBar";
-import { appUrl, type AppQueryState, type AppView } from "../../navigation/queryState";
+import { appUrl, isCatalogView, preservedCatalogCategory, type AppQueryState, type AppView, type CatalogView } from "../../navigation/queryState";
 import { profileEditUrl } from "../../navigation/profileEditing";
 import { useAuthStore } from "../../stores/authStore";
 import { useProfileStore } from "../../stores/profileStore";
@@ -12,7 +12,8 @@ import type { ThemeApplicationProps } from "../../themes/application/contracts";
 import type { DiscoverMovie, Movie, PlaybackSession } from "../../types/api";
 import { completionFraction, isPlayableMovie } from "../../utils/media";
 import { DetailsRouter } from "../details/DetailsRouter";
-import { groupMoviesByGenre } from "./catalogPresentation";
+import { buildCatalogPresentation } from "./catalogPresentation";
+import { CategoryFilterRail } from "./CategoryFilterRail";
 import { ServerDownloads } from "./ServerDownloads";
 import type { CatalogController } from "./useCatalogController";
 import { ROTATION_INTERVAL, useRotatingFeature } from "./useRotatingFeature";
@@ -57,11 +58,26 @@ function RotatingBillboard({ items, variant, context, onDetails, onPlay }: { ite
   return <div className="billboard-rotator" style={{ "--billboard-rotation-duration": `${ROTATION_INTERVAL}ms` } as React.CSSProperties} data-motion-source={source} data-motion-direction={direction} data-rotation-paused={paused} onFocusCapture={(event) => setPaused((event.target as HTMLElement).matches(":focus-visible"))} onBlurCapture={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setPaused(false); }}><AnimatePresence mode="wait" initial={false} custom={direction}><motion.div key={featured.id} custom={direction} variants={reduceMotion ? REDUCED_BILLBOARD_MOTION : THEME_MOTION[activeTheme].billboard} initial="initial" animate="animate" exit="exit"><FeaturedStage movie={featured} variant={variant} context={context} onDetails={() => onDetails(featured)} onPlay={() => onPlay(featured)} /></motion.div></AnimatePresence>{rotationItems.length > 1 && <div className="billboard-pagination" aria-label="Featured media">{rotationItems.map((movie, itemIndex) => <button key={movie.id} data-active={itemIndex === index} aria-current={itemIndex === index ? "true" : undefined} onClick={() => setIndex(itemIndex)} aria-label={`Show ${movie.title}`} />)}</div>}</div>;
 }
 
-function BrowseView({ query, controller, theme, variant, onOpen, onPlay }: { query: AppQueryState; controller: CatalogController; theme: string; variant: string; onOpen: (movie: Movie) => void; onPlay: (movie: Movie) => void }) {
-  const source = query.view === "series" ? controller.seriesItems : controller.movieItems;
-  const collections = useMemo(() => groupMoviesByGenre(source, query.genre), [query.genre, source]);
-  if (!source.length) return <section className="browse-view"><EmptyState title={`No ${query.view} found`} body="The server has not catalogued titles for this view." /></section>;
-  return <div className="browse-discovery"><RotatingBillboard items={source} variant={variant} context={query.view as "movies" | "series"} onDetails={onOpen} onPlay={onPlay} /><div className="browse-genre-collections">{collections.map((collection) => <MediaCollection key={collection.genre} label={`${query.view.toUpperCase()} / GENRE`} title={collection.genre} items={collection.items} sessions={controller.sessions} theme={theme} onOpen={onOpen} />)}{!collections.length && <EmptyState title="No matching category" body="No server titles match this genre." />}</div></div>;
+function CatalogGrid({ title, label, items, sessions, theme, onOpen }: { title: string; label: string; items: Movie[]; sessions: PlaybackSession[]; theme: string; onOpen: (movie: Movie) => void }) {
+  return <motion.section layout variants={CONTENT_REVEAL} className="category-catalog-grid"><header><div><p>{label}</p><h2>{title}</h2></div><span>{items.length} title{items.length === 1 ? "" : "s"}</span></header><motion.div layout variants={CONTENT_STAGGER} initial="hidden" animate="shown" className="browse-grid">{items.map((movie) => <MediaCard key={movie.id} movie={movie} session={sessions.find((session) => session.movieId === movie.id)} theme={theme} onOpen={onOpen} />)}</motion.div></motion.section>;
+}
+
+function CatalogDiscoveryView({ query, controller, theme, variant, onOpen, onPlay, onCategory }: { query: AppQueryState; controller: CatalogController; theme: string; variant: string; onOpen: (movie: Movie) => void; onPlay: (movie: Movie) => void; onCategory: (category: string) => void }) {
+  const view = query.view as CatalogView;
+  const model = useMemo(() => buildCatalogPresentation({ movies: controller.movies, continueWatching: controller.continueWatching, view, category: query.genre }), [controller.continueWatching, controller.movies, query.genre, view]);
+  const context = view as "home" | "movies" | "series";
+  const collectionsClass = view === "home" ? "home-collections" : "browse-genre-collections";
+  const emptyTitle = !model.sourceItems.length ? view === "home" ? "The catalog is empty" : `No ${view} found` : `No ${model.activeLabel} titles`;
+  const emptyBody = !model.sourceItems.length ? "No media records were returned by the server." : `No server titles match the ${model.activeLabel} category.`;
+  const hasResults = model.gridItems.length > 0 || model.sections.length > 0;
+
+  return <div className={`${view === "home" ? "home-view" : "browse-discovery"} category-discovery`} data-category-mode={model.mode}>
+    {model.billboardItems.length > 0 && <RotatingBillboard items={model.billboardItems} variant={variant} context={context} onDetails={onOpen} onPlay={onPlay} />}
+    <CategoryFilterRail options={model.categories} active={model.activeCategory} variant="shared" onSelect={onCategory} />
+    <AnimatedState stateKey={`${model.mode}:${model.activeCategory}`}>
+      {model.gridItems.length > 0 ? <CatalogGrid title={model.mode === "all" ? "All Releases" : model.activeLabel} label={model.mode === "all" ? "COMPLETE SERVER CATALOG" : "CATEGORY CATALOG"} items={model.gridItems} sessions={controller.sessions} theme={theme} onOpen={onOpen} /> : hasResults ? <motion.div variants={CONTENT_STAGGER} initial="hidden" animate="shown" className={collectionsClass}>{model.sections.map((collection) => <MediaCollection key={collection.id} label={collection.label} title={collection.title} items={collection.items} sessions={controller.sessions} theme={theme} onOpen={onOpen} />)}</motion.div> : <div className="category-discovery__empty"><EmptyState title={emptyTitle} body={emptyBody} /></div>}
+    </AnimatedState>
+  </div>;
 }
 
 function WatchlistView({ controller, theme, onOpen }: { controller: CatalogController; theme: string; onOpen: (movie: Movie) => void }) {
@@ -99,12 +115,13 @@ export function LegacyThemeAdapter({ query, controller, presentation: definition
   const Background = definition.Background;
   const Navigation = definition.Navigation;
   const appNavigate = (view: AppView, options: Parameters<typeof appUrl>[2] = {}) => navigate(appUrl(profile.id, view, options), { state: { fromApp: true, previous: location.search } });
+  const navigateView = (view: AppView) => appNavigate(view, preservedCatalogCategory(query, view));
   const openDetails = (movie: Movie) => appNavigate("details", { media: movie.id });
   const openWatch = (movie: Movie) => appNavigate("watch", { media: movie.id });
   const closeDetails = () => (location.state as { fromApp?: boolean } | null)?.fromApp ? navigate(-1) : appNavigate("home");
   const selected = query.media ? controller.movies.find((movie) => movie.id === query.media) ?? null : null;
-  const navigationProps = { profile, activeView: query.view, query: query.q, isAdmin: profile.id === "1", onView: (view: AppView) => appNavigate(view), onSearch: (q: string) => appNavigate("search", q ? { q } : {}), onEditProfile: () => navigate(profileEditUrl(profile.id), { state: { returnTo: `${location.pathname}${location.search}${location.hash}` } }), onProfiles: () => { clearProfile(); navigate("/profiles"); }, onAdmin: () => appNavigate("admin", { section: "account" }), onLogout: logout };
-  const content = controller.loading ? <LoadingState /> : query.view === "home" ? <div className="home-view">{controller.movies.length ? <RotatingBillboard items={controller.movies} variant={definition.heroVariant} context="home" onDetails={openDetails} onPlay={openWatch} /> : <EmptyState title="The catalog is empty" body="No media records were returned by the server." />}<motion.div variants={CONTENT_STAGGER} initial="hidden" animate="shown" className="home-collections"><MediaCollection label="RESUME INDEX" title="Continue watching" items={controller.continueWatching} sessions={controller.sessions} theme={definition.cardVariant} onOpen={openDetails} /><MediaCollection label="FEATURE ARCHIVE" title="Movies" items={controller.movieItems} sessions={controller.sessions} theme={definition.cardVariant} onOpen={openDetails} /><MediaCollection label="EPISODIC ARCHIVE" title="Series" items={controller.seriesItems} sessions={controller.sessions} theme={definition.cardVariant} onOpen={openDetails} /></motion.div></div> : query.view === "movies" || query.view === "series" ? <BrowseView query={query} controller={controller} theme={definition.cardVariant} variant={definition.heroVariant} onOpen={openDetails} onPlay={openWatch} /> : query.view === "watchlist" ? <WatchlistView controller={controller} theme={definition.cardVariant} onOpen={openDetails} /> : query.view === "search" ? <SearchView query={query} controller={controller} theme={definition.cardVariant} onOpen={openDetails} onSearch={(q) => appNavigate("search", q ? { q } : {})} /> : query.view === "downloads" ? <ServerDownloads /> : query.view === "details" ? selected ? <DetailsRouter movie={selected} onClose={closeDetails} isWatchlisted={controller.watchlist.includes(selected.id)} onWatchlistChange={controller.setWatchlist} /> : <EmptyState title="Title not found" body="That media identifier is not present in the server catalog." /> : null;
+  const navigationProps = { profile, activeView: query.view, query: query.q, isAdmin: profile.id === "1", onView: navigateView, onSearch: (q: string) => appNavigate("search", q ? { q } : {}), onEditProfile: () => navigate(profileEditUrl(profile.id), { state: { returnTo: `${location.pathname}${location.search}${location.hash}` } }), onProfiles: () => { clearProfile(); navigate("/profiles"); }, onAdmin: () => appNavigate("admin", { section: "account" }), onLogout: logout };
+  const content = controller.loading ? <LoadingState /> : isCatalogView(query.view) ? <CatalogDiscoveryView query={query} controller={controller} theme={definition.cardVariant} variant={definition.heroVariant} onOpen={openDetails} onPlay={openWatch} onCategory={(category) => appNavigate(query.view, { genre: category })} /> : query.view === "watchlist" ? <WatchlistView controller={controller} theme={definition.cardVariant} onOpen={openDetails} /> : query.view === "search" ? <SearchView query={query} controller={controller} theme={definition.cardVariant} onOpen={openDetails} onSearch={(q) => appNavigate("search", q ? { q } : {})} /> : query.view === "downloads" ? <ServerDownloads /> : query.view === "details" ? selected ? <DetailsRouter movie={selected} onClose={closeDetails} isWatchlisted={controller.watchlist.includes(selected.id)} onWatchlistChange={controller.setWatchlist} /> : <EmptyState title="Title not found" body="That media identifier is not present in the server catalog." /> : null;
 
   return <div className={`theme-app ${definition.shellClass}`} data-theme={theme} data-interaction={definition.interaction.id} data-view={query.view}><Background /><Navigation {...navigationProps} /><main className="theme-main">{controller.error && <div className="catalog-error" role="alert">{controller.error}</div>}<AnimatedView theme={theme} viewKey={appViewMotionKey(query)}>{content}</AnimatedView></main></div>;
 }

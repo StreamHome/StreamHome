@@ -38,7 +38,7 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
     let active = true;
     setLoading(true);
     setError("");
-    Promise.all([getMovies(), getPlaybackSessions(profile.id), getWatchlist(profile.id)])
+    Promise.all([getMovies(profile.id), getPlaybackSessions(profile.id), getWatchlist(profile.id)])
       .then(([catalog, playback, saved]) => {
         if (!active) return;
         setMovies(catalog); setSessions(playback); setWatchlist(saved);
@@ -68,7 +68,8 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   }, [movieItems, movies, query.view, seriesItems]);
   const browseItems = useMemo(() => {
     const source = query.view === "series" ? seriesItems : movieItems;
-    return query.genre ? source.filter((movie) => movie.genres.some((genre) => genre.toLocaleLowerCase() === query.genre?.toLocaleLowerCase())) : source;
+    const selected = query.genre?.toLocaleLowerCase();
+    return selected && selected !== "recommended" && selected !== "all" ? source.filter((movie) => movie.genres.some((genre) => genre.toLocaleLowerCase() === selected)) : source;
   }, [movieItems, query.genre, query.view, seriesItems]);
   const continueWatching = useMemo(() => sessions.map((session) => movies.find((movie) => movie.id === session.movieId)).filter((movie): movie is Movie => Boolean(movie)), [movies, sessions]);
   const watchlistItems = useMemo(() => watchlist.map((id) => movies.find((movie) => movie.id === id)).filter((movie): movie is Movie => Boolean(movie)), [movies, watchlist]);

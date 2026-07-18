@@ -3,7 +3,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { useLocation, useNavigate } from "react-router-dom";
 import { MediaArtwork } from "../../../components/media/MediaArtwork";
 import { ProgressBar } from "../../../components/ui/ProgressBar";
-import { appUrl, type AppView } from "../../../navigation/queryState";
+import { appUrl, isCatalogView, preservedCatalogCategory, type AppQueryState, type AppView, type CatalogView } from "../../../navigation/queryState";
 import { profileEditUrl } from "../../../navigation/profileEditing";
 import { useAuthStore } from "../../../stores/authStore";
 import { useProfileStore } from "../../../stores/profileStore";
@@ -11,7 +11,8 @@ import type { ThemeApplicationProps } from "../../../themes/application/contract
 import type { DiscoverMovie, Movie, PlaybackSession } from "../../../types/api";
 import { completionFraction, isPlayableMovie } from "../../../utils/media";
 import { DetailsRouter } from "../../details/DetailsRouter";
-import { groupMoviesByGenre } from "../catalogPresentation";
+import { buildCatalogPresentation } from "../catalogPresentation";
+import { CategoryFilterRail } from "../CategoryFilterRail";
 import { ROTATION_INTERVAL, useRotatingFeature } from "../useRotatingFeature";
 import { EmberDownloads } from "./EmberDownloads";
 import { AnimatedState, AnimatedView, CONTENT_REVEAL, CONTENT_STAGGER, REDUCED_BILLBOARD_MOTION, THEME_MOTION, useAppMotion } from "../../../motion/motionSystem";
@@ -32,6 +33,10 @@ function EmberRail({ label, title, items, sessions, onOpen }: { label: string; t
   return <motion.section variants={CONTENT_REVEAL} className="ember-rail" data-rail-direction={direction}><header><div><p>{label}</p><h2>{title}</h2></div><span>{String(items.length).padStart(2, "0")} catalog records</span></header><div className="ember-rail__frame"><button className="ember-rail__blade ember-rail__blade--previous" disabled={!canScrollPrevious} onClick={() => scroll(-1)} aria-label={`Scroll ${title} backward`}>‹</button><div ref={rail} className="ember-rail__track">{items.map((movie) => <EmberMediaCard key={movie.id} movie={movie} session={sessions.find((session) => session.movieId === movie.id)} onOpen={onOpen} />)}</div><button className="ember-rail__blade ember-rail__blade--next" disabled={!canScrollNext} onClick={() => scroll(1)} aria-label={`Scroll ${title} forward`}>›</button></div></motion.section>;
 }
 
+function EmberGrid({ title, label, items, sessions, onOpen }: { title: string; label: string; items: Movie[]; sessions: PlaybackSession[]; onOpen: (movie: Movie) => void }) {
+  return <motion.section layout variants={CONTENT_REVEAL} className="ember-category-grid"><header><div><p>{label}</p><h2>{title}</h2></div><span>{String(items.length).padStart(2, "0")} catalog records</span></header><motion.div layout variants={CONTENT_STAGGER} initial="hidden" animate="shown" className="ember-grid">{items.map((movie) => <EmberMediaCard key={movie.id} movie={movie} session={sessions.find((session) => session.movieId === movie.id)} onOpen={onOpen} />)}</motion.div></motion.section>;
+}
+
 function EmberActions({ movie, onDetails, onPlay }: { movie: Movie; onDetails: () => void; onPlay: () => void }) {
   const playable = isPlayableMovie(movie);
   if (movie.type === "series") return <div className="ember-actions"><button className="ember-action ember-action--primary" onClick={onDetails}>Select episode</button><button className="ember-action" onClick={onDetails}>View details</button></div>;
@@ -47,16 +52,22 @@ function EmberBillboard({ items, context, onDetails, onPlay }: { items: Movie[];
   return <section className="ember-billboard" style={{ "--billboard-rotation-duration": `${ROTATION_INTERVAL}ms` } as React.CSSProperties} data-motion-source={source} data-motion-direction={direction} data-rotation-paused={paused} onFocusCapture={(event) => setPaused((event.target as HTMLElement).matches(":focus-visible"))} onBlurCapture={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setPaused(false); }}><AnimatePresence mode="wait" initial={false} custom={direction}><motion.div className="ember-hero" key={featured.id} custom={direction} variants={reduceMotion ? REDUCED_BILLBOARD_MOTION : THEME_MOTION.ember.billboard} initial="initial" animate="animate" exit="exit"><div className="ember-hero__art"><MediaArtwork src={featured.bannerUrl || featured.thumbnailUrl} alt={featured.title} media={featured} className="h-full w-full object-cover" /></div><div className="ember-hero__shade" /><div className="ember-hero__copy"><span className="ember-status"><i />CATALOG ONLINE</span><small>{label}</small><h1>{featured.title}</h1><p>{featured.description || "No server description is available for this title."}</p><div className="ember-meta"><span>{featured.releaseYear || "YEAR N/A"}</span>{featured.quality && <span>{featured.quality}</span>}{featured.genres[0] && <span>{featured.genres[0]}</span>}</div><EmberActions movie={featured} onDetails={() => onDetails(featured)} onPlay={() => onPlay(featured)} /></div></motion.div></AnimatePresence>{rotationItems.length > 1 && <div className="ember-billboard__pagination" aria-label="Featured media">{rotationItems.map((movie, itemIndex) => <button key={movie.id} data-active={itemIndex === index} aria-current={itemIndex === index ? "true" : undefined} onClick={() => setIndex(itemIndex)} aria-label={`Show ${movie.title}`} />)}</div>}</section>;
 }
 
-function EmberHome({ controller, onDetails, onPlay }: Pick<ThemeApplicationProps, "controller"> & { onDetails: (movie: Movie) => void; onPlay: (movie: Movie) => void }) {
-  if (!controller.movies.length) return <EmberStatePanel code="NO CATALOG SIGNAL" title="The catalog is empty" body="No media records were returned by the server." />;
-  return <div className="ember-home"><EmberBillboard items={controller.movies} context="home" onDetails={onDetails} onPlay={onPlay} /><motion.div variants={CONTENT_STAGGER} initial="hidden" animate="shown" className="ember-collections"><EmberRail label="RESUME INDEX" title="Continue watching" items={controller.continueWatching} sessions={controller.sessions} onOpen={onDetails} /><EmberRail label="FEATURE ARCHIVE" title="Movies" items={controller.movieItems} sessions={controller.sessions} onOpen={onDetails} /><EmberRail label="EPISODIC ARCHIVE" title="Series" items={controller.seriesItems} sessions={controller.sessions} onOpen={onDetails} /></motion.div></div>;
-}
+function EmberCatalogView({ query, controller, onOpen, onPlay, onCategory }: { query: AppQueryState; controller: ThemeApplicationProps["controller"]; onOpen: (movie: Movie) => void; onPlay: (movie: Movie) => void; onCategory: (category: string) => void }) {
+  const view = query.view as CatalogView;
+  const model = useMemo(() => buildCatalogPresentation({ movies: controller.movies, continueWatching: controller.continueWatching, view, category: query.genre }), [controller.continueWatching, controller.movies, query.genre, view]);
+  const context = view as "home" | "movies" | "series";
+  const collectionsClass = view === "home" ? "ember-collections" : "ember-genre-collections";
+  const emptyTitle = !model.sourceItems.length ? view === "home" ? "The catalog is empty" : `No ${view} found` : `No ${model.activeLabel} titles`;
+  const emptyBody = !model.sourceItems.length ? "No media records were returned by the server." : `No server titles match the ${model.activeLabel} category.`;
+  const hasResults = model.gridItems.length > 0 || model.sections.length > 0;
 
-function EmberBrowse({ query, controller, onOpen, onPlay }: Pick<ThemeApplicationProps, "query" | "controller"> & { onOpen: (movie: Movie) => void; onPlay: (movie: Movie) => void }) {
-  const source = query.view === "series" ? controller.seriesItems : controller.movieItems;
-  const collections = useMemo(() => groupMoviesByGenre(source, query.genre), [query.genre, source]);
-  if (!source.length) return <section className="ember-browse"><EmberStatePanel code="NO CATALOG SIGNAL" title={`No ${query.view} found`} body="The server has not catalogued titles for this view." /></section>;
-  return <div className="ember-discovery"><EmberBillboard items={source} context={query.view as "movies" | "series"} onDetails={onOpen} onPlay={onPlay} /><div className="ember-genre-collections">{collections.map((collection) => <EmberRail key={collection.genre} label={`${query.view.toUpperCase()} / GENRE`} title={collection.genre} items={collection.items} sessions={controller.sessions} onOpen={onOpen} />)}{!collections.length && <EmberStatePanel code="NO GENRE SIGNAL" title="No matching category" body="No server titles match this genre." />}</div></div>;
+  return <div className={`${view === "home" ? "ember-home" : "ember-discovery"} ember-category-discovery`} data-category-mode={model.mode}>
+    {model.billboardItems.length > 0 && <EmberBillboard items={model.billboardItems} context={context} onDetails={onOpen} onPlay={onPlay} />}
+    <CategoryFilterRail options={model.categories} active={model.activeCategory} variant="ember" onSelect={onCategory} />
+    <AnimatedState stateKey={`${model.mode}:${model.activeCategory}`}>
+      {model.gridItems.length > 0 ? <EmberGrid title={model.mode === "all" ? "All Releases" : model.activeLabel} label={model.mode === "all" ? "COMPLETE SERVER CATALOG" : "CATEGORY CATALOG"} items={model.gridItems} sessions={controller.sessions} onOpen={onOpen} /> : hasResults ? <motion.div variants={CONTENT_STAGGER} initial="hidden" animate="shown" className={collectionsClass}>{model.sections.map((collection) => <EmberRail key={collection.id} label={collection.label} title={collection.title} items={collection.items} sessions={controller.sessions} onOpen={onOpen} />)}</motion.div> : <div className="ember-category-discovery__empty"><EmberStatePanel code="NO CATEGORY SIGNAL" title={emptyTitle} body={emptyBody} /></div>}
+    </AnimatedState>
+  </div>;
 }
 
 function EmberWatchlist({ controller, onOpen }: Pick<ThemeApplicationProps, "controller"> & { onOpen: (movie: Movie) => void }) {
@@ -88,12 +99,13 @@ export function EmberDashboard({ query, controller, presentation }: ThemeApplica
   const Background = presentation.Background;
   const Navigation = presentation.Navigation;
   const appNavigate = (view: AppView, options: Parameters<typeof appUrl>[2] = {}) => navigate(appUrl(profile.id, view, options), { state: { fromApp: true, previous: location.search } });
+  const navigateView = (view: AppView) => appNavigate(view, preservedCatalogCategory(query, view));
   const openDetails = (movie: Movie) => appNavigate("details", { media: movie.id });
   const openWatch = (movie: Movie) => appNavigate("watch", { media: movie.id });
   const closeDetails = () => (location.state as { fromApp?: boolean } | null)?.fromApp ? navigate(-1) : appNavigate("home");
   const selected = query.media ? controller.movies.find((movie) => movie.id === query.media) ?? null : null;
-  const navigationProps = { profile, activeView: query.view, query: query.q, isAdmin: profile.id === "1", onView: (view: AppView) => appNavigate(view), onSearch: (value: string) => appNavigate("search", value ? { q: value } : {}), onEditProfile: () => navigate(profileEditUrl(profile.id), { state: { returnTo: `${location.pathname}${location.search}${location.hash}` } }), onProfiles: () => { clearProfile(); navigate("/profiles"); }, onAdmin: () => appNavigate("admin", { section: "account" }), onLogout: logout };
-  const content = controller.loading ? <EmberStatePanel code="CATALOG HANDSHAKE" title="Loading server catalog" body="Synchronizing this profile with the server index." loading /> : query.view === "home" ? <EmberHome controller={controller} onDetails={openDetails} onPlay={openWatch} /> : query.view === "movies" || query.view === "series" ? <EmberBrowse query={query} controller={controller} onOpen={openDetails} onPlay={openWatch} /> : query.view === "watchlist" ? <EmberWatchlist controller={controller} onOpen={openDetails} /> : query.view === "search" ? <EmberSearch query={query} controller={controller} onOpen={openDetails} onSearch={(value) => appNavigate("search", value ? { q: value } : {})} /> : query.view === "downloads" ? <EmberDownloads /> : query.view === "details" ? selected ? <DetailsRouter movie={selected} onClose={closeDetails} isWatchlisted={controller.watchlist.includes(selected.id)} onWatchlistChange={controller.setWatchlist} /> : <EmberStatePanel code="INVALID MEDIA ID" title="Title not found" body="That media identifier is not present in the server catalog." /> : null;
+  const navigationProps = { profile, activeView: query.view, query: query.q, isAdmin: profile.id === "1", onView: navigateView, onSearch: (value: string) => appNavigate("search", value ? { q: value } : {}), onEditProfile: () => navigate(profileEditUrl(profile.id), { state: { returnTo: `${location.pathname}${location.search}${location.hash}` } }), onProfiles: () => { clearProfile(); navigate("/profiles"); }, onAdmin: () => appNavigate("admin", { section: "account" }), onLogout: logout };
+  const content = controller.loading ? <EmberStatePanel code="CATALOG HANDSHAKE" title="Loading server catalog" body="Synchronizing this profile with the server index." loading /> : isCatalogView(query.view) ? <EmberCatalogView query={query} controller={controller} onOpen={openDetails} onPlay={openWatch} onCategory={(category) => appNavigate(query.view, { genre: category })} /> : query.view === "watchlist" ? <EmberWatchlist controller={controller} onOpen={openDetails} /> : query.view === "search" ? <EmberSearch query={query} controller={controller} onOpen={openDetails} onSearch={(value) => appNavigate("search", value ? { q: value } : {})} /> : query.view === "downloads" ? <EmberDownloads /> : query.view === "details" ? selected ? <DetailsRouter movie={selected} onClose={closeDetails} isWatchlisted={controller.watchlist.includes(selected.id)} onWatchlistChange={controller.setWatchlist} /> : <EmberStatePanel code="INVALID MEDIA ID" title="Title not found" body="That media identifier is not present in the server catalog." /> : null;
 
   return <div className="theme-app theme-app--ember ember-app" data-theme="ember" data-interaction={presentation.interaction.id} data-view={query.view}><Background /><Navigation {...navigationProps} /><main className="theme-main ember-main">{controller.error && <div className="ember-error" role="alert">{controller.error}</div>}<AnimatedView theme="ember" viewKey={appViewMotionKey(query)}>{content}</AnimatedView></main></div>;
 }
