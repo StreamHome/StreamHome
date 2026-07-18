@@ -8,7 +8,7 @@ from typing import List, Optional
 from datetime import datetime
 
 import time
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -19,9 +19,17 @@ from db import init_db, engine
 from models import (
     Movie, Episode, PlaybackSession, WatchlistItem, MovieResponse, 
     PlaybackSessionResponse, DiscoverMovieResponse, EpisodeResponse, 
-    Profile, ProfileResponse, APIModel, DownloadTask, TelemetryRequest
+    Profile, ProfileResponse, APIModel, DownloadTask, TelemetryRequest,
+    RecommendationFeedResponse
 )
-from services.recommendation import process_telemetry_event, calculate_movie_recommendation_score, get_profile_preferences
+from services.recommendation import (
+    process_telemetry_event,
+    record_authoritative_signal,
+    record_playback_progress,
+    rank_movies_for_profile,
+    build_recommendation_payload,
+    recommendation_worker,
+)
 from config import settings
 from services.logger import logger
 from services.queue import queue_manager
@@ -176,6 +184,9 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(auto_update_worker())
 
+    recommendation_stop = asyncio.Event()
+    recommendation_task = asyncio.create_task(recommendation_worker(recommendation_stop))
+
     logger.info("[Server] Lifespan: Startup completed (with fallback checks).")
     
     yield  # Sunucu bu noktada çalışmaya devam eder
@@ -190,6 +201,16 @@ async def lifespan(app: FastAPI):
         hevc_compressor.stop()
     except Exception as h_stop_err:
         logger.error(f"[Lifespan Shutdown] Error stopping hevc compressor: {h_stop_err}")
+    recommendation_stop.set()
+    try:
+        await asyncio.wait_for(recommendation_task, timeout=5)
+    except asyncio.TimeoutError:
+        recommendation_task.cancel()
+    try:
+        from services.tmdb import tmdb_client
+        await tmdb_client.close()
+    except Exception as tmdb_close_err:
+        logger.error(f"[Lifespan Shutdown] Error closing TMDB client: {tmdb_close_err}")
     logger.info("[Server] Lifespan: Queue Manager stopped securely.")
 
 class ActivityTrackingMiddleware(BaseHTTPMiddleware):
@@ -360,24 +381,16 @@ async def get_movies(profile_id: Optional[str] = Query(None), user = Depends(get
         result = await db.exec(stmt)
         movies = result.all()
         
-        results = []
-        for m in movies:
-            episodes = None
-            if m.type == "series":
-                ep_stmt = select(Episode).where(Episode.movie_id == m.id).order_by(Episode.season_number, Episode.episode_number)
-                ep_result = await db.exec(ep_stmt)
-                episodes = ep_result.all()
-            
-            results.append((m, MovieResponse.from_db(m, episodes)))
+        ep_result = await db.exec(select(Episode).order_by(Episode.season_number, Episode.episode_number))
+        episodes_by_movie = {}
+        for episode in ep_result.all():
+            episodes_by_movie.setdefault(episode.movie_id, []).append(episode)
+        results = [(m, MovieResponse.from_db(m, episodes_by_movie.get(m.id))) for m in movies]
         
         if profile_id:
-            # Calculate score for each movie and sort descending
-            scored_results = []
-            for m, res in results:
-                score = await calculate_movie_recommendation_score(m, profile_id)
-                scored_results.append((score, res))
-            scored_results.sort(key=lambda x: x[0], reverse=True)
-            return [res for score, res in scored_results]
+            ranked = await rank_movies_for_profile(db, profile_id, movies, episodes_by_movie)
+            responses = {movie.id: response for movie, response in results}
+            return [responses[movie.id] for _, movie, _, _, _ in ranked]
             
         return [res for m, res in results]
 
@@ -427,8 +440,8 @@ async def get_playback_tracking(profile_id: str, user = Depends(get_current_user
 @app.post("/api/telemetry")
 async def handle_telemetry(request: TelemetryRequest, profile_id: str = Query(...), user = Depends(get_current_user)):
     """Receives generic tracking telemetry from the web UI."""
-    await process_telemetry_event(profile_id, request)
-    return {"status": "ok"}
+    accepted = await process_telemetry_event(profile_id, request)
+    return {"status": "accepted" if accepted else "ignored", "accepted": accepted}
 
 @app.post("/api/track")
 async def update_playback_tracking(request: Request, user = Depends(get_current_user)):
@@ -448,7 +461,7 @@ async def update_playback_tracking(request: Request, user = Depends(get_current_
     episode_id = body.get("episodeId")
     is_finished = body.get("is_finished", False)
     
-    if not movie_id or not profile_id:
+    if not movie_id or not profile_id or timestamp is None:
         raise HTTPException(
             status_code=400,
             detail="Missing required parameters: movieId, profileId"
@@ -461,6 +474,8 @@ async def update_playback_tracking(request: Request, user = Depends(get_current_
         ]
         if episode_id:
             filters.append(PlaybackSession.episode_id == episode_id)
+        else:
+            filters.append(PlaybackSession.episode_id.is_(None))
         stmt = select(PlaybackSession).where(*filters)
         result = await db.exec(stmt)
         session = result.first()
@@ -488,15 +503,16 @@ async def update_playback_tracking(request: Request, user = Depends(get_current_
             
         await db.commit()
         
-    if is_finished:
-        req = TelemetryRequest(
-            event_type="playback_end",
-            movie_id=movie_id,
-            metadata_json={"completion_rate": completion_rate}
-        )
-        await process_telemetry_event(profile_id, req)
-        
-    return {"status": "ok"}
+    viewing_attempt_id = await record_playback_progress(
+        profile_id=profile_id,
+        movie_id=movie_id,
+        episode_id=episode_id,
+        position=int(timestamp),
+        duration_watched=int(duration_watched or 0),
+        completion_rate=float(completion_rate or 0.0),
+        is_finished=bool(is_finished),
+    )
+    return {"status": "ok", "viewingSessionId": viewing_attempt_id}
 
 # ----------------- Watchlist Management API -----------------
 
@@ -505,6 +521,24 @@ from pydantic import BaseModel
 class WatchlistToggleRequest(BaseModel):
     profile_id: str
     movie_id: str
+
+@app.get("/api/recommendations/{profile_id}", response_model=RecommendationFeedResponse)
+async def get_recommendations(
+    profile_id: str,
+    scope: str = Query("home"),
+    category: str = Query("recommended"),
+    limit: int = Query(48, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    user = Depends(get_current_user),
+):
+    """Return a personalized mixed cached/server catalog for the future web client."""
+    if scope not in {"home", "movies", "series"}:
+        raise HTTPException(status_code=400, detail="Invalid recommendation scope")
+    async with AsyncSession(engine) as db:
+        if not await db.get(Profile, profile_id):
+            raise HTTPException(status_code=404, detail="Profile not found")
+        payload = await build_recommendation_payload(db, profile_id, scope, category, limit, offset)
+        return RecommendationFeedResponse(**payload)
 
 @app.get("/api/watchlist/{profile_id}", response_model=List[str])
 async def get_watchlist(profile_id: str, user = Depends(get_current_user)):
@@ -547,7 +581,14 @@ async def toggle_watchlist(req: WatchlistToggleRequest, user = Depends(get_curre
         result_all = await db.exec(stmt_all)
         items_all = result_all.all()
         items_all.sort(key=lambda x: x.created_at, reverse=True)
-        return {"status": status, "watchlist": [x.movie_id for x in items_all]}
+        response = {"status": status, "watchlist": [x.movie_id for x in items_all]}
+
+    await record_authoritative_signal(
+        req.profile_id,
+        req.movie_id,
+        "watchlist_add" if status == "added" else "watchlist_remove",
+    )
+    return response
 
 
 @app.get("/api/discover", response_model=List[DiscoverMovieResponse])

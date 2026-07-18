@@ -67,6 +67,7 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
     
     # Query TMDB asynchronously to resolve the title
     media_title = f"TMDB {payload.tmdb_id}"
+    meta: Dict[str, Any] = {}
     try:
         if payload.media_type == "movie":
             meta = await tmdb_client.fetch_movie_metadata(payload.tmdb_id)
@@ -113,6 +114,7 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
             if not movie:
                 movie = Movie(
                     id=movie_id,
+                    tmdb_id=payload.tmdb_id,
                     title=meta.get("title", media_title),
                     description=meta.get("description", ""),
                     thumbnail_url=meta.get("thumbnailUrl", ""),
@@ -126,7 +128,9 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
                     type="movie",
                     quality=payload.quality or "Source",
                     vote_average=meta.get("vote_average", 7.5),
-                    vote_count=meta.get("vote_count", 100)
+                    vote_count=meta.get("vote_count", 100),
+                    catalog_source="server",
+                    availability="processing"
                 )
                 movie.genres = meta.get("genres", [])
                 movie.cast = meta.get("cast", [])
@@ -134,6 +138,9 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
                 db.add(movie)
             else:
                 movie.video_url = payload.video_url
+                movie.tmdb_id = payload.tmdb_id
+                movie.catalog_source = "server"
+                movie.availability = "processing"
                 if payload.skip_markers:
                     movie.skip_markers = payload.skip_markers
                 db.add(movie)
@@ -143,6 +150,7 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
             if not show:
                 show = Movie(
                     id=show_id,
+                    tmdb_id=payload.tmdb_id,
                     title=meta.get("title", media_title),
                     description=meta.get("description", ""),
                     thumbnail_url=meta.get("thumbnailUrl", ""),
@@ -155,7 +163,9 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
                     original_language=payload.language or meta.get("originalLanguage", "en"),
                     type="series",
                     vote_average=meta.get("vote_average", 7.5),
-                    vote_count=meta.get("vote_count", 100)
+                    vote_count=meta.get("vote_count", 100),
+                    catalog_source="server",
+                    availability="processing"
                 )
                 show.genres = meta.get("genres", [])
                 show.cast = meta.get("cast", [])
@@ -187,6 +197,10 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
                     if payload.skip_markers:
                         ep_entry.skip_markers = payload.skip_markers
                     db.add(ep_entry)
+                show.tmdb_id = payload.tmdb_id
+                show.catalog_source = "server"
+                show.availability = "processing"
+                db.add(show)
 
         await db.commit()
         await db.refresh(new_task)

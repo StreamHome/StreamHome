@@ -22,6 +22,13 @@ class TMDBClient:
         self.base_url = "https://api.themoviedb.org/3"
         self._cache_semaphore = asyncio.Semaphore(2)
         self._img_semaphore = asyncio.Semaphore(4)
+        self._request_semaphore = asyncio.Semaphore(4)
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def close(self):
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
 
     async def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         if not self.api_key and not self.read_access_token:
@@ -39,14 +46,31 @@ class TMDBClient:
             # v3 API key authentication (legacy fallback)
             params["api_key"] = self.api_key
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(f"{self.base_url}{path}", params=params, headers=headers, timeout=10.0)
-                if response.status_code == 200:
-                    return response.json()
-                logger.error(f"[TMDB Client] API Error {response.status_code}: {response.text}")
-            except Exception as e:
-                logger.error(f"[TMDB Client] Exception querying TMDB: {e}")
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
+        async with self._request_semaphore:
+            for attempt in range(3):
+                try:
+                    response = await self._client.get(f"{self.base_url}{path}", params=params, headers=headers)
+                    if response.status_code == 200:
+                        return response.json()
+                    if response.status_code == 429:
+                        retry_after = min(30.0, max(1.0, float(response.headers.get("Retry-After", "2"))))
+                        await asyncio.sleep(retry_after)
+                        continue
+                    if response.status_code >= 500 and attempt < 2:
+                        await asyncio.sleep(0.5 * (2 ** attempt))
+                        continue
+                    logger.error(f"[TMDB Client] API Error {response.status_code}: {response.text[:500]}")
+                    return None
+                except (httpx.TimeoutException, httpx.NetworkError) as e:
+                    if attempt < 2:
+                        await asyncio.sleep(0.5 * (2 ** attempt))
+                        continue
+                    logger.error(f"[TMDB Client] Exception querying TMDB: {e}")
+                except Exception as e:
+                    logger.error(f"[TMDB Client] Exception querying TMDB: {e}")
+                    return None
         return None
 
     async def fetch_movie_metadata(self, tmdb_id: int) -> Dict[str, Any]:
@@ -226,216 +250,127 @@ class TMDBClient:
         }
 
     async def cache_media_locally(self, item_dict: Dict[str, Any], raw_poster_url: str, raw_backdrop_url: str):
-        """
-        Asynchronously creates directories, downloads posters/backdrops, and writes a local registry file
-        so that discovered/recommended media has its assets saved locally in a portable, self-contained way.
-        Uses a semaphore to ensure caching tasks are processed sequentially and don't flood the network.
-        """
+        """Cache truthful title metadata/artwork in the existing media tree, never video."""
         async with self._cache_semaphore:
             try:
-                tmdb_id = item_dict.get("tmdb_id")
-                media_type = item_dict.get("type", "movie")
+                import time
+                from sqlmodel.ext.asyncio.session import AsyncSession
+                from db import engine
+                from models import Movie
+                from services.ffmpeg import download_and_cache_metadata_image
+
+                tmdb_id = int(item_dict.get("tmdb_id"))
+                media_type = "series" if item_dict.get("type") in ("series", "tv") else "movie"
+                if not item_dict.get("cast") or (item_dict.get("director") or "").casefold() in {"", "various", "unknown"}:
+                    details = await (self.fetch_show_metadata(tmdb_id) if media_type == "series" else self.fetch_movie_metadata(tmdb_id))
+                    item_dict = {**item_dict, **{key: value for key, value in details.items() if value not in (None, "", [])}}
                 title = item_dict.get("title", f"Media_{tmdb_id}")
-                release_year = item_dict.get("release_year", 2026)
-                
+                release_year = int(item_dict.get("release_year") or 0)
+                movie_id = f"tv_{tmdb_id}" if media_type == "series" else f"m_{tmdb_id}"
+                async with AsyncSession(engine) as db:
+                    existing_server_media = await db.get(Movie, movie_id)
+                    if existing_server_media and existing_server_media.catalog_source == "server":
+                        return movie_id
                 clean_title = "".join(c for c in title if c.isalnum() or c in " .-_")
                 server_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-                storage_root = settings.MEDIA_DIR
-                
-                # Image download rate limiting helper
-                from services.ffmpeg import download_and_cache_metadata_image
-                async def safe_download_image(url, dest_path):
+                folder_name = f"{clean_title}_TMDB_{tmdb_id}" if media_type == "series" else f"{clean_title}_{release_year}_TMDB_{tmdb_id}"
+                library_name = "Series" if media_type == "series" else "Movies"
+                folder_rel = os.path.join(settings.MEDIA_DIR, library_name, folder_name)
+                folder_abs = os.path.abspath(os.path.join(server_root, folder_rel))
+                metadata_dir = os.path.join(folder_abs, ".metadata")
+                os.makedirs(metadata_dir, exist_ok=True)
+
+                poster_abs = os.path.join(folder_abs, "poster.jpg")
+                backdrop_abs = os.path.join(folder_abs, "backdrop.jpg")
+
+                async def safe_download(url: str, destination: str):
+                    if not url or not url.startswith("http") or os.path.exists(destination):
+                        return
                     async with self._img_semaphore:
-                        return await download_and_cache_metadata_image(url, dest_path)
-                
-                if media_type == "movie":
-                    folder_name = f"{clean_title}_{release_year}_TMDB_{tmdb_id}"
-                    folder_rel_path = os.path.join(storage_root, "Movies", folder_name)
-                    folder_abs_path = os.path.abspath(os.path.join(server_root, folder_rel_path))
-                    
-                    # Write registry metadata.json
-                    metadata_dir = os.path.join(folder_abs_path, ".metadata")
-                    metadata_file = os.path.join(metadata_dir, "metadata.json")
-                    
-                    if os.path.exists(metadata_file):
-                        return
+                        await download_and_cache_metadata_image(url, destination)
 
-                    os.makedirs(folder_abs_path, exist_ok=True)
-                    os.makedirs(metadata_dir, exist_ok=True)
-                    
-                    # Save metadata if it doesn't exist
-                    metadata_content = {
-                        "tmdb_id": int(tmdb_id),
-                        "media_type": media_type,
-                        "title": title,
-                        "release_year": int(release_year),
-                        "original_language": item_dict.get("original_language", "en"),
-                        "video_url": ""
-                    }
-                    with open(metadata_file, "w", encoding="utf-8") as f:
-                        json.dump(metadata_content, f, indent=2, ensure_ascii=False)
-                            
-                    poster_abs = os.path.join(folder_abs_path, "poster.jpg")
-                    backdrop_abs = os.path.join(folder_abs_path, "backdrop.jpg")
-                    
-                    tasks = []
-                    if raw_poster_url and raw_poster_url.startswith("http"):
-                        tasks.append(safe_download_image(raw_poster_url, poster_abs))
-                    if raw_backdrop_url and raw_backdrop_url.startswith("http"):
-                        tasks.append(safe_download_image(raw_backdrop_url, backdrop_abs))
-                        
-                    if tasks:
-                        await asyncio.gather(*tasks)
-                        
-                else: # TV series/show
-                    folder_name = f"{clean_title}_TMDB_{tmdb_id}"
-                    series_rel_path = os.path.join(storage_root, "Series", folder_name)
-                    series_abs_path = os.path.abspath(os.path.join(server_root, series_rel_path))
-                    
-                    series_metadata_dir = os.path.join(series_abs_path, ".metadata")
-                    series_metadata_file = os.path.join(series_metadata_dir, "metadata.json")
-                    
-                    if os.path.exists(series_metadata_file):
-                        return
+                await asyncio.gather(
+                    safe_download(raw_poster_url, poster_abs),
+                    safe_download(raw_backdrop_url, backdrop_abs),
+                )
 
-                    os.makedirs(series_abs_path, exist_ok=True)
-                    os.makedirs(series_metadata_dir, exist_ok=True)
-                            
-                    series_poster_abs = os.path.join(series_abs_path, "poster.jpg")
-                    series_backdrop_abs = os.path.join(series_abs_path, "backdrop.jpg")
-                    
-                    tasks = []
-                    if raw_poster_url and raw_poster_url.startswith("http"):
-                        tasks.append(safe_download_image(raw_poster_url, series_poster_abs))
-                    if raw_backdrop_url and raw_backdrop_url.startswith("http"):
-                        tasks.append(safe_download_image(raw_backdrop_url, series_backdrop_abs))
-                        
-                    if tasks:
-                        await asyncio.gather(*tasks)
-                        
-                    # Fetch full show details to find seasons and episodes
-                    show_data = await self._get(f"/tv/{tmdb_id}")
-                    if show_data:
-                        from datetime import datetime
-                        today = datetime.now().date()
-                        seasons = show_data.get("seasons", [])
-                        active_seasons = []
-                        for s in seasons:
-                            if s.get("season_number", 0) <= 0:
-                                continue
-                            air_date = s.get("air_date")
-                            if air_date:
-                                try:
-                                    air_dt = datetime.strptime(air_date, "%Y-%m-%d").date()
-                                    if air_dt > today:
-                                        logger.info(f"[TMDB Client] Skipping unreleased Season {s.get('season_number')} (Air Date: {air_date})")
-                                        continue
-                                except ValueError:
-                                    pass
-                            active_seasons.append(s)
-                        if not active_seasons and seasons:
-                            active_seasons = seasons
-                            
-                        for s in active_seasons:
-                            season_num = s.get("season_number", 1)
-                            
-                            season_data = await self._get(f"/tv/{tmdb_id}/season/{season_num}")
-                            if not season_data or not season_data.get("episodes"):
-                                continue
-                                
-                            episodes = season_data.get("episodes", [])
-                            season_image_tasks = []
-                            
-                            for ep in episodes:
-                                ep_air_date = ep.get("air_date")
-                                if ep_air_date:
-                                    try:
-                                        ep_air_dt = datetime.strptime(ep_air_date, "%Y-%m-%d").date()
-                                        if ep_air_dt > today:
-                                            continue
-                                    except ValueError:
-                                        pass
-                                episode_num = ep.get("episode_number", 1)
-                                ep_title = ep.get("name", f"Episode {episode_num}")
-                                ep_desc = ep.get("overview", "")
-                                
-                                logger.info(f"[TMDB Client] Caching {title}: Season {season_num}, Episode {episode_num} ({ep_title})...")
-                                
-                                ep_folder_rel = os.path.join(storage_root, "Series", folder_name, f"Season_{season_num}", f"Episode_{episode_num}")
-                                ep_folder_abs = os.path.abspath(os.path.join(server_root, ep_folder_rel))
-                                os.makedirs(ep_folder_abs, exist_ok=True)
-                                
-                                ep_metadata_dir = os.path.join(ep_folder_abs, ".metadata")
-                                os.makedirs(ep_metadata_dir, exist_ok=True)
-                                ep_metadata_file = os.path.join(ep_metadata_dir, "metadata.json")
-                                
-                                ep_served_url = f"/media/Series/{folder_name}/Season_{season_num}/Episode_{episode_num}/{clean_title}_S{season_num:02d}E{episode_num:02d}.mp4"
-                                
-                                still_path = ep.get("still_path")
-                                ep_thumb_url = f"https://image.tmdb.org/t/p/w500{still_path}" if still_path else ""
-                                
-                                ep_metadata_content = {
-                                    "tmdb_id": int(tmdb_id),
-                                    "media_type": "series",
-                                    "title": ep_title,
-                                    "description": ep_desc,
-                                    "season": season_num,
-                                    "episode": episode_num,
-                                    "video_url": ep_served_url,
-                                    "thumbnailUrl": ep_thumb_url,
-                                    "language": item_dict.get("original_language", "en"),
-                                    "original_language": item_dict.get("original_language", "en")
-                                }
-                                
-                                with open(ep_metadata_file, "w", encoding="utf-8") as f:
-                                    json.dump(ep_metadata_content, f, indent=2, ensure_ascii=False)
-                                    
-                                sync_compatible_metadata_file = os.path.join(ep_metadata_dir, f"metadata_s{season_num}_e{episode_num}.json")
-                                with open(sync_compatible_metadata_file, "w", encoding="utf-8") as f:
-                                    json.dump(ep_metadata_content, f, indent=2, ensure_ascii=False)
-                                
-                                ep_poster_abs = os.path.join(ep_folder_abs, "poster.jpg")
-                                ep_backdrop_abs = os.path.join(ep_folder_abs, "backdrop.jpg")
-                                ep_thumb_abs = os.path.join(ep_folder_abs, "thumbnail.jpg")
-                                
-                                if raw_poster_url:
-                                    season_image_tasks.append(safe_download_image(raw_poster_url, ep_poster_abs))
-                                if raw_backdrop_url:
-                                    season_image_tasks.append(safe_download_image(raw_backdrop_url, ep_backdrop_abs))
-                                if still_path:
-                                    ep_still_url = f"https://image.tmdb.org/t/p/w500{still_path}"
-                                    season_image_tasks.append(safe_download_image(ep_still_url, ep_thumb_abs))
-                                        
-                            if season_image_tasks:
-                                logger.info(f"[TMDB Client] Downloading assets for {title}: Season {season_num} (contains {len(episodes)} episodes)...")
-                                await asyncio.gather(*season_image_tasks)
-                                logger.info(f"[TMDB Client] Completed caching for {title}: Season {season_num}.")
-                        
-                        # Write registry metadata.json ONLY on successful completion of all loops
-                        series_metadata_content = {
-                            "tmdb_id": int(tmdb_id),
-                            "media_type": media_type,
-                            "title": title,
-                            "release_year": int(release_year),
-                            "original_language": item_dict.get("original_language", "en"),
-                            "video_url": ""
-                        }
-                        with open(series_metadata_file, "w", encoding="utf-8") as f:
-                            json.dump(series_metadata_content, f, indent=2, ensure_ascii=False)
-                            
-                logger.info(f"[TMDB Client] Local caching complete for: {title}")
+                metadata_content = {
+                    "tmdb_id": tmdb_id,
+                    "media_type": media_type,
+                    "title": title,
+                    "description": item_dict.get("description", ""),
+                    "release_year": release_year,
+                    "genres": item_dict.get("genres", []),
+                    "cast": item_dict.get("cast", []),
+                    "director": item_dict.get("director"),
+                    "original_language": item_dict.get("original_language", "en"),
+                    "catalog_source": "tmdb_cache",
+                    "availability": "cached",
+                    "video_url": "",
+                }
+                metadata_file = os.path.join(metadata_dir, "metadata.json")
+                with open(metadata_file, "w", encoding="utf-8") as file:
+                    json.dump(metadata_content, file, indent=2, ensure_ascii=False)
+
+                local_poster = f"/media/{library_name}/{folder_name}/poster.jpg" if os.path.exists(poster_abs) else (raw_poster_url or "")
+                local_backdrop = f"/media/{library_name}/{folder_name}/backdrop.jpg" if os.path.exists(backdrop_abs) else (raw_backdrop_url or "")
+                now = time.time()
+                async with AsyncSession(engine) as db:
+                    movie = await db.get(Movie, movie_id)
+                    if not movie:
+                        movie = Movie(
+                            id=movie_id,
+                            tmdb_id=tmdb_id,
+                            title=title,
+                            description=item_dict.get("description", ""),
+                            thumbnail_url=local_poster,
+                            banner_url=local_backdrop,
+                            video_url="",
+                            duration=item_dict.get("duration", "45m" if media_type == "series" else "2h"),
+                            release_year=release_year,
+                            rating=item_dict.get("rating"),
+                            director=item_dict.get("director"),
+                            type=media_type,
+                            vote_average=float(item_dict.get("vote_average") or 0.0),
+                            vote_count=int(item_dict.get("vote_count") or 0),
+                            popularity=float(item_dict.get("popularity") or 0.0),
+                            catalog_source="tmdb_cache",
+                            availability="cached",
+                            cached_at=now,
+                            metadata_refreshed_at=now,
+                        )
+                        movie.genres = item_dict.get("genres", [])
+                        movie.cast = item_dict.get("cast", [])
+                    elif movie.availability != "available":
+                        movie.title = title
+                        movie.description = item_dict.get("description", movie.description)
+                        movie.thumbnail_url = local_poster or movie.thumbnail_url
+                        movie.banner_url = local_backdrop or movie.banner_url
+                        movie.genres = item_dict.get("genres", movie.genres)
+                        movie.cast = item_dict.get("cast", movie.cast)
+                        movie.director = item_dict.get("director", movie.director)
+                        movie.vote_average = float(item_dict.get("vote_average") or movie.vote_average or 0.0)
+                        movie.vote_count = int(item_dict.get("vote_count") or movie.vote_count or 0)
+                        movie.popularity = float(item_dict.get("popularity") or movie.popularity or 0.0)
+                        movie.catalog_source = "tmdb_cache"
+                        movie.availability = "cached"
+                        movie.cached_at = movie.cached_at or now
+                        movie.metadata_refreshed_at = now
+                    db.add(movie)
+                    await db.commit()
+                logger.info(f"[TMDB Client] In-place recommendation cache complete for: {title}")
+                return movie_id
             except Exception as e:
-                logger.error(f"[TMDB Client] Error in background caching task for {item_dict.get('title')}: {e}")
+                logger.error(f"[TMDB Client] Error caching {item_dict.get('title')}: {e}")
+                raise
 
-    async def discover_media(self, category: str, media_type: str = "movie", profile_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def discover_media(self, category: str, media_type: str = "movie", profile_id: Optional[str] = None, cache_limit: Optional[int] = None) -> List[Dict[str, Any]]:
         import asyncio
         from services.recommendation import get_profile_preferences
         
         is_tv = media_type.lower() in ("series", "tv")
         
-        params = {
-            "sort_by": "popularity.desc"
-        }
+        params = {"sort_by": "popularity.desc", "include_adult": "false"}
         
         is_trending = category.lower() == "trending"
         
@@ -444,7 +379,8 @@ class TMDBClient:
             prefs = await get_profile_preferences(profile_id)
             if prefs["genre"]:
                 # Map our genre strings to TMDB IDs
-                genre_ids = [str(k) for k, v in GENRES_MAP.items() if v in prefs["genre"]]
+                preferred_genres = {value.casefold() for value in prefs["genre"]}
+                genre_ids = [str(k) for k, v in GENRES_MAP.items() if v.casefold() in preferred_genres]
                 if genre_ids:
                     params["with_genres"] = "|".join(genre_ids[:3])  # OR top 3 genres
             if prefs["actor"]:
@@ -478,6 +414,7 @@ class TMDBClient:
 
         
         raw_results = []
+        cache_jobs = []
         if not all_results:
             return []
             
@@ -532,19 +469,25 @@ class TMDBClient:
                 "vote_count": item.get("vote_count", 1000),
                 "director": "Various",
                 "cast": [],
-                "type": "series" if is_tv else "movie"
+                "type": "series" if is_tv else "movie",
+                "popularity": item.get("popularity", 0.0),
+                "original_language": item.get("original_language", "en"),
+                "source": "tmdb_cache",
+                "availability": "cached",
             }
             
             raw_results.append(result_item)
             
-            # Start background caching task
-            asyncio.create_task(self.cache_media_locally(result_item, raw_poster_url, raw_backdrop_url))
+            effective_limit = cache_limit if cache_limit is not None else 12
+            if len(raw_results) <= effective_limit:
+                cache_jobs.append(self.cache_media_locally(result_item, raw_poster_url, raw_backdrop_url))
             
-        return raw_results
+        if cache_jobs:
+            await asyncio.gather(*cache_jobs, return_exceptions=False)
+        return raw_results[:cache_limit] if cache_limit is not None else raw_results
 
     async def search_media(self, query: str) -> List[Dict[str, Any]]:
         """Search movies from TMDB matching a text query."""
-        import asyncio
         data = await self._get("/search/movie", params={"query": query, "include_adult": "false"})
         
         raw_results = []
@@ -589,13 +532,17 @@ class TMDBClient:
                 "vote_count": item.get("vote_count", 1000),
                 "director": "Various",
                 "cast": [],
-                "type": "movie"
+                "type": "movie",
+                "popularity": item.get("popularity", 0.0),
+                "original_language": item.get("original_language", "en"),
+                "source": "tmdb_cache",
+                "availability": "cached",
             }
             
             raw_results.append(result_item)
             
-            # Start background caching task
-            asyncio.create_task(self.cache_media_locally(result_item, raw_poster_url, raw_backdrop_url))
+            if len(raw_results) <= 10:
+                await self.cache_media_locally(result_item, raw_poster_url, raw_backdrop_url)
             
         return raw_results
 

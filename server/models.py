@@ -2,6 +2,7 @@ import json
 from typing import Optional, List, Any, Dict
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import SQLModel, Field, Relationship
+from sqlalchemy import UniqueConstraint
 
 def to_camel(s: str) -> str:
     parts = s.split("_")
@@ -46,6 +47,12 @@ class Movie(SQLModel, table=True):
     vote_count: Optional[int] = Field(default=100)
     skip_markers_str: Optional[str] = Field(default="{}")  # Serialized JSON Dict
     hevc_compressed: bool = Field(default=False)
+    tmdb_id: Optional[int] = Field(default=None, index=True)
+    catalog_source: str = Field(default="server", index=True)  # server or tmdb_cache
+    availability: str = Field(default="available", index=True)  # cached, processing, available
+    popularity: float = Field(default=0.0)
+    cached_at: Optional[float] = Field(default=None)
+    metadata_refreshed_at: Optional[float] = Field(default=None)
 
     @property
     def genres(self) -> List[str]:
@@ -165,6 +172,7 @@ class TelemetryEvent(SQLModel, table=True):
     tmdb_id: Optional[int] = None
     metadata_json: Optional[str] = Field(default="{}")
     timestamp: float
+    dedupe_key: Optional[str] = Field(default=None, index=True)
 
     @property
     def event_metadata(self) -> Dict[str, Any]:
@@ -178,12 +186,63 @@ class TelemetryEvent(SQLModel, table=True):
         self.metadata_json = json.dumps(val or {})
 
 class ProfileTaste(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("profile_id", "tag_type", "tag_value", name="uq_profile_taste_tag"),)
     id: Optional[int] = Field(default=None, primary_key=True)
     profile_id: str = Field(index=True)
     tag_type: str  # genre, actor, director
     tag_value: str = Field(index=True)
     score: float = Field(default=0.0)
     last_updated: float
+
+class ViewingAttempt(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    profile_id: str = Field(index=True)
+    movie_id: str = Field(index=True)
+    episode_id: Optional[str] = Field(default=None, index=True)
+    started_at: float = Field(index=True)
+    last_seen_at: float
+    max_completion: float = Field(default=0.0)
+    duration_watched: int = Field(default=0)
+    completed_at: Optional[float] = Field(default=None)
+    early_exit_recorded: bool = Field(default=False)
+    rewatch_reward: float = Field(default=0.0)
+
+class PlaybackMilestone(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("attempt_id", "milestone", name="uq_playback_attempt_milestone"),)
+    id: Optional[int] = Field(default=None, primary_key=True)
+    attempt_id: str = Field(foreign_key="viewingattempt.id", index=True)
+    milestone: int
+    recorded_at: float
+
+class ProfileRecommendation(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("profile_id", "movie_id", name="uq_profile_recommendation_movie"),)
+    id: Optional[int] = Field(default=None, primary_key=True)
+    profile_id: str = Field(index=True)
+    movie_id: str = Field(foreign_key="movie.id", index=True)
+    media_type: str = Field(index=True)
+    score: float = Field(default=0.0)
+    reasons_str: str = Field(default="[]")
+    generated_at: float = Field(index=True)
+
+    @property
+    def reasons(self) -> List[str]:
+        try:
+            return json.loads(self.reasons_str or "[]")
+        except Exception:
+            return []
+
+    @reasons.setter
+    def reasons(self, val: List[str]):
+        self.reasons_str = json.dumps(val or [])
+
+class RecommendationRefreshState(SQLModel, table=True):
+    profile_id: str = Field(primary_key=True)
+    taste_version: int = Field(default=0)
+    last_ranked_at: Optional[float] = Field(default=None)
+    last_tmdb_refresh_at: Optional[float] = Field(default=None)
+    next_tmdb_refresh_at: Optional[float] = Field(default=None)
+    refresh_requested: bool = Field(default=True)
+    last_error: Optional[str] = Field(default=None)
 
 class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -411,6 +470,35 @@ class DiscoverMovieResponse(APIModel):
     director: Optional[str] = "Unknown"
     cast: List[str] = []
     type: Optional[str] = "movie"
+    source: str = "tmdb_cache"
+    availability: str = "cached"
+
+class RecommendationCategoryResponse(APIModel):
+    value: str
+    label: str
+    affinity: float = 0.0
+    server_count: int = 0
+    cached_count: int = 0
+
+class RecommendationItemResponse(APIModel):
+    media: MovieResponse
+    source: str
+    availability: str
+    score: float
+    reasons: List[str] = []
+
+class RecommendationFeedResponse(APIModel):
+    profile_id: str
+    scope: str
+    category: str
+    generated_at: float
+    stale: bool = False
+    total: int
+    offset: int
+    limit: int
+    categories: List[RecommendationCategoryResponse] = []
+    items: List[RecommendationItemResponse] = []
+    watch_again: List[RecommendationItemResponse] = []
 
 class PlaybackSessionResponse(APIModel):
     movie_id: str

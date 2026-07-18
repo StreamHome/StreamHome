@@ -305,7 +305,7 @@ class DownloadQueueManager:
                     await db.commit()
                     
                     try:
-                        await self._catalog_media(db, tmdb_id, media_type, season, episode, meta, output_rel_path, extracted_languages, language, subtitles_list, quality)
+                        await self._catalog_media(db, tmdb_id, media_type, season, episode, meta, output_rel_path, extracted_languages, language, subtitles_list, quality, task.skip_markers)
                     except Exception as cat_err:
                         logger.error(f"[Queue Manager] Error cataloging media: {cat_err}")
                 else:
@@ -336,7 +336,8 @@ class DownloadQueueManager:
         self, db: AsyncSession, tmdb_id: int, media_type: str, season: Optional[int], 
         episode: Optional[int], meta: Dict[str, Any], file_path: str, 
         extracted_languages: Optional[List[str]] = None, language: Optional[str] = None, 
-        subtitles_list: Optional[List[Dict[str, str]]] = None, quality: Optional[str] = None
+        subtitles_list: Optional[List[Dict[str, str]]] = None, quality: Optional[str] = None,
+        skip_markers: Optional[Dict[str, Any]] = None
     ):
         server_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         
@@ -429,7 +430,7 @@ class DownloadQueueManager:
                             break
 
             duration_str = meta.get("duration", "1h 30m")
-            skip_data = task.skip_markers
+            skip_data = skip_markers or {}
             
             movie = await db.get(Movie, movie_id)
             if not movie:
@@ -439,7 +440,8 @@ class DownloadQueueManager:
                     duration=duration_str, release_year=meta.get("releaseYear", 2026),
                     rating=meta.get("rating", "PG-13"), director=meta.get("director", "Unknown"),
                     original_language=language or meta.get("originalLanguage", "en"), type="movie",
-                    vote_average=meta.get("vote_average", 7.5), vote_count=meta.get("vote_count", 100)
+                    vote_average=meta.get("vote_average", 7.5), vote_count=meta.get("vote_count", 100),
+                    tmdb_id=int(tmdb_id), catalog_source="server", availability="available"
                 )
                 movie.genres = meta.get("genres", [])
                 movie.cast = meta.get("cast", [])
@@ -456,6 +458,9 @@ class DownloadQueueManager:
                 movie.thumbnail_url = local_thumbnail or movie.thumbnail_url
                 movie.banner_url = local_banner or movie.banner_url
                 movie.video_url = served_url
+                movie.tmdb_id = int(tmdb_id)
+                movie.catalog_source = "server"
+                movie.availability = "available"
                 movie.duration = duration_str
                 movie.release_year = meta.get("releaseYear", movie.release_year)
                 movie.rating = meta.get("rating", movie.rating)
@@ -472,6 +477,9 @@ class DownloadQueueManager:
                 db.add(movie)
                 await db.commit()
                 movie.video_url = served_url
+                movie.tmdb_id = int(tmdb_id)
+                movie.catalog_source = "server"
+                movie.availability = "available"
                 movie.duration = meta.get("duration", movie.duration)
                 movie.release_year = meta.get("releaseYear", movie.release_year)
                 movie.rating = meta.get("rating", movie.rating)
@@ -500,6 +508,8 @@ class DownloadQueueManager:
                 "description": meta.get("description", movie.description),
                 "release_year": int(meta.get("releaseYear", movie.release_year)),
                 "video_url": served_url,
+                "catalog_source": "server",
+                "availability": "available",
                 "language": language or "en",
                 "languages": movie_languages,
                 "quality": movie_quality,
@@ -519,7 +529,8 @@ class DownloadQueueManager:
                     duration=meta.get("duration", "45m"), release_year=meta.get("releaseYear", 2026),
                     rating=meta.get("rating", "TV-14"), director=meta.get("director", "Various"),
                     original_language=language or meta.get("originalLanguage", "en"), type="series",
-                    vote_average=meta.get("vote_average", 7.5), vote_count=meta.get("vote_count", 100)
+                    vote_average=meta.get("vote_average", 7.5), vote_count=meta.get("vote_count", 100),
+                    tmdb_id=int(tmdb_id), catalog_source="server", availability="available"
                 )
                 show.genres = meta.get("genres", [])
                 show.cast = meta.get("cast", [])
@@ -592,7 +603,7 @@ class DownloadQueueManager:
                 await download_and_cache_metadata_image(meta.get("bannerUrl"), ep_backdrop_abs)
                 
             ep_dur_str = ep_meta.get("duration", "45m")
-            ep_skip_data = task.skip_markers
+            ep_skip_data = skip_markers or {}
             
             if not ep_entry:
                 ep_entry = Episode(
@@ -605,7 +616,6 @@ class DownloadQueueManager:
                 ep_entry.subtitles = subs_on_disk
                 ep_entry.skip_markers = ep_skip_data
                 db.add(ep_entry)
-                await db.commit()
                 print(f"[Queue Manager] Cataloged new episode: S{season_num}E{episode_num}")
             else:
                 ep_entry.title = ep_title
@@ -618,8 +628,13 @@ class DownloadQueueManager:
                 ep_entry.subtitles = subs_on_disk
                 ep_entry.skip_markers = ep_skip_data
                 db.add(ep_entry)
-                await db.commit()
                 print(f"[Queue Manager] Updated episode: S{season_num}E{episode_num}")
+
+            show.tmdb_id = int(tmdb_id)
+            show.catalog_source = "server"
+            show.availability = "available"
+            db.add(show)
+            await db.commit()
 
             # Create episode's local .metadata/metadata.json
             ep_metadata_dir = os.path.join(ep_folder_abs, ".metadata")
@@ -635,6 +650,8 @@ class DownloadQueueManager:
                 "season": season_num,
                 "episode": episode_num,
                 "video_url": served_url,
+                "catalog_source": "server",
+                "availability": "available",
                 "language": language or "en",
                 "languages": ep_languages,
                 "quality": ep_quality,
@@ -818,7 +835,55 @@ class DownloadQueueManager:
                                         logger.info(f"[Queue Manager Recovery] Restoring Series TMDB {tmdb_id} from {meta_path}...")
                                         meta = await tmdb_client.fetch_show_metadata(tmdb_id)
                                 
-                                # Re-run cataloging (which will map original files and cache settings correctly)
+                                # Metadata/artwork-only TMDB cache records stay in the same media tree,
+                                # but must never be restored as playable catalog media.
+                                if not file_path:
+                                    data["catalog_source"] = "tmdb_cache"
+                                    data["availability"] = "cached"
+                                    data["video_url"] = ""
+                                    try:
+                                        with open(meta_path, "w", encoding="utf-8") as cache_meta_file:
+                                            json.dump(data, cache_meta_file, indent=2, ensure_ascii=False)
+                                    except Exception as metadata_err:
+                                        logger.error(f"[Queue Manager] Failed to annotate cached metadata {meta_path}: {metadata_err}")
+                                    cached_id = f"m_{tmdb_id}" if media_type == "movie" else f"tv_{tmdb_id}"
+                                    cached = await db.get(Movie, cached_id)
+                                    if not cached:
+                                        relative_meta = os.path.relpath(meta_path, media_dir).replace("\\", "/").split("/")
+                                        library = "Movies" if media_type == "movie" else "Series"
+                                        folder = relative_meta[1] if len(relative_meta) > 1 else ""
+                                        base_url = f"/media/{library}/{folder}" if folder else ""
+                                        cached = Movie(
+                                            id=cached_id,
+                                            tmdb_id=int(tmdb_id),
+                                            title=meta.get("title", data.get("title", f"TMDB {tmdb_id}")),
+                                            description=meta.get("description", data.get("description", "")),
+                                            thumbnail_url=f"{base_url}/poster.jpg" if base_url else meta.get("thumbnailUrl", ""),
+                                            banner_url=f"{base_url}/backdrop.jpg" if base_url else meta.get("bannerUrl", ""),
+                                            video_url="",
+                                            duration=meta.get("duration", "45m" if media_type != "movie" else "2h"),
+                                            release_year=int(meta.get("releaseYear", data.get("release_year", 0)) or 0),
+                                            rating=meta.get("rating"),
+                                            director=meta.get("director"),
+                                            type="movie" if media_type == "movie" else "series",
+                                            vote_average=float(meta.get("vote_average", 0.0) or 0.0),
+                                            vote_count=int(meta.get("vote_count", 0) or 0),
+                                            catalog_source="tmdb_cache",
+                                            availability="cached",
+                                            cached_at=time.time(),
+                                            metadata_refreshed_at=time.time(),
+                                        )
+                                        cached.genres = meta.get("genres", data.get("genres", []))
+                                        cached.cast = meta.get("cast", data.get("cast", []))
+                                    elif cached.availability != "available":
+                                        cached.catalog_source = "tmdb_cache"
+                                        cached.availability = "cached"
+                                    db.add(cached)
+                                    await db.commit()
+                                    count += 1
+                                    continue
+
+                                # Re-run cataloging only for metadata with a physical video.
                                 await self._catalog_media(db, tmdb_id, media_type, season, episode, meta, file_path, language=language)
                                 count += 1
                                 

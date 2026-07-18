@@ -1,4 +1,8 @@
 from typing import AsyncGenerator  # <-- TİP DOĞRULAMA İÇİN EKLENDİ
+import os
+import sqlite3
+from datetime import datetime
+
 from sqlmodel import SQLModel
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -23,6 +27,22 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
 async def init_db():
     # Ensure models are imported before creating tables
     import models
+    if os.path.exists(settings.db_path):
+        check = sqlite3.connect(settings.db_path)
+        try:
+            movie_columns = {row[1] for row in check.execute("PRAGMA table_info(movie)").fetchall()}
+            if movie_columns and "catalog_source" not in movie_columns:
+                backup_dir = os.path.join(os.path.dirname(settings.db_path), "backup")
+                os.makedirs(backup_dir, exist_ok=True)
+                backup_path = os.path.join(backup_dir, f"pre-recommendation-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db")
+                target = sqlite3.connect(backup_path)
+                try:
+                    check.backup(target)
+                    logger.info(f"[Database] Pre-recommendation migration backup created: {backup_path}")
+                finally:
+                    target.close()
+        finally:
+            check.close()
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
         
@@ -79,6 +99,70 @@ async def init_db():
                 if "vote_count" not in movie_cols:
                     logger.info("[Database] Migrating: Adding 'vote_count' column to 'movie' table...")
                     sync_conn.exec_driver_sql("ALTER TABLE movie ADD COLUMN vote_count INTEGER DEFAULT 100")
+                recommendation_columns = {
+                    "tmdb_id": "INTEGER",
+                    "catalog_source": "TEXT DEFAULT 'server'",
+                    "availability": "TEXT DEFAULT 'available'",
+                    "popularity": "FLOAT DEFAULT 0",
+                    "cached_at": "FLOAT",
+                    "metadata_refreshed_at": "FLOAT",
+                }
+                for column, sql_type in recommendation_columns.items():
+                    if column not in movie_cols:
+                        logger.info(f"[Database] Migrating: Adding '{column}' column to 'movie' table...")
+                        sync_conn.exec_driver_sql(f"ALTER TABLE movie ADD COLUMN {column} {sql_type}")
+
+                # Existing IDs are already stable TMDB-derived identifiers. Backfill them once,
+                # then classify rows by actual playable media instead of their folder location.
+                sync_conn.exec_driver_sql(
+                    "UPDATE movie SET tmdb_id = CAST(SUBSTR(id, 3) AS INTEGER) "
+                    "WHERE tmdb_id IS NULL AND (id LIKE 'm_%' OR id LIKE 'tv_%')"
+                )
+                sync_conn.exec_driver_sql(
+                    "UPDATE movie SET catalog_source = 'tmdb_cache', availability = 'cached' "
+                    "WHERE COALESCE(TRIM(video_url), '') = '' "
+                    "AND NOT EXISTS (SELECT 1 FROM episode e WHERE e.movie_id = movie.id "
+                    "AND COALESCE(TRIM(e.video_url), '') <> '')"
+                )
+                sync_conn.exec_driver_sql(
+                    "UPDATE movie SET catalog_source = 'server', availability = 'available' "
+                    "WHERE COALESCE(TRIM(video_url), '') <> '' "
+                    "OR EXISTS (SELECT 1 FROM episode e WHERE e.movie_id = movie.id "
+                    "AND COALESCE(TRIM(e.video_url), '') <> '')"
+                )
+                if "downloadtask" in inspector.get_table_names():
+                    sync_conn.exec_driver_sql(
+                        "UPDATE movie SET catalog_source = 'server', availability = 'processing' "
+                        "WHERE tmdb_id IN (SELECT tmdb_id FROM downloadtask "
+                        "WHERE status IN ('PENDING', 'DOWNLOADING', 'MERGING', 'MOVING_CLOUD'))"
+                    )
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_tmdb_id ON movie (tmdb_id)")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_catalog_source ON movie (catalog_source)")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_availability ON movie (availability)")
+
+            if "telemetryevent" in inspector.get_table_names():
+                telemetry_cols = [col["name"] for col in inspector.get_columns("telemetryevent")]
+                if "dedupe_key" not in telemetry_cols:
+                    sync_conn.exec_driver_sql("ALTER TABLE telemetryevent ADD COLUMN dedupe_key TEXT")
+                sync_conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_telemetry_dedupe_key "
+                    "ON telemetryevent (dedupe_key) WHERE dedupe_key IS NOT NULL"
+                )
+
+            if "profiletaste" in inspector.get_table_names():
+                # Older builds allowed duplicate taste rows. Merge them before enforcing the
+                # invariant used by atomic recommendation updates.
+                sync_conn.exec_driver_sql(
+                    "DELETE FROM profiletaste WHERE id NOT IN ("
+                    "SELECT MAX(id) FROM profiletaste GROUP BY profile_id, tag_type, LOWER(TRIM(tag_value)))"
+                )
+                sync_conn.exec_driver_sql(
+                    "UPDATE profiletaste SET tag_value = LOWER(TRIM(tag_value))"
+                )
+                sync_conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_profile_taste_tag "
+                    "ON profiletaste (profile_id, tag_type, tag_value)"
+                )
                     
         await conn.run_sync(migrate)
 
