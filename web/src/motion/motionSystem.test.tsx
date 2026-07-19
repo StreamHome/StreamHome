@@ -30,7 +30,7 @@ describe("cinematic motion system", () => {
     expect(MOTION_TIMINGS.menuExit).toBeLessThan(MOTION_TIMINGS.menuEnter);
     expect(MOTION_TIMINGS.dialogExit).toBeLessThan(MOTION_TIMINGS.dialogEnter);
     expect(MOTION_TIMINGS.controlsEnter).toBeLessThan(MOTION_TIMINGS.controlsExit);
-    expect(MOTION_TIMINGS.rail).toBe(920);
+    expect(MOTION_TIMINGS.rail).toBe(1080);
     expect(MOTION_TIMINGS.billboardExit).toBe(.88);
     expect(MOTION_TIMINGS.billboardEnter).toBe(1.12);
     expect(MOTION_TIMINGS.billboardExit + MOTION_TIMINGS.billboardEnter).toBe(MOTION_TIMINGS.billboard);

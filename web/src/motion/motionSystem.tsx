@@ -17,7 +17,7 @@ export const MOTION_TIMINGS = {
   viewExit: 0.28,
   viewEnter: 0.52,
   view: 0.8,
-  rail: 920,
+  rail: 1080,
   billboardExit: 0.88,
   billboardEnter: 1.12,
   billboard: 2,

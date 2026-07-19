@@ -60,6 +60,7 @@
 .ember-rail header > span,.ember-page-heading > span { color: #c18d7e; font: 500 8px/1 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; }
 .ember-rail__frame { position: relative; }
 .ember-rail__track { display: flex; gap: clamp(12px,1vw,18px); overflow-x: auto; overflow-y: hidden; padding: 7px clamp(4px,.7vw,12px) 22px; scroll-padding-inline: clamp(4px,.7vw,12px); scroll-snap-type: x mandatory; scrollbar-width: none; -ms-overflow-style: none; }
+.ember-rail__track::after { content: ""; flex: 0 0 var(--rail-end-space,0px); }
 .ember-rail__track::-webkit-scrollbar { display: none; }
 .ember-rail__blade { position: absolute; z-index: 8; top: 50%; bottom: auto; width: 40px; height: 40px; display: grid; place-items: center; border: 1px solid rgba(255,95,31,.38); border-radius: 0; background: rgba(30,16,11,.88); color: #ff8a5b; font: 300 28px/1 var(--font-body); opacity: 0; transform: translateY(-50%) scale(.92); box-shadow: 0 8px 24px rgba(10,3,1,.42); backdrop-filter: blur(14px); transition: opacity .32s cubic-bezier(.16,1,.3,1),transform .32s cubic-bezier(.16,1,.3,1),background .32s cubic-bezier(.16,1,.3,1),box-shadow .32s cubic-bezier(.16,1,.3,1); }
 .ember-rail__blade:disabled { opacity: 0; pointer-events: none; }
@@ -67,7 +68,7 @@
 .ember-rail__blade--next { right: 0; }
 
 .ember-media-card { width: 100%; min-width: 0; position: relative; overflow: hidden; scroll-snap-align: start; border: 1px solid rgba(255,95,31,.16); border-radius: 0; background: rgba(29,13,9,.65); color: white; text-align: left; }
-.ember-media-card-shell { --rail-card-width: clamp(176px,11vw,212px); position: relative; width: var(--rail-card-width); flex: 0 0 var(--rail-card-width); scroll-snap-align: start; }
+.ember-media-card-shell { --rail-card-width: clamp(176px,11vw,212px); --rail-card-min: 164px; position: relative; width: var(--rail-card-fitted,var(--rail-card-width)); flex: 0 0 var(--rail-card-fitted,var(--rail-card-width)); scroll-snap-align: start; }
 .ember-media-card-shell > .ember-media-card { width: 100%; min-width: 0; flex: none; }
 .ember-grid .ember-media-card-shell { width: 100%; min-width: 0; }
 .ember-media-card__tilt { display: block; }

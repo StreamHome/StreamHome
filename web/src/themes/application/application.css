@@ -370,12 +370,13 @@
 .catalog-collection > header > span, .browse-heading > span { color: var(--text-muted); font: 500 9px/1 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; }
 .catalog-collection__frame { position: relative; }
 .catalog-collection__rail { display: flex; gap: clamp(12px,1vw,18px); overflow-x: auto; overscroll-behavior-inline: contain; scroll-snap-type: x mandatory; scroll-padding-inline: clamp(4px,.7vw,12px); padding: 7px clamp(4px,.7vw,12px) 18px; scrollbar-width: none; -ms-overflow-style: none; }
+.catalog-collection__rail::after { content: ""; flex: 0 0 var(--rail-end-space,0px); }
 .catalog-collection__rail::-webkit-scrollbar { display: none; }
 .catalog-card { scroll-snap-align: start; }
-.catalog-card-shell { --rail-card-width: clamp(174px,11.25vw,216px); position: relative; width: var(--rail-card-width); flex: 0 0 var(--rail-card-width); scroll-snap-align: start; }
+.catalog-card-shell { --rail-card-width: clamp(174px,11.25vw,216px); --rail-card-min: 164px; position: relative; width: var(--rail-card-fitted,var(--rail-card-width)); flex: 0 0 var(--rail-card-fitted,var(--rail-card-width)); scroll-snap-align: start; }
 .catalog-card-shell > .catalog-card { width: 100%; min-width: 0; flex: none; }
-.catalog-card-shell[data-card-theme="glass"] { --rail-card-width: clamp(184px,11.75vw,224px); }
-.catalog-card-shell[data-card-theme="module"] { --rail-card-width: clamp(184px,11.6vw,222px); }
+.catalog-card-shell[data-card-theme="glass"] { --rail-card-width: clamp(184px,11.75vw,224px); --rail-card-min: 172px; }
+.catalog-card-shell[data-card-theme="module"] { --rail-card-width: clamp(184px,11.6vw,222px); --rail-card-min: 172px; }
 .browse-grid .catalog-card-shell { width: 100%; min-width: 0; }
 .recommendation-feedback { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .recommendation-feedback__button { min-height: 36px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid color-mix(in srgb,var(--accent-primary) 28%,var(--glass-border)); border-radius: 999px; padding: 7px 12px; background: color-mix(in srgb,var(--page-bg) 76%,transparent); color: var(--text-muted); font: 600 10px/1 var(--font-body); letter-spacing: .04em; backdrop-filter: blur(18px); transition: transform .22s var(--easing-smooth),color .22s var(--easing-smooth),border-color .22s var(--easing-smooth),background .22s var(--easing-smooth),box-shadow .22s var(--easing-smooth); }
