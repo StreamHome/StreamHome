@@ -12,6 +12,7 @@ import type { Episode, Movie } from "../../types/api";
 import { isAvailableMedia, isPlayableMovie, mediaAvailability, tmdbIdFromMovie } from "../../utils/media";
 import { AnimatedState, CONTENT_REVEAL, CONTENT_STAGGER, MOTION_EASE, MOTION_TIMINGS, useAppMotion } from "../../motion/motionSystem";
 import { AvailabilityBadge } from "../dashboard/RecommendationMeta";
+import { RecommendationFeedback, useRecommendationFeedback } from "../dashboard/RecommendationFeedback";
 
 interface DetailsRouterProps {
   movie: Movie;
@@ -34,6 +35,7 @@ export function DetailsRouter({ movie, onClose, isWatchlisted, onWatchlistChange
   const [error, setError] = useState("");
   const [savingWatchlist, setSavingWatchlist] = useState(false);
   const { reduced } = useAppMotion();
+  const recommendationFeedback = useRecommendationFeedback();
 
   useEffect(() => {
     setEpisodes(movie.episodes ?? []);
@@ -97,6 +99,7 @@ export function DetailsRouter({ movie, onClose, isWatchlisted, onWatchlistChange
         <motion.h1 variants={CONTENT_REVEAL}>{movie.title}</motion.h1>
         <motion.div variants={CONTENT_REVEAL} className="details-meta">{movie.releaseYear > 0 && <span>{movie.releaseYear}</span>}{movie.duration && <span>{movie.duration}</span>}{movie.rating && <span>{movie.rating}</span>}{movie.quality && <span>{movie.quality}</span>}{movie.voteAverage > 0 && <span>{movie.voteAverage.toFixed(1)} / 10</span>}</motion.div>
         {movie.recommendationReasons?.length ? <motion.div variants={CONTENT_REVEAL} className="details-reasons"><small>Why this was selected</small>{movie.recommendationReasons.map((reason) => <span key={reason}>{reason}</span>)}</motion.div> : null}
+        {recommendationFeedback && <motion.div variants={CONTENT_REVEAL} className="details-feedback"><small>Shape your recommendations</small><RecommendationFeedback movieId={movie.id} preference={recommendationFeedback.preferences[movie.id] ?? movie.viewerPreference ?? null} onChange={recommendationFeedback.onChange} /></motion.div>}
         {movie.description && <motion.p variants={CONTENT_REVEAL} className="details-description">{movie.description}</motion.p>}
         {movie.genres.length > 0 && <motion.div variants={CONTENT_REVEAL} className="details-genres">{movie.genres.map((genre) => <span key={genre}>{genre}</span>)}</motion.div>}
         <motion.div variants={CONTENT_REVEAL} className="feature-actions">

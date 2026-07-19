@@ -20,7 +20,8 @@ from models import (
     Movie, Episode, PlaybackSession, WatchlistItem, MovieResponse, 
     PlaybackSessionResponse, DiscoverMovieResponse, EpisodeResponse, 
     Profile, ProfileResponse, APIModel, DownloadTask, TelemetryRequest,
-    RecommendationFeedResponse
+    RecommendationFeedResponse, MediaPreferenceRequest, RecommendationExposureBatch,
+    RecommendationOnboardingRequest
 )
 from services.recommendation import (
     process_telemetry_event,
@@ -29,6 +30,14 @@ from services.recommendation import (
     rank_movies_for_profile,
     build_recommendation_payload,
     recommendation_worker,
+    set_media_preference,
+    get_media_preferences,
+    record_recommendation_exposures,
+    set_onboarding_preferences,
+    get_onboarding_preferences,
+    get_recommendation_diagnostics,
+    reset_media_preferences,
+    persist_profile_pool,
 )
 from config import settings
 from services.logger import logger
@@ -560,6 +569,51 @@ async def get_recommendations(
             raise HTTPException(status_code=404, detail="Profile not found")
         payload = await build_recommendation_payload(db, profile_id, scope, category, limit, offset)
         return RecommendationFeedResponse(**payload)
+
+@app.get("/api/recommendations/{profile_id}/preferences")
+async def list_recommendation_preferences(profile_id: str, user = Depends(get_current_user)):
+    return {"preferences": await get_media_preferences(profile_id)}
+
+@app.put("/api/recommendations/{profile_id}/preferences/{movie_id}")
+async def update_recommendation_preference(profile_id: str, movie_id: str, request: MediaPreferenceRequest, user = Depends(get_current_user)):
+    try:
+        return await set_media_preference(profile_id, movie_id, request.preference)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+
+@app.post("/api/recommendations/{profile_id}/exposures")
+async def add_recommendation_exposures(profile_id: str, request: RecommendationExposureBatch, user = Depends(get_current_user)):
+    return {"accepted": await record_recommendation_exposures(profile_id, request.exposures)}
+
+@app.get("/api/recommendations/{profile_id}/onboarding")
+async def read_recommendation_onboarding(profile_id: str, user = Depends(get_current_user)):
+    return await get_onboarding_preferences(profile_id)
+
+@app.put("/api/recommendations/{profile_id}/onboarding")
+async def update_recommendation_onboarding(profile_id: str, request: RecommendationOnboardingRequest, user = Depends(get_current_user)):
+    try:
+        return await set_onboarding_preferences(profile_id, request.genres, request.title_ids)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+
+@app.get("/api/recommendations/{profile_id}/diagnostics")
+async def recommendation_diagnostics(profile_id: str, user = Depends(get_current_user)):
+    return await get_recommendation_diagnostics(profile_id)
+
+@app.post("/api/recommendations/{profile_id}/rebuild")
+async def rebuild_recommendations(profile_id: str, user = Depends(get_current_user)):
+    async with AsyncSession(engine) as db:
+        if not await db.get(Profile, profile_id):
+            raise HTTPException(status_code=404, detail="Profile not found")
+        await persist_profile_pool(db, profile_id)
+        await db.commit()
+    return {"status": "rebuilt"}
+
+@app.delete("/api/recommendations/{profile_id}/preferences")
+async def clear_recommendation_preferences(profile_id: str, user = Depends(get_current_user)):
+    return {"cleared": await reset_media_preferences(profile_id)}
 
 @app.get("/api/watchlist/{profile_id}", response_model=List[str])
 async def get_watchlist(profile_id: str, user = Depends(get_current_user)):

@@ -9,10 +9,12 @@ import { useThemeStore } from "../../stores/themeStore";
 import { getThemeDefinition } from "../../themes/application/themeRegistry";
 import { AccountPanel } from "./panels/AccountPanel";
 import { DownloadsPanel } from "./panels/DownloadsPanel";
+import { RecommendationsPanel } from "./panels/RecommendationsPanel";
 import { StoragePanel } from "./panels/StoragePanel";
 
 const PANELS: Array<{ id: AdminSection; label: string }> = [
   { id: "account", label: "Account & Security" },
+  { id: "recommendations", label: "Recommendations" },
   { id: "storage", label: "Storage & HEVC" },
   { id: "downloads", label: "Downloads" },
 ];
@@ -46,6 +48,7 @@ export function AdminCenter() {
         <AnimatePresence mode="wait" initial={false}>
           <motion.div className="admin-content__transition" key={section} variants={CONTENT_REVEAL} initial="hidden" animate="shown" exit="exit">
             {section === "account" && <AccountPanel />}
+            {section === "recommendations" && <RecommendationsPanel />}
             {section === "storage" && <StoragePanel />}
             {section === "downloads" && <DownloadsPanel />}
           </motion.div>

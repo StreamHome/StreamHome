@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getRecommendations } from "./recommendations";
+import { getMediaPreferences, getRecommendationDiagnostics, getRecommendationOnboarding, getRecommendations, setMediaPreference } from "./recommendations";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -36,5 +36,19 @@ describe("recommendation API", () => {
     expect(result.categories[0]).toMatchObject({ serverCount: 2, cachedCount: 3 });
     expect(result.items).toEqual([]);
     expect(result.watchAgain).toEqual([]);
+  });
+
+  it("uses explicit preference and diagnostics contracts", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ preferences: { m_1: "love" } }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ movie_id: "m_1", preference: "dislike" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ profile_id: "1", period_days: 30, exposures: 10, details_opens: 4, playback_starts: 2, completions: 1, play_rate: .2, completion_rate: .5, preferences: { like: 1, love: 2, dislike: 3 }, candidate_pool: 12, candidate_sources: { taste_affinity: 12 }, catalog: { total: 20, available: 8, cached: 12 }, top_tastes: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ genres: ["action"], title_ids: ["m_1"] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await getMediaPreferences("1")).toEqual({ m_1: "love" });
+    await setMediaPreference("1", "m_1", "dislike");
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ preference: "dislike" });
+    expect(await getRecommendationDiagnostics("1")).toMatchObject({ periodDays: 30, candidatePool: 12, playRate: .2 });
+    expect(await getRecommendationOnboarding("1")).toEqual({ genres: ["action"], titleIds: ["m_1"] });
   });
 });

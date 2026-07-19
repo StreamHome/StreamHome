@@ -127,6 +127,8 @@ class TMDBClient:
                 "vote_count": movie.vote_count,
                 "popularity": movie.popularity,
                 "original_language": movie.original_language,
+                "keywords": movie.keywords,
+                "collection_name": movie.collection_name,
             }
             poster = movie.remote_thumbnail_url or (movie.thumbnail_url if movie.thumbnail_url.startswith("http") else "")
             backdrop = movie.remote_banner_url or (movie.banner_url if movie.banner_url and movie.banner_url.startswith("http") else "")
@@ -177,7 +179,7 @@ class TMDBClient:
 
     async def fetch_movie_metadata(self, tmdb_id: int) -> Dict[str, Any]:
         """Fetch movie details and crew credits from TMDB."""
-        data = await self._get(f"/movie/{tmdb_id}", params={"append_to_response": "credits,release_dates"})
+        data = await self._get(f"/movie/{tmdb_id}", params={"append_to_response": "credits,release_dates,keywords"})
         
         if not data:
             # High-quality fallback metadata
@@ -253,12 +255,14 @@ class TMDBClient:
             "cast": cast_list or ["Unknown Actor"],
             "originalLanguage": data.get("original_language", "en"),
             "vote_average": data.get("vote_average", 7.5),
-            "vote_count": data.get("vote_count", 100)
+            "vote_count": data.get("vote_count", 100),
+            "keywords": [item.get("name") for item in data.get("keywords", {}).get("keywords", [])[:12] if item.get("name")],
+            "collectionName": (data.get("belongs_to_collection") or {}).get("name")
         }
 
     async def fetch_show_metadata(self, tmdb_id: int) -> Dict[str, Any]:
         """Fetch TV Show metadata."""
-        data = await self._get(f"/tv/{tmdb_id}", params={"append_to_response": "credits,content_ratings"})
+        data = await self._get(f"/tv/{tmdb_id}", params={"append_to_response": "credits,content_ratings,keywords"})
         
         if not data:
             # Fallback
@@ -322,7 +326,9 @@ class TMDBClient:
             "cast": cast_list or ["Unknown Actor"],
             "originalLanguage": data.get("original_language", "en"),
             "vote_average": data.get("vote_average", 7.5),
-            "vote_count": data.get("vote_count", 100)
+            "vote_count": data.get("vote_count", 100),
+            "keywords": [item.get("name") for item in data.get("keywords", {}).get("results", [])[:12] if item.get("name")],
+            "collectionName": None
         }
 
     async def fetch_episode_metadata(self, tmdb_id: int, season: int, episode: int) -> Dict[str, Any]:
@@ -423,6 +429,8 @@ class TMDBClient:
                     "quality": item_dict.get("quality", "Source"),
                     "languages": item_dict.get("languages", []),
                     "subtitles": item_dict.get("subtitles", []),
+                    "keywords": item_dict.get("keywords", []),
+                    "collection_name": item_dict.get("collection_name") or item_dict.get("collectionName"),
                 }
                 metadata_file = os.path.join(metadata_dir, "metadata.json")
                 with open(metadata_file, "w", encoding="utf-8") as file:
@@ -462,6 +470,8 @@ class TMDBClient:
                         )
                         movie.genres = item_dict.get("genres", [])
                         movie.cast = item_dict.get("cast", [])
+                        movie.keywords = item_dict.get("keywords", [])
+                        movie.collection_name = item_dict.get("collection_name") or item_dict.get("collectionName")
                     elif movie.availability != "available":
                         movie.title = title
                         movie.description = item_dict.get("description", movie.description)
@@ -482,6 +492,8 @@ class TMDBClient:
                         movie.local_thumbnail_url = f"/media/{library_name}/{folder_name}/poster.jpg" if raw_poster_url else movie.local_thumbnail_url
                         movie.local_banner_url = f"/media/{library_name}/{folder_name}/backdrop.jpg" if raw_backdrop_url else movie.local_banner_url
                         movie.cache_state = "ready"
+                        movie.keywords = item_dict.get("keywords", movie.keywords)
+                        movie.collection_name = item_dict.get("collection_name") or item_dict.get("collectionName") or movie.collection_name
                     db.add(movie)
                     await db.commit()
                 logger.info(f"[TMDB Client] In-place recommendation cache complete for: {title}")
@@ -682,6 +694,52 @@ class TMDBClient:
             raw_results.append(result_item)
 
         return await self._upsert_search_results(raw_results)
+
+    async def discover_related_media(self, tmdb_id: int, media_type: str, limit: int = 12) -> List[Dict[str, Any]]:
+        """Cache a bounded mix of TMDB recommendations and similar titles for one seed."""
+        is_tv = media_type in {"series", "tv"}
+        api_type = "tv" if is_tv else "movie"
+        payloads = await asyncio.gather(
+            self._get(f"/{api_type}/{tmdb_id}/recommendations", params={"page": 1}),
+            self._get(f"/{api_type}/{tmdb_id}/similar", params={"page": 1}),
+        )
+        seen: set[int] = set()
+        items: List[Dict[str, Any]] = []
+        for payload in payloads:
+            for item in (payload or {}).get("results", []):
+                related_id = item.get("id")
+                if not related_id or related_id == tmdb_id or related_id in seen or item.get("adult") is True:
+                    continue
+                seen.add(related_id)
+                poster_path, backdrop_path = item.get("poster_path"), item.get("backdrop_path")
+                poster = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else ""
+                backdrop = f"https://image.tmdb.org/t/p/original{backdrop_path}" if backdrop_path else ""
+                title = (item.get("name") if is_tv else item.get("title")) or item.get("title") or item.get("name") or "Unknown Title"
+                date = item.get("first_air_date") if is_tv else item.get("release_date")
+                try:
+                    year = int(date.split("-")[0]) if date else 0
+                except (TypeError, ValueError):
+                    year = 0
+                clean_title = "".join(char for char in title if char.isalnum() or char in " .-_")
+                library = "Series" if is_tv else "Movies"
+                folder = f"{clean_title}_TMDB_{related_id}" if is_tv else f"{clean_title}_{year}_TMDB_{related_id}"
+                items.append({
+                    "id": f"tv_{related_id}" if is_tv else f"m_{related_id}", "tmdb_id": related_id,
+                    "title": title, "description": item.get("overview", ""), "thumbnail_url": poster,
+                    "banner_url": backdrop, "genres": [GENRES_MAP[gid] for gid in item.get("genre_ids", []) if gid in GENRES_MAP] or ["Discovery"],
+                    "duration": "45m" if is_tv else "2h", "release_year": year,
+                    "rating": "TV-14" if is_tv else "PG-13", "vote_average": item.get("vote_average", 0),
+                    "vote_count": item.get("vote_count", 0), "director": "Various", "cast": [],
+                    "type": "series" if is_tv else "movie", "popularity": item.get("popularity", 0),
+                    "original_language": item.get("original_language", "en"), "source": "tmdb_cache", "availability": "cached",
+                    "remote_thumbnail_url": poster or None, "remote_banner_url": backdrop or None,
+                    "local_thumbnail_url": f"/media/{library}/{folder}/poster.jpg" if poster else None,
+                    "local_banner_url": f"/media/{library}/{folder}/backdrop.jpg" if backdrop else None,
+                    "cache_state": "queued",
+                })
+                if len(items) >= limit:
+                    return await self._upsert_search_results(items)
+        return await self._upsert_search_results(items)
 
     async def _upsert_search_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         import time

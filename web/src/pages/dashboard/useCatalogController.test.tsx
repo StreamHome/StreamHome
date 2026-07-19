@@ -5,13 +5,13 @@ import type { Movie, Profile, RecommendationFeed } from "../../types/api";
 import { useCatalogController } from "./useCatalogController";
 
 const mocks = vi.hoisted(() => ({
-  getMovie: vi.fn(), getMovies: vi.fn(), getPlaybackSessions: vi.fn(), getWatchlist: vi.fn(), getRecommendations: vi.fn(), search: vi.fn(),
+  getMovie: vi.fn(), getMovies: vi.fn(), getPlaybackSessions: vi.fn(), getWatchlist: vi.fn(), getRecommendations: vi.fn(), getMediaPreferences: vi.fn(), setMediaPreference: vi.fn(), search: vi.fn(),
 }));
 
 vi.mock("../../api/movies", () => ({ getMovie: mocks.getMovie, getMovies: mocks.getMovies, search: mocks.search }));
 vi.mock("../../api/playback", () => ({ getPlaybackSessions: mocks.getPlaybackSessions }));
 vi.mock("../../api/watchlist", () => ({ getWatchlist: mocks.getWatchlist }));
-vi.mock("../../api/recommendations", () => ({ getRecommendations: mocks.getRecommendations }));
+vi.mock("../../api/recommendations", () => ({ getRecommendations: mocks.getRecommendations, getMediaPreferences: mocks.getMediaPreferences, setMediaPreference: mocks.setMediaPreference }));
 
 const profile: Profile = { id: "profile one", name: "Viewer", avatarColor: "", theme: "ember", pinEnabled: false, pin: null };
 
@@ -37,6 +37,8 @@ beforeEach(() => {
   mocks.getMovies.mockResolvedValue([]);
   mocks.getPlaybackSessions.mockResolvedValue([]);
   mocks.getWatchlist.mockResolvedValue([]);
+  mocks.getMediaPreferences.mockResolvedValue({});
+  mocks.setMediaPreference.mockResolvedValue(undefined);
   mocks.search.mockResolvedValue([]);
   mocks.getMovie.mockRejectedValue(new Error("Media not found"));
 });
@@ -104,5 +106,19 @@ describe("useCatalogController recommendations", () => {
     expect(result.current.resolveMovie("m_42")?.title).toBe("Search Only");
     await waitFor(() => expect(mocks.getMovie).toHaveBeenCalledWith("m_42", expect.any(AbortSignal)));
     await waitFor(() => expect(result.current.resolveMovie("m_42")?.cacheState).toBe("ready"));
+  });
+
+  it("optimistically removes a disliked title without reordering Watch Again", async () => {
+    mocks.getRecommendations
+      .mockResolvedValueOnce(feed("recommended", ["liked", "hidden"], 2, ["hidden", "liked"]))
+      .mockResolvedValue({ ...feed("recommended", ["liked"], 1, ["hidden", "liked"]), watchAgain: feed("recommended", [], 0, ["hidden", "liked"]).watchAgain.map((item) => item.media.id === "hidden" ? { ...item, viewerPreference: "dislike" } : item) });
+    const query: AppQueryState = { profile: profile.id, view: "home" };
+    const { result } = renderHook(() => useCatalogController(profile, query));
+    await waitFor(() => expect(result.current.recommendation?.items).toHaveLength(2));
+    await act(async () => { await result.current.updatePreference("hidden", "dislike"); });
+    expect(mocks.setMediaPreference).toHaveBeenCalledWith(profile.id, "hidden", "dislike");
+    await waitFor(() => expect(result.current.recommendation?.items.map((entry) => entry.media.id)).toEqual(["liked"]));
+    expect(result.current.recommendation?.watchAgain.map((entry) => entry.media.id)).toEqual(["hidden", "liked"]);
+    expect(result.current.recommendation?.watchAgain[0].viewerPreference).toBe("dislike");
   });
 });

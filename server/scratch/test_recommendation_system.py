@@ -14,7 +14,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 import services.recommendation as recommendation
 import db as db_module
 from config import settings
-from models import Episode, Movie, Profile, ProfileTaste, TelemetryRequest, ViewingAttempt
+from models import Episode, Movie, Profile, ProfileMediaPreference, ProfileTaste, RecommendationExposure, RecommendationExposureInput, TelemetryRequest, ViewingAttempt
 from services.tmdb import tmdb_client
 
 
@@ -98,6 +98,14 @@ async def main() -> None:
         assert not await recommendation.process_telemetry_event("profile", TelemetryRequest(event_type="watchlist_add", movie_id="m_1")), "browser must not forge authoritative signals"
         assert await recommendation.record_authoritative_signal("profile", "m_1", "watchlist_add")
 
+        assert (await recommendation.set_media_preference("profile", "m_2", "like"))["preference"] == "like"
+        assert (await recommendation.set_media_preference("profile", "m_2", "love"))["preference"] == "love"
+        assert (await recommendation.set_media_preference("profile", "m_2", "dislike"))["preference"] == "dislike"
+        assert await recommendation.get_media_preferences("profile") == {"m_2": "dislike"}
+        exposure = RecommendationExposureInput(movie_id="m_1", feed_generation="generation", surface="home-card", scope="home", category="recommended", position=0)
+        assert await recommendation.record_recommendation_exposures("profile", [exposure]) == 1
+        assert await recommendation.record_recommendation_exposures("profile", [exposure]) == 0, "impressions must be idempotent"
+
         async with AsyncSession(test_engine) as db:
             tastes = list((await db.exec(select(ProfileTaste))).all())
             assert tastes and any(taste.tag_type == "genre" and taste.tag_value == "action" for taste in tastes)
@@ -105,7 +113,11 @@ async def main() -> None:
             assert payload["total"] == 2, "All Releases must contain only the playable movie and series"
             assert all(item["availability"] == "available" for item in payload["items"])
             genre_payload = await recommendation.build_recommendation_payload(db, "profile", "home", "drama", 50, 0)
-            assert genre_payload["total"] == 1 and genre_payload["items"][0]["source"] == "tmdb_cache"
+            assert genre_payload["total"] == 0, "disliked titles must leave personalized genre feeds"
+            recommended = await recommendation.build_recommendation_payload(db, "profile", "home", "recommended", 50, 0)
+            assert all(item["media"].id != "m_2" for item in recommended["items"])
+            assert len(list((await db.exec(select(ProfileMediaPreference))).all())) == 1, "preference transitions must update one row"
+            assert len(list((await db.exec(select(RecommendationExposure))).all())) == 1
 
         first_attempt = await recommendation.record_playback_progress("profile", "m_1", None, 4000, 4000, 0.80, False)
         assert first_attempt
@@ -117,9 +129,13 @@ async def main() -> None:
         second_attempt = await recommendation.record_playback_progress("profile", "m_1", None, 0, 0, 0.0, False)
         assert second_attempt and second_attempt != first_attempt
         await recommendation.record_playback_progress("profile", "m_1", None, 3000, 3000, 0.55, False)
+        await recommendation.set_media_preference("profile", "m_1", "dislike")
         async with AsyncSession(test_engine) as db:
             attempts = list((await db.exec(select(ViewingAttempt).where(ViewingAttempt.movie_id == "m_1"))).all())
             assert any(attempt.rewatch_reward == 1.0 for attempt in attempts), "genuine rewatch reward was not recorded"
+            payload = await recommendation.build_recommendation_payload(db, "profile", "home", "recommended", 50, 0)
+            assert all(item["media"].id != "m_1" for item in payload["items"]), "dislike must hide personalized recommendations"
+            assert [item["media"].id for item in payload["watch_again"]] == ["m_1"], "Watch Again must remain pure history even after dislike"
 
         half_life_taste = ProfileTaste(profile_id="profile", tag_type="genre", tag_value="action", score=10.0, last_updated=time.time() - 90 * 86400)
         assert 4.95 <= recommendation.decayed_score(half_life_taste) <= 5.05

@@ -111,6 +111,8 @@ async def init_db():
                     "local_thumbnail_url": "TEXT",
                     "local_banner_url": "TEXT",
                     "cache_state": "TEXT",
+                    "keywords_str": "TEXT DEFAULT '[]'",
+                    "collection_name": "TEXT",
                 }
                 for column, sql_type in recommendation_columns.items():
                     if column not in movie_cols:
@@ -145,11 +147,19 @@ async def init_db():
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_catalog_source ON movie (catalog_source)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_availability ON movie (availability)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_cache_state ON movie (cache_state)")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_collection_name ON movie (collection_name)")
                 sync_conn.exec_driver_sql(
                     "UPDATE movie SET cache_state = CASE "
                     "WHEN catalog_source = 'tmdb_cache' THEN 'ready' ELSE NULL END "
                     "WHERE cache_state IS NULL"
                 )
+
+            if "profilerecommendation" in inspector.get_table_names():
+                recommendation_cols = [col["name"] for col in inspector.get_columns("profilerecommendation")]
+                if "candidate_source" not in recommendation_cols:
+                    sync_conn.exec_driver_sql("ALTER TABLE profilerecommendation ADD COLUMN candidate_source TEXT DEFAULT 'ranked'")
+                if "source_confidence" not in recommendation_cols:
+                    sync_conn.exec_driver_sql("ALTER TABLE profilerecommendation ADD COLUMN source_confidence FLOAT DEFAULT 0.5")
 
             if "telemetryevent" in inspector.get_table_names():
                 telemetry_cols = [col["name"] for col in inspector.get_columns("telemetryevent")]

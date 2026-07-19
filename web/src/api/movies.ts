@@ -50,6 +50,7 @@ export function normalizeMovie(raw: Partial<Movie>): Movie {
     localThumbnailUrl: raw.localThumbnailUrl ?? null,
     localBannerUrl: raw.localBannerUrl ?? null,
     cacheState: raw.cacheState ?? null,
+    viewerPreference: raw.viewerPreference ?? null,
   };
 }
 

@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getMovie, getMovies, search as searchServer } from "../../api/movies";
 import { getPlaybackSessions } from "../../api/playback";
-import { getRecommendations } from "../../api/recommendations";
+import { getMediaPreferences, getRecommendations, setMediaPreference } from "../../api/recommendations";
 import { getWatchlist } from "../../api/watchlist";
 import { isCatalogView, type AppQueryState, type CatalogView } from "../../navigation/queryState";
-import type { DiscoverMovie, Movie, PlaybackSession, Profile, RecommendationFeed } from "../../types/api";
+import type { DiscoverMovie, MediaPreference, Movie, PlaybackSession, Profile, RecommendationFeed } from "../../types/api";
 
 const FEED_PAGE_SIZE = 48;
 
@@ -37,6 +37,8 @@ export interface CatalogController {
   detailsLoading: boolean;
   detailsError: string;
   retryDetails: () => void;
+  preferences: Record<string, Exclude<MediaPreference, null>>;
+  updatePreference: (movieId: string, preference: MediaPreference) => Promise<void>;
 }
 
 function discoverId(result: DiscoverMovie): string {
@@ -81,6 +83,7 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   const [baseMovies, setBaseMovies] = useState<Movie[]>([]);
   const [sessions, setSessions] = useState<PlaybackSession[]>([]);
   const [watchlist, setWatchlist] = useState<string[]>([]);
+  const [preferences, setPreferences] = useState<Record<string, Exclude<MediaPreference, null>>>({});
   const [results, setResults] = useState<DiscoverMovie[]>([]);
   const [retainedMovies, setRetainedMovies] = useState<Record<string, Movie>>({});
   const [recommendation, setRecommendation] = useState<RecommendationFeed | null>(null);
@@ -106,10 +109,10 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
     const abort = new AbortController();
     setCatalogLoading(true);
     setError("");
-    Promise.all([getMovies(profile.id, abort.signal), getPlaybackSessions(profile.id, abort.signal), getWatchlist(profile.id, abort.signal)])
-      .then(([catalog, playback, saved]) => {
+    Promise.all([getMovies(profile.id, abort.signal), getPlaybackSessions(profile.id, abort.signal), getWatchlist(profile.id, abort.signal), getMediaPreferences(profile.id, abort.signal)])
+      .then(([catalog, playback, saved, preferenceMap]) => {
         if (abort.signal.aborted) return;
-        setBaseMovies(catalog); setSessions(playback); setWatchlist(saved);
+        setBaseMovies(catalog); setSessions(playback); setWatchlist(saved); setPreferences(preferenceMap);
       })
       .catch((requestError: unknown) => {
         if (!abort.signal.aborted) setError(requestError instanceof Error ? requestError.message : "The catalog could not be loaded.");
@@ -242,6 +245,35 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   const retryRecommendations = useCallback(() => setRefreshVersion((value) => value + 1), []);
   const retryDetails = useCallback(() => setDetailsVersion((value) => value + 1), []);
   const refreshRecommendations = retryRecommendations;
+  const updatePreference = useCallback(async (movieId: string, preference: MediaPreference) => {
+    const previous = preferences[movieId] ?? null;
+    setError("");
+    setPreferences((current) => {
+      const next = { ...current };
+      if (preference) next[movieId] = preference;
+      else delete next[movieId];
+      return next;
+    });
+    setRecommendation((current) => current ? {
+      ...current,
+      items: current.items.filter((item) => preference !== "dislike" || item.media.id !== movieId).map((item) => item.media.id === movieId ? { ...item, viewerPreference: preference, media: { ...item.media, viewerPreference: preference } } : item),
+      watchAgain: current.watchAgain.map((item) => item.media.id === movieId ? { ...item, viewerPreference: preference, media: { ...item.media, viewerPreference: preference } } : item),
+    } : current);
+    try {
+      await setMediaPreference(profile.id, movieId, preference);
+      setRefreshVersion((value) => value + 1);
+    } catch (requestError) {
+      setPreferences((current) => {
+        const next = { ...current };
+        if (previous) next[movieId] = previous;
+        else delete next[movieId];
+        return next;
+      });
+      setRefreshVersion((value) => value + 1);
+      setError(requestError instanceof Error ? requestError.message : "Your recommendation feedback could not be saved.");
+      throw requestError;
+    }
+  }, [preferences, profile.id]);
   const loadMoreRecommendations = useCallback(async () => {
     if (!scope || !recommendation || recommendationLoadingMore || recommendation.items.length >= recommendation.total) return;
     const key = requestedKey;
@@ -267,5 +299,6 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
     recommendationLoadingMore, recommendationError, recommendationHasMore, retryRecommendations,
     refreshRecommendations, loadMoreRecommendations, resolveMovie, loading, searching, error, setError,
     detailsLoading, detailsError, retryDetails,
+    preferences, updatePreference,
   };
 }

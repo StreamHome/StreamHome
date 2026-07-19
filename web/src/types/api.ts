@@ -121,11 +121,13 @@ export interface Movie {
   localThumbnailUrl?: string | null;
   localBannerUrl?: string | null;
   cacheState?: MediaCacheState | null;
+  viewerPreference?: MediaPreference;
 }
 
 export type MediaSource = "server" | "tmdb_cache" | string;
 export type MediaAvailability = "available" | "processing" | "cached" | string;
 export type MediaCacheState = "queued" | "caching" | "ready" | "error";
+export type MediaPreference = "like" | "love" | "dislike" | null;
 
 export interface RecommendationCategory {
   value: string;
@@ -141,6 +143,9 @@ export interface RecommendationItem {
   availability: MediaAvailability;
   score: number;
   reasons: string[];
+    viewerPreference?: MediaPreference;
+    candidateSource?: string;
+    sourceConfidence?: number;
 }
 
 export interface RecommendationFeed {
@@ -155,6 +160,22 @@ export interface RecommendationFeed {
   categories: RecommendationCategory[];
   items: RecommendationItem[];
   watchAgain: RecommendationItem[];
+}
+
+export interface RecommendationDiagnostics {
+  profileId: string;
+  periodDays: number;
+  exposures: number;
+  detailsOpens: number;
+  playbackStarts: number;
+  completions: number;
+  playRate: number;
+  completionRate: number;
+  preferences: Record<"like" | "love" | "dislike", number>;
+  candidatePool: number;
+  candidateSources: Record<string, number>;
+  catalog: { total: number; available: number; cached: number };
+  topTastes: Array<{ kind: string; value: string; score: number }>;
 }
 
 export interface PlaybackSession {

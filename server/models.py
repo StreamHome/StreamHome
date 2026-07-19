@@ -58,6 +58,8 @@ class Movie(SQLModel, table=True):
     local_thumbnail_url: Optional[str] = Field(default=None)
     local_banner_url: Optional[str] = Field(default=None)
     cache_state: Optional[str] = Field(default=None, index=True)
+    keywords_str: Optional[str] = Field(default="[]")
+    collection_name: Optional[str] = Field(default=None, index=True)
 
     @property
     def genres(self) -> List[str]:
@@ -116,6 +118,17 @@ class Movie(SQLModel, table=True):
     @skip_markers.setter
     def skip_markers(self, val: Dict[str, Any]):
         self.skip_markers_str = json.dumps(val or {})
+
+    @property
+    def keywords(self) -> List[str]:
+        try:
+            return json.loads(self.keywords_str or "[]")
+        except Exception:
+            return []
+
+    @keywords.setter
+    def keywords(self, val: List[str]):
+        self.keywords_str = json.dumps(val or [])
 
 class Episode(SQLModel, table=True):
     id: str = Field(primary_key=True)
@@ -199,6 +212,34 @@ class ProfileTaste(SQLModel, table=True):
     score: float = Field(default=0.0)
     last_updated: float
 
+class ProfileMediaPreference(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("profile_id", "movie_id", name="uq_profile_media_preference"),)
+    id: Optional[int] = Field(default=None, primary_key=True)
+    profile_id: str = Field(index=True)
+    movie_id: str = Field(foreign_key="movie.id", index=True)
+    preference: str = Field(index=True)  # like, love, dislike
+    updated_at: float = Field(index=True)
+
+class ProfileOnboardingPreference(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("profile_id", "kind", "value", name="uq_profile_onboarding_preference"),)
+    id: Optional[int] = Field(default=None, primary_key=True)
+    profile_id: str = Field(index=True)
+    kind: str = Field(index=True)  # genre or title
+    value: str = Field(index=True)
+    updated_at: float
+
+class RecommendationExposure(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    profile_id: str = Field(index=True)
+    movie_id: str = Field(foreign_key="movie.id", index=True)
+    feed_generation: str = Field(index=True)
+    surface: str = Field(index=True)
+    scope: str = Field(index=True)
+    category: str = Field(index=True)
+    position: int
+    shown_at: float = Field(index=True)
+    dedupe_key: str = Field(unique=True, index=True)
+
 class ViewingAttempt(SQLModel, table=True):
     id: str = Field(primary_key=True)
     profile_id: str = Field(index=True)
@@ -228,6 +269,8 @@ class ProfileRecommendation(SQLModel, table=True):
     score: float = Field(default=0.0)
     reasons_str: str = Field(default="[]")
     generated_at: float = Field(index=True)
+    candidate_source: str = Field(default="ranked", index=True)
+    source_confidence: float = Field(default=0.5)
 
     @property
     def reasons(self) -> List[str]:
@@ -510,6 +553,9 @@ class RecommendationItemResponse(APIModel):
     availability: str
     score: float
     reasons: List[str] = []
+    viewer_preference: Optional[str] = None
+    candidate_source: str = "ranked"
+    source_confidence: float = 0.5
 
 class RecommendationFeedResponse(APIModel):
     profile_id: str
@@ -543,6 +589,24 @@ class TelemetryRequest(BaseModel):
     movie_id: Optional[str] = None
     tmdb_id: Optional[int] = None
     metadata_json: Optional[Dict[str, Any]] = None
+
+class MediaPreferenceRequest(BaseModel):
+    preference: Optional[str] = None
+
+class RecommendationExposureInput(BaseModel):
+    movie_id: str
+    feed_generation: str
+    surface: str
+    scope: str
+    category: str
+    position: int = 0
+
+class RecommendationExposureBatch(BaseModel):
+    exposures: List[RecommendationExposureInput] = []
+
+class RecommendationOnboardingRequest(BaseModel):
+    genres: List[str] = []
+    title_ids: List[str] = []
 
 class DownloadAddRequest(BaseModel):
     tmdb_id: int

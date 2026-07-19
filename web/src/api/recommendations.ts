@@ -1,6 +1,6 @@
-import { apiGet } from "./client";
+import { apiDelete, apiGet, apiPost, apiPut } from "./client";
 import { normalizeMovie } from "./movies";
-import type { RecommendationCategory, RecommendationFeed, RecommendationItem } from "../types/api";
+import type { MediaPreference, RecommendationCategory, RecommendationDiagnostics, RecommendationFeed, RecommendationItem } from "../types/api";
 import type { CatalogView } from "../navigation/queryState";
 
 type RawRecommendationCategory = Partial<RecommendationCategory> & {
@@ -49,8 +49,50 @@ function normalizeItem(raw: RawRecommendationItem): RecommendationItem {
   media.availability = availability;
   media.recommendationScore = raw.score ?? 0;
   media.recommendationReasons = reasons;
-  return { media, source, availability, score: raw.score ?? 0, reasons };
+  const viewerPreference = raw.viewerPreference ?? null;
+  media.viewerPreference = viewerPreference;
+  return { media, source, availability, score: raw.score ?? 0, reasons, viewerPreference, candidateSource: raw.candidateSource ?? "ranked", sourceConfidence: raw.sourceConfidence ?? 0.5 };
 }
+
+export async function getMediaPreferences(profileId: string, signal?: AbortSignal): Promise<Record<string, Exclude<MediaPreference, null>>> {
+  const response = await apiGet<{ preferences: Record<string, Exclude<MediaPreference, null>> }>(`/api/recommendations/${encodeURIComponent(profileId)}/preferences`, { signal });
+  return response.preferences ?? {};
+}
+
+export async function setMediaPreference(profileId: string, movieId: string, preference: MediaPreference): Promise<void> {
+  await apiPut(`/api/recommendations/${encodeURIComponent(profileId)}/preferences/${encodeURIComponent(movieId)}`, { preference });
+}
+
+export interface RecommendationExposurePayload { movie_id: string; feed_generation: string; surface: string; scope: string; category: string; position: number }
+export async function sendRecommendationExposures(profileId: string, exposures: RecommendationExposurePayload[]): Promise<void> {
+  if (exposures.length) await apiPost(`/api/recommendations/${encodeURIComponent(profileId)}/exposures`, { exposures });
+}
+
+export async function getRecommendationDiagnostics(profileId: string): Promise<RecommendationDiagnostics> {
+  const raw = await apiGet<Record<string, unknown>>(`/api/recommendations/${encodeURIComponent(profileId)}/diagnostics`);
+  return {
+    profileId,
+    periodDays: Number(raw.periodDays ?? raw.period_days ?? 30),
+    exposures: Number(raw.exposures ?? 0),
+    detailsOpens: Number(raw.detailsOpens ?? raw.details_opens ?? 0),
+    playbackStarts: Number(raw.playbackStarts ?? raw.playback_starts ?? 0),
+    completions: Number(raw.completions ?? 0),
+    playRate: Number(raw.playRate ?? raw.play_rate ?? 0),
+    completionRate: Number(raw.completionRate ?? raw.completion_rate ?? 0),
+    preferences: (raw.preferences ?? { like: 0, love: 0, dislike: 0 }) as RecommendationDiagnostics["preferences"],
+    candidatePool: Number(raw.candidatePool ?? raw.candidate_pool ?? 0),
+    candidateSources: (raw.candidateSources ?? raw.candidate_sources ?? {}) as Record<string, number>,
+    catalog: (raw.catalog ?? { total: 0, available: 0, cached: 0 }) as RecommendationDiagnostics["catalog"],
+    topTastes: (raw.topTastes ?? raw.top_tastes ?? []) as RecommendationDiagnostics["topTastes"],
+  };
+}
+export const rebuildRecommendations = (profileId: string) => apiPost(`/api/recommendations/${encodeURIComponent(profileId)}/rebuild`);
+export const clearMediaPreferences = (profileId: string) => apiDelete<{ cleared: number }>(`/api/recommendations/${encodeURIComponent(profileId)}/preferences`);
+export async function getRecommendationOnboarding(profileId: string): Promise<{ genres: string[]; titleIds: string[] }> {
+  const raw = await apiGet<{ genres?: string[]; titleIds?: string[]; title_ids?: string[] }>(`/api/recommendations/${encodeURIComponent(profileId)}/onboarding`);
+  return { genres: raw.genres ?? [], titleIds: raw.titleIds ?? raw.title_ids ?? [] };
+}
+export const saveRecommendationOnboarding = (profileId: string, genres: string[], titleIds: string[] = []) => apiPut(`/api/recommendations/${encodeURIComponent(profileId)}/onboarding`, { genres, title_ids: titleIds });
 
 export async function getRecommendations({
   profileId,
