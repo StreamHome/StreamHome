@@ -12,6 +12,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -21,7 +22,7 @@ from models import (
     PlaybackSessionResponse, DiscoverMovieResponse, EpisodeResponse, 
     Profile, ProfileResponse, APIModel, DownloadTask, TelemetryRequest,
     RecommendationFeedResponse, MediaPreferenceRequest, RecommendationExposureBatch,
-    RecommendationOnboardingRequest
+    RecommendationOnboardingRequest, User
 )
 from services.recommendation import (
     process_telemetry_event,
@@ -49,6 +50,7 @@ from routes.auth import router as auth_router, health_router, get_current_user
 from routes.stream import router as stream_router
 from routes.backup import router as backup_router
 from routes.update import router as update_router
+from routes.setup import router as setup_router
 
 # 💥 WINDOWS ASYNC SUBPROCESS FIX
 if sys.platform == 'win32':
@@ -65,6 +67,15 @@ async def lifespan(app: FastAPI):
         await init_db()
     except Exception as db_err:
         logger.error(f"[Lifespan Startup] Database initialization failed (server continuing): {db_err}")
+
+    # An installation flag without an administrator is never considered complete.
+    try:
+        async with AsyncSession(engine) as db:
+            existing_user = (await db.exec(select(User))).first()
+            if not existing_user:
+                settings.SETUP_COMPLETE = False
+    except Exception as setup_state_err:
+        logger.error(f"[Lifespan Startup] Setup-state validation failed: {setup_state_err}")
     
     try:
         settings.get_system_profile()
@@ -244,11 +255,24 @@ class ActivityTrackingMiddleware(BaseHTTPMiddleware):
             state.ACTIVE_HTTP_REQUESTS = max(0, state.ACTIVE_HTTP_REQUESTS - 1)
             state.LAST_HTTP_ACTIVITY_TIMESTAMP = time.time()
 
+class SetupGateMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        allowed = request.method == "OPTIONS" or path.startswith("/api/setup") or path == "/api/health"
+        if not settings.SETUP_COMPLETE and not allowed:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": {"code": "setup_required", "message": "Complete StreamHome setup before using this endpoint."}},
+                headers={"Retry-After": "5"},
+            )
+        return await call_next(request)
+
 # Initialize FastAPI application with modern lifespan
 app = FastAPI(title="StreamHome Media Server", version=settings.APP_VERSION, lifespan=lifespan)
 
 # Setup CORS and activity tracking middlewares
 app.add_middleware(ActivityTrackingMiddleware)
+app.add_middleware(SetupGateMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -264,6 +288,7 @@ app.include_router(health_router)
 app.include_router(stream_router)
 app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
 app.include_router(update_router, prefix="/api/update", tags=["update"])
+app.include_router(setup_router)
 
 # Ensure directories exist before mounting static files
 os.makedirs(settings.MEDIA_DIR, exist_ok=True)

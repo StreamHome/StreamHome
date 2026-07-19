@@ -1,5 +1,7 @@
 import express from "express";
 import path from "path";
+import { fileURLToPath } from "url";
+import { readFileSync } from "fs";
 import { createServer as createViteServer } from "vite";
 import { createProxyMiddleware } from "http-proxy-middleware";
 
@@ -7,7 +9,8 @@ import { createProxyMiddleware } from "http-proxy-middleware";
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const requestedPort = Number.parseInt(process.env.WEB_PORT ?? "3000", 10);
+  const PORT = Number.isInteger(requestedPort) && requestedPort >= 1 && requestedPort <= 65535 ? requestedPort : 3000;
 
   // Proxy /api and /media requests to the live Python FastAPI backend
   app.use("/api", createProxyMiddleware({
@@ -25,7 +28,9 @@ async function startServer() {
 
 
   // Vite middleware setup
-  const isProd = process.env.NODE_ENV === "production" || process.argv[1]?.endsWith("server.cjs");
+  // `npm run dev` owns Vite development. The packaged Express entrypoint is
+  // production-first so a missing inherited NODE_ENV can never expose a dev server.
+  const isProd = process.env.NODE_ENV !== "development" || process.argv[1]?.endsWith("server.cjs");
   
   if (!isProd) {
     const vite = await createViteServer({
@@ -34,10 +39,13 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
+    const distPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "dist");
+    console.log(`[StreamHome Server] Serving web assets from ${distPath}`);
+    const indexDocument = readFileSync(path.join(distPath, "index.html"), "utf8");
     app.use(express.static(distPath));
-    app.get("*all", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
+    app.use((req, res, next) => {
+      if (req.method !== "GET") return next();
+      res.type("html").send(indexDocument);
     });
   }
 

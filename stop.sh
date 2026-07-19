@@ -1,24 +1,25 @@
-#!/bin/bash
-echo "===================================================="
-echo "Stopping StreamHome backend and frontend processes..."
-echo "===================================================="
-pkill -f "main.py" >/dev/null 2>&1
-pkill -f "tsx server.ts" >/dev/null 2>&1
-pkill -f "npm run dev" >/dev/null 2>&1
+#!/usr/bin/env bash
+set -u
 
-# 2. Port-based fallback killing (ensures ports 8000, 3000, 24678 are completely freed)
-if command -v fuser >/dev/null 2>&1; then
-    fuser -k 8000/tcp >/dev/null 2>&1
-    fuser -k 3000/tcp >/dev/null 2>&1
-    fuser -k 24678/tcp >/dev/null 2>&1
-else
-    # Fallback to lsof/kill if fuser is missing
-    for port in 8000 3000 24678; do
-        pid=$(lsof -t -i:$port 2>/dev/null)
-        if [ -n "$pid" ]; then
-            kill -9 $pid >/dev/null 2>&1
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_DIR="$ROOT_DIR/.run"
+QUIET="${1:-}"
+
+[[ "$QUIET" == "--quiet" ]] || echo "Stopping StreamHome processes..."
+for name in web backend; do
+    pid_file="$RUN_DIR/$name.pid"
+    if [[ -f "$pid_file" ]]; then
+        pid="$(cat "$pid_file" 2>/dev/null || true)"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            for _ in {1..20}; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.1
+            done
+            kill -9 "$pid" 2>/dev/null || true
         fi
-    done
-fi
+        rm -f "$pid_file"
+    fi
+done
 
-echo "Processes terminated."
+[[ "$QUIET" == "--quiet" ]] || echo "StreamHome stopped."

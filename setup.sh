@@ -129,13 +129,29 @@ cd web
 npm install
 cd ..
 
-# 3. Grant execute permissions to start/stop scripts
-chmod +x start.sh start_background.sh stop.sh setup.sh || true
+# 3. Build the production web application and prepare deployment settings
+echo "Building production Web Client..."
+cd web
+npm run build
+cd ..
+
+if [ ! -f ".env" ]; then
+    SETUP_STATE="false"
+    if [ -f "server/database.db" ]; then
+        HAS_ADMIN="$(python3 -c 'import sqlite3; p="server/database.db"; c=sqlite3.connect(p); print("true" if c.execute("SELECT 1 FROM user LIMIT 1").fetchone() else "false")' 2>/dev/null || echo false)"
+        if [ "$HAS_ADMIN" = "true" ]; then
+            SETUP_STATE="true"
+        fi
+    fi
+    printf 'SETUP=%s\nWEB_PORT=3000\n' "$SETUP_STATE" > .env
+fi
+
+chmod +x ./*.sh || true
 
 echo ""
 echo "===================================================="
 echo "       DEPENDENCIES ARE SUCCESSFULLY INSTALLED"
-echo "           LAUNCHING SETUP CONFIGURATION..."
+echo "       STREAMHOME IS READY TO BE STARTED"
 echo "===================================================="
 echo ""
-python3 server/cli.py --setup
+echo "Run: ./start.sh"

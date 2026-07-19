@@ -6,14 +6,28 @@ from dotenv import load_dotenv
 # Load .env file relative to the config.py location
 config_dir = os.path.dirname(os.path.abspath(__file__))
 base_dir = os.path.abspath(os.path.join(config_dir, ".."))
+root_env_path = os.path.join(base_dir, ".env")
+server_env_path = os.path.join(config_dir, ".env")
+
+def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(maximum, int(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
 
 # Inject local bin/ path into system PATH for discovery of ffmpeg/ffprobe/rclone
 bin_path = os.path.abspath(os.path.join(base_dir, "bin"))
 if bin_path not in os.environ["PATH"]:
     os.environ["PATH"] = bin_path + os.pathsep + os.environ["PATH"]
-load_dotenv(dotenv_path=os.path.join(config_dir, ".env"))
+load_dotenv(dotenv_path=root_env_path, override=False)
+load_dotenv(dotenv_path=server_env_path, override=False)
 
 class Settings:
+    BASE_DIR: str = base_dir
+    ROOT_ENV_PATH: str = root_env_path
+    SERVER_ENV_PATH: str = server_env_path
+    SETUP_COMPLETE: bool = os.getenv("SETUP", "true").lower() in ("true", "1", "yes")
+    WEB_PORT: int = env_int("WEB_PORT", 3000, 1, 65535)
     API_BEARER_TOKEN: str = os.getenv("API_BEARER_TOKEN", "secure-token-123")
     TMDB_API_KEY: str = os.getenv("TMDB_API_KEY", "")
     TMDB_READ_ACCESS_TOKEN: str = os.getenv("TMDB_READ_ACCESS_TOKEN", "")

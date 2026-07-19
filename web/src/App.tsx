@@ -11,6 +11,8 @@ import { AuthenticatedApp } from './pages/AuthenticatedApp';
 import { AuthGuard } from './components/guards/AuthGuard';
 import { QueryProfileGuard } from './components/guards/QueryProfileGuard';
 import { ErrorBoundary } from './components/ui/ErrorBoundary';
+import { SetupStateGate } from './components/guards/SetupStateGate';
+import { SetupPage } from './pages/SetupPage';
 import { AppFallbackRedirect, LegacyAccountSecurityRedirect, LegacyAdminRedirect, LegacyWatchRedirect } from './navigation/LegacyRedirects';
 
 export default function App() {
@@ -23,7 +25,9 @@ export default function App() {
   return (
     <ErrorBoundary>
     <BrowserRouter>
+      <SetupStateGate>
       <Routes>
+        <Route path="/setup" element={<SetupPage />} />
         <Route path="/login" element={<LoginPage />} />
         
         <Route path="/profiles" element={
@@ -63,6 +67,7 @@ export default function App() {
         <Route path="*" element={<AuthGuard><AppFallbackRedirect /></AuthGuard>} />
         
       </Routes>
+      </SetupStateGate>
     </BrowserRouter>
     </ErrorBoundary>
   );

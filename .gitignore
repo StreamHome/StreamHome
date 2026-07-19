@@ -45,6 +45,7 @@ server/bin/
 bin/
 
 *.log
+.run/
 .gemini/
 .gemini/antigravity/
 memory-bank/
