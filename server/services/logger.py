@@ -40,3 +40,20 @@ file_handler = RotatingFileHandler(
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
+
+
+class _MediaAccessFilter(logging.Filter):
+    """Keep high-volume internal media probes and streaming reads out of the console."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return '"GET /media/' not in message and '"HEAD /media/' not in message
+
+
+def install_uvicorn_access_filter() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(item, _MediaAccessFilter) for item in access_logger.filters):
+        access_logger.addFilter(_MediaAccessFilter())
+
+
+install_uvicorn_access_filter()

@@ -3,6 +3,7 @@ import time
 import json
 import shutil
 import asyncio
+import traceback
 import httpx
 import aiofiles
 from typing import Dict, Any, List, Optional
@@ -15,24 +16,45 @@ from services.tmdb import tmdb_client
 from config import settings
 from services.logger import logger
 from services.media_probe import probe_media_stream, notify_video_sender
+from services.ingestion_errors import IngestionFailure, IngestionTaskError, prune_task_diagnostics, write_task_diagnostics
 
 class DownloadQueueManager:
     def __init__(self):
         self.loop_task: Optional[asyncio.Task] = None
         self.is_running = False
         self.active_tasks = set()
+        self.worker_tasks: Dict[str, asyncio.Task] = {}
 
     def start(self):
         if not self.is_running:
             self.is_running = True
+            prune_task_diagnostics()
             self.loop_task = asyncio.create_task(self._worker_loop())
             logger.info("[Queue Manager] Background worker loop started.")
 
-    def stop(self):
+    async def stop(self):
         self.is_running = False
         if self.loop_task:
             self.loop_task.cancel()
-            logger.info("[Queue Manager] Background worker loop stopped.")
+            await asyncio.gather(self.loop_task, return_exceptions=True)
+            self.loop_task = None
+        workers = list(self.worker_tasks.values())
+        for worker in workers:
+            worker.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        self.worker_tasks.clear()
+        self.active_tasks.clear()
+        logger.info("[Queue Manager] Background worker loop stopped.")
+
+    def _worker_finished(self, task_id: str, worker: asyncio.Task) -> None:
+        self.active_tasks.discard(task_id)
+        self.worker_tasks.pop(task_id, None)
+        if worker.cancelled():
+            return
+        exception = worker.exception()
+        if exception:
+            logger.error(f"[Queue Manager] Worker {task_id} exited unexpectedly: {type(exception).__name__}")
 
     async def _worker_loop(self):
         os.makedirs(settings.MEDIA_DIR, exist_ok=True)
@@ -61,8 +83,9 @@ class DownloadQueueManager:
                     task_id = task.id
                 
                 self.active_tasks.add(task_id)
-                t = asyncio.create_task(self._process_task(task_id))
-                t.add_done_callback(lambda fut, tid=task_id: self.active_tasks.discard(tid))
+                worker = asyncio.create_task(self._process_task(task_id), name=f"ingestion-{task_id}")
+                self.worker_tasks[task_id] = worker
+                worker.add_done_callback(lambda future, tid=task_id: self._worker_finished(tid, future))
                 
             except asyncio.CancelledError:
                 break
@@ -99,7 +122,9 @@ class DownloadQueueManager:
 
     async def _process_task(self, task_id: str):
         logger.info(f"[Queue Manager] Processing task: {task_id}")
-        
+        output_abs_path: Optional[str] = None
+        created_artifacts: List[str] = []
+        submitted_video_url = ""
         try:
             async with AsyncSession(engine) as db:
                 task = await db.get(DownloadTask, task_id)
@@ -114,6 +139,7 @@ class DownloadQueueManager:
                 media_type = task.media_type
                 headers = task.headers
                 video_url = task.video_url
+                submitted_video_url = video_url
                 audio_url = task.audio_url
                 season = task.season
                 episode = task.episode
@@ -128,14 +154,26 @@ class DownloadQueueManager:
                 free_gb = free / (1024**3)
                 logger.info(f"[Queue Manager] Free space in storage root '{storage_root}': {free_gb:.2f} GB")
                 if free_gb < 5.0:
-                    raise Exception(f"Insufficient disk space on host: {free_gb:.2f} GB free (requires min 5.0 GB).")
-            except Exception as e:
-                logger.error(f"[Queue Manager] Disk check failed or space insufficient: {e}")
+                    raise IngestionTaskError(IngestionFailure("INSUFFICIENT_STORAGE", f"Only {free_gb:.2f} GB is free; ingestion requires at least 5 GB."))
+            except IngestionTaskError:
                 raise
+            except OSError as err:
+                diagnostics_path = write_task_diagnostics(task_id, "storage check", repr(err))
+                raise IngestionTaskError(IngestionFailure("STORAGE_UNAVAILABLE", "The configured storage root could not be checked.", False, diagnostics_path)) from err
 
             # 2. Probe Media Stream
-            logger.info(f"[Queue Manager] Probing media streams for task {task_id}...")
-            probe_res = await probe_media_stream(video_url, audio_url, headers)
+            logger.info(f"[Queue Manager] Validating media sender source for task {task_id}...")
+            probe_res = None
+            for probe_attempt in range(1, 4):
+                probe_res = await probe_media_stream(video_url, audio_url, headers, task_id=task_id)
+                probe_failure = probe_res.get("failure")
+                if not probe_failure or not probe_failure.retryable or probe_attempt == 3:
+                    break
+                backoff = 3 * probe_attempt
+                logger.warning(f"[Queue Manager] Source validation attempt {probe_attempt}/3 failed: {probe_failure.display}. Retrying in {backoff}s.")
+                await asyncio.sleep(backoff)
+
+            assert probe_res is not None
             has_video = probe_res["has_video"]
             has_audio = probe_res["has_audio"]
             scan_quality = probe_res["scan_quality"]
@@ -158,6 +196,11 @@ class DownloadQueueManager:
                 has_audio=has_audio,
                 quality=scan_quality
             ))
+
+            if probe_res.get("failure"):
+                raise IngestionTaskError(probe_res["failure"])
+            if not has_video:
+                raise IngestionTaskError(IngestionFailure("INVALID_MEDIA_SOURCE", "The media sender source contains no video stream."))
 
             duration_secs = 3600.0
             try:
@@ -211,13 +254,14 @@ class DownloadQueueManager:
                                 sub_abs_path = os.path.join(os.path.dirname(output_abs_path), f"subtitle_{sub_lang}{ext}")
                                 async with aiofiles.open(sub_abs_path, "wb") as f:
                                     await f.write(response.content)
+                                created_artifacts.append(sub_abs_path)
                     except Exception:
                         pass
 
             # 4. Retry Loop for Download & Merge
             max_retries = 3
             success = False
-            last_error = "Unknown download failure."
+            last_failure = IngestionFailure("MEDIA_PROCESSING_FAILED", "The media source could not be processed.", True)
             extracted_languages = []
             
             for attempt in range(1, max_retries + 1):
@@ -226,8 +270,7 @@ class DownloadQueueManager:
                     from services.state import update_task_metrics
                     update_task_metrics(task_id, 0.0, speed=f"Retrying ({attempt}/{max_retries})...", eta="00:00:00", force_write=True)
                 
-                # download_and_merge returns (bool, str) representing (success, error_reason)
-                success, error_reason = await download_and_merge(
+                success, failure = await download_and_merge(
                     task_id=task_id, video_url=video_url, audio_url=audio_url,
                     headers=headers, output_path=output_abs_path, duration_secs=duration_secs
                 )
@@ -235,13 +278,19 @@ class DownloadQueueManager:
                 if success:
                     break
                 
-                last_error = error_reason or "FFmpeg process failed."
-                logger.warning(f"[Queue Manager] Ingestion attempt {attempt} failed for task {task_id}: {last_error}")
+                last_failure = failure or last_failure
+                logger.warning(f"[Queue Manager] Ingestion attempt {attempt}/{max_retries} failed for task {task_id}: {last_failure.display}")
                 
+                if not last_failure.retryable:
+                    logger.info(f"[Queue Manager] Task {task_id} has a permanent source failure; no retry scheduled.")
+                    break
                 if attempt < max_retries:
                     backoff = 5 * (2 ** (attempt - 1))
                     logger.info(f"[Queue Manager] Backing off for {backoff} seconds before next retry...")
                     await asyncio.sleep(backoff)
+
+            if not success:
+                raise IngestionTaskError(last_failure)
 
             rclone_success = True
             if success:
@@ -290,6 +339,9 @@ class DownloadQueueManager:
                 else:
                     rclone_success = True
 
+            if not rclone_success:
+                raise IngestionTaskError(IngestionFailure("CLOUD_MOVE_FAILED", "Cloud upload and local fallback both failed."))
+
             async with AsyncSession(engine) as db:
                 task = await db.get(DownloadTask, task_id)
                 if not task:
@@ -298,39 +350,89 @@ class DownloadQueueManager:
                     remove_task_metrics(task_id)
                     return
                     
-                if success and rclone_success:
-                    task.status = "COMPLETED"
-                    task.error_message = None
-                    db.add(task)
-                    await db.commit()
+                task.status = "COMPLETED"
+                task.error_message = None
+                db.add(task)
+                await db.commit()
+
+                try:
+                    await self._catalog_media(db, tmdb_id, media_type, season, episode, meta, output_rel_path, extracted_languages, language, subtitles_list, quality, task.skip_markers)
+                except Exception as cat_err:
+                    logger.error(f"[Queue Manager] Error cataloging media: {cat_err}")
+                created_artifacts.clear()
                     
-                    try:
-                        await self._catalog_media(db, tmdb_id, media_type, season, episode, meta, output_rel_path, extracted_languages, language, subtitles_list, quality, task.skip_markers)
-                    except Exception as cat_err:
-                        logger.error(f"[Queue Manager] Error cataloging media: {cat_err}")
-                else:
-                    task.status = "FAILED"
-                    task.error_message = last_error if not rclone_success else "Cloud upload (rclone) failed."
-                    db.add(task)
-                    await db.commit()
-                    
+        except IngestionTaskError as err:
+            logger.error(f"[Queue Manager] Task {task_id} failed: {err.failure.display}")
+            await self._record_task_failure(task_id, err.failure, submitted_video_url)
+        except asyncio.CancelledError:
+            await self._record_task_failure(task_id, IngestionFailure("INGESTION_INTERRUPTED", "The task was interrupted by server shutdown."), submitted_video_url)
+            raise
         except Exception as err:
-            logger.error(f"[Queue Manager] Silent background exception caught for task {task_id}: {err}")
-            try:
-                async with AsyncSession(engine) as db:
-                    task = await db.get(DownloadTask, task_id)
-                    if task:
-                        task.status = "FAILED"
-                        task.error_message = str(err)
-                        db.add(task)
-                        await db.commit()
-            except Exception as db_err:
-                logger.error(f"[Queue Manager] Failed to update crashed task {task_id} state to FAILED: {db_err}")
+            diagnostics_path = write_task_diagnostics(task_id, "queue exception", traceback.format_exc())
+            failure = IngestionFailure("QUEUE_INTERNAL_ERROR", f"The queue encountered {type(err).__name__}.", False, diagnostics_path)
+            logger.error(f"[Queue Manager] Task {task_id} failed: {failure.display}")
+            await self._record_task_failure(task_id, failure, submitted_video_url)
                 
         finally:
+            for artifact in created_artifacts:
+                if os.path.exists(artifact):
+                    try:
+                        os.remove(artifact)
+                    except OSError:
+                        pass
+            if output_abs_path:
+                self._remove_empty_parents(os.path.dirname(output_abs_path))
             self.active_tasks.discard(task_id)
             from services.state import remove_task_metrics
             remove_task_metrics(task_id)
+
+    async def _record_task_failure(self, task_id: str, failure: IngestionFailure, submitted_video_url: str) -> None:
+        try:
+            async with AsyncSession(engine) as db:
+                task = await db.get(DownloadTask, task_id)
+                if not task:
+                    return
+                task.status = "FAILED"
+                task.error_message = failure.display
+                db.add(task)
+
+                if task.media_type == "movie":
+                    movie = await db.get(Movie, f"m_{task.tmdb_id}")
+                    if movie and movie.video_url == submitted_video_url:
+                        movie.video_url = ""
+                        movie.availability = "cached"
+                        db.add(movie)
+                elif task.season is not None and task.episode is not None:
+                    episode = await db.get(Episode, f"ep_{task.tmdb_id}_s{task.season}_e{task.episode}")
+                    if episode and episode.video_url == submitted_video_url:
+                        episode.video_url = ""
+                        db.add(episode)
+                    show = await db.get(Movie, f"tv_{task.tmdb_id}")
+                    if show:
+                        episode_result = await db.exec(select(Episode).where(Episode.movie_id == show.id))
+                        has_local_episode = any(item.video_url.startswith("/media/") for item in episode_result.all() if item.video_url)
+                        show.availability = "available" if has_local_episode else "cached"
+                        db.add(show)
+                await db.commit()
+        except Exception as db_err:
+            logger.error(f"[Queue Manager] Failed to persist task {task_id} failure: {type(db_err).__name__}")
+
+    @staticmethod
+    def _remove_empty_parents(start_dir: str) -> None:
+        current = os.path.abspath(start_dir)
+        roots = [os.path.abspath(settings.MEDIA_DIR), os.path.abspath(settings.TEMP_DIR)]
+        try:
+            root = next((candidate for candidate in roots if os.path.commonpath([current, candidate]) == candidate), None)
+        except ValueError:
+            return
+        if not root:
+            return
+        while current != root:
+            try:
+                os.rmdir(current)
+            except OSError:
+                break
+            current = os.path.dirname(current)
 
     async def _catalog_media(
         self, db: AsyncSession, tmdb_id: int, media_type: str, season: Optional[int], 
@@ -369,7 +471,7 @@ class DownloadQueueManager:
                 new_folder_abs = os.path.abspath(os.path.join(server_root, parent_dir_rel, correct_folder_name))
                 
                 if os.path.exists(old_folder_abs) and not os.path.exists(new_folder_abs):
-                    print(f"[Queue Manager] Renaming placeholder folder on disk: {current_folder_name} -> {correct_folder_name}")
+                    logger.info(f"[Queue Manager] Renaming placeholder folder on disk: {current_folder_name} -> {correct_folder_name}")
                     try:
                         os.rename(old_folder_abs, new_folder_abs)
                         file_path = file_path.replace(current_folder_name, correct_folder_name)
@@ -451,7 +553,7 @@ class DownloadQueueManager:
                 movie.skip_markers = skip_data
                 db.add(movie)
                 await db.commit()
-                print(f"[Queue Manager] Cataloged new movie: {meta.get('title', 'Unknown Movie')}")
+                logger.info(f"[Queue Manager] Cataloged new movie: {meta.get('title', 'Unknown Movie')}")
             else:
                 movie.title = meta.get("title", movie.title)
                 movie.description = meta.get("description", movie.description)
@@ -494,7 +596,7 @@ class DownloadQueueManager:
                 movie.vote_count = meta.get("vote_count", movie.vote_count)
                 db.add(movie)
                 await db.commit()
-                print(f"[Queue Manager] Updated existing movie details: {movie.title}")
+                logger.info(f"[Queue Manager] Updated existing movie details: {movie.title}")
 
             # Create movie's local .metadata/metadata.json
             movie_metadata_dir = os.path.join(movie_folder_abs, ".metadata")
@@ -536,7 +638,7 @@ class DownloadQueueManager:
                 show.cast = meta.get("cast", [])
                 db.add(show)
                 await db.commit()
-                print(f"[Queue Manager] Cataloged new TV show: {meta.get('title', 'Unknown Show')}")
+                logger.info(f"[Queue Manager] Cataloged new TV show: {meta.get('title', 'Unknown Show')}")
             else:
                 show.title = meta.get("title", show.title)
                 show.description = meta.get("description", show.description)
@@ -553,7 +655,7 @@ class DownloadQueueManager:
                 show.vote_count = meta.get("vote_count", show.vote_count)
                 db.add(show)
                 await db.commit()
-                print(f"[Queue Manager] Updated TV show: {show.title}")
+                logger.info(f"[Queue Manager] Updated TV show: {show.title}")
                 
             season_num = season or 1
             episode_num = episode or 1
@@ -616,7 +718,7 @@ class DownloadQueueManager:
                 ep_entry.subtitles = subs_on_disk
                 ep_entry.skip_markers = ep_skip_data
                 db.add(ep_entry)
-                print(f"[Queue Manager] Cataloged new episode: S{season_num}E{episode_num}")
+                logger.info(f"[Queue Manager] Cataloged new episode: S{season_num}E{episode_num}")
             else:
                 ep_entry.title = ep_title
                 ep_entry.description = ep_desc
@@ -628,7 +730,7 @@ class DownloadQueueManager:
                 ep_entry.subtitles = subs_on_disk
                 ep_entry.skip_markers = ep_skip_data
                 db.add(ep_entry)
-                print(f"[Queue Manager] Updated episode: S{season_num}E{episode_num}")
+                logger.info(f"[Queue Manager] Updated episode: S{season_num}E{episode_num}")
 
             show.tmdb_id = int(tmdb_id)
             show.catalog_source = "server"

@@ -7,11 +7,13 @@ import httpx
 from typing import Dict, Any, Optional
 from config import settings
 from services.logger import logger
+from services.ingestion_errors import IngestionFailure, classify_failure, compact_diagnostics, sanitize_url, write_task_diagnostics
 
 async def probe_media_stream(
     video_url: str,
     audio_url: Optional[str] = None,
-    headers: Optional[Dict[str, str]] = None
+    headers: Optional[Dict[str, str]] = None,
+    task_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Probes remote or local video and audio streams using ffprobe to detect
@@ -25,7 +27,7 @@ async def probe_media_stream(
 
     async def run_ffprobe(url: str) -> Dict[str, Any]:
         if not url:
-            return {"has_video": False, "has_audio": False, "height": 0}
+            return {"has_video": False, "has_audio": False, "height": 0, "failure": IngestionFailure("MISSING_SOURCE", "No media source URL was supplied.")}
             
         cmd = [ffprobe_path, "-v", "error", "-show_entries", "stream=codec_type,height,width", "-of", "json"]
         
@@ -36,7 +38,7 @@ async def probe_media_stream(
             cmd.extend(["-protocol_whitelist", "http,https,tcp,tls,crypto,dns", "-allowed_extensions", "ALL", "-extension_picky", "0"])
         cmd.append(url)
         
-        logger.info(f"[Media Probe] Probing URL: {url[:100]}...")
+        logger.info(f"[Media Probe] Probing source: {sanitize_url(url)[:120]}")
         
         try:
             # Run ffprobe process without opening a window on Windows
@@ -50,8 +52,10 @@ async def probe_media_stream(
             
             if process.returncode != 0:
                 err_msg = stderr.decode("utf-8", errors="ignore").strip()
-                logger.warning(f"[Media Probe] ffprobe failed for URL {url[:60]}: {err_msg}")
-                return {"has_video": False, "has_audio": False, "height": 0}
+                diagnostics_path = write_task_diagnostics(task_id, "ffprobe", err_msg) if task_id else None
+                failure = classify_failure(err_msg, "MEDIA_PROBE_FAILED")
+                failure = IngestionFailure(failure.code, failure.message, failure.retryable, diagnostics_path)
+                return {"has_video": False, "has_audio": False, "height": 0, "failure": failure}
                 
             data = json.loads(stdout.decode("utf-8", errors="ignore"))
             streams = data.get("streams", [])
@@ -63,19 +67,26 @@ async def probe_media_stream(
             heights = [int(s.get("height", 0)) for s in streams if s.get("codec_type") == "video" and s.get("height")]
             max_height = max(heights) if heights else 0
             
-            return {"has_video": has_video, "has_audio": has_audio, "height": max_height}
+            return {"has_video": has_video, "has_audio": has_audio, "height": max_height, "failure": None}
             
         except Exception as e:
-            logger.error(f"[Media Probe] Exception probing {url[:60]}: {e}")
-            return {"has_video": False, "has_audio": False, "height": 0}
+            diagnostics_path = write_task_diagnostics(task_id, "ffprobe exception", repr(e)) if task_id else None
+            failure = classify_failure(str(e), "MEDIA_PROBE_FAILED")
+            failure = IngestionFailure(failure.code, failure.message, failure.retryable, diagnostics_path)
+            return {"has_video": False, "has_audio": False, "height": 0, "failure": failure}
 
     # Run probes
     video_res = await run_ffprobe(video_url)
-    audio_res = await run_ffprobe(audio_url) if audio_url else {"has_video": False, "has_audio": False, "height": 0}
+    audio_res = await run_ffprobe(audio_url) if audio_url else {"has_video": False, "has_audio": False, "height": 0, "failure": None}
     
     has_video = video_res["has_video"]
     has_audio = video_res["has_audio"] or audio_res["has_audio"]
     height = video_res["height"]
+    failure = video_res.get("failure")
+    if not failure and not has_video:
+        failure = IngestionFailure("INVALID_MEDIA_SOURCE", "The media sender source contains no video stream.")
+    if audio_url and not audio_res["has_audio"] and not failure:
+        failure = audio_res.get("failure") or IngestionFailure("INVALID_AUDIO_SOURCE", "The separate audio source contains no audio stream.")
     
     # Map height to quality string
     quality = "Source"
@@ -92,12 +103,14 @@ async def probe_media_stream(
         if has_audio:
             quality = "Audio Only"
             
-    logger.info(f"[Media Probe] Scan Complete. Video: {has_video}, Audio: {has_audio}, Quality: {quality} (Height: {height})")
+    if not failure:
+        logger.info(f"[Media Probe] Scan complete. Video: {has_video}, Audio: {has_audio}, Quality: {quality} (Height: {height})")
     
     return {
         "has_video": has_video,
         "has_audio": has_audio,
-        "scan_quality": quality
+        "scan_quality": quality,
+        "failure": failure,
     }
 
 async def notify_video_sender(
@@ -113,7 +126,6 @@ async def notify_video_sender(
     """
     url = settings.VIDEO_SENDER_API_URL
     if not url:
-        logger.info("[Media Probe] No VIDEO_SENDER_API_URL configured. Skipping notification.")
         return False
         
     payload = {
@@ -124,7 +136,7 @@ async def notify_video_sender(
         "quality": quality
     }
     
-    logger.info(f"[Media Probe] Dispatching media scan notification to sender: {url}")
+    logger.info(f"[Media Probe] Dispatching media scan notification to sender: {sanitize_url(url)}")
     
     try:
         async with httpx.AsyncClient() as client:
@@ -133,8 +145,8 @@ async def notify_video_sender(
                 logger.info(f"[Media Probe] Notification sent successfully. Status: {response.status_code}")
                 return True
             else:
-                logger.warning(f"[Media Probe] Sender API returned error code {response.status_code}: {response.text}")
+                logger.warning(f"[Media Probe] Sender API returned HTTP {response.status_code}: {compact_diagnostics(response.text, 160)}")
                 return False
     except Exception as e:
-        logger.error(f"[Media Probe] Failed to dispatch scan notification to sender: {e}")
+        logger.warning(f"[Media Probe] Sender notification failed: {type(e).__name__}")
         return False

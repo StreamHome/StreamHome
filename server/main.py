@@ -208,7 +208,7 @@ async def lifespan(app: FastAPI):
     
     # Sunucu kapanırken (Shutdown) yapılacaklar:
     try:
-        queue_manager.stop()
+        await queue_manager.stop()
     except Exception as q_stop_err:
         logger.error(f"[Lifespan Shutdown] Error stopping queue manager: {q_stop_err}")
         

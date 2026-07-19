@@ -11,6 +11,7 @@ import subprocess
 from typing import Dict, Any, Optional
 from services.state import update_task_metrics, remove_task_metrics, register_process, unregister_process, ACTIVE_PROCESSES
 from services.logger import logger
+from services.ingestion_errors import IngestionFailure, classify_failure, sanitize_url, write_task_diagnostics
 
 # Regular expressions for parsing FFmpeg stderr progress
 time_regex = re.compile(r"time=\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)")
@@ -67,7 +68,6 @@ async def download_and_cache_metadata_image(image_url: str, dest_path: str) -> O
 
 def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[bool, str]:
     """Runs FFmpeg synchronously in a dedicated background thread, immune to asyncio loop resets."""
-    logger.info(f"[FFmpeg Service] Running threaded exec command: {' '.join(cmd)}")
     stderr_lines = []
     try:
         # Popen kullanarak süreci başlatıyoruz. Windows'ta ekstra CMD penceresi açılmasını engelliyoruz.
@@ -174,10 +174,8 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[boo
         return success, error_msg
         
     except Exception as e:
-        logger.error(f"[FFmpeg Service] Thread exception for task {task_id}: {repr(e)}")
-        traceback.print_exc()
         unregister_process(task_id)
-        return False, f"Exception occurred during execution: {repr(e)}"
+        return False, f"Exception occurred during execution: {repr(e)}\n{traceback.format_exc()}"
 
 async def download_and_merge(
     task_id: str,
@@ -185,8 +183,8 @@ async def download_and_merge(
     audio_url: Optional[str],
     headers: Dict[str, str],
     output_path: str,
-    duration_secs: float
-) -> tuple[bool, str]:
+    duration_secs: float,
+) -> tuple[bool, Optional[IngestionFailure]]:
     """Download video/audio streams, merge losslessly, inject headers, track progress."""
     
     abs_output_path = os.path.abspath(output_path)
@@ -218,25 +216,36 @@ async def download_and_merge(
         # faststart eklendi
         cmd.extend(["-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy", "-movflags", "+faststart"])
         
-    cmd.append(abs_output_path)
+    output_root, output_ext = os.path.splitext(abs_output_path)
+    temp_output_path = f"{output_root}.{task_id}.part{output_ext or '.mp4'}"
+    try:
+        if os.path.exists(temp_output_path):
+            os.remove(temp_output_path)
+    except OSError:
+        pass
+    cmd.append(temp_output_path)
 
     # Initialize metrics immediately to show 0.0% progress in CLI TUI
     update_task_metrics(task_id, 0.0, speed="Connecting...", eta="00:00:00", size="0 MB", force_write=True)
 
     loop = asyncio.get_running_loop()
+    logger.info(f"[FFmpeg Service] Starting task {task_id} from {sanitize_url(video_url)}")
     
     try:
         # Senkron FFmpeg fonksiyonunu sunucuyu bloke etmemesi için ayrı bir iş parçacığına yolluyoruz
-        success, error_reason = await loop.run_in_executor(None, _run_ffmpeg_sync, task_id, cmd, duration_secs)
+        success, diagnostics = await loop.run_in_executor(None, _run_ffmpeg_sync, task_id, cmd, duration_secs)
         
         if success:
+            os.replace(temp_output_path, abs_output_path)
             logger.info(f"[FFmpeg Service] Task completed successfully: {task_id}")
             update_task_metrics(task_id, 100.0, speed="Finished", eta="00:00:00")
-            return True, ""
-        else:
-            logger.error(f"[FFmpeg Service] Task failed: {task_id}. Error: {error_reason}")
-            update_task_metrics(task_id, 0.0, speed="Failed", eta="00:00:00")
-            return False, error_reason
+            return True, None
+
+        diagnostics_path = write_task_diagnostics(task_id, "ffmpeg", diagnostics)
+        failure = classify_failure(diagnostics)
+        failure = IngestionFailure(failure.code, failure.message, failure.retryable, diagnostics_path)
+        update_task_metrics(task_id, 0.0, speed="Failed", eta="00:00:00")
+        return False, failure
             
     except asyncio.CancelledError:
         logger.warning(f"[FFmpeg Service] Task {task_id} was cancelled/terminated.")
@@ -244,8 +253,23 @@ async def download_and_merge(
         if process:
             try:
                 process.kill()
+                if isinstance(process, subprocess.Popen):
+                    await loop.run_in_executor(None, process.wait)
+                else:
+                    await process.wait()
             except Exception:
                 pass
         unregister_process(task_id)
         update_task_metrics(task_id, 0.0, speed="Failed", eta="00:00:00")
         raise
+    except Exception as exc:
+        diagnostics_path = write_task_diagnostics(task_id, "ffmpeg wrapper", traceback.format_exc())
+        failure = IngestionFailure("FFMPEG_EXECUTION_FAILED", str(exc) or "FFmpeg could not process the source.", False, diagnostics_path)
+        update_task_metrics(task_id, 0.0, speed="Failed", eta="00:00:00")
+        return False, failure
+    finally:
+        if os.path.exists(temp_output_path):
+            try:
+                os.remove(temp_output_path)
+            except OSError:
+                pass

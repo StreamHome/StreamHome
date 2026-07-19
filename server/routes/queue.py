@@ -40,6 +40,10 @@ def is_safe_url(url: Optional[str]) -> bool:
     url_lower = url.lower()
     return url_lower.startswith("http://") or url_lower.startswith("https://")
 
+
+def is_local_playable_url(url: Optional[str]) -> bool:
+    return bool(url and url.startswith("/media/"))
+
 # ----------------- Ingestion Endpoint -----------------
 
 @router.post("/api/add-movie", status_code=status.HTTP_201_CREATED)
@@ -137,10 +141,12 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
                 movie.skip_markers = payload.skip_markers or {}
                 db.add(movie)
             else:
-                movie.video_url = payload.video_url
+                preserve_local_media = movie.availability == "available" and is_local_playable_url(movie.video_url)
+                if not preserve_local_media:
+                    movie.video_url = payload.video_url
+                    movie.availability = "processing"
                 movie.tmdb_id = payload.tmdb_id
                 movie.catalog_source = "server"
-                movie.availability = "processing"
                 if payload.skip_markers:
                     movie.skip_markers = payload.skip_markers
                 db.add(movie)
@@ -177,6 +183,7 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
                 ep_meta = meta.get("episode_detail", {})
                 ep_title = ep_meta.get("title", f"Episode {payload.episode}")
                 ep_desc = ep_meta.get("description", f"Season {payload.season}, Episode {payload.episode}")
+                preserve_local_episode = bool(ep_entry and is_local_playable_url(ep_entry.video_url))
                 if not ep_entry:
                     ep_entry = Episode(
                         id=ep_id,
@@ -193,13 +200,15 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
                     ep_entry.skip_markers = payload.skip_markers or {}
                     db.add(ep_entry)
                 else:
-                    ep_entry.video_url = payload.video_url
+                    if not preserve_local_episode:
+                        ep_entry.video_url = payload.video_url
                     if payload.skip_markers:
                         ep_entry.skip_markers = payload.skip_markers
                     db.add(ep_entry)
                 show.tmdb_id = payload.tmdb_id
                 show.catalog_source = "server"
-                show.availability = "processing"
+                if show.availability != "available":
+                    show.availability = "processing"
                 db.add(show)
 
         await db.commit()

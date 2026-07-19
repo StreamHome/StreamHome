@@ -19,6 +19,7 @@ import os
 import time
 
 from config import config_dir
+from services.logger import logger
 
 _last_metrics_file_write = 0.0
 
@@ -71,20 +72,20 @@ async def cancel_and_kill_process(task_id: str) -> bool:
         return False
         
     try:
-        print(f"[Process Registry] Terminating active FFmpeg process for task: {task_id}")
+        logger.info(f"[Process Registry] Terminating active FFmpeg process for task: {task_id}")
         process.terminate()
         try:
             # Give the process 2 seconds to clean up and exit gracefully
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, process.wait, 2.0)
-            print(f"[Process Registry] Process for task {task_id} exited gracefully.")
+            logger.info(f"[Process Registry] Process for task {task_id} exited gracefully.")
         except Exception:
-            print(f"[Process Registry] Process did not respond to SIGTERM. Killing task {task_id}...")
+            logger.warning(f"[Process Registry] Process did not respond to SIGTERM. Killing task {task_id}...")
             process.kill()
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, process.wait)
-            print(f"[Process Registry] Process for task {task_id} killed successfully.")
+            logger.info(f"[Process Registry] Process for task {task_id} killed successfully.")
         return True
     except Exception as e:
-        print(f"[Process Registry] Error trying to kill process for task {task_id}: {e}")
+        logger.error(f"[Process Registry] Error trying to kill process for task {task_id}: {type(e).__name__}")
         return False

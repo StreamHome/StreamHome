@@ -19,7 +19,7 @@ async def test_ffmpeg():
     output_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "test_output.mp4"))
     
     print(f"[Test FFmpeg] Starting stream download to: {output_path}")
-    success = await download_and_merge(
+    success, failure = await download_and_merge(
         task_id=task_id,
         video_url=video_url,
         audio_url=audio_url,
@@ -28,7 +28,8 @@ async def test_ffmpeg():
         duration_secs=15.0  # 15s duration
     )
     
-    print(f"[Test FFmpeg] Result: {'SUCCESS' if success else 'FAILURE'}")
+    result_label = "SUCCESS" if success else f"FAILURE ({failure.display if failure else 'unknown'})"
+    print(f"[Test FFmpeg] Result: {result_label}")
     if success and os.path.exists(output_path):
         size_bytes = os.path.getsize(output_path)
         print(f"[Test FFmpeg] Output file exists. Size: {size_bytes} bytes")
