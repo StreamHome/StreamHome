@@ -19,9 +19,7 @@
 .ember-hero__art > [role="img"] { background: radial-gradient(circle at 62% 45%,rgba(255,95,31,.13),transparent 24%),linear-gradient(135deg,rgba(255,95,31,.04),transparent 45%),repeating-linear-gradient(90deg,rgba(255,95,31,.04) 0 1px,transparent 1px 80px),#22120d; color: #9e6d5e; }
 .ember-hero__shade { position: absolute; z-index: -2; inset: 0; background: linear-gradient(90deg,#1e100b 0%,rgba(30,16,11,.9) 35%,rgba(30,16,11,.28) 70%),linear-gradient(to top,#1e100b 0%,transparent 42%),linear-gradient(to bottom,rgba(20,8,5,.45),transparent 28%); }
 .ember-hero__copy { width: min(580px,calc(100% - 48px)); margin-left: max(24px,5vw); border: 1px solid rgba(255,95,31,.22); border-radius: 2px; padding: clamp(30px,4vw,52px); background: rgba(30,16,11,.54); box-shadow: 0 0 34px rgba(255,95,31,.08); backdrop-filter: blur(16px); }
-.ember-status { width: fit-content; display: flex; align-items: center; gap: 9px; border: 1px solid #f97316; padding: 7px 10px; color: #ffb59c; font: 500 9px/1 var(--font-mono); letter-spacing: .16em; }
-.ember-status i { width: 6px; height: 6px; background: #ff5f1f; box-shadow: 0 0 10px #ff5f1f; animation: ember-status-pulse 1.7s ease-in-out infinite; }
-.ember-hero__copy > small { display: block; margin-top: 28px; color: #d68b70; font: 500 9px/1 var(--font-mono); letter-spacing: .15em; }
+.ember-hero__copy > small { display: block; color: #d68b70; font: 500 9px/1 var(--font-mono); letter-spacing: .15em; }
 .ember-hero__copy h1 { margin-top: 15px; font: 900 clamp(50px,6vw,86px)/.95 var(--font-headline); letter-spacing: -.04em; text-wrap: balance; }
 .ember-hero__copy > p { max-width: 540px; margin-top: 21px; color: #e3bfb3; font-size: 15px; line-height: 1.7; }
 .ember-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
@@ -139,7 +137,6 @@
 .player-complete-panel button { border: 1px solid #f97316; background: transparent; color: #ffb59c; padding: 11px 15px; font: 500 9px/1 var(--font-mono); letter-spacing: .1em; text-transform: uppercase; }
 
 @keyframes ember-spin { to { transform: rotate(360deg); } }
-@keyframes ember-status-pulse { 50% { opacity: .35; } }
 @keyframes ember-hero-drift { from { transform: scale(1.015) translate3d(-.5%,0,0); } to { transform: scale(1.075) translate3d(1.5%,-1%,0); } }
 
 @media (max-width: 1100px) {
@@ -190,14 +187,13 @@
 @media (prefers-reduced-motion: reduce) {
   .ember-media-card,.ember-media-card__tilt { transform: none !important; }
   .ember-media-card::after { display: none; }
-  .ember-status i { animation: none; }
   .ember-hero__art > img { animation: none; }
 }
 
 /* Personalized feed signal presentation */
-.ember-media-card__art > .media-availability { position: absolute; z-index: 3; top: 10px; left: 10px; max-width: calc(100% - 20px); border-radius: 0; border-color: rgba(255,95,31,.42); background: rgba(20,8,5,.82); color: #ffd7ca; box-shadow: inset 2px 0 #ff5f1f,0 0 16px rgba(255,95,31,.14); }
+.ember-media-card__art > .media-availability { position: absolute; z-index: 3; top: 10px; left: 10px; border-radius: 2px; border-color: rgba(255,95,31,.42); background: rgba(20,8,5,.78); color: #ffd7ca; box-shadow: inset 2px 0 #ff5f1f,0 0 16px rgba(255,95,31,.14); }
 .ember-media-card__copy .recommendation-reason { color: #ff9c79; font-size: 7px; letter-spacing: .07em; }
-.ember-hero__copy > .media-availability { margin-top: 13px; border-radius: 0; border-color: rgba(255,95,31,.42); background: rgba(20,8,5,.72); color: #ffd7ca; box-shadow: inset 2px 0 #ff5f1f; }
+.ember-hero > .media-availability { position: absolute; z-index: 4; top: 84px; right: max(24px,4vw); border-radius: 2px; border-color: rgba(255,95,31,.42); background: rgba(20,8,5,.72); color: #ffd7ca; box-shadow: inset 2px 0 #ff5f1f,0 0 16px rgba(255,95,31,.14); }
 .ember-hero__copy > .recommendation-reason { width: fit-content; margin-top: 9px; border-left: 2px solid #ff5f1f; color: #ffb59c; padding-left: 8px; }
 .ember-feed-status { width: min(1430px,calc(100% - max(48px,8vw))); min-height: 42px; display: flex; align-items: center; gap: 10px; margin: 24px auto 0; border: 1px solid rgba(255,95,31,.24); background: rgba(27,12,8,.62); color: #bd8b7d; padding: 9px 12px; font: 600 8px/1.4 var(--font-mono); letter-spacing: .09em; text-transform: uppercase; }
 .ember-feed-status > i { width: 7px; height: 7px; border: 1px solid #ff7e4e; border-top-color: transparent; border-radius: 50%; animation: ember-spin 1s linear infinite; }

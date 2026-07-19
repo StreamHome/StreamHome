@@ -92,10 +92,10 @@ export function DetailsRouter({ movie, onClose, isWatchlisted, onWatchlistChange
     <motion.button variants={CONTENT_REVEAL} className="details-close" onClick={close}>Close / Back</motion.button>
     <motion.section variants={CONTENT_REVEAL} className="details-hero">
       <motion.div className="details-backdrop" initial={reduced ? { opacity: 0 } : { opacity: 0, scale: 1.06 }} animate={{ opacity: 1, scale: 1 }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.billboard, ease: MOTION_EASE }}><MediaArtwork src={movie.bannerUrl || movie.thumbnailUrl} alt={movie.title} media={movie} className="h-full w-full object-cover" /></motion.div>
+      <AvailabilityBadge movie={movie} />
       <motion.div className="details-poster" initial={reduced ? { opacity: 0 } : { opacity: 0, y: 28, rotate: -1.5 }} animate={{ opacity: 1, y: 0, rotate: 0 }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.artwork, delay: reduced ? 0 : .1, ease: MOTION_EASE }}><MediaArtwork src={movie.thumbnailUrl} alt={movie.title} media={movie} className="h-full w-full object-cover" /></motion.div>
       <motion.div variants={CONTENT_STAGGER} className="details-copy">
         <motion.p variants={CONTENT_REVEAL}>{movie.type.toUpperCase()} / CATALOG RECORD</motion.p>
-        <motion.div variants={CONTENT_REVEAL}><AvailabilityBadge movie={movie} /></motion.div>
         <motion.h1 variants={CONTENT_REVEAL}>{movie.title}</motion.h1>
         <motion.div variants={CONTENT_REVEAL} className="details-meta">{movie.releaseYear > 0 && <span>{movie.releaseYear}</span>}{movie.duration && <span>{movie.duration}</span>}{movie.rating && <span>{movie.rating}</span>}{movie.quality && <span>{movie.quality}</span>}{movie.voteAverage > 0 && <span>{movie.voteAverage.toFixed(1)} / 10</span>}</motion.div>
         {movie.recommendationReasons?.length ? <motion.div variants={CONTENT_REVEAL} className="details-reasons"><small>Why this was selected</small>{movie.recommendationReasons.map((reason) => <span key={reason}>{reason}</span>)}</motion.div> : null}

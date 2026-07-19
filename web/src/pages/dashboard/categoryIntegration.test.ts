@@ -47,4 +47,21 @@ describe("category renderer parity", () => {
     for (const profile of ["terminal", "editorial", "cinematic", "workspace"]) expect(interactions).toContain(`data-interaction=\"${profile}\"] .category-filter button`);
     for (const profile of ["terminal", "editorial", "cinematic", "workspace"]) expect(interactions).toContain(`data-interaction=\"${profile}\"] .genre-category-gallery__grid > button:hover`);
   });
+
+  it("keeps availability signals icon-only and on artwork surfaces", () => {
+    const meta = read("src/pages/dashboard/RecommendationMeta.tsx");
+    const shared = read("src/pages/dashboard/ThemeDashboard.tsx");
+    const emberDashboard = read("src/pages/dashboard/ember/EmberDashboard.tsx");
+    const application = read("src/themes/application/application.css");
+    const ember = read("src/themes/ember/ember-application.css");
+    expect(meta).toContain('data-icon={icon} role="img"');
+    expect(meta).toContain("Stored on StreamHome server");
+    expect(meta).toContain("Metadata cached — media unavailable");
+    expect(shared).toContain('<div className="terminal-feature__art">{art}<AvailabilityBadge');
+    expect(shared).toContain('<div className="workspace-art">{art}<AvailabilityBadge');
+    expect(emberDashboard).not.toContain("PROFILE FEED ONLINE");
+    expect(emberDashboard).toContain('<div className="ember-hero__shade" /><AvailabilityBadge');
+    expect(application).toContain(".feature-stage--cinematic > .media-availability");
+    expect(ember).toContain(".ember-hero > .media-availability");
+  });
 });
