@@ -123,7 +123,7 @@ export function SetupPage() {
   });
 
   const secretsText = useMemo(() => result ? [
-    "StreamHome first-run secrets", `Ingestion token: ${result.ingestionToken}`,
+    result.ingestionToken,
     ...(result.recoveryCodes.length ? ["", "TOTP recovery codes:", ...result.recoveryCodes] : []),
   ].join("\n") : "", [result]);
 
