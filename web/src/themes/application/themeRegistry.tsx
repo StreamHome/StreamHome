@@ -11,7 +11,7 @@ import { EmberBackground } from "../ember/EmberBackground";
 import { ScanLines } from "../ember/ScanLines";
 import { GeminiBackground } from "../gemini/GeminiBackground";
 import type { ThemeApplicationProps, ThemeInteractionProfile, ThemeNavigationProps, ThemePresentation } from "./contracts";
-import { MOTION_EASE, MOTION_TIMINGS, THEME_MOTION } from "../../motion/motionSystem";
+import { MOTION_EASE, MOTION_TIMINGS, THEME_MOTION, useAppMotion, type MotionPreference } from "../../motion/motionSystem";
 import { BrandLogo } from "../../components/brand/BrandLogo";
 export type { ThemeNavigationProps } from "./contracts";
 
@@ -34,7 +34,13 @@ type ProfileMenuPlacement = "bottom-end" | "top-start";
 function ProfileControl({ profile, onProfiles, onEditProfile, onLogout, placement = "bottom-end" }: Pick<ThemeNavigationProps, "profile" | "onProfiles" | "onEditProfile" | "onLogout"> & { placement?: ProfileMenuPlacement }) {
   const root = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
+  const { preference: motionPreference, setPreference: setMotionPreference } = useAppMotion();
   const opensAbove = placement === "top-start";
+  const motionOptions: Array<{ value: MotionPreference; label: string }> = [
+    { value: "full", label: "Full" },
+    { value: "system", label: "System" },
+    { value: "reduced", label: "Reduced" },
+  ];
 
   useEffect(() => {
     if (!open) return;
@@ -45,7 +51,7 @@ function ProfileControl({ profile, onProfiles, onEditProfile, onLogout, placemen
     return () => { document.removeEventListener("pointerdown", close); document.removeEventListener("keydown", escape); };
   }, [open]);
 
-  return <div ref={root} className="theme-profile-menu"><button className="theme-profile-control" onClick={() => setOpen((value) => !value)} aria-haspopup="menu" aria-expanded={open} aria-label={`Open settings for ${profile.name}`}><span style={{ background: avatarPresetBackground(profile) }} /><b>{profile.name}</b></button><AnimatePresence>{open && <motion.div key="profile-menu" className="theme-profile-menu__panel" data-placement={placement} role="menu" initial={{ opacity: 0, y: opensAbove ? 14 : -14, scale: .94, filter: "blur(10px)" }} animate={{ opacity: 1, y: 0, scale: 1, filter: "blur(0px)" }} exit={{ opacity: 0, y: opensAbove ? 10 : -10, scale: .97, filter: "blur(7px)" }} transition={{ duration: MOTION_TIMINGS.menu, ease: MOTION_EASE }}><strong>{profile.name}</strong><small>{profile.id === "1" ? "Administrator" : "Profile"}</small><motion.button role="menuitem" initial={{ opacity: 0, x: 8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: .18, duration: MOTION_TIMINGS.menuItem, ease: MOTION_EASE }} onClick={() => { setOpen(false); onEditProfile(); }}>Edit profile</motion.button><motion.button role="menuitem" initial={{ opacity: 0, x: 8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: .3, duration: MOTION_TIMINGS.menuItem, ease: MOTION_EASE }} onClick={onProfiles}>Switch profile</motion.button><motion.button role="menuitem" initial={{ opacity: 0, x: 8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: .42, duration: MOTION_TIMINGS.menuItem, ease: MOTION_EASE }} onClick={onLogout}>Sign out</motion.button></motion.div>}</AnimatePresence></div>;
+  return <div ref={root} className="theme-profile-menu"><button className="theme-profile-control" onClick={() => setOpen((value) => !value)} aria-haspopup="menu" aria-expanded={open} aria-label={`Open settings for ${profile.name}`}><span style={{ background: avatarPresetBackground(profile) }} /><b>{profile.name}</b></button><AnimatePresence>{open && <motion.div key="profile-menu" className="theme-profile-menu__panel" data-placement={placement} role="menu" initial={{ opacity: 0, y: opensAbove ? 14 : -14, scale: .94, filter: "blur(10px)" }} animate={{ opacity: 1, y: 0, scale: 1, filter: "blur(0px)" }} exit={{ opacity: 0, y: opensAbove ? 10 : -10, scale: .97, filter: "blur(7px)" }} transition={{ duration: MOTION_TIMINGS.menu, ease: MOTION_EASE }}><strong>{profile.name}</strong><small>{profile.id === "1" ? "Administrator" : "Profile"}</small><div className="theme-profile-menu__motion" role="group" aria-label="Animation preference"><span>Motion</span><div>{motionOptions.map((option) => <button key={option.value} type="button" role="menuitemradio" aria-checked={motionPreference === option.value} onClick={() => setMotionPreference(option.value)}>{option.label}</button>)}</div></div><motion.button role="menuitem" initial={{ opacity: 0, x: 8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: .18, duration: MOTION_TIMINGS.menuItem, ease: MOTION_EASE }} onClick={() => { setOpen(false); onEditProfile(); }}>Edit profile</motion.button><motion.button role="menuitem" initial={{ opacity: 0, x: 8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: .3, duration: MOTION_TIMINGS.menuItem, ease: MOTION_EASE }} onClick={onProfiles}>Switch profile</motion.button><motion.button role="menuitem" initial={{ opacity: 0, x: 8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: .42, duration: MOTION_TIMINGS.menuItem, ease: MOTION_EASE }} onClick={onLogout}>Sign out</motion.button></motion.div>}</AnimatePresence></div>;
 }
 
 function MobileCatalogNav({ activeView, onView, isAdmin }: Pick<ThemeNavigationProps, "activeView" | "onView" | "isAdmin">) {

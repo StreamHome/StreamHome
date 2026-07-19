@@ -98,26 +98,48 @@ export const THEME_MOTION: Record<ThemeId, ThemeMotionDefinition> = {
 interface MotionContextValue {
   reduced: boolean;
   documentHidden: boolean;
+  preference: MotionPreference;
+  setPreference: (preference: MotionPreference) => void;
 }
 
-const MotionContext = createContext<MotionContextValue>({ reduced: false, documentHidden: false });
+export type MotionPreference = "full" | "system" | "reduced";
+
+const MOTION_PREFERENCE_KEY = "streamhome.motion-preference";
+
+function storedMotionPreference(): MotionPreference {
+  if (typeof window === "undefined") return "full";
+  const stored = window.localStorage.getItem(MOTION_PREFERENCE_KEY);
+  return stored === "system" || stored === "reduced" ? stored : "full";
+}
+
+const MotionContext = createContext<MotionContextValue>({ reduced: false, documentHidden: false, preference: "full", setPreference: () => undefined });
 
 export function MotionProvider({ children }: { children: React.ReactNode }) {
-  const [prefersReduced, setPrefersReduced] = useState(() => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  const [prefersReduced, setPrefersReduced] = useState(() => typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const [documentHidden, setDocumentHidden] = useState(() => typeof document !== "undefined" && document.hidden);
+  const [preference, setPreferenceState] = useState<MotionPreference>(storedMotionPreference);
   useEffect(() => {
-    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const updateMotion = () => setPrefersReduced(media.matches);
+    const media = typeof window.matchMedia === "function" ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+    const updateMotion = () => setPrefersReduced(Boolean(media?.matches));
     const update = () => setDocumentHidden(document.hidden);
-    media.addEventListener?.("change", updateMotion);
+    media?.addEventListener?.("change", updateMotion);
     document.addEventListener("visibilitychange", update);
     return () => {
-      media.removeEventListener?.("change", updateMotion);
+      media?.removeEventListener?.("change", updateMotion);
       document.removeEventListener("visibilitychange", update);
     };
   }, []);
-  const value = useMemo(() => ({ reduced: Boolean(prefersReduced), documentHidden }), [documentHidden, prefersReduced]);
-  return <MotionConfig reducedMotion="user"><MotionContext.Provider value={value}>{children}</MotionContext.Provider></MotionConfig>;
+  const setPreference = (nextPreference: MotionPreference) => {
+    window.localStorage.setItem(MOTION_PREFERENCE_KEY, nextPreference);
+    setPreferenceState(nextPreference);
+  };
+  const reduced = preference === "reduced" || (preference === "system" && prefersReduced);
+  useEffect(() => {
+    document.documentElement.dataset.motionPreference = preference;
+    return () => { delete document.documentElement.dataset.motionPreference; };
+  }, [preference]);
+  const value = useMemo(() => ({ reduced, documentHidden, preference, setPreference }), [documentHidden, preference, reduced]);
+  return <MotionConfig reducedMotion={reduced ? "always" : "never"}><MotionContext.Provider value={value}>{children}</MotionContext.Provider></MotionConfig>;
 }
 
 export function useAppMotion(): MotionContextValue {

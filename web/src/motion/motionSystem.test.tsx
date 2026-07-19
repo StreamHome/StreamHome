@@ -1,5 +1,5 @@
 import React from "react";
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { MOTION_TIMINGS, MotionProvider, THEME_MOTION, useAppMotion } from "./motionSystem";
 
@@ -17,7 +17,11 @@ function matchMedia(matches: boolean) {
 }
 
 describe("cinematic motion system", () => {
-  beforeEach(() => Object.defineProperty(window, "matchMedia", { configurable: true, value: () => matchMedia(false) }));
+  beforeEach(() => {
+    window.localStorage.clear();
+    delete document.documentElement.dataset.motionPreference;
+    Object.defineProperty(window, "matchMedia", { configurable: true, value: () => matchMedia(false) });
+  });
 
   it("keeps interactions responsive and cinematic transitions deliberate", () => {
     expect(MOTION_TIMINGS.menu).toBe(.26);
@@ -48,13 +52,23 @@ describe("cinematic motion system", () => {
     expect(new Set(definitions.map((definition) => JSON.stringify(definition.billboardTiming))).size).toBe(4);
   });
 
-  it("exposes normal and reduced preferences through one provider", () => {
+  it("defaults to full motion instead of silently inheriting a false browser reduction", () => {
+    Object.defineProperty(window, "matchMedia", { configurable: true, value: () => matchMedia(true) });
     const wrapper = ({ children }: { children: React.ReactNode }) => <MotionProvider>{children}</MotionProvider>;
     const { result } = renderHook(() => useAppMotion(), { wrapper });
     expect(result.current.reduced).toBe(false);
+    expect(result.current.preference).toBe("full");
+    expect(document.documentElement.dataset.motionPreference).toBe("full");
+  });
+
+  it("persists explicit system and reduced motion choices", () => {
     Object.defineProperty(window, "matchMedia", { configurable: true, value: () => matchMedia(true) });
-    const reducedWrapper = ({ children }: { children: React.ReactNode }) => <MotionProvider>{children}</MotionProvider>;
-    const reduced = renderHook(() => useAppMotion(), { wrapper: reducedWrapper });
-    expect(reduced.result.current.reduced).toBe(true);
+    const wrapper = ({ children }: { children: React.ReactNode }) => <MotionProvider>{children}</MotionProvider>;
+    const { result } = renderHook(() => useAppMotion(), { wrapper });
+    act(() => result.current.setPreference("system"));
+    expect(result.current.reduced).toBe(true);
+    expect(window.localStorage.getItem("streamhome.motion-preference")).toBe("system");
+    act(() => result.current.setPreference("reduced"));
+    expect(result.current.preference).toBe("reduced");
   });
 });

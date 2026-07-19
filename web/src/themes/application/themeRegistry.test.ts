@@ -2,6 +2,7 @@ import React from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { THEME_DEFINITIONS } from "./themeRegistry";
+import { MotionProvider } from "../../motion/motionSystem";
 
 const navigationProps = {
   profile: { id: "1", name: "Admin", avatarColor: "#ff5f1f", theme: "gemini", pinEnabled: false, pin: null },
@@ -61,6 +62,15 @@ describe("theme definition registry", () => {
       expect(onEditProfile).toHaveBeenCalledOnce();
       unmount();
     }
+  });
+
+  it("exposes the explicit motion preference in the shared profile menu", () => {
+    window.localStorage.clear();
+    render(React.createElement(MotionProvider, null, React.createElement(THEME_DEFINITIONS.ember.Navigation, navigationProps)));
+    fireEvent.click(screen.getByLabelText("Open settings for Admin"));
+    expect(screen.getByRole("menuitemradio", { name: "Full" }).getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Reduced" }));
+    expect(window.localStorage.getItem("streamhome.motion-preference")).toBe("reduced");
   });
 
   it("marks Cinema navigation as scrolled after the document passes its threshold", () => {
