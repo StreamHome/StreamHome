@@ -5,6 +5,17 @@ import { describe, expect, it } from "vitest";
 const read = (path: string) => readFileSync(resolve(path), "utf8");
 
 describe("category renderer parity", () => {
+  it("keeps the visual genre gallery reversibly disabled without preparing artwork", () => {
+    const features = read("src/pages/dashboard/catalogFeatures.ts");
+    const presentation = read("src/pages/dashboard/catalogPresentation.ts");
+    const shared = read("src/pages/dashboard/ThemeDashboard.tsx");
+    const ember = read("src/pages/dashboard/ember/EmberDashboard.tsx");
+    expect(features).toContain("ENABLE_VISUAL_GENRE_CATEGORIES = false");
+    expect(presentation).toContain("ENABLE_VISUAL_GENRE_CATEGORIES\n    ? genreCategoryCards");
+    expect(shared).toContain("ENABLE_VISUAL_GENRE_CATEGORIES && <GenreCategoryGallery");
+    expect(ember).toContain("ENABLE_VISUAL_GENRE_CATEGORIES && <GenreCategoryGallery");
+  });
+
   it("keeps Ember and compatibility themes on the shared behavior model", () => {
     const shared = read("src/pages/dashboard/ThemeDashboard.tsx");
     const ember = read("src/pages/dashboard/ember/EmberDashboard.tsx");

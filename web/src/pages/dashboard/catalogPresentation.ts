@@ -1,5 +1,6 @@
 import type { CatalogView } from "../../navigation/queryState";
 import type { Movie, RecommendationCategory, RecommendationFeed } from "../../types/api";
+import { ENABLE_VISUAL_GENRE_CATEGORIES } from "./catalogFeatures";
 
 export const RECOMMENDED_CATEGORY = "recommended";
 export const ALL_RELEASES_CATEGORY = "all";
@@ -94,7 +95,9 @@ export function buildCatalogPresentation({
   const sourceItems = feed.items.map((item) => item.media);
   const watchAgain = feed.watchAgain.map((item) => item.media);
   const categories = categoryOptions(feed.categories);
-  const genreCards = genreCategoryCards(feed.categories, sourceItems, fallbackMovies);
+  const genreCards = ENABLE_VISUAL_GENRE_CATEGORIES
+    ? genreCategoryCards(feed.categories, sourceItems, fallbackMovies)
+    : [];
   const requested = feed.category?.trim() || RECOMMENDED_CATEGORY;
   const key = categoryKey(requested);
   const active = categories.find((category) => categoryKey(category.value) === key);

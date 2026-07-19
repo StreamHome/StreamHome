@@ -16,6 +16,7 @@ import type { DiscoverMovie, Movie, PlaybackSession } from "../../types/api";
 import { completionFraction, isAvailableMedia, isPlayableMovie, mediaAvailability } from "../../utils/media";
 import { DetailsRouter } from "../details/DetailsRouter";
 import { buildCatalogPresentation } from "./catalogPresentation";
+import { ENABLE_VISUAL_GENRE_CATEGORIES } from "./catalogFeatures";
 import { CategoryFilterRail } from "./CategoryFilterRail";
 import { GenreCategoryGallery } from "./GenreCategoryGallery";
 import { AvailabilityBadge, RecommendationReason } from "./RecommendationMeta";
@@ -88,7 +89,7 @@ function CatalogDiscoveryView({ query, controller, theme, variant, onOpen, onPla
     {model.billboardItems.length > 0 && <RotatingBillboard items={model.billboardItems} variant={variant} context={context} onDetails={onOpen} onPlay={onPlay} />}
     <FeedStatus controller={controller} />
     <CategoryFilterRail options={model.categories} active={model.activeCategory} variant="shared" onSelect={onCategory} />
-    <GenreCategoryGallery cards={model.genreCards} active={model.activeCategory} variant="shared" onSelect={onCategory} />
+    {ENABLE_VISUAL_GENRE_CATEGORIES && <GenreCategoryGallery cards={model.genreCards} active={model.activeCategory} variant="shared" onSelect={onCategory} />}
     <AnimatedState stateKey={`${model.mode}:${model.activeCategory}`}>
       {model.gridItems.length > 0 ? <CatalogGrid title={model.mode === "all" ? "All Releases" : model.activeLabel} label={model.mode === "all" ? "COMPLETE SERVER CATALOG" : "CATEGORY CATALOG"} items={model.gridItems} total={model.total} sessions={controller.sessions} theme={theme} showReasons={model.mode !== "all"} onOpen={onOpen} /> : hasResults ? <motion.div variants={CONTENT_STAGGER} initial="hidden" animate="shown" className={collectionsClass}>{model.sections.map((collection) => <MediaCollection key={collection.id} label={collection.label} title={collection.title} items={collection.items} sessions={controller.sessions} theme={theme} showReasons={collection.showReasons} onOpen={onOpen} />)}</motion.div> : <div className="category-discovery__empty"><EmptyState title={emptyTitle} body={`No titles match the ${model.activeLabel} category.`} /></div>}
     </AnimatedState>

@@ -16,6 +16,7 @@ import { completionFraction, isAvailableMedia, isPlayableMovie, mediaAvailabilit
 import { DetailsRouter } from "../../details/DetailsRouter";
 import { appViewMotionKey } from "../ThemeDashboard";
 import { buildCatalogPresentation } from "../catalogPresentation";
+import { ENABLE_VISUAL_GENRE_CATEGORIES } from "../catalogFeatures";
 import { CategoryFilterRail } from "../CategoryFilterRail";
 import { GenreCategoryGallery } from "../GenreCategoryGallery";
 import { AvailabilityBadge, RecommendationReason } from "../RecommendationMeta";
@@ -76,7 +77,7 @@ function EmberCatalogView({ query, controller, onOpen, onPlay, onCategory }: { q
     {model.billboardItems.length > 0 && <EmberBillboard items={model.billboardItems} context={context} onDetails={onOpen} onPlay={onPlay} />}
     <EmberFeedStatus controller={controller} />
     <CategoryFilterRail options={model.categories} active={model.activeCategory} variant="ember" onSelect={onCategory} />
-    <GenreCategoryGallery cards={model.genreCards} active={model.activeCategory} variant="ember" onSelect={onCategory} />
+    {ENABLE_VISUAL_GENRE_CATEGORIES && <GenreCategoryGallery cards={model.genreCards} active={model.activeCategory} variant="ember" onSelect={onCategory} />}
     <AnimatedState stateKey={`${model.mode}:${model.activeCategory}`}>
       {model.gridItems.length > 0 ? <EmberGrid title={model.mode === "all" ? "All Releases" : model.activeLabel} label={model.mode === "all" ? "COMPLETE SERVER CATALOG" : "CATEGORY CATALOG"} items={model.gridItems} total={model.total} sessions={controller.sessions} showReasons={model.mode !== "all"} onOpen={onOpen} /> : hasResults ? <motion.div variants={CONTENT_STAGGER} initial="hidden" animate="shown" className={collectionsClass}>{model.sections.map((collection) => <EmberRail key={collection.id} label={collection.label} title={collection.title} items={collection.items} sessions={controller.sessions} showReasons={collection.showReasons} onOpen={onOpen} />)}</motion.div> : <div className="ember-category-discovery__empty"><EmberStatePanel code="NO CATEGORY SIGNAL" title={`No ${model.activeLabel} titles`} body={`No titles match the ${model.activeLabel} category.`} /></div>}
     </AnimatedState>
