@@ -11,6 +11,7 @@ from db import engine, get_session
 from models import Movie, Episode, DownloadTask
 from config import settings
 from services.logger import logger
+from services.rclone import rclone_service
 from routes.auth import get_current_user
 
 router = APIRouter(prefix="/api/stream", tags=["Streaming"])
@@ -21,75 +22,42 @@ import json
 ACTIVE_CLOUD_DOWNLOADS = set()
 
 def get_rclone_path() -> Optional[str]:
-    rclone_path = shutil.which("rclone")
-    if not rclone_path:
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        bin_path = os.path.abspath(os.path.join(base_dir, "bin"))
-        rclone_exe = "rclone.exe" if os.name == "nt" else "rclone"
-        fallback_path = os.path.join(bin_path, rclone_exe)
-        if os.path.exists(fallback_path):
-            rclone_path = fallback_path
-    return rclone_path
+    return rclone_service.executable()
 
 async def download_file_from_cloud_task(target_remote: str, abs_path: str):
     try:
-        rclone_path = get_rclone_path()
-        if not rclone_path:
+        if not get_rclone_path():
             logger.error(f"[Cloud Download] Rclone not found. Cannot download {target_remote} to {abs_path}")
             return
-            
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-        cmd = [rclone_path, "copyto", target_remote, abs_path]
-        logger.info(f"[Cloud Download] Starting background copy: {' '.join(cmd)}")
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-        await process.wait()
-        
-        if process.returncode == 0:
+        logger.info("[Cloud Download] Starting protected background cache copy.")
+        result = await rclone_service.copyto_atomic(target_remote, abs_path)
+        if result.ok:
             logger.info(f"[Cloud Download] Successfully downloaded {target_remote} to local path {abs_path}!")
         else:
-            logger.error(f"[Cloud Download] Rclone copyto failed with status code {process.returncode}")
+            logger.error(f"[Cloud Download] Rclone copy failed: {result.error_code or 'rclone_failed'}")
     except Exception as e:
         logger.error(f"[Cloud Download] Exception during download of {target_remote}: {e}")
     finally:
         ACTIVE_CLOUD_DOWNLOADS.discard(abs_path)
 
 async def cloud_stream_generator(target_remote: str, start: int, count: Optional[int] = None):
-    rclone_path = get_rclone_path()
-    if not rclone_path:
+    if not get_rclone_path():
         logger.error("[Cloud Streaming] Rclone binary not found. Cannot stream.")
         return
-        
-    cmd = [rclone_path, "cat", "--offset", str(start)]
+    arguments = ["cat", "--offset", str(start)]
     if count is not None and count > 0:
-        cmd += ["--count", str(count)]
-    cmd += [target_remote]
-    
-    logger.info(f"[Cloud Streaming] Starting cloud stream: {' '.join(cmd)}")
+        arguments += ["--count", str(count)]
+    arguments += [target_remote]
+    logger.info("[Cloud Streaming] Starting protected Drive stream.")
+    process = None
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-        
-        while True:
-            chunk = await process.stdout.read(64 * 1024)
-            if not chunk:
-                break
+        process, chunks = await rclone_service.open_stream(*arguments)
+        async for chunk in chunks:
             yield chunk
-            
-        await process.wait()
     except asyncio.CancelledError:
         logger.info("[Cloud Streaming] Client disconnected. Killing rclone cat subprocess.")
-        try:
+        if process and process.returncode is None:
             process.kill()
-        except:
-            pass
         raise
     except Exception as e:
         logger.error(f"[Cloud Streaming] Error in stream generator: {e}")
@@ -123,8 +91,8 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
             
             rclone_path = get_rclone_path()
             if rclone_path:
-                rclone_cmd = [rclone_path, "cat", target_remote]
-                logger.info(f"[Streaming Router] Cloud transcoding source: {' '.join(rclone_cmd)}")
+                rclone_cmd = rclone_service.command("cat", target_remote)
+                logger.info("[Streaming Router] Opening protected cloud transcoding source.")
                 rclone_input_proc = await asyncio.create_subprocess_exec(
                     *rclone_cmd,
                     stdout=asyncio.subprocess.PIPE,
@@ -151,7 +119,7 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
                 remote_audio_dir = f"{settings.RCLONE_REMOTE_PATH}/{sub_path_dir}/audio"
                 try:
                     proc_ls = await asyncio.create_subprocess_exec(
-                        rclone_path, "lsjson", remote_audio_dir,
+                        *rclone_service.command("lsjson", remote_audio_dir),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.DEVNULL
                     )
@@ -167,12 +135,7 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
                             # Download the audio file synchronously if not on disk
                             if not os.path.exists(audio_file_path):
                                 remote_audio_file = f"{remote_audio_dir}/{audio_filename}"
-                                proc_dl = await asyncio.create_subprocess_exec(
-                                    rclone_path, "copyto", remote_audio_file, audio_file_path,
-                                    stdout=asyncio.subprocess.DEVNULL,
-                                    stderr=asyncio.subprocess.DEVNULL
-                                )
-                                await proc_dl.wait()
+                                await rclone_service.copyto_atomic(remote_audio_file, audio_file_path)
                 except Exception as e:
                     logger.error(f"[Streaming Router] Error checking/downloading cloud audio tracks: {e}")
     else:
@@ -441,7 +404,7 @@ async def stream_media(
                 if rclone_path:
                     try:
                         proc = await asyncio.create_subprocess_exec(
-                            rclone_path, "lsjson", target_remote,
+                            *rclone_service.command("lsjson", target_remote),
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.DEVNULL
                         )

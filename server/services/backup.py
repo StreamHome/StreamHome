@@ -12,6 +12,7 @@ from db import engine
 from models import PlaybackSession
 from services.logger import logger
 from services.queue import queue_manager
+from services.rclone import rclone_service
 
 def get_backup_dir() -> str:
     """Resolve absolute path to server/backup folder."""
@@ -129,40 +130,22 @@ def get_local_backups() -> list:
 
 async def sync_backups_to_cloud() -> bool:
     """Sync the local backup directory to the cloud backup location using Rclone."""
-    rclone_path = shutil.which("rclone")
-    if not rclone_path:
-        # Check in local bin/ directory
-        config_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        local_bin_rclone = os.path.abspath(os.path.join(config_dir, "..", "bin", "rclone.exe"))
-        if os.path.exists(local_bin_rclone):
-            rclone_path = local_bin_rclone
-        else:
-            logger.error("[Backup Service] Rclone binary not found. Cannot sync to cloud.")
-            return False
-
     backup_dir = get_backup_dir()
     target_remote = f"{settings.RCLONE_REMOTE_PATH}/backup"
-    
+
     logger.info(f"[Backup Service] Syncing backup folder with cloud: {backup_dir} -> {target_remote}")
-    cmd = [rclone_path, "sync", backup_dir, target_remote, "--retries", "3"]
-    
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-        if process.returncode == 0:
-            logger.info("[Backup Service] Cloud synchronization complete.")
-            return True
-        else:
-            err_msg = stderr.decode().strip()
-            logger.error(f"[Backup Service] Rclone sync failed with exit code {process.returncode}: {err_msg}")
-            return False
-    except Exception as e:
-        logger.error(f"[Backup Service] Error running rclone sync subprocess: {e}")
-        return False
+    result = await rclone_service.run("sync", backup_dir, target_remote, "--retries", "3", timeout=60 * 60)
+    if result.ok:
+        logger.info("[Backup Service] Cloud synchronization complete.")
+        return True
+    logger.error(
+        "[Backup Service] Rclone sync failed (%s): %s",
+        result.error_code or "rclone_failed",
+        result.stderr.strip(),
+    )
+    if result.error_code == "rclone_unavailable":
+        logger.error("[Backup Service] Rclone binary not found. Cannot sync to cloud.")
+    return False
 
 async def restore_backup(filename: str) -> bool:
     """

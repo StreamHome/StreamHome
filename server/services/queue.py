@@ -17,6 +17,7 @@ from config import settings
 from services.logger import logger
 from services.media_probe import probe_media_stream, notify_video_sender
 from services.ingestion_errors import IngestionFailure, IngestionTaskError, prune_task_diagnostics, write_task_diagnostics
+from services.rclone import rclone_service
 
 class DownloadQueueManager:
     def __init__(self):
@@ -93,29 +94,21 @@ class DownloadQueueManager:
                 logger.error(f"[Queue Manager] Error in worker loop: {e}")
 
     async def run_rclone_move_dir(self, local_dir: str, remote_subpath: str) -> bool:
-        rclone_path = shutil.which("rclone")
-        if not rclone_path:
-            workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-            rclone_exe = "rclone.exe" if os.name == "nt" else "rclone"
-            fallback_path = os.path.join(workspace_root, "bin", rclone_exe)
-            if os.path.exists(fallback_path):
-                rclone_path = fallback_path
-                
-        if not rclone_path:
+        if not rclone_service.executable():
             logger.error("[Queue Manager] Rclone binary not found. Cannot perform cloud upload.")
             return False
-        
         target_remote = f"{settings.RCLONE_REMOTE_PATH}/{remote_subpath.replace('\\', '/')}"
-        cmd = [rclone_path, "move", local_dir, target_remote, "--cleanup", "--retries", "3"]
-        
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            return process.returncode == 0
+            upload = await rclone_service.run("copy", local_dir, target_remote, "--retries", "3", timeout=6 * 60 * 60)
+            if not upload.ok:
+                logger.error(f"[Queue Manager] Drive upload failed: {upload.error_code or 'rclone_failed'}")
+                return False
+            verification = await rclone_service.run("check", local_dir, target_remote, "--one-way", timeout=60 * 60)
+            if not verification.ok:
+                logger.error(f"[Queue Manager] Drive upload verification failed: {verification.error_code or 'rclone_failed'}")
+                return False
+            shutil.rmtree(local_dir, ignore_errors=True)
+            return True
         except Exception as e:
             logger.error(f"[Queue Manager] Rclone move subprocess exception: {e}")
             return False

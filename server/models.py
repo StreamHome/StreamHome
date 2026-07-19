@@ -343,6 +343,23 @@ class SecurityEvent(SQLModel, table=True):
     session_id: Optional[str] = Field(default=None, index=True)
     details: Optional[str] = Field(default=None)
 
+
+class DriveSetupJob(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    session_hash: str = Field(index=True)
+    state_hash: str = Field(unique=True, index=True)
+    status: str = Field(index=True)
+    remote_name: str
+    audience: str = Field(default="external")
+    publishing_status: str = Field(default="production")
+    public_url: str
+    selected_path: Optional[str] = Field(default=None)
+    progress: str = Field(default="Waiting for Google authorization")
+    error_code: Optional[str] = Field(default=None)
+    created_at: float
+    updated_at: float
+    expires_at: float = Field(index=True)
+
 class PlaybackSession(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     profile_id: str

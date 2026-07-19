@@ -28,6 +28,7 @@ class Settings:
     SERVER_ENV_PATH: str = server_env_path
     SETUP_COMPLETE: bool = os.getenv("SETUP", "true").lower() in ("true", "1", "yes")
     WEB_PORT: int = env_int("WEB_PORT", 3000, 1, 65535)
+    PUBLIC_URL: str = os.getenv("PUBLIC_URL", f"http://localhost:{WEB_PORT}").rstrip("/")
     API_BEARER_TOKEN: str = os.getenv("API_BEARER_TOKEN", "secure-token-123")
     TMDB_API_KEY: str = os.getenv("TMDB_API_KEY", "")
     TMDB_READ_ACCESS_TOKEN: str = os.getenv("TMDB_READ_ACCESS_TOKEN", "")
@@ -61,6 +62,8 @@ class Settings:
     
     # Cloud storage configuration for rclone
     RCLONE_REMOTE_PATH: str = os.getenv("RCLONE_REMOTE_PATH", "gdrive:media")
+    GOOGLE_DRIVE_AUDIENCE: str = os.getenv("GOOGLE_DRIVE_AUDIENCE", "external")
+    GOOGLE_DRIVE_PUBLISHING_STATUS: str = os.getenv("GOOGLE_DRIVE_PUBLISHING_STATUS", "production")
 
     # Automated Database Backup System
     BACKUP_ENABLED: bool = os.getenv("BACKUP_ENABLED", "False").lower() in ("true", "1", "yes")
@@ -82,6 +85,9 @@ class Settings:
                     data = json.load(f)
                     self.STORAGE_ENGINE = data.get("storage_engine", self.STORAGE_ENGINE)
                     self.RCLONE_REMOTE_PATH = data.get("rclone_remote_path", self.RCLONE_REMOTE_PATH)
+                    self.PUBLIC_URL = data.get("public_url", self.PUBLIC_URL)
+                    self.GOOGLE_DRIVE_AUDIENCE = data.get("google_drive_audience", getattr(self, "GOOGLE_DRIVE_AUDIENCE", "external"))
+                    self.GOOGLE_DRIVE_PUBLISHING_STATUS = data.get("google_drive_publishing_status", getattr(self, "GOOGLE_DRIVE_PUBLISHING_STATUS", "production"))
                     self.BACKUP_ENABLED = data.get("backup_enabled", self.BACKUP_ENABLED)
                     self.AUTO_UPDATE_ENABLED = data.get("auto_update_enabled", self.AUTO_UPDATE_ENABLED)
                     self.HEVC_COMPRESSION_MODE = data.get("hevc_compression_mode", self.HEVC_COMPRESSION_MODE)
@@ -97,6 +103,9 @@ class Settings:
                 json.dump({
                     "storage_engine": self.STORAGE_ENGINE,
                     "rclone_remote_path": self.RCLONE_REMOTE_PATH,
+                    "public_url": self.PUBLIC_URL,
+                    "google_drive_audience": getattr(self, "GOOGLE_DRIVE_AUDIENCE", "external"),
+                    "google_drive_publishing_status": getattr(self, "GOOGLE_DRIVE_PUBLISHING_STATUS", "production"),
                     "backup_enabled": self.BACKUP_ENABLED,
                     "auto_update_enabled": self.AUTO_UPDATE_ENABLED,
                     "hevc_compression_mode": self.HEVC_COMPRESSION_MODE,

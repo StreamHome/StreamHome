@@ -22,7 +22,7 @@ from models import (
     PlaybackSessionResponse, DiscoverMovieResponse, EpisodeResponse, 
     Profile, ProfileResponse, APIModel, DownloadTask, TelemetryRequest,
     RecommendationFeedResponse, MediaPreferenceRequest, RecommendationExposureBatch,
-    RecommendationOnboardingRequest, User
+    RecommendationOnboardingRequest, User, DriveSetupJob
 )
 from services.recommendation import (
     process_telemetry_event,
@@ -76,6 +76,38 @@ async def lifespan(app: FastAPI):
                 settings.SETUP_COMPLETE = False
     except Exception as setup_state_err:
         logger.error(f"[Lifespan Startup] Setup-state validation failed: {setup_state_err}")
+
+    # Preserve resumable Drive setup jobs while repairing work interrupted mid-command.
+    try:
+        async with AsyncSession(engine) as db:
+            drive_jobs = (await db.exec(select(DriveSetupJob))).all()
+            changed = False
+            for job in drive_jobs:
+                job_changed = False
+                if job.expires_at < time.time() and job.status not in {"cancelled", "failed", "expired"}:
+                    job.status = "expired"
+                    job.error_code = "drive_job_expired"
+                    job.progress = "Google Drive setup expired. Start again."
+                    rclone_service.cleanup_job(job.id)
+                    job_changed = True
+                elif job.status == "exchanging_code":
+                    job.status = "failed"
+                    job.error_code = "drive_server_restarted"
+                    job.progress = "The server restarted during Google authorization. Start the Drive connection again."
+                    job_changed = True
+                elif job.status == "testing":
+                    job.status = "selecting_folder"
+                    job.error_code = "drive_test_interrupted"
+                    job.progress = "The Drive test was interrupted. Run it again."
+                    job_changed = True
+                if job_changed:
+                    changed = True
+                    job.updated_at = time.time()
+                    db.add(job)
+            if changed:
+                await db.commit()
+    except Exception as drive_state_err:
+        logger.error(f"[Lifespan Startup] Drive setup recovery failed: {drive_state_err}")
     
     try:
         settings.get_system_profile()
@@ -299,6 +331,7 @@ os.makedirs(os.path.join(settings.MEDIA_DIR, "Series"), exist_ok=True)
 from fastapi.responses import FileResponse, StreamingResponse
 import re
 from routes.stream import get_rclone_path, cloud_stream_generator, download_file_from_cloud_task, ACTIVE_CLOUD_DOWNLOADS
+from services.rclone import rclone_service
 
 @app.get("/media/{file_path:path}")
 async def serve_media_file(file_path: str, request: Request):
@@ -350,7 +383,7 @@ async def serve_media_file(file_path: str, request: Request):
             # Query size from rclone
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    rclone_path, "lsjson", target_remote,
+                    *rclone_service.command("lsjson", target_remote),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL
                 )
@@ -929,14 +962,32 @@ class SystemSettingsResponse(APIModel):
     storage_engine: str
     rclone_remote_path: str
     hevc_compression_mode: str
+    drive_configured: bool = False
+    drive_reachable: Optional[bool] = None
+    drive_error_code: Optional[str] = None
+    google_drive_audience: str = "external"
+    google_drive_publishing_status: str = "production"
+
+async def _drive_settings_status() -> tuple[bool, Optional[bool], Optional[str]]:
+    configured = rclone_service.config_path.exists() and ":" in settings.RCLONE_REMOTE_PATH
+    if not configured:
+        return False, None, None
+    result = await rclone_service.run("about", settings.RCLONE_REMOTE_PATH.split(":", 1)[0] + ":", "--json", timeout=12)
+    return True, result.ok, result.error_code
 
 @app.get("/api/system/settings", response_model=SystemSettingsResponse)
 async def get_system_settings(user = Depends(get_current_user)):
     """Retrieves current server storage engine and Rclone settings."""
+    drive_configured, drive_reachable, drive_error_code = await _drive_settings_status()
     return SystemSettingsResponse(
         storage_engine=settings.STORAGE_ENGINE,
         rclone_remote_path=settings.RCLONE_REMOTE_PATH,
-        hevc_compression_mode=settings.HEVC_COMPRESSION_MODE
+        hevc_compression_mode=settings.HEVC_COMPRESSION_MODE,
+        drive_configured=drive_configured,
+        drive_reachable=drive_reachable,
+        drive_error_code=drive_error_code,
+        google_drive_audience=settings.GOOGLE_DRIVE_AUDIENCE,
+        google_drive_publishing_status=settings.GOOGLE_DRIVE_PUBLISHING_STATUS,
     )
 
 @app.post("/api/system/settings", response_model=SystemSettingsResponse)
@@ -947,17 +998,37 @@ async def save_system_settings(req: SystemSettingsRequest, user = Depends(get_cu
     
     if req.hevc_compression_mode not in ["auto", "on", "off"]:
         raise HTTPException(status_code=400, detail="Invalid hevc compression mode. Must be auto, on, or off.")
+    if req.storage_engine == "CLOUD":
+        if req.rclone_remote_path != settings.RCLONE_REMOTE_PATH:
+            raise HTTPException(status_code=400, detail="Google Drive targets must be changed through the guided Drive connection flow.")
+        configured, reachable, error_code = await _drive_settings_status()
+        if not configured or not reachable:
+            raise HTTPException(status_code=422, detail={"code": error_code or "drive_not_configured", "message": "Connect and test Google Drive before enabling cloud storage."})
     
     settings.STORAGE_ENGINE = req.storage_engine
     settings.RCLONE_REMOTE_PATH = req.rclone_remote_path
     settings.HEVC_COMPRESSION_MODE = req.hevc_compression_mode
     settings.save_to_json()
-    
+    drive_configured, drive_reachable, drive_error_code = await _drive_settings_status()
     return SystemSettingsResponse(
         storage_engine=settings.STORAGE_ENGINE,
         rclone_remote_path=settings.RCLONE_REMOTE_PATH,
-        hevc_compression_mode=settings.HEVC_COMPRESSION_MODE
+        hevc_compression_mode=settings.HEVC_COMPRESSION_MODE,
+        drive_configured=drive_configured,
+        drive_reachable=drive_reachable,
+        drive_error_code=drive_error_code,
+        google_drive_audience=settings.GOOGLE_DRIVE_AUDIENCE,
+        google_drive_publishing_status=settings.GOOGLE_DRIVE_PUBLISHING_STATUS,
     )
+
+@app.post("/api/system/drive/test")
+async def test_system_drive(user = Depends(get_current_user)):
+    configured, reachable, error_code = await _drive_settings_status()
+    if not configured:
+        raise HTTPException(status_code=409, detail={"code": "drive_not_configured", "message": "Google Drive has not been configured."})
+    if not reachable:
+        raise HTTPException(status_code=422, detail={"code": error_code or "drive_unreachable", "message": "Google Drive could not be reached."})
+    return {"configured": True, "reachable": True, "remotePath": settings.RCLONE_REMOTE_PATH}
 
 
 if __name__ == "__main__":
