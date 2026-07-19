@@ -208,6 +208,11 @@ export interface SystemSettings {
   storageEngine: "LOCAL" | "CLOUD";
   rcloneRemotePath: string;
   hevcCompressionMode: "auto" | "on" | "off";
+  driveConfigured?: boolean;
+  driveReachable?: boolean | null;
+  driveErrorCode?: string | null;
+  googleDriveAudience?: "external" | "internal";
+  googleDrivePublishingStatus?: "testing" | "production";
 }
 
 export interface DownloadEvent {

@@ -1,9 +1,8 @@
 import React, { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { getSettings, updateSettings } from "../../../api/system";
+import { getSettings, testGoogleDrive, updateSettings } from "../../../api/system";
 import { Button } from "../../../components/ui/Button";
 import { GlassPane } from "../../../components/ui/GlassPane";
-import { Input } from "../../../components/ui/Input";
 import type { SystemSettings } from "../../../types/api";
 import { SudoModal } from "../SudoModal";
 import { MOTION_TIMINGS } from "../../../motion/motionSystem";
@@ -15,6 +14,7 @@ export function StoragePanel() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [testingDrive, setTestingDrive] = useState(false);
 
   const loadSettings = () => {
     setLoading(true);
@@ -38,6 +38,21 @@ export function StoragePanel() {
     setDraft(saved);
     setMessage("Server settings saved.");
     setSudoOpen(false);
+  };
+
+  const testDrive = async () => {
+    setTestingDrive(true);
+    setError("");
+    setMessage("");
+    try {
+      await testGoogleDrive();
+      setMessage("Google Drive is reachable and authorized.");
+      loadSettings();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Google Drive could not be tested.");
+    } finally {
+      setTestingDrive(false);
+    }
   };
 
   const header = (
@@ -73,11 +88,17 @@ export function StoragePanel() {
               <span>Storage engine</span>
               <select value={draft.storageEngine} onChange={(event) => setDraft({ ...draft, storageEngine: event.target.value as SystemSettings["storageEngine"] })}>
                 <option value="LOCAL">Local server storage</option>
-                <option value="CLOUD">Rclone cloud storage</option>
+              <option value="CLOUD" disabled={!draft.driveConfigured}>Google Drive</option>
               </select>
               <small>Choose where newly ingested media is stored.</small>
             </label>
-            <Input className="admin-control admin-control--input" label="Rclone remote path" value={draft.rcloneRemotePath} onChange={(event) => setDraft({ ...draft, rcloneRemotePath: event.target.value })} disabled={draft.storageEngine !== "CLOUD"} placeholder="remote:streamhome/media" />
+            <div className="admin-control admin-drive-status" data-ready={draft.driveReachable === true}>
+              <span>Google Drive</span>
+              <strong>{draft.driveConfigured ? draft.driveReachable ? "Connected" : "Needs attention" : "Not configured"}</strong>
+              <small>{draft.driveConfigured ? draft.rcloneRemotePath : "Connect Drive during setup before selecting cloud storage."}</small>
+              {draft.driveConfigured && <Button type="button" variant="secondary" disabled={testingDrive} onClick={testDrive}>{testingDrive ? "Testing…" : "Test connection"}</Button>}
+              <a href="https://github.com/WaqSea/StreamHome/blob/main/docs/google-drive.md" target="_blank" rel="noreferrer">Google Drive setup guide ↗</a>
+            </div>
             <label className="admin-control">
               <span>HEVC compression</span>
               <select value={draft.hevcCompressionMode} onChange={(event) => setDraft({ ...draft, hevcCompressionMode: event.target.value as SystemSettings["hevcCompressionMode"] })}>
