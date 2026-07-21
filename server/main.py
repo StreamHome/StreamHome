@@ -3,6 +3,7 @@ import sys
 import warnings
 import asyncio
 import json
+import mimetypes
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from datetime import datetime
@@ -22,7 +23,7 @@ from models import (
     PlaybackSessionResponse, DiscoverMovieResponse, EpisodeResponse, 
     Profile, ProfileResponse, APIModel, DownloadTask, TelemetryRequest,
     RecommendationFeedResponse, MediaPreferenceRequest, RecommendationExposureBatch,
-    RecommendationOnboardingRequest, User, DriveSetupJob
+    RecommendationOnboardingRequest, User, DriveSetupJob, PlaybackRun
 )
 from services.recommendation import (
     process_telemetry_event,
@@ -44,6 +45,7 @@ from config import settings
 from services.logger import logger
 from services.queue import queue_manager
 from services.hevc_compressor import hevc_compressor
+from services.playback_prep import playback_prep_service
 import services.state as state
 from routes.queue import router as queue_router
 from routes.auth import router as auth_router, health_router, get_current_user
@@ -51,15 +53,36 @@ from routes.stream import router as stream_router
 from routes.backup import router as backup_router
 from routes.update import router as update_router
 from routes.setup import router as setup_router
+from routes.playback import router as playback_router
 
 # 💥 WINDOWS ASYNC SUBPROCESS FIX
 if sys.platform == 'win32':
-    # Python 3.14'ün verdiği "Deprecated" uyarılarını terminali kirletmemesi için susturuyoruz
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-# 🚀 MODERN FASTAPI LIFESPAN (Eski on_event yapısının yerine)
+async def playback_run_reaper():
+    """Expire abandoned playback runs after 24 hours without activity."""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Check every 5 minutes
+            async with AsyncSession(engine) as db:
+                cutoff = time.time() - 24 * 60 * 60
+                stmt = select(PlaybackRun).where(PlaybackRun.lifecycle_state == "active", PlaybackRun.last_seen_at < cutoff)
+                result = await db.exec(stmt)
+                expired_runs = result.all()
+                if expired_runs:
+                    logger.info(f"[Lifespan Reaper] Found {len(expired_runs)} inactive playback runs. Marking as expired.")
+                    for run in expired_runs:
+                        run.lifecycle_state = "expired"
+                        db.add(run)
+                    await db.commit()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[Lifespan Reaper] Error reaping expired playback runs: {e}")
+
+# 🚀 MODERN FASTAPI LIFESPAN
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Sunucu başlarken (Startup) yapılacaklar:
@@ -68,7 +91,6 @@ async def lifespan(app: FastAPI):
     except Exception as db_err:
         logger.error(f"[Lifespan Startup] Database initialization failed (server continuing): {db_err}")
 
-    # An installation flag without an administrator is never considered complete.
     try:
         async with AsyncSession(engine) as db:
             existing_user = (await db.exec(select(User))).first()
@@ -77,7 +99,6 @@ async def lifespan(app: FastAPI):
     except Exception as setup_state_err:
         logger.error(f"[Lifespan Startup] Setup-state validation failed: {setup_state_err}")
 
-    # Preserve resumable Drive setup jobs while repairing work interrupted mid-command.
     try:
         async with AsyncSession(engine) as db:
             drive_jobs = (await db.exec(select(DriveSetupJob))).all()
@@ -114,7 +135,6 @@ async def lifespan(app: FastAPI):
     except Exception as pf_err:
         logger.error(f"[Lifespan Startup] System profile generation failed: {pf_err}")
     
-    # Check if TMDB credentials are set and show a warning if they are missing
     try:
         from services.tmdb import tmdb_client
         if not tmdb_client.api_key and not tmdb_client.read_access_token:
@@ -124,7 +144,6 @@ async def lifespan(app: FastAPI):
     except Exception as tmdb_err:
         logger.error(f"[Lifespan Startup] TMDB client credentials verification failed: {tmdb_err}")
         
-    # Clean up dangling tasks from previous run
     try:
         async with AsyncSession(engine) as db:
             stmt = select(DownloadTask).where(DownloadTask.status.in_(["DOWNLOADING", "MERGING", "MOVING_CLOUD"]))
@@ -140,7 +159,6 @@ async def lifespan(app: FastAPI):
     except Exception as dangling_err:
         logger.error(f"[Lifespan Startup] Error cleaning up dangling tasks: {dangling_err}")
 
-    # Seed default Admin profile if none exists
     try:
         async with AsyncSession(engine) as db:
             stmt = select(Profile)
@@ -160,9 +178,17 @@ async def lifespan(app: FastAPI):
     except Exception as seed_err:
         logger.error(f"[Lifespan Startup] Error seeding default profile: {seed_err}")
             
+    async def recover_catalog_and_playback() -> None:
+        try:
+            await queue_manager.sync_media_from_disk()
+            await playback_prep_service.schedule_catalog_baselines()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"[Lifespan Startup] Catalog/playback recovery failed: {type(exc).__name__}: {exc}")
+
     try:
-        # Run sync in the background so Uvicorn startup can complete instantly (prevents 504 gateway timeout)
-        asyncio.create_task(queue_manager.sync_media_from_disk())
+        asyncio.create_task(recover_catalog_and_playback())
     except Exception as sync_err:
         logger.error(f"[Lifespan Startup] Error scheduling media sync from disk: {sync_err}")
 
@@ -182,9 +208,8 @@ async def lifespan(app: FastAPI):
     except Exception as h_start_err:
         logger.error(f"[Lifespan Startup] Error starting hevc compressor: {h_start_err}")
 
-    # 💾 DAILY BACKUP & SYNC SCHEDULER
     async def daily_backup_worker():
-        await asyncio.sleep(30)  # Wait 30s after boot before first check
+        await asyncio.sleep(30)
         while True:
             try:
                 if settings.BACKUP_ENABLED:
@@ -212,44 +237,47 @@ async def lifespan(app: FastAPI):
                             continue
             except Exception as e:
                 logger.error(f"[Backup Worker] Error in daily backup scheduler: {e}")
-            await asyncio.sleep(3600)  # Check hourly
+            await asyncio.sleep(3600)
 
     asyncio.create_task(daily_backup_worker())
 
-    # 🔄 AUTOMATIC UPDATE SCHEDULER
     async def auto_update_worker():
-        await asyncio.sleep(45)  # Wait 45s after boot before first check
+        await asyncio.sleep(45)
         while True:
             try:
                 if settings.AUTO_UPDATE_ENABLED:
                     from services.update import check_for_github_updates, is_system_idle, pull_and_install_updates, self_restart_server
                     if await check_for_github_updates():
-                        # Wait for idle state (poll every 5 minutes)
                         while not await is_system_idle():
                             logger.info("[Update Worker] Update is available, but system is currently in use. Retrying idle check in 5 minutes...")
                             await asyncio.sleep(300)
                             
-                        # Idle achieved: perform upgrade
                         logger.info("[Update Worker] System is idle. Executing pull and update...")
                         success = await pull_and_install_updates()
                         if success:
                             logger.info("[Update Worker] Update successfully applied. Restarting server...")
                             self_restart_server()
-                            break # Exiting current process loop
+                            break
             except Exception as e:
                 logger.error(f"[Update Worker] Error in automatic update scheduler: {e}")
-            await asyncio.sleep(3600)  # Check every 1 hour
+            await asyncio.sleep(3600)
 
     asyncio.create_task(auto_update_worker())
 
     recommendation_stop = asyncio.Event()
     recommendation_task = asyncio.create_task(recommendation_worker(recommendation_stop))
+    
+    # Spawn background reaper task for expired playback runs
+    reaper_task = asyncio.create_task(playback_run_reaper())
 
     logger.info("[Server] Lifespan: Startup completed (with fallback checks).")
     
-    yield  # Sunucu bu noktada çalışmaya devam eder
+    yield
     
-    # Sunucu kapanırken (Shutdown) yapılacaklar:
+    reaper_task.cancel()
+    for playback_task in list(playback_prep_service.active_jobs.values()):
+        playback_task.cancel()
+    
     try:
         await queue_manager.stop()
     except Exception as q_stop_err:
@@ -274,7 +302,6 @@ async def lifespan(app: FastAPI):
 
 class ActivityTrackingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Exclude update endpoints from activity tracking to allow status checks
         if "/api/update" in request.url.path:
             return await call_next(request)
             
@@ -299,10 +326,8 @@ class SetupGateMiddleware(BaseHTTPMiddleware):
             )
         return await call_next(request)
 
-# Initialize FastAPI application with modern lifespan
 app = FastAPI(title="StreamHome Media Server", version=settings.APP_VERSION, lifespan=lifespan)
 
-# Setup CORS and activity tracking middlewares
 app.add_middleware(ActivityTrackingMiddleware)
 app.add_middleware(SetupGateMiddleware)
 app.add_middleware(
@@ -313,134 +338,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register routes
 app.include_router(queue_router)
 app.include_router(auth_router)
 app.include_router(health_router)
 app.include_router(stream_router)
+app.include_router(playback_router)
 app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
 app.include_router(update_router, prefix="/api/update", tags=["update"])
 app.include_router(setup_router)
 
-# Ensure directories exist before mounting static files
 os.makedirs(settings.MEDIA_DIR, exist_ok=True)
 os.makedirs(os.path.join(settings.MEDIA_DIR, "Movies"), exist_ok=True)
 os.makedirs(os.path.join(settings.MEDIA_DIR, "Series"), exist_ok=True)
 
-# Dynamic media route replacing standard StaticFiles to support cloud fallback & background caching
 from fastapi.responses import FileResponse, StreamingResponse
 import re
-from routes.stream import get_rclone_path, cloud_stream_generator, download_file_from_cloud_task, ACTIVE_CLOUD_DOWNLOADS
+from routes.stream import download_file_from_cloud_task, ACTIVE_CLOUD_DOWNLOADS
+from routes.playback import cloud_file_size, open_cloud_chunks
 from services.rclone import rclone_service
+from services.media_source import is_safe_presentation_asset, local_path_for
 
 @app.get("/media/{file_path:path}")
 async def serve_media_file(file_path: str, request: Request):
     file_path = file_path.lstrip("/")
-    abs_path = os.path.abspath(os.path.join(settings.MEDIA_DIR, file_path))
-    if not abs_path.startswith(os.path.abspath(settings.MEDIA_DIR)):
+    catalog_path = f"/media/{file_path.replace(chr(92), '/')}"
+    if not is_safe_presentation_asset(catalog_path):
+        raise HTTPException(status_code=403, detail="Direct access is limited to safe presentation assets.")
+    try:
+        abs_path = str(local_path_for(catalog_path))
+    except ValueError:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # 1. If it exists on disk, serve it immediately
     if os.path.exists(abs_path):
         return FileResponse(abs_path)
 
-    # 2. If not on disk, check if we are in CLOUD storage engine
     if settings.STORAGE_ENGINE == "CLOUD":
         target_remote = f"{settings.RCLONE_REMOTE_PATH}/{file_path.replace('\\', '/')}"
         
-        # Trigger background download so it's cached locally for next time
         if abs_path not in ACTIVE_CLOUD_DOWNLOADS:
             ACTIVE_CLOUD_DOWNLOADS.add(abs_path)
             asyncio.create_task(download_file_from_cloud_task(target_remote, abs_path))
             
-        # Parse range header
-        range_header = request.headers.get("range")
-        start_byte = 0
-        end_byte = None
-        file_size = 0
-        
-        # Determine media content-type
-        content_type = "application/octet-stream"
-        ext = os.path.splitext(file_path.lower())[1]
-        if ext == ".mp4":
-            content_type = "video/mp4"
-        elif ext == ".mp3":
-            content_type = "audio/mpeg"
-        elif ext in (".m4a", ".aac"):
-            content_type = "audio/mp4"
-        elif ext == ".vtt":
-            content_type = "text/vtt"
-        elif ext == ".srt":
-            content_type = "text/plain"
-        elif ext in (".jpg", ".jpeg"):
-            content_type = "image/jpeg"
-        elif ext == ".png":
-            content_type = "image/png"
-            
-        is_streamable = ext in (".mp4", ".mp3", ".m4a")
-        rclone_path = get_rclone_path()
-        if is_streamable and rclone_path:
-            # Query size from rclone
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *rclone_service.command("lsjson", target_remote),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
-                stdout, _ = await proc.communicate()
-                if proc.returncode == 0:
-                    data = json.loads(stdout)
-                    if isinstance(data, list) and len(data) > 0:
-                        file_size = data[0].get("Size", 0)
-            except Exception as e:
-                logger.error(f"[Media Router] Error fetching file size: {e}")
-
-            # Parse byte ranges
-            count = None
-            if range_header:
-                match = re.match(r"bytes=(\d+)-(\d*)", range_header)
-                if match:
-                    start_byte = int(match.group(1))
-                    if match.group(2):
-                        end_byte = int(match.group(2))
-                    elif file_size > 0:
-                        end_byte = file_size - 1
-                    
-                    if end_byte is not None:
-                        count = end_byte - start_byte + 1
-            
-            if file_size > 0 and end_byte is None:
-                end_byte = file_size - 1
-                count = file_size - start_byte
-            
-            headers = {
-                "Accept-Ranges": "bytes",
-                "Content-Type": content_type,
-            }
-            
-            if range_header:
-                content_range = f"bytes {start_byte}-{end_byte}/{file_size if file_size > 0 else '*'}"
-                headers["Content-Range"] = content_range
-                headers["Content-Length"] = str(count) if count is not None else "0"
-                return StreamingResponse(
-                    cloud_stream_generator(target_remote, start_byte, count),
-                    status_code=206,
-                    headers=headers
-                )
-            else:
-                if file_size > 0:
-                    headers["Content-Length"] = str(file_size)
-                return StreamingResponse(
-                    cloud_stream_generator(target_remote, 0, None),
-                    status_code=200,
-                    headers=headers
-                )
-        else:
-            return StreamingResponse(
-                cloud_stream_generator(target_remote, 0, None),
-                status_code=200,
-                headers={"Content-Type": content_type}
-            )
+        file_size = await cloud_file_size(target_remote)
+        chunks = await open_cloud_chunks(target_remote, 0, file_size)
+        content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        return StreamingResponse(
+            chunks,
+            status_code=200,
+            media_type=content_type,
+            headers={"Content-Length": str(file_size), "Cache-Control": "public, max-age=300"},
+        )
 
     raise HTTPException(status_code=404, detail="File not found")
 
@@ -680,7 +627,6 @@ async def get_watchlist(profile_id: str, user = Depends(get_current_user)):
         stmt = select(WatchlistItem).where(WatchlistItem.profile_id == profile_id)
         result = await db.exec(stmt)
         items = result.all()
-        # Sort items by created_at desc so latest items are shown first
         items.sort(key=lambda x: x.created_at, reverse=True)
         return [item.movie_id for item in items]
 
@@ -709,7 +655,6 @@ async def toggle_watchlist(req: WatchlistToggleRequest, user = Depends(get_curre
             
         await db.commit()
         
-        # Return updated watchlist
         stmt_all = select(WatchlistItem).where(WatchlistItem.profile_id == req.profile_id)
         result_all = await db.exec(stmt_all)
         items_all = result_all.all()
@@ -757,19 +702,16 @@ async def get_series_episodes(tmdb_id: int, user = Depends(get_current_user)):
     """Fetches real seasons and episodes for a TV series from TMDB, enriched with local catalog data if available."""
     from services.tmdb import tmdb_client
     
-    # 1. Fetch local episodes cataloged in the database
     async with AsyncSession(engine) as db:
         stmt = select(Episode).where(Episode.movie_id == f"tv_{tmdb_id}").order_by(Episode.season_number, Episode.episode_number)
         result = await db.exec(stmt)
         local_episodes = result.all()
         
-    # Map local episodes by (season_number, episode_number) for O(1) enrichment lookup
     local_map = {
         (e.season_number, e.episode_number): e
         for e in local_episodes
     }
         
-    # 2. Fetch episodes dynamically from TMDB so we always get all seasons and episodes
     try:
         show_data = await tmdb_client._get(f"/tv/{tmdb_id}")
         if not show_data:
@@ -817,7 +759,6 @@ async def get_series_episodes(tmdb_id: int, user = Depends(get_current_user)):
                 runtime = ep.get("runtime", 0) or 45
                 duration_str = f"{runtime}m"
                 
-                # Check if this episode is locally downloaded/cataloged in our database
                 local_ep = local_map.get((season_num, ep_num))
                 if local_ep:
                     eps.append(
@@ -858,7 +799,6 @@ async def get_series_episodes(tmdb_id: int, user = Depends(get_current_user)):
         
     except Exception as e:
         print(f"[API Series] Error fetching seasons/episodes from TMDB for {tmdb_id}: {e}")
-        # Fallback to local episodes if TMDB fetch fails
         return [
             EpisodeResponse(
                 id=e.id,

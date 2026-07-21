@@ -4,6 +4,7 @@ import asyncio
 import json
 import subprocess
 import httpx
+import hashlib
 from typing import Dict, Any, Optional
 from config import settings
 from services.logger import logger
@@ -150,3 +151,124 @@ async def notify_video_sender(
     except Exception as e:
         logger.warning(f"[Media Probe] Sender notification failed: {type(e).__name__}")
         return False
+
+async def probe_completed_media(file_path: str) -> Dict[str, Any]:
+    """
+    Probes completed local media file with FFprobe to extract detailed information:
+    duration, container format, video codec, resolution width & height, frame rate,
+    source fingerprint, and audio track metadata.
+    """
+    ffprobe_path = shutil.which("ffprobe") or r"C:\ffmpeg\bin\ffprobe.exe"
+    if not os.path.exists(file_path):
+        logger.warning(f"[Media Probe] Completed media file not found for probing: {file_path}")
+        return {}
+    
+    cmd = [
+        ffprobe_path, "-v", "error",
+        "-show_entries", "format=duration,format_name:stream=index,codec_type,codec_name,width,height,r_frame_rate,channels:stream_tags=language,title:stream_disposition=default",
+        "-of", "json", file_path
+    ]
+    
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            logger.error(f"[Media Probe] Failed to probe completed media {file_path}: {stderr.decode('utf-8', errors='ignore')}")
+            return {}
+            
+        data = json.loads(stdout.decode("utf-8", errors="ignore"))
+        fmt = data.get("format", {})
+        streams = data.get("streams", [])
+        
+        duration = float(fmt.get("duration") or 0.0)
+        container = fmt.get("format_name", "")
+        
+        video_streams = [s for s in streams if s.get("codec_type") == "video"]
+        audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+        
+        codec = ""
+        width = 0
+        height = 0
+        frame_rate = 0.0
+        
+        if video_streams:
+            v = video_streams[0]
+            codec = v.get("codec_name", "")
+            width = int(v.get("width") or 0)
+            height = int(v.get("height") or 0)
+            
+            r_fr = v.get("r_frame_rate", "")
+            if "/" in r_fr:
+                try:
+                    num, den = map(float, r_fr.split("/"))
+                    if den > 0:
+                        frame_rate = round(num / den, 3)
+                except Exception:
+                    pass
+            else:
+                try:
+                    frame_rate = float(r_fr)
+                except ValueError:
+                    pass
+        
+        audio_meta = []
+        for idx, a in enumerate(audio_streams):
+            tags = a.get("tags", {})
+            lang = tags.get("language", "und").lower()
+            channels = int(a.get("channels") or 2)
+            audio_meta.append({
+                "index": idx,
+                "streamIndex": int(a.get("index", idx)),
+                "codec": a.get("codec_name", ""),
+                "language": lang,
+                "label": tags.get("title") or lang.upper(),
+                "channels": channels,
+                "default": bool((a.get("disposition") or {}).get("default")),
+            })
+
+        # Older StreamHome catalogs may contain a silent video plus language-labelled
+        # audio files in the sibling audio directory. Treat those as real tracks only
+        # when the container itself has no audio, avoiding duplicate playlists for
+        # modern files that retain their embedded default track.
+        if not audio_meta:
+            audio_dir = os.path.join(os.path.dirname(file_path), "audio")
+            supported_audio = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"}
+            if os.path.isdir(audio_dir):
+                external_files = sorted(
+                    path for path in (os.path.join(audio_dir, name) for name in os.listdir(audio_dir))
+                    if os.path.isfile(path) and os.path.splitext(path)[1].lower() in supported_audio
+                )
+                for idx, external_path in enumerate(external_files):
+                    language = os.path.splitext(os.path.basename(external_path))[0].lower() or "und"
+                    audio_meta.append({
+                        "index": idx,
+                        "streamIndex": 0,
+                        "codec": os.path.splitext(external_path)[1].lstrip(".").lower(),
+                        "language": language,
+                        "label": language.upper(),
+                        "channels": 2,
+                        "default": idx == 0,
+                    })
+            
+        stat = os.stat(file_path)
+        val = f"{stat.st_size}_{stat.st_mtime}"
+        source_fingerprint = hashlib.md5(val.encode()).hexdigest()
+        
+        return {
+            "probed_duration": duration,
+            "container": container,
+            "codec": codec,
+            "width": width,
+            "height": height,
+            "frame_rate": frame_rate,
+            "source_fingerprint": source_fingerprint,
+            "audio_metadata": audio_meta
+        }
+    except Exception as e:
+        logger.error(f"[Media Probe] Exception probing completed media {file_path}: {e}")
+        return {}

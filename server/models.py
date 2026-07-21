@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Optional, List, Any, Dict
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import SQLModel, Field, Relationship
@@ -60,6 +61,16 @@ class Movie(SQLModel, table=True):
     cache_state: Optional[str] = Field(default=None, index=True)
     keywords_str: Optional[str] = Field(default="[]")
     collection_name: Optional[str] = Field(default=None, index=True)
+
+    # Rich Media Probe Fields (Additive)
+    probed_duration: Optional[float] = Field(default=None)
+    container: Optional[str] = Field(default=None)
+    codec: Optional[str] = Field(default=None)
+    width: Optional[int] = Field(default=None)
+    height: Optional[int] = Field(default=None)
+    frame_rate: Optional[float] = Field(default=None)
+    source_fingerprint: Optional[str] = Field(default=None, index=True)
+    audio_metadata_str: Optional[str] = Field(default="[]")
 
     @property
     def genres(self) -> List[str]:
@@ -130,6 +141,17 @@ class Movie(SQLModel, table=True):
     def keywords(self, val: List[str]):
         self.keywords_str = json.dumps(val or [])
 
+    @property
+    def audio_metadata(self) -> List[Dict[str, Any]]:
+        try:
+            return json.loads(self.audio_metadata_str or "[]")
+        except Exception:
+            return []
+
+    @audio_metadata.setter
+    def audio_metadata(self, val: List[Dict[str, Any]]):
+        self.audio_metadata_str = json.dumps(val or [])
+
 class Episode(SQLModel, table=True):
     id: str = Field(primary_key=True)
     movie_id: str = Field(foreign_key="movie.id")
@@ -145,6 +167,16 @@ class Episode(SQLModel, table=True):
     subtitles_str: Optional[str] = Field(default="[]")  # Serialized JSON List[Dict[str, str]]
     skip_markers_str: Optional[str] = Field(default="{}")  # Serialized JSON Dict
     hevc_compressed: bool = Field(default=False)
+
+    # Rich Media Probe Fields (Additive)
+    probed_duration: Optional[float] = Field(default=None)
+    container: Optional[str] = Field(default=None)
+    codec: Optional[str] = Field(default=None)
+    width: Optional[int] = Field(default=None)
+    height: Optional[int] = Field(default=None)
+    frame_rate: Optional[float] = Field(default=None)
+    source_fingerprint: Optional[str] = Field(default=None, index=True)
+    audio_metadata_str: Optional[str] = Field(default="[]")
 
     @property
     def languages(self) -> List[str]:
@@ -181,6 +213,17 @@ class Episode(SQLModel, table=True):
     @skip_markers.setter
     def skip_markers(self, val: Dict[str, Any]):
         self.skip_markers_str = json.dumps(val or {})
+
+    @property
+    def audio_metadata(self) -> List[Dict[str, Any]]:
+        try:
+            return json.loads(self.audio_metadata_str or "[]")
+        except Exception:
+            return []
+
+    @audio_metadata.setter
+    def audio_metadata(self, val: List[Dict[str, Any]]):
+        self.audio_metadata_str = json.dumps(val or [])
 
 class TelemetryEvent(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -343,7 +386,6 @@ class SecurityEvent(SQLModel, table=True):
     session_id: Optional[str] = Field(default=None, index=True)
     details: Optional[str] = Field(default=None)
 
-
 class DriveSetupJob(SQLModel, table=True):
     id: str = Field(primary_key=True)
     session_hash: str = Field(index=True)
@@ -361,6 +403,7 @@ class DriveSetupJob(SQLModel, table=True):
     expires_at: float = Field(index=True)
 
 class PlaybackSession(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("profile_id", "movie_id", "episode_id", name="uq_profile_movie_episode_playback_session"),)
     id: Optional[int] = Field(default=None, primary_key=True)
     profile_id: str
     movie_id: str
@@ -370,6 +413,20 @@ class PlaybackSession(SQLModel, table=True):
     completion_rate: Optional[float] = Field(default=0.0)  # Ratio of watched to total duration
     updated_at: str
     is_finished: Optional[bool] = Field(default=False)
+
+class PlaybackRun(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    profile_id: str = Field(index=True)
+    movie_id: str = Field(index=True)
+    episode_id: Optional[str] = Field(default=None, index=True)
+    auth_session_id: Optional[str] = Field(default=None)
+    sequence_number: int = Field(default=1)
+    lifecycle_state: str = Field(default="active")  # "active", "finished", "expired", "abandoned"
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+    last_seen_at: float = Field(default_factory=time.time)
+    last_progress_at: float = Field(default_factory=time.time)
+    total_seconds_played: int = Field(default=0)
 
 class DownloadTask(SQLModel, table=True):
     id: str = Field(primary_key=True)

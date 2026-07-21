@@ -1,6 +1,9 @@
 import os
 import shutil
 import asyncio
+import re
+import json
+import mimetypes
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, status, Query, Request
 from fastapi.responses import StreamingResponse, FileResponse
@@ -12,12 +15,11 @@ from models import Movie, Episode, DownloadTask
 from config import settings
 from services.logger import logger
 from services.rclone import rclone_service
+from services.media_source import MediaSourceError, resolve_media_source
 from routes.auth import get_current_user
+from routes.playback import cloud_file_size, open_cloud_chunks, parse_byte_range
 
 router = APIRouter(prefix="/api/stream", tags=["Streaming"])
-
-import re
-import json
 
 ACTIVE_CLOUD_DOWNLOADS = set()
 
@@ -64,22 +66,19 @@ async def cloud_stream_generator(target_remote: str, start: int, count: Optional
 
 async def transcode_generator(input_path: str, height: int, start_sec: float, media_id: str, quality: str, audio_track_idx: int = 0, should_cache: bool = True):
     import aiofiles
-    # Only cache if we're generating from the beginning
     if start_sec > 0:
         should_cache = False
         
-    # Resolve ffmpeg binary path dynamically
     ffmpeg_path = shutil.which("ffmpeg") or r"C:\ffmpeg\bin\ffmpeg.exe"
     
-    # Cache path files setup
     cache_dir = os.path.join(settings.TEMP_DIR, "transcode_cache")
     os.makedirs(cache_dir, exist_ok=True)
-    temp_cache_file = os.path.join(cache_dir, f"{media_id}_{quality}.mp4.tmp")
-    final_cache_file = os.path.join(cache_dir, f"{media_id}_{quality}.mp4")
+    cache_key = f"{media_id}_{quality}_a{audio_track_idx}"
+    temp_cache_file = os.path.join(cache_dir, f"{cache_key}.mp4.tmp")
+    final_cache_file = os.path.join(cache_dir, f"{cache_key}.mp4")
     
     original_input_path = input_path
     
-    # If input path is not on disk, check if it's on cloud
     stdin_arg = None
     rclone_input_proc = None
     
@@ -101,16 +100,12 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
                 stdin_arg = rclone_input_proc.stdout
                 input_path = "pipe:0"
 
-    # Find the audio directory and locate the requested track
     audio_file_path = None
     parent_dir = os.path.dirname(original_input_path)
     audio_dir = os.path.join(parent_dir, "audio")
     
-    # For cloud paths, the local audio dir might not exist yet. We can try to download the audio file synchronously.
     if input_path == "pipe:0":
         os.makedirs(audio_dir, exist_ok=True)
-        # Try to resolve remote audio files
-        # We can list the files in the remote 'audio' directory using rclone lsjson
         rclone_path = get_rclone_path()
         if rclone_path:
             media_idx = original_input_path.replace("\\", "/").find("/media/")
@@ -132,7 +127,6 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
                             audio_filename = audio_files[idx]
                             audio_file_path = os.path.join(audio_dir, audio_filename)
                             
-                            # Download the audio file synchronously if not on disk
                             if not os.path.exists(audio_file_path):
                                 remote_audio_file = f"{remote_audio_dir}/{audio_filename}"
                                 await rclone_service.copyto_atomic(remote_audio_file, audio_file_path)
@@ -148,7 +142,6 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
             except Exception:
                 pass
 
-    # Set dynamic bitrate ceilings based on requested quality
     maxrate = "1500k"
     bufsize = "3000k"
     crf = "26"
@@ -175,7 +168,6 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
         bufsize = "500k"
         audio_bitrate = "64k"
 
-    # Build transcoding command
     if audio_file_path and os.path.exists(audio_file_path):
         if input_path == "pipe:0":
             cmd = [
@@ -262,11 +254,10 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
                 "pipe:1"
             ]
     
-    logger.info(f"[Streaming Router] Executing on-the-fly transcode command: {' '.join(cmd)}")
+    logger.info(f"[Streaming Router] Starting protected {quality} transcode for {media_id} (audio track {audio_track_idx}).")
     
     f_cache = None
     if should_cache:
-        # If a temp file already exists, delete it first to prevent lock/append corruption
         if os.path.exists(temp_cache_file):
             try: os.remove(temp_cache_file)
             except Exception: pass
@@ -285,7 +276,7 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
         )
         
         while True:
-            chunk = await process.stdout.read(64 * 1024)  # 64 KB chunks
+            chunk = await process.stdout.read(64 * 1024)
             if not chunk:
                 break
             if should_cache and f_cache:
@@ -300,7 +291,6 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
         
         if process.returncode == 0 and should_cache:
             if os.path.exists(temp_cache_file):
-                # Clean up if another thread finished first (extremely rare race condition)
                 if os.path.exists(final_cache_file):
                     try: os.remove(temp_cache_file)
                     except Exception: pass
@@ -344,19 +334,24 @@ async def transcode_generator(input_path: str, height: int, start_sec: float, me
 async def stream_media(
     media_id: str,
     request: Request,
-    quality: Optional[str] = Query(None), # "Source", "720p", "480p"
-    start: float = Query(0.0), # Start seek point in seconds
-    audio_track: Optional[int] = Query(0), # Requested audio track index
+    quality: Optional[str] = Query(None),
+    start: float = Query(0.0),
+    audio_track: Optional[int] = Query(0),
     db: AsyncSession = Depends(get_session),
     user = Depends(get_current_user)
 ):
     """
     Streams media file dynamically. If quality matches Source, serves directly.
-    If 720p/480p, streams an on-the-fly transcoded FFmpeg stream (or serves from cache).
+    If 720p/480p, streams an on-the-fly transcoded FFmpeg stream.
     """
+    # Strict Quality and Audio track Validation
+    if quality and quality not in ["Source", "1080p", "720p", "480p", "360p", "240p"]:
+        raise HTTPException(status_code=400, detail="Invalid quality parameter")
+    if audio_track is None or audio_track < 0 or audio_track > 31:
+        raise HTTPException(status_code=400, detail="Invalid audio track parameter")
+
     video_url = None
     
-    # 1. Resolve media_id to find video url
     if media_id.startswith("m_"):
         stmt = select(Movie).where(Movie.id == media_id)
         res = await db.execute(stmt)
@@ -373,92 +368,36 @@ async def stream_media(
     if not video_url:
         raise HTTPException(status_code=404, detail="Media asset not found")
         
-    # Remove leading slash if it exists
-    rel_path = video_url.lstrip("/")
-    
-    # Resolve absolute path to the local video file
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    abs_path = os.path.join(base_dir, rel_path)
+    try:
+        source = await resolve_media_source(video_url)
+    except MediaSourceError as exc:
+        raise HTTPException(status_code=409, detail="The catalog contains an invalid media path") from exc
+    abs_path = str(source.local_path)
     
     if not os.path.exists(abs_path):
-        # Fallback: check if the file exists on the cloud
-        if settings.STORAGE_ENGINE == "CLOUD" and rel_path.startswith("media/"):
-            sub_path = rel_path[6:].replace('\\', '/')
-            target_remote = f"{settings.RCLONE_REMOTE_PATH}/{sub_path}"
+        if source.cloud_exists and source.cloud_path:
+            target_remote = source.cloud_path
             
-            # Start background copy if not already in progress
             if abs_path not in ACTIVE_CLOUD_DOWNLOADS:
                 ACTIVE_CLOUD_DOWNLOADS.add(abs_path)
                 asyncio.create_task(download_file_from_cloud_task(target_remote, abs_path))
             
-            # Serve the cloud stream directly (using byte ranges if "Source" is requested)
             if not quality or quality == "Source":
-                # Parse Range header
-                range_header = request.headers.get("range")
-                start_byte = 0
-                end_byte = None
-                
-                # Fetch size from rclone
-                file_size = 0
-                rclone_path = get_rclone_path()
-                if rclone_path:
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            *rclone_service.command("lsjson", target_remote),
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.DEVNULL
-                        )
-                        stdout, _ = await proc.communicate()
-                        if proc.returncode == 0:
-                            data = json.loads(stdout)
-                            if isinstance(data, list) and len(data) > 0:
-                                file_size = data[0].get("Size", 0)
-                    except Exception as e:
-                        logger.error(f"[Streaming Router] Error fetching file size from cloud: {e}")
-                
-                # Parse byte ranges
-                count = None
-                if range_header:
-                    match = re.match(r"bytes=(\d+)-(\d*)", range_header)
-                    if match:
-                        start_byte = int(match.group(1))
-                        if match.group(2):
-                            end_byte = int(match.group(2))
-                        elif file_size > 0:
-                            end_byte = file_size - 1
-                        
-                        if end_byte is not None:
-                            count = end_byte - start_byte + 1
-                
-                if file_size > 0 and end_byte is None:
-                    end_byte = file_size - 1
-                    count = file_size - start_byte
-                
+                file_size = await cloud_file_size(target_remote)
+                start_byte, end_byte, partial = parse_byte_range(request.headers.get("range"), file_size)
+                count = end_byte - start_byte + 1
+                content_type = mimetypes.guess_type(source.catalog_path)[0] or "application/octet-stream"
                 headers = {
                     "Accept-Ranges": "bytes",
-                    "Content-Type": "video/mp4",
+                    "Content-Length": str(count),
+                    "Content-Type": content_type,
+                    "Cache-Control": "private, no-store",
                 }
-                
-                if range_header:
-                    content_range = f"bytes {start_byte}-{end_byte}/{file_size if file_size > 0 else '*'}"
-                    headers["Content-Range"] = content_range
-                    headers["Content-Length"] = str(count) if count is not None else "0"
-                    
-                    return StreamingResponse(
-                        cloud_stream_generator(target_remote, start_byte, count),
-                        status_code=206,
-                        headers=headers
-                    )
-                else:
-                    if file_size > 0:
-                        headers["Content-Length"] = str(file_size)
-                    return StreamingResponse(
-                        cloud_stream_generator(target_remote, 0, None),
-                        status_code=200,
-                        headers=headers
-                    )
+                if partial:
+                    headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
+                chunks = await open_cloud_chunks(target_remote, start_byte, count)
+                return StreamingResponse(chunks, status_code=206 if partial else 200, media_type=content_type, headers=headers)
 
-        # Fallback 2: Check if it's currently downloading and we can proxy the external URL
         tmdb_id_str = None
         if media_id.startswith("m_"):
             tmdb_id_str = media_id[2:]
@@ -474,7 +413,6 @@ async def stream_media(
             task = res.scalars().first()
             
             if task and task.status in ["PENDING", "DOWNLOADING", "MERGING"] and task.video_url.startswith("http"):
-                # Seamless Proxy to external URL
                 if not quality or quality == "Source":
                     import httpx
                     range_header = request.headers.get("range")
@@ -512,24 +450,19 @@ async def stream_media(
                         headers=resp_headers
                     )
                 else:
-                    # For transcoded streams, feed the external URL to FFmpeg
                     abs_path = task.video_url
             else:
                 raise HTTPException(status_code=404, detail=f"Media file not found on disk: {abs_path}")
         else:
             raise HTTPException(status_code=404, detail=f"Media file not found on disk: {abs_path}")
         
-    # 2. Check quality transcode requirements
     if not quality or quality == "Source":
-        # Return static file response supporting ranges natively
-        return FileResponse(abs_path, media_type="video/mp4")
+        return FileResponse(abs_path, media_type=mimetypes.guess_type(abs_path)[0] or "application/octet-stream")
         
-    # 3. Transcode Cache Check
-    cache_file = os.path.join(settings.TEMP_DIR, "transcode_cache", f"{media_id}_{quality}.mp4")
+    cache_file = os.path.join(settings.TEMP_DIR, "transcode_cache", f"{media_id}_{quality}_a{audio_track}.mp4")
     if os.path.exists(cache_file):
         if start > 0:
             logger.info(f"[Streaming Router] Seeking into cached transcode file: {cache_file} at {start}s")
-            # We must output an MP4 stream starting at `start` to satisfy the frontend's expectation
             ffmpeg_path = shutil.which("ffmpeg") or r"C:\ffmpeg\bin\ffmpeg.exe"
             cmd = [
                 ffmpeg_path,

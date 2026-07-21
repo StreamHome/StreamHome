@@ -6,6 +6,7 @@ import asyncio
 import traceback
 import httpx
 import aiofiles
+import re
 from typing import Dict, Any, List, Optional
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -15,9 +16,64 @@ from services.ffmpeg import download_and_merge, download_and_cache_metadata_imag
 from services.tmdb import tmdb_client
 from config import settings
 from services.logger import logger
-from services.media_probe import probe_media_stream, notify_video_sender
+from services.media_probe import probe_media_stream, notify_video_sender, probe_completed_media
 from services.ingestion_errors import IngestionFailure, IngestionTaskError, prune_task_diagnostics, write_task_diagnostics
 from services.rclone import rclone_service
+from services.media_source import MediaSourceError, resolve_media_source
+
+def srt_to_vtt(srt_path: str, vtt_path: str) -> bool:
+    """
+    Converts a SubRip (.srt) subtitle file to a WebVTT (.vtt) file.
+    Atomically ensures UTF-8 encoding.
+    """
+    try:
+        content = ""
+        for encoding in ["utf-8", "latin-1", "cp1252"]:
+            try:
+                with open(srt_path, "r", encoding=encoding) as f:
+                    content = f.read()
+                break
+            except UnicodeDecodeError:
+                continue
+        if not content:
+            with open(srt_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+                
+        # Fix timestamps: commas to periods
+        fixed_content = re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", content)
+        if fixed_content.startswith("\ufeff"):
+            fixed_content = fixed_content[1:]
+            
+        if not fixed_content.strip().startswith("WEBVTT"):
+            fixed_content = "WEBVTT\n\n" + fixed_content
+            
+        temporary_path = f"{vtt_path}.tmp"
+        with open(temporary_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(fixed_content)
+        os.replace(temporary_path, vtt_path)
+        return True
+    except Exception as e:
+        try:
+            os.remove(f"{vtt_path}.tmp")
+        except OSError:
+            pass
+        logger.error(f"[Subtitles] Exception converting SRT to VTT: {e}")
+        return False
+
+async def verify_media_exists(rel_path: str) -> bool:
+    """
+    Checks if physical media exists either locally on disk or inside rclone cloud storage.
+    """
+    if not rel_path:
+        return False
+    candidate = rel_path.replace("\\", "/")
+    if candidate.startswith("media/"):
+        candidate = f"/{candidate}"
+    try:
+        return (await resolve_media_source(candidate)).available
+    except MediaSourceError:
+        return False
+
 
 class DownloadQueueManager:
     def __init__(self):
@@ -127,7 +183,6 @@ class DownloadQueueManager:
                     remove_task_metrics(task_id)
                     return
                 
-                # Verileri ham olarak dışarı alıyoruz (Veritabanı çökmesini engellemek için)
                 tmdb_id = task.tmdb_id
                 media_type = task.media_type
                 headers = task.headers
@@ -181,7 +236,7 @@ class DownloadQueueManager:
                     db.add(task_db)
                     await db.commit()
 
-            # 3. Notify Video Sender API (Non-blocking background task)
+            # 3. Notify Video Sender API
             asyncio.create_task(notify_video_sender(
                 task_id=task_id,
                 tmdb_id=tmdb_id,
@@ -251,6 +306,24 @@ class DownloadQueueManager:
                     except Exception:
                         pass
 
+            # Convert any SRT subtitles to WebVTT
+            for sub in subtitles_list:
+                sub_lang = sub.get("language", "en")
+                srt_path = os.path.join(os.path.dirname(output_abs_path), f"subtitle_{sub_lang}.srt")
+                vtt_path = os.path.join(os.path.dirname(output_abs_path), f"subtitle_{sub_lang}.vtt")
+                if os.path.exists(srt_path):
+                    if srt_to_vtt(srt_path, vtt_path):
+                        try:
+                            os.rename(srt_path, srt_path + ".bak")
+                            created_artifacts.append(vtt_path)
+                            if srt_path in created_artifacts:
+                                created_artifacts.remove(srt_path)
+                            created_artifacts.append(srt_path + ".bak")
+                        except Exception:
+                            pass
+                    else:
+                        created_artifacts.append(srt_path)
+
             # 4. Retry Loop for Download & Merge
             max_retries = 3
             success = False
@@ -287,7 +360,6 @@ class DownloadQueueManager:
 
             rclone_success = True
             if success:
-                # Run audio extraction and video stripping
                 from services.audio_extractor import extract_audio_and_strip_video
                 extracted_languages = await extract_audio_and_strip_video(output_abs_path, default_lang=language or "en")
                 
@@ -325,7 +397,6 @@ class DownloadQueueManager:
                                     shutil.rmtree(dest_dir, ignore_errors=True)
                                 shutil.move(local_dir, dest_dir)
                                 logger.info(f"[Queue Manager] Local fallback copy completed for task {task_id}. Files moved to {dest_dir}")
-                                # Treat fallback success as completion
                                 rclone_success = True
                         except Exception as fallback_err:
                             logger.error(f"[Queue Manager] Local fallback copy failed for task {task_id}: {fallback_err}")
@@ -427,6 +498,26 @@ class DownloadQueueManager:
                 break
             current = os.path.dirname(current)
 
+    async def _schedule_playback_baseline(self, db: AsyncSession, media_obj: Any) -> None:
+        if not getattr(media_obj, "video_url", ""):
+            return
+        try:
+            from services.playback_prep import playback_prep_service
+
+            source = await resolve_media_source(media_obj.video_url)
+            if not source.available:
+                return
+            if media_obj.source_fingerprint != source.fingerprint:
+                media_obj.source_fingerprint = source.fingerprint
+                db.add(media_obj)
+                await db.commit()
+            await playback_prep_service.prepare(media_obj.id, media_obj, source, include_remaining=False)
+        except Exception as exc:
+            logger.warning(
+                f"[Queue Manager] Playback baseline scheduling failed for "
+                f"{getattr(media_obj, 'id', 'unknown')}: {type(exc).__name__}"
+            )
+
     async def _catalog_media(
         self, db: AsyncSession, tmdb_id: int, media_type: str, season: Optional[int], 
         episode: Optional[int], meta: Dict[str, Any], file_path: str, 
@@ -436,7 +527,6 @@ class DownloadQueueManager:
     ):
         server_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         
-        # Get correct folder name
         raw_title = meta.get("title", f"Media_{tmdb_id}")
         clean_title = "".join(c for c in raw_title if c.isalnum() or c in " .-_")
         
@@ -448,7 +538,6 @@ class DownloadQueueManager:
             correct_folder_name = f"{clean_title}_TMDB_{tmdb_id}"
             parent_dir_rel = "media/Series"
             
-        # Parse current folder name from file_path if provided
         current_folder_name = None
         served_url = ""
         virtual_path = ""
@@ -468,7 +557,6 @@ class DownloadQueueManager:
                     try:
                         os.rename(old_folder_abs, new_folder_abs)
                         file_path = file_path.replace(current_folder_name, correct_folder_name)
-                        # For movies, also rename the filename to match the corrected title
                         if media_type == "movie":
                             old_file_name = parts[-1]
                             new_file_name = f"{clean_title}_{release_year}.mp4"
@@ -495,7 +583,6 @@ class DownloadQueueManager:
         main_folder_abs = os.path.abspath(os.path.join(server_root, main_folder_rel))
         os.makedirs(main_folder_abs, exist_ok=True)
         
-        # Save poster.jpg and backdrop.jpg directly to the Movie / Series folder
         poster_rel = os.path.join(main_folder_rel, "poster.jpg")
         backdrop_rel = os.path.join(main_folder_rel, "backdrop.jpg")
         poster_abs = os.path.abspath(os.path.join(server_root, poster_rel))
@@ -503,26 +590,40 @@ class DownloadQueueManager:
         
         local_thumbnail = await download_and_cache_metadata_image(meta.get("thumbnailUrl"), poster_abs)
         local_banner = await download_and_cache_metadata_image(meta.get("bannerUrl"), backdrop_abs)
+
+        # Probe completed media file
+        probe_meta = {}
+        if file_path:
+            probe_meta = await probe_completed_media(abs_file_path)
+
+        probed_duration = probe_meta.get("probed_duration")
+        container = probe_meta.get("container")
+        codec = probe_meta.get("codec")
+        width = probe_meta.get("width")
+        height = probe_meta.get("height")
+        frame_rate = probe_meta.get("frame_rate")
+        source_fingerprint = probe_meta.get("source_fingerprint")
+        audio_meta_list = probe_meta.get("audio_metadata", [])
         
         if media_type == "movie":
             movie_id = f"m_{tmdb_id}"
-
-            # Prepare metadata values for both DB and metadata.json
             movie_folder_abs = os.path.dirname(abs_file_path)
             movie_quality = quality or "Source"
             movie_languages = extracted_languages if extracted_languages else ([language] if language else ["en"])
+            
             subs_on_disk = []
             if subtitles_list:
                 for sub in subtitles_list:
                     sub_lang = sub.get("language", "en")
-                    for ext in [".vtt", ".srt"]:
-                        sub_file_name = f"subtitle_{sub_lang}{ext}"
-                        if os.path.exists(os.path.join(movie_folder_abs, sub_file_name)):
-                            subs_on_disk.append({
-                                "language": sub_lang,
-                                "ext": ext
-                            })
-                            break
+                    srt_abs = os.path.join(movie_folder_abs, f"subtitle_{sub_lang}.srt")
+                    vtt_abs = os.path.join(movie_folder_abs, f"subtitle_{sub_lang}.vtt")
+                    if os.path.exists(srt_abs) and not os.path.exists(vtt_abs):
+                        srt_to_vtt(srt_abs, vtt_abs)
+                    if os.path.exists(vtt_abs):
+                        subs_on_disk.append({
+                            "language": sub_lang,
+                            "ext": ".vtt"
+                        })
 
             duration_str = meta.get("duration", "1h 30m")
             skip_data = skip_markers or {}
@@ -536,7 +637,10 @@ class DownloadQueueManager:
                     rating=meta.get("rating", "PG-13"), director=meta.get("director", "Unknown"),
                     original_language=language or meta.get("originalLanguage", "en"), type="movie",
                     vote_average=meta.get("vote_average", 7.5), vote_count=meta.get("vote_count", 100),
-                    tmdb_id=int(tmdb_id), catalog_source="server", availability="available"
+                    tmdb_id=int(tmdb_id), catalog_source="server", availability="available",
+                    probed_duration=probed_duration, container=container, codec=codec,
+                    width=width, height=height, frame_rate=frame_rate,
+                    source_fingerprint=source_fingerprint
                 )
                 movie.genres = meta.get("genres", [])
                 movie.cast = meta.get("cast", [])
@@ -544,6 +648,7 @@ class DownloadQueueManager:
                 movie.languages = movie_languages
                 movie.subtitles = subs_on_disk
                 movie.skip_markers = skip_data
+                movie.audio_metadata = audio_meta_list
                 db.add(movie)
                 await db.commit()
                 logger.info(f"[Queue Manager] Cataloged new movie: {meta.get('title', 'Unknown Movie')}")
@@ -569,29 +674,19 @@ class DownloadQueueManager:
                 movie.skip_markers = skip_data
                 movie.vote_average = meta.get("vote_average", movie.vote_average)
                 movie.vote_count = meta.get("vote_count", movie.vote_count)
-                db.add(movie)
-                await db.commit()
-                movie.video_url = served_url
-                movie.tmdb_id = int(tmdb_id)
-                movie.catalog_source = "server"
-                movie.availability = "available"
-                movie.duration = meta.get("duration", movie.duration)
-                movie.release_year = meta.get("releaseYear", movie.release_year)
-                movie.rating = meta.get("rating", movie.rating)
-                movie.director = meta.get("director", movie.director)
-                movie.cast = meta.get("cast", movie.cast)
-                movie.genres = meta.get("genres", movie.genres)
-                movie.original_language = language or meta.get("originalLanguage", movie.original_language)
-                movie.quality = movie_quality
-                movie.languages = movie_languages
-                movie.subtitles = subs_on_disk
-                movie.vote_average = meta.get("vote_average", movie.vote_average)
-                movie.vote_count = meta.get("vote_count", movie.vote_count)
+                
+                movie.probed_duration = probed_duration
+                movie.container = container
+                movie.codec = codec
+                movie.width = width
+                movie.height = height
+                movie.frame_rate = frame_rate
+                movie.source_fingerprint = source_fingerprint
+                movie.audio_metadata = audio_meta_list
                 db.add(movie)
                 await db.commit()
                 logger.info(f"[Queue Manager] Updated existing movie details: {movie.title}")
 
-            # Create movie's local .metadata/metadata.json
             movie_metadata_dir = os.path.join(movie_folder_abs, ".metadata")
             os.makedirs(movie_metadata_dir, exist_ok=True)
             movie_metadata_file = os.path.join(movie_metadata_dir, "metadata.json")
@@ -610,10 +705,19 @@ class DownloadQueueManager:
                 "quality": movie_quality,
                 "subtitles": subs_on_disk,
                 "original_language": language or "en",
-                "skip_markers": skip_data
+                "skip_markers": skip_data,
+                "probed_duration": probed_duration,
+                "container": container,
+                "codec": codec,
+                "width": width,
+                "height": height,
+                "frame_rate": frame_rate,
+                "source_fingerprint": source_fingerprint,
+                "audio_metadata": audio_meta_list
             }
             with open(movie_metadata_file, "w", encoding="utf-8") as f:
                 json.dump(movie_metadata_content, f, indent=2, ensure_ascii=False)
+            await self._schedule_playback_baseline(db, movie)
         else:
             show_id = f"tv_{tmdb_id}"
             show = await db.get(Movie, show_id)
@@ -661,14 +765,15 @@ class DownloadQueueManager:
             if subtitles_list:
                 for sub in subtitles_list:
                     sub_lang = sub.get("language", "en")
-                    for ext in [".vtt", ".srt"]:
-                        sub_file_name = f"subtitle_{sub_lang}{ext}"
-                        if os.path.exists(os.path.join(ep_folder_abs, sub_file_name)):
-                            subs_on_disk.append({
-                                "language": sub_lang,
-                                "ext": ext
-                            })
-                            break
+                    srt_abs = os.path.join(ep_folder_abs, f"subtitle_{sub_lang}.srt")
+                    vtt_abs = os.path.join(ep_folder_abs, f"subtitle_{sub_lang}.vtt")
+                    if os.path.exists(srt_abs) and not os.path.exists(vtt_abs):
+                        srt_to_vtt(srt_abs, vtt_abs)
+                    if os.path.exists(vtt_abs):
+                        subs_on_disk.append({
+                            "language": sub_lang,
+                            "ext": ".vtt"
+                        })
             
             ep_id = f"ep_{tmdb_id}_s{season_num}_e{episode_num}"
             ep_entry = await db.get(Episode, ep_id)
@@ -683,7 +788,6 @@ class DownloadQueueManager:
                 ep_thumb_abs = os.path.join(ep_folder_abs, "thumbnail.jpg")
                 ep_thumb_rel = await download_and_cache_metadata_image(ep_still_url, ep_thumb_abs)
 
-            # Save poster, backdrop, and still image inside each episode folder
             ep_poster_abs = os.path.join(ep_folder_abs, "poster.jpg")
             ep_backdrop_abs = os.path.join(ep_folder_abs, "backdrop.jpg")
             
@@ -704,12 +808,16 @@ class DownloadQueueManager:
                 ep_entry = Episode(
                     id=ep_id, movie_id=show_id, episode_number=episode_num, season_number=season_num,
                     title=ep_title, description=ep_desc, thumbnail_url=ep_thumb_rel or "",
-                    video_url=served_url, duration=ep_dur_str
+                    video_url=served_url, duration=ep_dur_str,
+                    probed_duration=probed_duration, container=container, codec=codec,
+                    width=width, height=height, frame_rate=frame_rate,
+                    source_fingerprint=source_fingerprint
                 )
                 ep_entry.quality = ep_quality
                 ep_entry.languages = ep_languages
                 ep_entry.subtitles = subs_on_disk
                 ep_entry.skip_markers = ep_skip_data
+                ep_entry.audio_metadata = audio_meta_list
                 db.add(ep_entry)
                 logger.info(f"[Queue Manager] Cataloged new episode: S{season_num}E{episode_num}")
             else:
@@ -722,6 +830,15 @@ class DownloadQueueManager:
                 ep_entry.languages = ep_languages
                 ep_entry.subtitles = subs_on_disk
                 ep_entry.skip_markers = ep_skip_data
+                
+                ep_entry.probed_duration = probed_duration
+                ep_entry.container = container
+                ep_entry.codec = codec
+                ep_entry.width = width
+                ep_entry.height = height
+                ep_entry.frame_rate = frame_rate
+                ep_entry.source_fingerprint = source_fingerprint
+                ep_entry.audio_metadata = audio_meta_list
                 db.add(ep_entry)
                 logger.info(f"[Queue Manager] Updated episode: S{season_num}E{episode_num}")
 
@@ -731,7 +848,6 @@ class DownloadQueueManager:
             db.add(show)
             await db.commit()
 
-            # Create episode's local .metadata/metadata.json
             ep_metadata_dir = os.path.join(ep_folder_abs, ".metadata")
             os.makedirs(ep_metadata_dir, exist_ok=True)
             
@@ -752,17 +868,23 @@ class DownloadQueueManager:
                 "quality": ep_quality,
                 "subtitles": subs_on_disk,
                 "original_language": language or "en",
-                "skip_markers": ep_skip_data
+                "skip_markers": ep_skip_data,
+                "probed_duration": probed_duration,
+                "container": container,
+                "codec": codec,
+                "width": width,
+                "height": height,
+                "frame_rate": frame_rate,
+                "source_fingerprint": source_fingerprint,
+                "audio_metadata": audio_meta_list
             }
             with open(ep_metadata_file, "w", encoding="utf-8") as f:
                 json.dump(ep_metadata_content, f, indent=2, ensure_ascii=False)
                 
-            # For compatibility with older sync mechanisms expecting files starting with metadata_s
             sync_compatible_metadata_file = os.path.join(ep_metadata_dir, f"metadata_s{season_num}_e{episode_num}.json")
             with open(sync_compatible_metadata_file, "w", encoding="utf-8") as f:
                 json.dump(ep_metadata_content, f, indent=2, ensure_ascii=False)
-
-
+            await self._schedule_playback_baseline(db, ep_entry)
 
     def _parse_duration_to_seconds(self, duration_str: str) -> float:
         total_seconds = 0.0
@@ -783,12 +905,72 @@ class DownloadQueueManager:
     async def sync_media_from_disk(self):
         """
         Scans the media directory for metadata.json files and re-catalogs them into the database if they are missing.
-        This acts as an automatic recovery system in case the database is deleted.
+        Also sweeps the database to verify path containment, localhost urls and file existence.
         """
         try:
             server_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
             media_dir = os.path.join(server_root, "media")
             
+            # Sweep DB first to reconcile URLs and check actual file/cloud presence
+            logger.info("[Queue Manager Recovery] Sweeping database to reconcile video URLs...")
+            async with AsyncSession(engine) as db:
+                # Reconcile Movies
+                movie_stmt = select(Movie)
+                movies = (await db.exec(movie_stmt)).all()
+                for m in movies:
+                    if m.video_url:
+                        # Convert localhost URL to canonical path
+                        if "localhost" in m.video_url or "127.0.0.1" in m.video_url:
+                            match = re.search(r"/media/(.*)", m.video_url)
+                            if match:
+                                m.video_url = f"/media/{match.group(1)}"
+                        
+                        rel_path = m.video_url.lstrip("/")
+                        exists = await verify_media_exists(rel_path)
+                        if not exists:
+                            logger.warning(f"[Sync Recovery] Movie {m.title} file missing at {rel_path}. Demoting to cached.")
+                            m.video_url = ""
+                            m.availability = "cached"
+                            m.catalog_source = "tmdb_cache"
+                            db.add(m)
+                        else:
+                            m.catalog_source = "server"
+                            m.availability = "available"
+                            db.add(m)
+                            
+                # Reconcile Episodes
+                ep_stmt = select(Episode)
+                episodes = (await db.exec(ep_stmt)).all()
+                for ep in episodes:
+                    if ep.video_url:
+                        if "localhost" in ep.video_url or "127.0.0.1" in ep.video_url:
+                            match = re.search(r"/media/(.*)", ep.video_url)
+                            if match:
+                                ep.video_url = f"/media/{match.group(1)}"
+                        
+                        rel_path = ep.video_url.lstrip("/")
+                        exists = await verify_media_exists(rel_path)
+                        if not exists:
+                            logger.warning(f"[Sync Recovery] Episode {ep.title} file missing at {rel_path}. Clearing video URL.")
+                            ep.video_url = ""
+                            db.add(ep)
+                        else:
+                            db.add(ep)
+
+                playable_series_ids = {episode.movie_id for episode in episodes if episode.video_url}
+                for movie in movies:
+                    if movie.type != "series":
+                        continue
+                    if movie.id in playable_series_ids:
+                        movie.catalog_source = "server"
+                        movie.availability = "available"
+                    else:
+                        movie.catalog_source = "tmdb_cache"
+                        movie.availability = "cached"
+                    db.add(movie)
+
+                await db.commit()
+
             if not os.path.exists(media_dir):
                 logger.info(f"[Queue Manager] No media directory found at {media_dir}. Skipping sync.")
                 return
@@ -820,11 +1002,9 @@ class DownloadQueueManager:
                                 season = None
                                 episode = None
                                 if media_type == "series" or media_type == "tv":
-                                    # 1. Try to get from json data keys first
                                     if data.get("season") is not None and data.get("episode") is not None:
                                         season = int(data.get("season"))
                                         episode = int(data.get("episode"))
-                                    # 2. Try parsing filename metadata_sX_eY.json
                                     elif file.startswith("metadata_s") and "_e" in file:
                                         try:
                                             parts = file.replace("metadata_s", "").replace(".json", "").split("_e")
@@ -832,11 +1012,9 @@ class DownloadQueueManager:
                                             episode = int(parts[1])
                                         except Exception:
                                             pass
-                                    # 3. Try parsing from root folder if inside Episode / Season folder
                                     if season is None or episode is None:
                                         try:
                                             root_parts = root.replace("\\", "/").split("/")
-                                            # If root is inside an Episode folder like .../Season_1/Episode_2/.metadata
                                             if len(root_parts) >= 3 and root_parts[-3].startswith("Season_") and root_parts[-2].startswith("Episode_"):
                                                 season = int(root_parts[-3].replace("Season_", ""))
                                                 episode = int(root_parts[-2].replace("Episode_", ""))
@@ -844,12 +1022,9 @@ class DownloadQueueManager:
                                             pass
                                             
                                     if season is not None and episode is not None:
-                                        # Determine the episode directory where video file should reside
-                                        # Style A: .metadata is inside the Episode folder itself
                                         if os.path.basename(parent_dir).startswith("Episode_"):
                                             ep_dir = parent_dir
                                         else:
-                                            # Style B: .metadata is in the main show folder
                                             ep_dir = os.path.join(parent_dir, f"Season_{season}", f"Episode_{episode}")
                                             
                                         if os.path.exists(ep_dir):
@@ -868,7 +1043,6 @@ class DownloadQueueManager:
                                         
                                 if video_file_rel:
                                     file_path = video_file_rel.replace("\\", "/")
-                                    # Always check and extract audio if not yet done
                                     abs_video_path = os.path.abspath(os.path.join(server_root, file_path))
                                     from services.audio_extractor import extract_audio_and_strip_video
                                     default_language = data.get("language") or data.get("original_language") or "en"
@@ -881,7 +1055,6 @@ class DownloadQueueManager:
                                         except Exception:
                                             pass
                                         
-                                        # Also update the existing DB records if they are already in the DB
                                         if media_type == "movie":
                                             movie_id = f"m_{tmdb_id}"
                                             movie_obj = await db.get(Movie, movie_id)
@@ -897,17 +1070,40 @@ class DownloadQueueManager:
                                                     ep_obj.languages = extracted_langs
                                                     db.add(ep_obj)
                                                     await db.commit()
+
+                                    # Probe completed file for rich media metadata if not present in the JSON
+                                    if "source_fingerprint" not in data or not data.get("source_fingerprint"):
+                                        probe_info = await probe_completed_media(abs_video_path)
+                                        if probe_info:
+                                            data.update(probe_info)
+                                            try:
+                                                with open(meta_path, "w", encoding="utf-8") as fw:
+                                                    json.dump(data, fw, indent=2, ensure_ascii=False)
+                                            except Exception:
+                                                pass
                                 else:
-                                    # Restore placeholder metadata even if the video file hasn't finished downloading yet
                                     file_path = None
                                         
                                 language = data.get("language") or data.get("original_language")
                                 
-                                # Recheck database to avoid unnecessary re-cataloging if already exists
                                 if media_type == "movie":
                                     movie_id = f"m_{tmdb_id}"
                                     existing = await db.get(Movie, movie_id)
                                     if existing and not (existing.title.startswith("Captured ") or "credentials are not set" in (existing.description or "")):
+                                        # Update probed metadata even if it exists
+                                        if file_path:
+                                            abs_video_path = os.path.abspath(os.path.join(server_root, file_path))
+                                            probe_info = await probe_completed_media(abs_video_path)
+                                            existing.probed_duration = probe_info.get("probed_duration")
+                                            existing.container = probe_info.get("container")
+                                            existing.codec = probe_info.get("codec")
+                                            existing.width = probe_info.get("width")
+                                            existing.height = probe_info.get("height")
+                                            existing.frame_rate = probe_info.get("frame_rate")
+                                            existing.source_fingerprint = probe_info.get("source_fingerprint")
+                                            existing.audio_metadata = probe_info.get("audio_metadata", [])
+                                            db.add(existing)
+                                            await db.commit()
                                         continue
                                     logger.info(f"[Queue Manager Recovery] Restoring Movie TMDB {tmdb_id} from {meta_path}...")
                                     meta = await tmdb_client.fetch_movie_metadata(tmdb_id)
@@ -917,6 +1113,20 @@ class DownloadQueueManager:
                                         ep_id = f"ep_{tmdb_id}_s{season}_e{episode}"
                                         existing = await db.get(Episode, ep_id)
                                         if existing and not (existing.title.startswith("Episode ") or "stream." in (existing.description or "")):
+                                            # Update probed metadata even if it exists
+                                            if file_path:
+                                                abs_video_path = os.path.abspath(os.path.join(server_root, file_path))
+                                                probe_info = await probe_completed_media(abs_video_path)
+                                                existing.probed_duration = probe_info.get("probed_duration")
+                                                existing.container = probe_info.get("container")
+                                                existing.codec = probe_info.get("codec")
+                                                existing.width = probe_info.get("width")
+                                                existing.height = probe_info.get("height")
+                                                existing.frame_rate = probe_info.get("frame_rate")
+                                                existing.source_fingerprint = probe_info.get("source_fingerprint")
+                                                existing.audio_metadata = probe_info.get("audio_metadata", [])
+                                                db.add(existing)
+                                                await db.commit()
                                             continue
                                         logger.info(f"[Queue Manager Recovery] Restoring Episode S{season}E{episode} (TMDB {tmdb_id}) from {meta_path}...")
                                         meta = await tmdb_client.fetch_show_metadata(tmdb_id)
@@ -930,8 +1140,6 @@ class DownloadQueueManager:
                                         logger.info(f"[Queue Manager Recovery] Restoring Series TMDB {tmdb_id} from {meta_path}...")
                                         meta = await tmdb_client.fetch_show_metadata(tmdb_id)
                                 
-                                # Metadata/artwork-only TMDB cache records stay in the same media tree,
-                                # but must never be restored as playable catalog media.
                                 if not file_path:
                                     data["catalog_source"] = "tmdb_cache"
                                     data["availability"] = "cached"
@@ -978,8 +1186,12 @@ class DownloadQueueManager:
                                     count += 1
                                     continue
 
-                                # Re-run cataloging only for metadata with a physical video.
-                                await self._catalog_media(db, tmdb_id, media_type, season, episode, meta, file_path, language=language)
+                                # Re-run cataloging with physical video.
+                                await self._catalog_media(
+                                    db, tmdb_id, media_type, season, episode, meta, file_path,
+                                    language=language, subtitles_list=data.get("subtitles"),
+                                    quality=data.get("quality"), skip_markers=data.get("skip_markers")
+                                )
                                 count += 1
                                 
                             except Exception as e:

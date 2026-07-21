@@ -34,8 +34,10 @@ class Settings:
     TMDB_READ_ACCESS_TOKEN: str = os.getenv("TMDB_READ_ACCESS_TOKEN", "")
     db_path = os.path.abspath(os.path.join(config_dir, "database.db")).replace("\\", "/")
     DATABASE_URL: str = os.getenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
-    MEDIA_DIR: str = os.getenv("MEDIA_DIR", "media")
-    TEMP_DIR: str = os.getenv("TEMP_DIR", "temp")
+    MEDIA_DIR: str = os.path.abspath(os.getenv("MEDIA_DIR", os.path.join(config_dir, "media")))
+    TEMP_DIR: str = os.path.abspath(os.getenv("TEMP_DIR", os.path.join(config_dir, "temp")))
+    PLAYBACK_CACHE_GB: float = max(0.25, min(500.0, float(os.getenv("PLAYBACK_CACHE_GB", "20"))))
+    PLAYBACK_TRANSCODE_CONCURRENCY: int = env_int("PLAYBACK_TRANSCODE_CONCURRENCY", 2, 1, 8)
     
     # 2FA Authentication JWT settings
     JWT_SECRET = os.getenv("JWT_SECRET")

@@ -15,8 +15,8 @@ def get_ffprobe_path() -> str:
 async def extract_audio_and_strip_video(video_path: str, default_lang: str = "en") -> List[str]:
     """
     Probes the video file for audio streams. Extracts each stream to a separate MP3 file
-    inside an 'audio' folder next to the video file. Removes all audio from the original
-    video file to leave it silent. Returns a list of language codes extracted.
+    inside an 'audio' folder next to the video file. Does NOT strip audio from the original
+    video file (keeps the default audio intact). Returns a list of language codes extracted.
     """
     if not os.path.exists(video_path):
         logger.warning(f"[Audio Extractor] File not found: {video_path}")
@@ -51,7 +51,7 @@ async def extract_audio_and_strip_video(video_path: str, default_lang: str = "en
 
     streams = probe_data.get("streams", [])
     if not streams:
-        logger.info(f"[Audio Extractor] No audio streams found in {video_path}. Already stripped or silent.")
+        logger.info(f"[Audio Extractor] No audio streams found in {video_path}.")
         return []
 
     # 2. Prepare folders
@@ -103,39 +103,5 @@ async def extract_audio_and_strip_video(video_path: str, default_lang: str = "en
                 logger.error(f"[Audio Extractor] Extraction failed for track {idx}: {stderr_ext.decode('utf-8', errors='ignore')}")
         except Exception as e:
             logger.error(f"[Audio Extractor] Extraction exception for track {idx}: {e}")
-
-    if not languages:
-        logger.warning("[Audio Extractor] No audio tracks could be successfully extracted. Aborting strip.")
-        return []
-
-    # 4. Strip audio from the original video file
-    temp_video_path = video_path + ".silent.mp4"
-    cmd_strip = [
-        ffmpeg, "-y", "-i", video_path,
-        "-an", "-c:v", "copy",
-        "-movflags", "+faststart",
-        temp_video_path
-    ]
-    
-    try:
-        proc_strip = await asyncio.create_subprocess_exec(
-            *cmd_strip,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-        )
-        _, stderr_strip = await proc_strip.communicate()
-        if proc_strip.returncode == 0:
-            # Replace the original with the silent copy
-            os.replace(temp_video_path, video_path)
-            logger.info(f"[Audio Extractor] Successfully stripped all audio from video file: {video_path}")
-        else:
-            logger.error(f"[Audio Extractor] Strip failed: {stderr_strip.decode('utf-8', errors='ignore')}")
-            if os.path.exists(temp_video_path):
-                os.remove(temp_video_path)
-    except Exception as e:
-        logger.error(f"[Audio Extractor] Strip exception: {e}")
-        if os.path.exists(temp_video_path):
-            os.remove(temp_video_path)
 
     return languages

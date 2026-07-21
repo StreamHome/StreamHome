@@ -1,4 +1,4 @@
-from typing import AsyncGenerator  # <-- TİP DOĞRULAMA İÇİN EKLENDİ
+from typing import AsyncGenerator
 import os
 import sqlite3
 from datetime import datetime
@@ -30,7 +30,24 @@ async def init_db():
     if os.path.exists(settings.db_path):
         check = sqlite3.connect(settings.db_path)
         try:
+            existing_tables = {row[0] for row in check.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             movie_columns = {row[1] for row in check.execute("PRAGMA table_info(movie)").fetchall()}
+            playback_run_columns = {row[1] for row in check.execute("PRAGMA table_info(playbackrun)").fetchall()} if "playbackrun" in existing_tables else set()
+            playback_upgrade_needed = (
+                "playbackrun" not in existing_tables
+                or bool(playback_run_columns and "last_progress_at" not in playback_run_columns)
+                or bool(movie_columns and "source_fingerprint" not in movie_columns)
+            )
+            if playback_upgrade_needed:
+                backup_dir = os.path.join(os.path.dirname(settings.db_path), "backup")
+                os.makedirs(backup_dir, exist_ok=True)
+                backup_path = os.path.join(backup_dir, f"pre-playback-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db")
+                target = sqlite3.connect(backup_path)
+                try:
+                    check.backup(target)
+                    logger.info(f"[Database] Pre-playback migration backup created: {backup_path}")
+                finally:
+                    target.close()
             if movie_columns and "catalog_source" not in movie_columns:
                 backup_dir = os.path.join(os.path.dirname(settings.db_path), "backup")
                 os.makedirs(backup_dir, exist_ok=True)
@@ -91,6 +108,22 @@ async def init_db():
                 if "last_login_device" not in user_cols:
                     sync_conn.exec_driver_sql("ALTER TABLE user ADD COLUMN last_login_device TEXT")
 
+            if "playbacksession" in inspector.get_table_names():
+                logger.info("[Database] Deduplicating playbacksession rows...")
+                sync_conn.exec_driver_sql(
+                    "DELETE FROM playbacksession WHERE id NOT IN ("
+                    "SELECT id FROM ("
+                    "SELECT id, ROW_NUMBER() OVER (PARTITION BY profile_id, movie_id, COALESCE(episode_id, '') "
+                    "ORDER BY updated_at DESC, timestamp DESC, is_finished DESC) as rn "
+                    "FROM playbacksession"
+                    ") WHERE rn = 1)"
+                )
+                logger.info("[Database] Adding unique constraint index to playbacksession...")
+                sync_conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_playback_session_profile_movie_episode "
+                    "ON playbacksession (profile_id, movie_id, COALESCE(episode_id, ''))"
+                )
+
             if "movie" in inspector.get_table_names():
                 movie_cols = [col["name"] for col in inspector.get_columns("movie")]
                 if "vote_average" not in movie_cols:
@@ -115,6 +148,22 @@ async def init_db():
                     "collection_name": "TEXT",
                 }
                 for column, sql_type in recommendation_columns.items():
+                    if column not in movie_cols:
+                        logger.info(f"[Database] Migrating: Adding '{column}' column to 'movie' table...")
+                        sync_conn.exec_driver_sql(f"ALTER TABLE movie ADD COLUMN {column} {sql_type}")
+
+                # Probe fields migration
+                probe_columns = {
+                    "probed_duration": "FLOAT",
+                    "container": "TEXT",
+                    "codec": "TEXT",
+                    "width": "INTEGER",
+                    "height": "INTEGER",
+                    "frame_rate": "FLOAT",
+                    "source_fingerprint": "TEXT",
+                    "audio_metadata_str": "TEXT DEFAULT '[]'",
+                }
+                for column, sql_type in probe_columns.items():
                     if column not in movie_cols:
                         logger.info(f"[Database] Migrating: Adding '{column}' column to 'movie' table...")
                         sync_conn.exec_driver_sql(f"ALTER TABLE movie ADD COLUMN {column} {sql_type}")
@@ -148,11 +197,37 @@ async def init_db():
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_availability ON movie (availability)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_cache_state ON movie (cache_state)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_collection_name ON movie (collection_name)")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_source_fingerprint ON movie (source_fingerprint)")
                 sync_conn.exec_driver_sql(
                     "UPDATE movie SET cache_state = CASE "
                     "WHEN catalog_source = 'tmdb_cache' THEN 'ready' ELSE NULL END "
                     "WHERE cache_state IS NULL"
                 )
+
+            if "episode" in inspector.get_table_names():
+                ep_cols = [col["name"] for col in inspector.get_columns("episode")]
+                probe_columns = {
+                    "probed_duration": "FLOAT",
+                    "container": "TEXT",
+                    "codec": "TEXT",
+                    "width": "INTEGER",
+                    "height": "INTEGER",
+                    "frame_rate": "FLOAT",
+                    "source_fingerprint": "TEXT",
+                    "audio_metadata_str": "TEXT DEFAULT '[]'",
+                }
+                for column, sql_type in probe_columns.items():
+                    if column not in ep_cols:
+                        logger.info(f"[Database] Migrating: Adding '{column}' column to 'episode' table...")
+                        sync_conn.exec_driver_sql(f"ALTER TABLE episode ADD COLUMN {column} {sql_type}")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_episode_source_fingerprint ON episode (source_fingerprint)")
+
+            if "playbackrun" in inspector.get_table_names():
+                playback_run_cols = [col["name"] for col in inspector.get_columns("playbackrun")]
+                if "last_progress_at" not in playback_run_cols:
+                    logger.info("[Database] Migrating: Adding 'last_progress_at' column to 'playbackrun' table...")
+                    sync_conn.exec_driver_sql("ALTER TABLE playbackrun ADD COLUMN last_progress_at FLOAT NOT NULL DEFAULT 0")
+                    sync_conn.exec_driver_sql("UPDATE playbackrun SET last_progress_at = COALESCE(last_seen_at, created_at, 0)")
 
             if "profilerecommendation" in inspector.get_table_names():
                 recommendation_cols = [col["name"] for col in inspector.get_columns("profilerecommendation")]
@@ -187,7 +262,6 @@ async def init_db():
                     
         await conn.run_sync(migrate)
 
-# STRICT TYPE CORRECTION FIX: Updated return signature to completely satisfy Pylance type diagnostics
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     async_session = sessionmaker(
         engine, class_=AsyncSession, expire_on_commit=False
