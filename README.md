@@ -99,71 +99,19 @@ Actual requirements depend on catalog size, source quality, concurrent playback 
 
 ## 📦 Quick Installation
 
-The bootstrap installers clone StreamHome into `~/StreamHome`, install missing supported dependencies, build the production web client, and start the protected web setup wizard.
+StreamHome will provide installation scripts for supported platforms. These scripts are intended to install and configure the required dependencies, including Python, FFmpeg, Node.js, and Rclone.
 
-> [!CAUTION]
-> A command piped into a shell executes the downloaded script immediately. Use the inspect-first alternatives below if you want to review it before execution.
-
-### Linux and macOS
+### Linux — Ubuntu and Debian
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/WaqSea/StreamHome/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
 ```
 
-Inspect first:
-
-```bash
-curl -fsSLo streamhome-install.sh https://raw.githubusercontent.com/WaqSea/StreamHome/main/install.sh
-less streamhome-install.sh
-bash streamhome-install.sh
-```
-
-The automated system-package step supports APT-based Linux distributions, Fedora/RHEL, Arch Linux, and macOS with Homebrew. Python 3.11+, Node.js 18+, FFmpeg/FFprobe, rclone, Git, and npm are required.
-
-### Windows — PowerShell
+### Windows — PowerShell as Administrator
 
 ```powershell
-irm https://raw.githubusercontent.com/WaqSea/StreamHome/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.ps1 | iex
 ```
-
-Inspect first:
-
-```powershell
-irm https://raw.githubusercontent.com/WaqSea/StreamHome/main/install.ps1 -OutFile streamhome-install.ps1
-Get-Content .\streamhome-install.ps1
-.\streamhome-install.ps1
-```
-
-Windows uses Winget for missing Python, Node.js, FFmpeg, rclone, or Git installations. If Winget installs a dependency but Windows has not refreshed the command path yet, open a new PowerShell window and run the installer again.
-
-### Installation options
-
-Use environment variables to select another directory or Git branch/tag:
-
-```bash
-STREAMHOME_INSTALL_DIR=/opt/streamhome STREAMHOME_REF=main \
-  bash streamhome-install.sh
-```
-
-```powershell
-$env:STREAMHOME_INSTALL_DIR = "D:\StreamHome"
-$env:STREAMHOME_REF = "main"
-.\streamhome-install.ps1
-```
-
-An existing installation is updated only when it points to the official StreamHome repository and has no local changes. Updates are fast-forward-only. Unrelated, non-empty, or dirty directories are never overwritten.
-
-To install and build without starting the services:
-
-```bash
-./setup.sh --no-start
-```
-
-```powershell
-.\setup.bat --no-start
-```
-
-After setup, open `http://localhost:3000/setup`. The terminal displays the one-time bootstrap code. Change `WEB_PORT` in the root `.env` before starting if port 3000 is unavailable. Existing `.env`, database, media, backup, and Google Drive/rclone state are preserved when setup is run again.
 
 ## 📚 Documentation and Support
 
