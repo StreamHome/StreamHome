@@ -1,7 +1,5 @@
 @echo off
-if exist "venv\Scripts\activate.bat" (
-    start "StreamHome Backend" cmd /k "call venv\Scripts\activate && cd server && python main.py"
-) else (
-    start "StreamHome Backend" cmd /k "cd server && python main.py"
-)
-start "StreamHome Frontend" cmd /k "cd web && npm run dev"
+setlocal
+cd /d "%~dp0"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start-windows.ps1" %*
+exit /b %errorlevel%

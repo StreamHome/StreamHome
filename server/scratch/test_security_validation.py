@@ -1,12 +1,21 @@
 import asyncio
 import os
 import sys
+import tempfile
+import time
+from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
 from services.request_security import client_ip
+from services.rate_limit import _key as rate_limit_key
+from services.rate_limit import fail as record_rate_limit_failure
 from services.secret_crypto import protect_secret, reveal_secret
+from models import RateLimitBucket
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlmodel import SQLModel
+from sqlmodel.ext.asyncio.session import AsyncSession
 from starlette.requests import Request
 
 
@@ -50,6 +59,41 @@ async def run() -> None:
 
     encrypted = protect_secret("TOTP-TEST-SECRET")
     assert encrypted != "TOTP-TEST-SECRET" and reveal_secret(encrypted) == "TOTP-TEST-SECRET"
+
+    temp_root = Path(__file__).resolve().parents[2] / "temp"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=temp_root) as directory:
+        database_path = Path(directory) / "rate-limit.db"
+        engine = create_async_engine(f"sqlite+aiosqlite:///{database_path.as_posix()}?timeout=30")
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(SQLModel.metadata.create_all)
+
+            identity = "concurrent-security-test"
+            key = rate_limit_key("test", identity)
+            async with AsyncSession(engine) as session:
+                session.add(RateLimitBucket(
+                    key_hash=key,
+                    namespace="test",
+                    attempts=4,
+                    window_started_at=time.time() - 120,
+                    updated_at=time.time() - 120,
+                ))
+                await session.commit()
+                await record_rate_limit_failure(session, "test", identity, limit=5, window_seconds=60)
+                reset_bucket = await session.get(RateLimitBucket, key)
+                assert reset_bucket and reset_bucket.attempts == 1 and reset_bucket.blocked_until is None
+
+            async def record_concurrent_failure() -> None:
+                async with AsyncSession(engine) as session:
+                    await record_rate_limit_failure(session, "test", "parallel", limit=100, window_seconds=60)
+
+            await asyncio.gather(*(record_concurrent_failure() for _ in range(8)))
+            async with AsyncSession(engine) as session:
+                parallel = await session.get(RateLimitBucket, rate_limit_key("test", "parallel"))
+                assert parallel and parallel.attempts == 8
+        finally:
+            await engine.dispose()
 
     print("Ingestion security validation checks passed.")
 

@@ -21,14 +21,24 @@ if ! [[ "$WEB_PORT" =~ ^[0-9]+$ ]] || (( WEB_PORT < 1 || WEB_PORT > 65535 )); th
     echo "Invalid WEB_PORT in .env: $WEB_PORT" >&2
     exit 1
 fi
+if [[ "$WEB_PORT" == "8000" ]]; then
+    echo "WEB_PORT cannot be 8000 because the API uses that port." >&2
+    exit 1
+fi
 
 export WEB_PORT SETUP PUBLIC_URL
-if [[ "${SETUP,,}" != "true" && "${SETUP}" != "1" ]]; then
-    if [[ -x "$ROOT_DIR/venv/bin/python" ]]; then
-        STREAMHOME_SETUP_CODE="$($ROOT_DIR/venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(18))')"
-    else
-        STREAMHOME_SETUP_CODE="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
-    fi
+SETUP_NORMALIZED="$(printf '%s' "$SETUP" | tr '[:upper:]' '[:lower:]')"
+if [[ -x "$ROOT_DIR/venv/bin/python" ]]; then
+    BACKEND_PYTHON="$ROOT_DIR/venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    BACKEND_PYTHON="$(command -v python3)"
+else
+    echo "Python is unavailable. Run ./setup.sh first." >&2
+    exit 1
+fi
+
+if [[ "$SETUP_NORMALIZED" != "true" && "$SETUP" != "1" ]]; then
+    STREAMHOME_SETUP_CODE="$($BACKEND_PYTHON -c 'import secrets; print(secrets.token_urlsafe(18))')"
     export STREAMHOME_SETUP_CODE
     echo "First-run setup is active."
     echo "Setup URL: http://localhost:${WEB_PORT}/setup"
@@ -39,17 +49,52 @@ if [[ -x "$ROOT_DIR/stop.sh" ]]; then
     "$ROOT_DIR/stop.sh" --quiet || true
 fi
 
-echo "Starting StreamHome API on 127.0.0.1:8000..."
-if [[ -x "$ROOT_DIR/venv/bin/python" ]]; then
-    nohup bash -c "cd '$ROOT_DIR/server' && exec '$ROOT_DIR/venv/bin/python' main.py" > "$ROOT_DIR/backend.log" 2>&1 &
-else
-    nohup bash -c "cd '$ROOT_DIR/server' && exec python3 main.py" > "$ROOT_DIR/backend.log" 2>&1 &
+port_available() {
+    "$BACKEND_PYTHON" - "$1" <<'PY'
+import socket
+import sys
+
+sock = socket.socket()
+try:
+    sock.bind(("0.0.0.0", int(sys.argv[1])))
+except OSError:
+    raise SystemExit(1)
+finally:
+    sock.close()
+PY
+}
+
+if ! port_available 8000; then
+    echo "API port 8000 is already in use. Stop the conflicting service and retry." >&2
+    exit 1
 fi
-echo $! > "$RUN_DIR/backend.pid"
+if ! port_available "$WEB_PORT"; then
+    echo "Web port $WEB_PORT is already in use. Stop the conflicting service and retry." >&2
+    exit 1
+fi
+
+echo "Starting StreamHome API on 127.0.0.1:8000..."
+(
+    cd "$ROOT_DIR/server"
+    nohup "$BACKEND_PYTHON" main.py > "$ROOT_DIR/backend.log" 2>&1 &
+    echo $! > "$RUN_DIR/backend.pid"
+)
 
 echo "Starting StreamHome web on 0.0.0.0:${WEB_PORT}..."
-nohup bash -c "cd '$ROOT_DIR/web' && exec env NODE_ENV=production WEB_PORT='$WEB_PORT' SETUP='$SETUP' npm run server" > "$ROOT_DIR/frontend.log" 2>&1 &
-echo $! > "$RUN_DIR/web.pid"
+(
+    cd "$ROOT_DIR/web"
+    nohup env NODE_ENV=production WEB_PORT="$WEB_PORT" SETUP="$SETUP" PUBLIC_URL="$PUBLIC_URL" npm run server > "$ROOT_DIR/frontend.log" 2>&1 &
+    echo $! > "$RUN_DIR/web.pid"
+)
+
+sleep 1
+BACKEND_PID="$(cat "$RUN_DIR/backend.pid")"
+WEB_PID="$(cat "$RUN_DIR/web.pid")"
+if ! kill -0 "$BACKEND_PID" 2>/dev/null || ! kill -0 "$WEB_PID" 2>/dev/null; then
+    "$ROOT_DIR/stop.sh" --quiet || true
+    echo "A StreamHome process exited during startup. Review backend.log and frontend.log." >&2
+    exit 1
+fi
 
 echo "StreamHome is running at http://localhost:${WEB_PORT}"
 echo "Logs: backend.log and frontend.log"

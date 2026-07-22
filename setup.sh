@@ -1,157 +1,194 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-echo "===================================================="
-echo "            STREAMHOME AUTOMATED SETUP WIZARD"
-echo "===================================================="
-echo ""
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NO_START=false
+SKIP_SYSTEM_PACKAGES=false
+CURRENT_STEP="initialization"
 
-# Helper function to check and install missing dependencies
-check_and_install() {
-    MISSING_DEPS=()
-    
-    # Check for python3
-    if ! command -v python3 >/dev/null 2>&1; then
-        MISSING_DEPS+=("python3")
-    fi
-    
-    # Check for pip3
-    if ! command -v pip3 >/dev/null 2>&1 && ! python3 -m pip --version >/dev/null 2>&1; then
-        # On some systems pip is python3-pip
-        if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-            MISSING_DEPS+=("python3-pip")
-        fi
-    fi
-    
-    # Check for node
-    if ! command -v node >/dev/null 2>&1; then
-        MISSING_DEPS+=("nodejs")
-    fi
-    
-    # Check for npm
-    if ! command -v npm >/dev/null 2>&1; then
-        # On brew/mac node includes npm, but on linux apt it might be separate
-        if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-            MISSING_DEPS+=("npm")
-        fi
-    fi
-    
-    # Check for ffmpeg
-    if ! command -v ffmpeg >/dev/null 2>&1; then
-        MISSING_DEPS+=("ffmpeg")
-    fi
-    
-    # Check for rclone
-    if ! command -v rclone >/dev/null 2>&1; then
-        MISSING_DEPS+=("rclone")
-    fi
-    
-    if [ ${#MISSING_DEPS[@]} -eq 0 ]; then
-        echo "All core system dependencies (Python, Node, FFmpeg, Rclone) are already installed!"
-        return 0
-    fi
-    
-    echo "Missing dependencies detected: ${MISSING_DEPS[*]}"
-    echo "Installing missing dependencies..."
-    
-    # Determine if sudo is needed (skip if running as root)
-    SUDO="sudo"
-    if [ "$EUID" -eq 0 ]; then
-        SUDO=""
-    fi
+usage() {
+    cat <<'EOF'
+StreamHome Unix setup
 
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        if [ -x "$(command -v apt-get)" ]; then
-            echo "Using APT package manager to install..."
-            $SUDO apt-get update
-            $SUDO apt-get install -y "${MISSING_DEPS[@]}"
-        elif [ -x "$(command -v yum)" ]; then
-            echo "Using YUM package manager to install..."
-            $SUDO yum check-update || true
-            # Ensure epel-release is installed for ffmpeg/rclone on older RHEL/CentOS
-            if [[ " ${MISSING_DEPS[*]} " == *" ffmpeg "* ]] || [[ " ${MISSING_DEPS[*]} " == *" rclone "* ]]; then
-                $SUDO yum install -y epel-release || true
-            fi
-            $SUDO yum install -y "${MISSING_DEPS[@]}"
-        else
-            echo "Error: Supported package manager (apt/yum) not found. Please install missing tools manually: ${MISSING_DEPS[*]}"
-            exit 1
-        fi
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        if [ -x "$(command -v brew)" ]; then
-            echo "Using Homebrew to install..."
-            for dep in "${MISSING_DEPS[@]}"; do
-                case "$dep" in
-                    python3-pip) continue ;; # installed with python
-                    nodejs) brew install node ;;
-                    python3) brew install python ;;
-                    *) brew install "$dep" ;;
-                esac
-            done
-        else
-            echo "Homebrew is missing. Installing Homebrew first..."
-            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-            eval "$(/opt/homebrew/bin/brew shellenv)"
-            for dep in "${MISSING_DEPS[@]}"; do
-                case "$dep" in
-                    python3-pip) continue ;;
-                    nodejs) brew install node ;;
-                    python3) brew install python ;;
-                    *) brew install "$dep" ;;
-                esac
-            done
-        fi
+Usage:
+  ./setup.sh [--no-start] [--skip-system-packages] [--help]
+
+Options:
+  --no-start             Install and build without starting StreamHome.
+  --skip-system-packages Do not install missing operating-system packages.
+  --help                 Show this help text.
+EOF
+}
+
+log() {
+    printf '\n[StreamHome Setup] %s\n' "$1"
+}
+
+fail() {
+    printf '\n[StreamHome Setup] ERROR: %s\n' "$1" >&2
+    exit 1
+}
+
+on_error() {
+    local exit_code=$?
+    printf '\n[StreamHome Setup] ERROR: %s failed near line %s (exit %s).\n' "$CURRENT_STEP" "$1" "$exit_code" >&2
+    printf '[StreamHome Setup] Fix the reported problem and run ./setup.sh again; existing data was not removed.\n' >&2
+    exit "$exit_code"
+}
+trap 'on_error $LINENO' ERR
+
+run_privileged() {
+    if [[ "${EUID}" -eq 0 ]]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
     else
-        echo "Unsupported OS type: $OSTYPE. Please install missing dependencies manually: ${MISSING_DEPS[*]}"
-        exit 1
+        fail "Administrator privileges are required to install missing system packages."
     fi
 }
 
-# 1. Run the dependency checks
-check_and_install
+missing_commands() {
+    local missing=()
+    command -v python3 >/dev/null 2>&1 || missing+=(python)
+    command -v node >/dev/null 2>&1 || missing+=(node)
+    command -v npm >/dev/null 2>&1 || missing+=(npm)
+    command -v ffmpeg >/dev/null 2>&1 || missing+=(ffmpeg)
+    command -v ffprobe >/dev/null 2>&1 || missing+=(ffprobe)
+    command -v rclone >/dev/null 2>&1 || missing+=(rclone)
+    command -v git >/dev/null 2>&1 || missing+=(git)
+    printf '%s\n' "${missing[@]}"
+}
 
-# 2. Setup Virtual Environment and Install requirements
-echo ""
-echo "Setting up Python virtual environment..."
-if [ ! -d "venv" ]; then
-    python3 -m venv venv
-fi
-echo "Activating virtual environment..."
-source venv/bin/activate
+install_system_packages() {
+    local -a missing=("$@") packages=()
+    [[ ${#missing[@]} -gt 0 ]] || return 0
+    if [[ "$SKIP_SYSTEM_PACKAGES" == true ]]; then
+        fail "Missing required commands: ${missing[*]}. Install them manually or omit --skip-system-packages."
+    fi
 
-echo "Installing Server Python dependencies inside virtual environment..."
-pip install --upgrade pip
-pip install -r server/requirements.txt
+    log "Installing missing system dependencies: ${missing[*]}"
+    if command -v apt-get >/dev/null 2>&1; then
+        packages=(ca-certificates curl git python3 python3-pip python3-venv nodejs npm ffmpeg rclone)
+        run_privileged apt-get update
+        run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+    elif command -v dnf >/dev/null 2>&1; then
+        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg rclone)
+        run_privileged dnf install -y "${packages[@]}"
+    elif command -v yum >/dev/null 2>&1; then
+        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg rclone)
+        run_privileged yum install -y "${packages[@]}"
+    elif command -v pacman >/dev/null 2>&1; then
+        packages=(ca-certificates curl git python python-pip nodejs npm ffmpeg rclone)
+        run_privileged pacman -Sy --needed --noconfirm "${packages[@]}"
+    elif command -v brew >/dev/null 2>&1; then
+        packages=(git python node ffmpeg rclone)
+        brew install "${packages[@]}"
+    else
+        fail "No supported package manager was found. Install Python 3.11+, Node.js 18+, FFmpeg, FFprobe, and rclone manually."
+    fi
+}
 
-echo ""
-echo "Installing Web Client Node dependencies..."
-cd web
-npm install
-cd ..
+validate_versions() {
+    CURRENT_STEP="runtime version validation"
+    command -v python3 >/dev/null 2>&1 || fail "python3 is unavailable after dependency installation."
+    command -v node >/dev/null 2>&1 || fail "node is unavailable after dependency installation."
+    command -v npm >/dev/null 2>&1 || fail "npm is unavailable after dependency installation."
+    command -v ffmpeg >/dev/null 2>&1 || fail "ffmpeg is unavailable after dependency installation."
+    command -v ffprobe >/dev/null 2>&1 || fail "ffprobe is unavailable after dependency installation."
+    command -v rclone >/dev/null 2>&1 || fail "rclone is unavailable after dependency installation."
 
-# 3. Build the production web application and prepare deployment settings
-echo "Building production Web Client..."
-cd web
-npm run build
-cd ..
+    python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+        || fail "Python 3.11 or newer is required."
+    local node_major
+    node_major="$(node -p 'Number(process.versions.node.split(".")[0])')"
+    [[ "$node_major" =~ ^[0-9]+$ && "$node_major" -ge 18 ]] \
+        || fail "Node.js 18 or newer is required."
+}
 
-if [ ! -f ".env" ]; then
-    SETUP_STATE="false"
-    if [ -f "server/database.db" ]; then
-        HAS_ADMIN="$(python3 -c 'import sqlite3; p="server/database.db"; c=sqlite3.connect(p); print("true" if c.execute("SELECT 1 FROM user LIMIT 1").fetchone() else "false")' 2>/dev/null || echo false)"
-        if [ "$HAS_ADMIN" = "true" ]; then
-            SETUP_STATE="true"
+prepare_virtual_environment() {
+    CURRENT_STEP="Python virtual environment creation"
+    if [[ -d "$ROOT_DIR/venv" && ! -x "$ROOT_DIR/venv/bin/python" ]]; then
+        local recovery="$ROOT_DIR/venv.broken.$(date +%Y%m%d%H%M%S)"
+        log "Moving the incomplete virtual environment to $recovery"
+        mv "$ROOT_DIR/venv" "$recovery"
+    fi
+    if [[ ! -x "$ROOT_DIR/venv/bin/python" ]]; then
+        if ! python3 -m venv "$ROOT_DIR/venv"; then
+            if command -v apt-get >/dev/null 2>&1 && [[ "$SKIP_SYSTEM_PACKAGES" == false ]]; then
+                run_privileged apt-get install -y python3-venv
+                python3 -m venv "$ROOT_DIR/venv"
+            else
+                fail "Python could not create a virtual environment. Install the Python venv package and retry."
+            fi
         fi
     fi
-    printf 'SETUP=%s\nWEB_PORT=3000\n' "$SETUP_STATE" > .env
-fi
 
-chmod +x ./*.sh || true
+    CURRENT_STEP="server dependency installation"
+    "$ROOT_DIR/venv/bin/python" -m pip install --upgrade pip
+    "$ROOT_DIR/venv/bin/python" -m pip install -r "$ROOT_DIR/server/requirements.txt"
+}
 
-echo ""
-echo "===================================================="
-echo "       DEPENDENCIES ARE SUCCESSFULLY INSTALLED"
-echo "       STREAMHOME IS READY TO BE STARTED"
-echo "===================================================="
-echo ""
-echo "Run: ./start.sh"
+prepare_web() {
+    CURRENT_STEP="web dependency installation"
+    (cd "$ROOT_DIR/web" && npm ci)
+    CURRENT_STEP="production web build"
+    (cd "$ROOT_DIR/web" && npm run build)
+}
+
+prepare_environment() {
+    CURRENT_STEP="environment initialization"
+    if [[ ! -f "$ROOT_DIR/.env" ]]; then
+        if [[ -f "$ROOT_DIR/.env.example" ]]; then
+            cp "$ROOT_DIR/.env.example" "$ROOT_DIR/.env"
+        else
+            printf 'SETUP=false\nWEB_PORT=3000\n' > "$ROOT_DIR/.env"
+        fi
+        chmod 600 "$ROOT_DIR/.env" 2>/dev/null || true
+        log "Created .env with first-run setup enabled"
+    else
+        log "Preserving the existing .env configuration"
+    fi
+
+    chmod +x \
+        "$ROOT_DIR/install.sh" \
+        "$ROOT_DIR/setup.sh" \
+        "$ROOT_DIR/start.sh" \
+        "$ROOT_DIR/stop.sh" \
+        "$ROOT_DIR/test.sh"
+}
+
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-start) NO_START=true ;;
+            --skip-system-packages) SKIP_SYSTEM_PACKAGES=true ;;
+            --help|-h) usage; return 0 ;;
+            *) fail "Unknown argument: $1 (use --help for usage)" ;;
+        esac
+        shift
+    done
+
+    cd "$ROOT_DIR"
+    log "Preparing StreamHome in $ROOT_DIR"
+    CURRENT_STEP="system dependency detection"
+    missing=()
+    while IFS= read -r command_name; do
+        [[ -n "$command_name" ]] && missing+=("$command_name")
+    done < <(missing_commands)
+    install_system_packages "${missing[@]}"
+    validate_versions
+    prepare_virtual_environment
+    prepare_web
+    prepare_environment
+
+    log "Setup dependencies and production assets are ready"
+    if [[ "$NO_START" == true ]]; then
+        printf '[StreamHome Setup] Start later with: ./start.sh\n'
+        return 0
+    fi
+
+    CURRENT_STEP="StreamHome startup"
+    exec "$ROOT_DIR/start.sh"
+}
+
+main "$@"

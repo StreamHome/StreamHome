@@ -16,6 +16,7 @@ SERVER_CHECKS=(
   scratch/test_rclone_fallback.py
   scratch/test_recommendation_system.py
   scratch/test_search_caching.py
+  scratch/test_setup_scripts.py
   scratch/test_vibe_analysis.py
 )
 

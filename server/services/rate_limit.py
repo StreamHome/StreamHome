@@ -5,6 +5,8 @@ import hmac
 import time
 
 from fastapi import HTTPException, status
+from sqlalchemy import case, update
+from sqlalchemy.dialects.sqlite import insert
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
@@ -35,22 +37,38 @@ async def enforce(db: AsyncSession, namespace: str, identity: str) -> None:
 async def fail(db: AsyncSession, namespace: str, identity: str, *, limit: int, window_seconds: int) -> None:
     current = time.time()
     key = _key(namespace, identity)
-    bucket = await db.get(RateLimitBucket, key)
-    if not bucket or current - bucket.window_started_at >= window_seconds:
-        bucket = RateLimitBucket(
+    await db.execute(
+        insert(RateLimitBucket)
+        .values(
             key_hash=key,
             namespace=namespace,
             attempts=0,
             window_started_at=current,
+            blocked_until=None,
             updated_at=current,
         )
-    bucket.attempts += 1
-    bucket.updated_at = current
-    if bucket.attempts >= limit:
-        bucket.blocked_until = current + window_seconds
-    db.add(bucket)
+        .on_conflict_do_nothing(index_elements=["key_hash"])
+    )
+    expired = RateLimitBucket.window_started_at <= current - window_seconds
+    incremented = RateLimitBucket.attempts + 1
+    await db.execute(
+        update(RateLimitBucket)
+        .where(RateLimitBucket.key_hash == key)
+        .values(
+            namespace=namespace,
+            attempts=case((expired, 1), else_=incremented),
+            window_started_at=case((expired, current), else_=RateLimitBucket.window_started_at),
+            blocked_until=case(
+                (expired, current + window_seconds if limit <= 1 else None),
+                (incremented >= limit, current + window_seconds),
+                else_=RateLimitBucket.blocked_until,
+            ),
+            updated_at=current,
+        )
+    )
     await db.commit()
-    if bucket.blocked_until:
+    bucket = await db.get(RateLimitBucket, key)
+    if bucket and bucket.blocked_until:
         raise _exception(window_seconds)
 
 
