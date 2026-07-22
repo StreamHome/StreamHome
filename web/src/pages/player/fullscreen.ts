@@ -73,7 +73,11 @@ async function exitPlayerFullscreen(
   }
 }
 
-async function enterPlayerFullscreen(container: HTMLElement, video: HTMLVideoElement): Promise<void> {
+async function enterPlayerFullscreen(
+  container: HTMLElement,
+  video: HTMLVideoElement,
+  allowVideoFallback: boolean,
+): Promise<void> {
   const webkitContainer = container as WebKitFullscreenElement;
   const webkitVideo = video as WebKitFullscreenVideo;
   let standardError: unknown = null;
@@ -96,7 +100,7 @@ async function enterPlayerFullscreen(container: HTMLElement, video: HTMLVideoEle
     }
   }
 
-  if (webkitVideo.webkitEnterFullscreen) {
+  if (allowVideoFallback && webkitVideo.webkitEnterFullscreen) {
     webkitVideo.webkitEnterFullscreen();
     return;
   }
@@ -109,12 +113,13 @@ export async function togglePlayerFullscreen(
   container: HTMLElement,
   video: HTMLVideoElement,
   documentObject: Document = document,
+  options: { allowVideoFallback?: boolean } = {},
 ): Promise<PlayerFullscreenResult> {
   if (isPlayerFullscreen(video, documentObject)) {
     await exitPlayerFullscreen(video, documentObject);
     return "exited";
   }
 
-  await enterPlayerFullscreen(container, video);
+  await enterPlayerFullscreen(container, video, options.allowVideoFallback ?? true);
   return "entered";
 }

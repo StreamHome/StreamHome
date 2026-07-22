@@ -23,6 +23,10 @@ interface PlayerIconProps {
   className?: string;
 }
 
+export function hasSubtitleOptions(options: readonly unknown[]): boolean {
+  return options.length > 0;
+}
+
 export function PlayerIcon({ name, className = "" }: PlayerIconProps) {
   const common = {
     className: `player-icon ${className}`.trim(),

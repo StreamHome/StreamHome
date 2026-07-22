@@ -2,7 +2,14 @@ import React, { useState } from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import { PlayerControlMenu, PlayerIconButton } from "./PlayerControls";
+import { hasSubtitleOptions, PlayerControlMenu, PlayerIconButton } from "./PlayerControls";
+
+describe("subtitle control availability", () => {
+  it("hides the subtitle menu on every presentation when no tracks exist", () => {
+    expect(hasSubtitleOptions([])).toBe(false);
+    expect(hasSubtitleOptions([{ language: "en" }])).toBe(true);
+  });
+});
 
 describe("player icon controls", () => {
   it("renders icon-only controls with accessible labels and tooltips", () => {

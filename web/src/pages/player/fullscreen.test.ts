@@ -53,6 +53,20 @@ describe("player fullscreen controller", () => {
     expect(webkitEnterFullscreen).toHaveBeenCalledOnce();
   });
 
+  it("does not surrender custom controls to native video fullscreen when fallback is disabled", async () => {
+    const requestFullscreen = vi.fn().mockRejectedValue(new Error("Blocked"));
+    const webkitEnterFullscreen = vi.fn();
+    const video = { webkitEnterFullscreen } as unknown as HTMLVideoElement;
+
+    await expect(togglePlayerFullscreen(
+      { requestFullscreen } as unknown as HTMLElement,
+      video,
+      fullscreenDocument(),
+      { allowVideoFallback: false },
+    )).rejects.toThrow("Blocked");
+    expect(webkitEnterFullscreen).not.toHaveBeenCalled();
+  });
+
   it("reports an unsupported fullscreen environment", async () => {
     const documentObject = { fullscreenElement: null, fullscreenEnabled: false } as unknown as Document;
     await expect(togglePlayerFullscreen({} as HTMLElement, {} as HTMLVideoElement, documentObject)).rejects.toThrow("Fullscreen is unavailable");
