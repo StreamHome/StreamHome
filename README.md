@@ -19,7 +19,7 @@ Built with a high-performance ASGI Python backend and a modern React 19 frontend
 Your media remains under your control. StreamHome can store media locally, synchronize it with Google Drive, preserve portable metadata alongside media files, and automatically maintain local and cloud database backups.
 
 > [!IMPORTANT]
-> StreamHome is currently under active development and has not yet reached its first public alpha release (you can access private alpha release from [early alpha pre-release](https://github.com/StreamHome/StreamHome/releases/tag/v0.1.0-alpha.1)). Features, APIs, installation steps, and system requirements may change before release.
+> StreamHome is currently under active development and has not yet reached its first public alpha release (you can access early alpha release from [early alpha pre-release](https://github.com/StreamHome/StreamHome/releases/tag/v0.1.0-alpha.1)). Features, APIs, installation steps, and system requirements may change before release.
 
 ## ✨ Core Features
 
