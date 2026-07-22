@@ -1086,3 +1086,13 @@
   .workspace-heading h1 { margin-top: 9px; font-size: clamp(32px,10vw,40px); line-height: 1; }
   .workspace-stat { display: none; }
 }
+.application-surface-loading {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  background: var(--background, #0b0807);
+  color: var(--foreground, #f4ebe7);
+  font: 600 0.78rem/1.2 var(--font-sans, system-ui, sans-serif);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}

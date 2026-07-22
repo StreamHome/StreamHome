@@ -2,7 +2,10 @@ import httpx
 import os
 import json
 import asyncio
+import time
+from pathlib import Path
 from typing import Dict, Any, List, Optional
+from urllib.parse import unquote, urlparse
 from config import settings
 from services.logger import logger
 from services.vibe_analysis import compute_trope_vectors, relevant_crew
@@ -28,6 +31,40 @@ class TMDBClient:
         self._cache_queue: Optional[asyncio.Queue] = None
         self._cache_pending: set[str] = set()
         self._cache_workers: List[asyncio.Task] = []
+        self._cache_retry_tasks: set[asyncio.Task] = set()
+
+    @staticmethod
+    def _local_artwork_exists(url: Optional[str]) -> bool:
+        """Resolve only contained /media URLs; never trust a database path directly."""
+        if not url or not url.startswith("/media/"):
+            return False
+        relative = unquote(urlparse(url).path[len("/media/"):]).replace("/", os.sep)
+        media_root = Path(settings.MEDIA_DIR).resolve()
+        candidate = (media_root / relative).resolve()
+        try:
+            candidate.relative_to(media_root)
+        except ValueError:
+            return False
+        return candidate.is_file()
+
+    def _reconcile_cached_artwork(self, movie) -> bool:
+        """Drop stale local pointers while retaining remote artwork as the live fallback."""
+        changed = False
+        thumbnail_candidate = movie.local_thumbnail_url or (movie.thumbnail_url if movie.thumbnail_url.startswith("/media/") else None)
+        banner_candidate = movie.local_banner_url or (movie.banner_url if (movie.banner_url or "").startswith("/media/") else None)
+        missing_thumbnail = bool(thumbnail_candidate) and not self._local_artwork_exists(thumbnail_candidate)
+        missing_banner = bool(banner_candidate) and not self._local_artwork_exists(banner_candidate)
+        if missing_thumbnail:
+            movie.local_thumbnail_url = None
+            if movie.thumbnail_url.startswith("/media/"):
+                movie.thumbnail_url = movie.remote_thumbnail_url or ""
+            changed = True
+        if missing_banner:
+            movie.local_banner_url = None
+            if (movie.banner_url or "").startswith("/media/"):
+                movie.banner_url = movie.remote_banner_url or ""
+            changed = True
+        return changed
 
     async def close(self):
         if self._client and not self._client.is_closed:
@@ -45,15 +82,45 @@ class TMDBClient:
         self._cache_queue = asyncio.Queue()
         async with AsyncSession(engine) as db:
             result = await db.exec(select(Movie).where(Movie.catalog_source == "tmdb_cache"))
-            interrupted = [movie for movie in result.all() if movie.cache_state in {"queued", "caching"}]
-            for movie in interrupted:
-                movie.cache_state = "queued"
+            now = time.time()
+            resumable_ids: List[str] = []
+            deferred: List[tuple[str, float]] = []
+            reconciled = 0
+            for movie in result.all():
+                stale_artwork = self._reconcile_cached_artwork(movie)
+                if stale_artwork:
+                    reconciled += 1
+                interrupted = movie.cache_state in {"queued", "caching"}
+                retry_due = (
+                    movie.cache_state == "error"
+                    and int(movie.cache_retry_count or 0) < 6
+                    and (movie.cache_next_retry_at is None or movie.cache_next_retry_at <= now)
+                )
+                retry_later = (
+                    movie.cache_state == "error"
+                    and int(movie.cache_retry_count or 0) < 6
+                    and movie.cache_next_retry_at is not None
+                    and movie.cache_next_retry_at > now
+                )
+                missing_remote_cache = stale_artwork and bool(movie.remote_thumbnail_url or movie.remote_banner_url)
+                if interrupted or retry_due or missing_remote_cache:
+                    movie.cache_state = "queued"
+                    resumable_ids.append(movie.id)
+                elif retry_later:
+                    deferred.append((movie.id, movie.cache_next_retry_at - now))
                 db.add(movie)
-            if interrupted:
+            if resumable_ids or reconciled:
                 await db.commit()
         self._cache_workers = [asyncio.create_task(self._cache_worker(index)) for index in range(2)]
-        for movie in interrupted:
-            await self.enqueue_cache(movie.id)
+        for movie_id in resumable_ids:
+            await self.enqueue_cache(movie_id)
+        for movie_id, delay in deferred:
+            self._schedule_cache_retry(movie_id, delay)
+        if reconciled or resumable_ids:
+            logger.info(
+                f"[TMDB Cache] Reconciled {reconciled} cached artwork records; "
+                f"queued {len(resumable_ids)} resumable jobs."
+            )
 
     async def stop_cache_workers(self):
         workers, self._cache_workers = self._cache_workers, []
@@ -61,6 +128,11 @@ class TMDBClient:
             worker.cancel()
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
+        retry_tasks, self._cache_retry_tasks = self._cache_retry_tasks, set()
+        for task in retry_tasks:
+            task.cancel()
+        if retry_tasks:
+            await asyncio.gather(*retry_tasks, return_exceptions=True)
         self._cache_pending.clear()
         self._cache_queue = None
 
@@ -69,6 +141,15 @@ class TMDBClient:
             return
         self._cache_pending.add(movie_id)
         await self._cache_queue.put(movie_id)
+
+    def _schedule_cache_retry(self, movie_id: str, delay: float) -> None:
+        async def delayed_enqueue() -> None:
+            await asyncio.sleep(max(0.0, delay))
+            await self.enqueue_cache(movie_id)
+
+        task = asyncio.create_task(delayed_enqueue(), name=f"tmdb-cache-retry-{movie_id}")
+        self._cache_retry_tasks.add(task)
+        task.add_done_callback(self._cache_retry_tasks.discard)
 
     async def _cache_worker(self, worker_index: int):
         assert self._cache_queue is not None
@@ -83,7 +164,9 @@ class TMDBClient:
                         raise
                     except Exception as error:
                         if attempt == 2:
-                            await self._mark_cache_error(movie_id)
+                            retry_delay = await self._mark_cache_error(movie_id, error)
+                            if retry_delay is not None:
+                                self._schedule_cache_retry(movie_id, retry_delay)
                             logger.error(f"[TMDB Cache Worker {worker_index}] {movie_id} failed: {error}")
                         else:
                             await asyncio.sleep(0.75 * (2 ** attempt))
@@ -91,16 +174,23 @@ class TMDBClient:
                 self._cache_pending.discard(movie_id)
                 self._cache_queue.task_done()
 
-    async def _mark_cache_error(self, movie_id: str):
+    async def _mark_cache_error(self, movie_id: str, error: Exception) -> Optional[float]:
         from sqlmodel.ext.asyncio.session import AsyncSession
         from db import engine
         from models import Movie
         async with AsyncSession(engine) as db:
             movie = await db.get(Movie, movie_id)
             if movie and movie.catalog_source == "tmdb_cache":
+                retry_count = int(movie.cache_retry_count or 0) + 1
+                retry_delay = min(24 * 60 * 60, 15 * 60 * (2 ** max(0, retry_count - 1)))
                 movie.cache_state = "error"
+                movie.cache_retry_count = retry_count
+                movie.cache_next_retry_at = time.time() + retry_delay if retry_count < 6 else None
+                movie.cache_last_error = f"{type(error).__name__}: {error}"[:500]
                 db.add(movie)
                 await db.commit()
+                return retry_delay if retry_count < 6 else None
+        return None
 
     async def _cache_movie_record(self, movie_id: str):
         from sqlmodel.ext.asyncio.session import AsyncSession
@@ -111,8 +201,6 @@ class TMDBClient:
             if not movie or movie.catalog_source != "tmdb_cache":
                 return
             movie.cache_state = "caching"
-            db.add(movie)
-            await db.commit()
             item = {
                 "tmdb_id": movie.tmdb_id,
                 "title": movie.title,
@@ -135,6 +223,8 @@ class TMDBClient:
             }
             poster = movie.remote_thumbnail_url or (movie.thumbnail_url if movie.thumbnail_url.startswith("http") else "")
             backdrop = movie.remote_banner_url or (movie.banner_url if movie.banner_url and movie.banner_url.startswith("http") else "")
+            db.add(movie)
+            await db.commit()
         await self.cache_media_locally(item, poster, backdrop)
 
     async def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -481,6 +571,7 @@ class TMDBClient:
                             local_thumbnail_url=f"/media/{library_name}/{folder_name}/poster.jpg" if raw_poster_url else None,
                             local_banner_url=f"/media/{library_name}/{folder_name}/backdrop.jpg" if raw_backdrop_url else None,
                             cache_state="ready",
+                            catalog_enrichment_version=1,
                         )
                         movie.genres = item_dict.get("genres", [])
                         movie.cast = item_dict.get("cast", [])
@@ -508,6 +599,10 @@ class TMDBClient:
                         movie.local_thumbnail_url = f"/media/{library_name}/{folder_name}/poster.jpg" if raw_poster_url else movie.local_thumbnail_url
                         movie.local_banner_url = f"/media/{library_name}/{folder_name}/backdrop.jpg" if raw_backdrop_url else movie.local_banner_url
                         movie.cache_state = "ready"
+                        movie.cache_retry_count = 0
+                        movie.cache_next_retry_at = None
+                        movie.cache_last_error = None
+                        movie.catalog_enrichment_version = 1
                         movie.keywords = item_dict.get("keywords", movie.keywords)
                         movie.crew = item_dict.get("crew", movie.crew)
                         movie.trope_vectors = item_dict.get("trope_vectors") or item_dict.get("tropeVectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
@@ -810,6 +905,10 @@ class TMDBClient:
                 movie.availability = "cached"
                 if is_new or movie.cache_state in {None, "queued", "caching", "error"}:
                     movie.cache_state = "queued"
+                    if movie.cache_retry_count >= 6:
+                        movie.cache_retry_count = 0
+                    movie.cache_next_retry_at = None
+                    movie.cache_last_error = None
                     queued.append(movie.id)
                 db.add(movie)
                 response.append(self._discover_from_movie(movie))

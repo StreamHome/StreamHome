@@ -330,7 +330,7 @@ class VibeAnalysisManager:
 vibe_analysis_manager = VibeAnalysisManager()
 
 
-async def backfill_catalog_vibes(limit: int = 12) -> int:
+async def backfill_catalog_vibes(limit: int = 24) -> int:
     """Incrementally enrich legacy catalog records without blocking startup or moving media."""
     from services.tmdb import tmdb_client
 
@@ -338,20 +338,26 @@ async def backfill_catalog_vibes(limit: int = 12) -> int:
         return 0
     async with AsyncSession(engine) as db:
         movies = list((await db.exec(select(Movie))).all())
-        targets = [movie for movie in movies if movie.tmdb_id and (not movie.crew or not movie.trope_vectors)][:max(1, limit)]
+        targets = [
+            movie for movie in movies
+            if movie.tmdb_id and int(movie.catalog_enrichment_version or 0) < VIBE_ANALYSIS_VERSION
+        ][:max(1, limit)]
         changed = 0
         for movie in targets:
-            details = await (tmdb_client.fetch_show_metadata(movie.tmdb_id) if movie.type == "series" else tmdb_client.fetch_movie_metadata(movie.tmdb_id))
+            try:
+                details = await (tmdb_client.fetch_show_metadata(movie.tmdb_id) if movie.type == "series" else tmdb_client.fetch_movie_metadata(movie.tmdb_id))
+            except Exception as exc:
+                logger.warning(f"[Vibe Backfill] TMDB enrichment failed for {movie.id}: {exc}")
+                continue
             crew = details.get("crew") or []
             keywords = details.get("keywords") or movie.keywords
             tropes = details.get("tropeVectors") or compute_trope_vectors(details.get("genres") or movie.genres, keywords, details.get("description") or movie.description)
-            if not crew and not tropes:
-                continue
             movie.crew = crew or movie.crew
             movie.keywords = keywords
             movie.trope_vectors = tropes
             movie.director = details.get("director") or movie.director
             movie.metadata_refreshed_at = time.time()
+            movie.catalog_enrichment_version = VIBE_ANALYSIS_VERSION
             db.add(movie)
             folder = _media_folder(movie.video_url or movie.local_thumbnail_url or movie.thumbnail_url)
             if folder:

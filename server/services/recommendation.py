@@ -1110,11 +1110,12 @@ async def refresh_profile_cache(profile_id: str, force: bool = False) -> bool:
 
 
 async def recommendation_worker(stop_event) -> None:
-    """Coalesced hourly worker; callers own lifecycle and cancellation."""
+    """Refresh profiles hourly while draining bounded catalog-enrichment batches."""
     while not stop_event.is_set():
+        backfilled = 0
         try:
             from services.vibe_analysis import backfill_catalog_vibes
-            await backfill_catalog_vibes()
+            backfilled = await backfill_catalog_vibes(limit=24)
             async with AsyncSession(engine) as db:
                 profile_result = await db.exec(select(Profile))
                 profile_ids = [profile.id for profile in profile_result.all()]
@@ -1129,6 +1130,7 @@ async def recommendation_worker(stop_event) -> None:
         except Exception as exc:
             logger.error(f"[Recommendation] Background worker error: {exc}")
         try:
-            await __import__("asyncio").wait_for(stop_event.wait(), timeout=3600)
+            delay = 15 if backfilled >= 24 else 3600
+            await __import__("asyncio").wait_for(stop_event.wait(), timeout=delay)
         except __import__("asyncio").TimeoutError:
             pass

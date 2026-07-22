@@ -144,6 +144,10 @@ async def init_db():
                     "local_thumbnail_url": "TEXT",
                     "local_banner_url": "TEXT",
                     "cache_state": "TEXT",
+                    "cache_retry_count": "INTEGER DEFAULT 0",
+                    "cache_next_retry_at": "FLOAT",
+                    "cache_last_error": "TEXT",
+                    "catalog_enrichment_version": "INTEGER DEFAULT 0",
                     "keywords_str": "TEXT DEFAULT '[]'",
                     "collection_name": "TEXT",
                     "crew_str": "TEXT DEFAULT '[]'",
@@ -205,6 +209,8 @@ async def init_db():
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_catalog_source ON movie (catalog_source)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_availability ON movie (availability)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_cache_state ON movie (cache_state)")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_cache_next_retry_at ON movie (cache_next_retry_at)")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_catalog_enrichment_version ON movie (catalog_enrichment_version)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_collection_name ON movie (collection_name)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_source_fingerprint ON movie (source_fingerprint)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_vibe_analysis_status ON movie (vibe_analysis_status)")

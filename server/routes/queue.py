@@ -2,7 +2,7 @@ import json
 import uuid
 import time
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Security, Request
@@ -108,7 +108,7 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
             quality=payload.quality,
             language=payload.language,
             skip_markers_str=json.dumps(payload.skip_markers or {}),
-            created_at=datetime.utcnow().isoformat()
+            created_at=datetime.now(timezone.utc).isoformat()
         )
         db.add(new_task)
         

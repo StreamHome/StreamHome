@@ -1,12 +1,13 @@
-import React, { useLayoutEffect, useMemo } from "react";
+import React, { lazy, Suspense, useLayoutEffect, useMemo } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useLocation } from "react-router-dom";
 import { parseAppQuery } from "../navigation/queryState";
 import { MOTION_EASE, MOTION_TIMINGS, resetApplicationScroll, THEME_MOTION, useAppMotion } from "../motion/motionSystem";
 import { useThemeStore } from "../stores/themeStore";
-import { AdminGate } from "./admin/AdminGate";
-import { DashboardRouter } from "./dashboard/DashboardRouter";
-import { PlayerPage } from "./player/PlayerPage";
+
+const AdminGate = lazy(() => import("./admin/AdminGate").then((module) => ({ default: module.AdminGate })));
+const DashboardRouter = lazy(() => import("./dashboard/DashboardRouter").then((module) => ({ default: module.DashboardRouter })));
+const PlayerPage = lazy(() => import("./player/PlayerPage").then((module) => ({ default: module.PlayerPage })));
 
 export function AuthenticatedApp() {
   const location = useLocation();
@@ -26,7 +27,9 @@ export function AuthenticatedApp() {
       animate="animate"
       exit="exit"
     >
-      {surface === "watch" ? <PlayerPage /> : surface === "admin" ? <AdminGate /> : <DashboardRouter />}
+      <Suspense fallback={<div role="status" aria-live="polite" className="application-surface-loading">Loading view...</div>}>
+        {surface === "watch" ? <PlayerPage /> : surface === "admin" ? <AdminGate /> : <DashboardRouter />}
+      </Suspense>
     </motion.div>
   </AnimatePresence>;
 }
