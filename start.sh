@@ -16,12 +16,13 @@ read_env() {
 mkdir -p "$RUN_DIR"
 WEB_PORT="$(read_env WEB_PORT 3000)"
 SETUP="$(read_env SETUP false)"
+PUBLIC_URL="$(read_env PUBLIC_URL "http://localhost:${WEB_PORT}")"
 if ! [[ "$WEB_PORT" =~ ^[0-9]+$ ]] || (( WEB_PORT < 1 || WEB_PORT > 65535 )); then
     echo "Invalid WEB_PORT in .env: $WEB_PORT" >&2
     exit 1
 fi
 
-export WEB_PORT SETUP
+export WEB_PORT SETUP PUBLIC_URL
 if [[ "${SETUP,,}" != "true" && "${SETUP}" != "1" ]]; then
     if [[ -x "$ROOT_DIR/venv/bin/python" ]]; then
         STREAMHOME_SETUP_CODE="$($ROOT_DIR/venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(18))')"

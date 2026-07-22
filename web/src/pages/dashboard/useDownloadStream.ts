@@ -31,19 +31,19 @@ export function parseDownloadPayload(payload: string): DownloadEvent[] | null {
 }
 
 export function useDownloadStream() {
-  const token = useAuthStore((state) => state.token);
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const [downloads, setDownloads] = useState<DownloadEvent[]>([]);
-  const [connectionState, setConnectionState] = useState<DownloadConnectionState>(token ? "connecting" : "disconnected");
+  const [connectionState, setConnectionState] = useState<DownloadConnectionState>(isAuthenticated ? "connecting" : "disconnected");
 
   useEffect(() => {
-    if (!token) {
+    if (!isAuthenticated) {
       setDownloads([]);
       setConnectionState("disconnected");
       return;
     }
     setDownloads([]);
     setConnectionState("connecting");
-    const source = new EventSource(`/api/downloads/stream?token=${encodeURIComponent(token)}`);
+    const source = new EventSource("/api/downloads/stream", { withCredentials: true });
     source.onopen = () => setConnectionState("connected");
     source.onerror = () => setConnectionState("reconnecting");
     source.onmessage = (event) => {
@@ -53,7 +53,7 @@ export function useDownloadStream() {
       setConnectionState("connected");
     };
     return () => source.close();
-  }, [token]);
+  }, [isAuthenticated]);
 
   return { downloads, connectionState };
 }

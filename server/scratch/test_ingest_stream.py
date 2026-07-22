@@ -571,10 +571,13 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def run(argv: Sequence[str] | None = None) -> int:
     load_environment()
     args = parse_arguments(argv)
-    api_token = os.getenv("API_BEARER_TOKEN", "").strip()
+    api_token = os.getenv("STREAMHOME_INGESTION_TOKEN", "").strip() or os.getenv("API_BEARER_TOKEN", "").strip()
     if not api_token:
-        print(f"{CONSOLE_PREFIX} API_BEARER_TOKEN is missing from the StreamHome environment.")
-        return 2
+        import getpass
+        api_token = getpass.getpass(f"{CONSOLE_PREFIX} MediaSender ingestion token: ").strip()
+        if not api_token:
+            print(f"{CONSOLE_PREFIX} An ingestion token is required.")
+            return 2
 
     try:
         tmdb_id, media_type, season, episode = prompt_media_identity(args)

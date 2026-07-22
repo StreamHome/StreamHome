@@ -3,6 +3,9 @@ import sqlite3
 import shutil
 import asyncio
 import time
+import re
+import tempfile
+from pathlib import Path
 from datetime import datetime, timedelta
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -14,12 +17,46 @@ from services.logger import logger
 from services.queue import queue_manager
 from services.rclone import rclone_service
 
+BACKUP_FILENAME_RE = re.compile(r"^backup_\d{8}_\d{6}\.db$")
+
 def get_backup_dir() -> str:
     """Resolve absolute path to server/backup folder."""
     config_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     backup_path = os.path.join(config_dir, "backup")
     os.makedirs(backup_path, exist_ok=True)
     return backup_path
+
+
+def resolve_backup_file(filename: str, *, must_exist: bool = False) -> Path | None:
+    """Resolve only application-generated backup basenames inside the backup root."""
+    if not isinstance(filename, str) or not BACKUP_FILENAME_RE.fullmatch(filename):
+        return None
+    root = Path(get_backup_dir()).resolve()
+    candidate = (root / filename).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    if candidate.is_symlink() or (must_exist and not candidate.is_file()):
+        return None
+    return candidate
+
+
+def validate_backup_database(path: Path) -> None:
+    with path.open("rb") as handle:
+        if handle.read(16) != b"SQLite format 3\x00":
+            raise ValueError("Backup does not contain a SQLite database.")
+    connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    try:
+        result = connection.execute("PRAGMA integrity_check").fetchone()
+        if not result or result[0] != "ok":
+            raise ValueError("Backup database integrity validation failed.")
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        required = {"user", "movie", "authsession"}
+        if not required.issubset(tables):
+            raise ValueError("Backup database schema is not compatible with StreamHome.")
+    finally:
+        connection.close()
 
 async def is_database_idle() -> bool:
     """
@@ -120,7 +157,6 @@ def get_local_backups() -> list:
                 "size_bytes": size,
                 "formatted_size": f"{size / (1024 * 1024):.2f} MB",
                 "timestamp": datetime.fromtimestamp(mtime).isoformat(),
-                "path": file_path
             })
         # Sort newest first
         backup_list.sort(key=lambda x: x["timestamp"], reverse=True)
@@ -152,24 +188,49 @@ async def restore_backup(filename: str) -> bool:
     Safely restore a database backup file to database.db.
     Disposes active sessions/connections to prevent locking.
     """
-    backup_dir = get_backup_dir()
-    backup_file_path = os.path.join(backup_dir, filename)
-    active_db_path = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "database.db"))
-    
-    if not os.path.exists(backup_file_path):
+    backup_file_path = resolve_backup_file(filename, must_exist=True)
+    active_db_path = Path(settings.db_path).resolve()
+
+    if not backup_file_path:
         logger.error(f"[Backup Service] Restore failed: Backup file '{filename}' does not exist.")
         return False
-        
+
+    temporary_path: Path | None = None
     try:
+        validate_backup_database(backup_file_path)
         logger.warning(f"[Backup Service] Restoring database to: {filename}")
-        
-        # 1. Close all active database connections in the engine pool
+
+        # Build and validate the replacement before touching the live database.
+        with tempfile.NamedTemporaryFile(
+            dir=active_db_path.parent,
+            prefix=".database-restore-",
+            suffix=".db",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+        shutil.copy2(backup_file_path, temporary_path)
+        validate_backup_database(temporary_path)
+
+        # Preserve a rollback point using SQLite's online backup API.
+        rollback_path = Path(get_backup_dir()) / f"pre-restore-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+        source = sqlite3.connect(active_db_path)
+        rollback = sqlite3.connect(rollback_path)
+        try:
+            source.backup(rollback)
+        finally:
+            rollback.close()
+            source.close()
+
         await engine.dispose()
-        
-        # 2. Overwrite database.db with the backup file
-        shutil.copy2(backup_file_path, active_db_path)
+        for suffix in ("-wal", "-shm"):
+            Path(f"{active_db_path}{suffix}").unlink(missing_ok=True)
+        os.replace(temporary_path, active_db_path)
+        temporary_path = None
         logger.info("[Backup Service] Database successfully restored.")
         return True
     except Exception as e:
         logger.error(f"[Backup Service] Restore error: {e}")
         return False
+    finally:
+        if temporary_path:
+            temporary_path.unlink(missing_ok=True)

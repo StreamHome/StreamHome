@@ -1,8 +1,8 @@
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException, status, Security, BackgroundTasks
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 
-from config import settings
+from models import AuthSession
+from routes.auth import require_recent_reauth
 from services.logger import logger
 from services.update import (
     check_for_github_updates,
@@ -14,19 +14,10 @@ from services.update import (
 )
 
 router = APIRouter()
-security = HTTPBearer()
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
-    if credentials.credentials != settings.API_BEARER_TOKEN:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API Bearer token."
-        )
-    return credentials.credentials
-
 @router.get("/status")
-async def get_update_status(token: str = Depends(verify_token)):
+async def get_update_status(session: AuthSession = Depends(require_recent_reauth)):
     """Check target GitHub repository to identify if updates are available."""
+    del session
     try:
         update_available = await check_for_github_updates()
         git_clean = await is_git_clean()
@@ -48,8 +39,9 @@ async def get_update_status(token: str = Depends(verify_token)):
         )
 
 @router.post("/trigger")
-async def trigger_manual_update(background_tasks: BackgroundTasks, token: str = Depends(verify_token)):
+async def trigger_manual_update(background_tasks: BackgroundTasks, session: AuthSession = Depends(require_recent_reauth)):
     """Manually triggers git pull and dependency updates. Restarts the server asynchronously."""
+    del session
     # 1. Verify working directory is clean
     if not await is_git_clean():
         raise HTTPException(

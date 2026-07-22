@@ -18,7 +18,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from config import settings
 from db import engine, init_db
 from models import AuthChallenge, AuthSession, RecoveryCode, SecurityEvent, User
-from routes.auth import get_current_user, health_router, router
+from routes.auth import AUTH_COOKIE, get_current_user, health_router, router
 
 EMAIL = "streamhome_auth_regression@example.test"
 PASSWORD = "StreamHome-Regression-Password"
@@ -102,10 +102,13 @@ def run() -> None:
 
         factor_step = client.post("/api/auth/verify", json={"challenge_token": challenge, "method": "totp", "code": pyotp.TOTP(SECRET).now()}, headers=headers)
         assert factor_step.status_code == 200
-        token = factor_step.json()["accessToken"]
+        token = client.cookies.get(AUTH_COOKIE)
+        assert token
         bearer = {**headers, "Authorization": f"Bearer {token}"}
         assert client.get("/protected", headers=bearer).status_code == 200
-        assert client.get(f"/protected?token={token}", headers=headers).status_code == 200
+        query_only_client = TestClient(app)
+        assert query_only_client.get(f"/protected?token={token}", headers=headers).status_code == 401
+        assert client.get("/protected", headers=headers).status_code == 200
         assert client.post("/api/auth/verify", json={"challenge_token": challenge, "method": "totp", "code": pyotp.TOTP(SECRET).now()}, headers=headers).status_code == 401
 
         legacy = jwt.encode({"sub": EMAIL, "exp": time.time() + 60}, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
@@ -148,7 +151,9 @@ def run() -> None:
 
         email_change = client.put("/api/auth/security/email", json={"email": UPDATED_EMAIL, "current_password": PASSWORD}, headers=bearer)
         assert email_change.status_code == 200 and email_change.json()["email"] == UPDATED_EMAIL
-        replacement_bearer = {**headers, "Authorization": f"Bearer {email_change.json()['accessToken']}"}
+        replacement_token = client.cookies.get(AUTH_COOKIE)
+        assert replacement_token
+        replacement_bearer = {**headers, "Authorization": f"Bearer {replacement_token}"}
         assert client.get("/protected", headers=bearer).status_code == 401
         assert client.get("/protected", headers=replacement_bearer).json()["email"] == UPDATED_EMAIL
 

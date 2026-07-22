@@ -3,12 +3,12 @@ import os
 import sqlite3
 from datetime import datetime
 
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, select
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy import event
-from config import settings
+from config import remove_env_key, settings
 
 from services.logger import logger
 
@@ -86,6 +86,9 @@ async def init_db():
                 if "skip_markers_str" not in columns:
                     logger.info("[Database] Migrating: Adding 'skip_markers_str' column to 'downloadtask' table...")
                     sync_conn.exec_driver_sql("ALTER TABLE downloadtask ADD COLUMN skip_markers_str TEXT DEFAULT '{}'")
+                if "private_source_allowed" not in columns:
+                    logger.info("[Database] Migrating: Adding private-source trust marker to download tasks...")
+                    sync_conn.exec_driver_sql("ALTER TABLE downloadtask ADD COLUMN private_source_allowed BOOLEAN NOT NULL DEFAULT 0")
             
             if "user" in inspector.get_table_names():
                 user_cols = [col["name"] for col in inspector.get_columns("user")]
@@ -287,6 +290,43 @@ async def init_db():
                 )
                     
         await conn.run_sync(migrate)
+
+    # Migrate the existing high-entropy ingestion token into the scoped,
+    # hashed credential store. Known defaults and empty values fail closed.
+    if settings.API_BEARER_TOKEN and settings.API_BEARER_TOKEN != "secure-token-123":
+        from models import IntegrationCredential
+        from services.integration_auth import integration_token_hash
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            digest = integration_token_hash(settings.API_BEARER_TOKEN)
+            credential_count = len((await db.execute(select(IntegrationCredential))).scalars().all())
+            existing = (await db.execute(select(IntegrationCredential).where(IntegrationCredential.token_hash == digest))).scalars().first()
+            if not existing and credential_count == 0:
+                credential = await db.get(IntegrationCredential, "legacy-ingestion")
+                if not credential:
+                    credential = IntegrationCredential(
+                        id="legacy-ingestion",
+                        name="Migrated MediaSender",
+                        token_hash=digest,
+                    )
+                credential.token_hash = digest
+                credential.revoked_at = None
+                credential.scopes = ["ingest"]
+                db.add(credential)
+                await db.commit()
+            remove_env_key(settings.SERVER_ENV_PATH, "API_BEARER_TOKEN")
+
+    from models import User
+    from services.secret_crypto import is_protected_secret, protect_secret
+    async with AsyncSession(engine, expire_on_commit=False) as db:
+        users = (await db.execute(select(User).where(User.totp_secret != None))).scalars().all()
+        changed = False
+        for user in users:
+            if user.totp_secret and not is_protected_secret(user.totp_secret):
+                user.totp_secret = protect_secret(user.totp_secret)
+                db.add(user)
+                changed = True
+        if changed:
+            await db.commit()
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     async_session = sessionmaker(

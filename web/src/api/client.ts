@@ -6,12 +6,7 @@ export class ApiError extends Error {
 }
 
 export async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = localStorage.getItem("streamhome_token");
   const headers = new Headers(options.headers || {});
-  
-  if (token && !headers.has("Authorization")) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
   
   if (!headers.has("Content-Type") && options.body && typeof options.body === "string") {
     headers.set("Content-Type", "application/json");
@@ -19,7 +14,7 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
 
   let response: Response;
   try {
-    response = await fetch(path, { ...options, headers });
+    response = await fetch(path, { ...options, headers, credentials: options.credentials ?? "same-origin" });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") throw new ApiError("The server took too long to respond.", 0, "request_timeout");
     throw new ApiError(navigator.onLine ? "StreamHome could not reach the server." : "This device is offline.", 0, navigator.onLine ? "server_unreachable" : "offline");
@@ -42,8 +37,7 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
       // Ignore if not JSON
     }
     
-    if (response.status === 401 && token && !["invalid_credentials", "invalid_factor", "challenge_expired"].includes(errorCode)) {
-      localStorage.removeItem("streamhome_token");
+    if (response.status === 401 && !["invalid_credentials", "invalid_factor", "challenge_expired"].includes(errorCode)) {
       if (window.location.pathname !== "/login") {
         window.location.href = "/login";
       }

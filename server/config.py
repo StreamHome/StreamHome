@@ -1,5 +1,8 @@
 import os
 import json
+import base64
+import secrets
+import stat
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -22,14 +25,52 @@ if bin_path not in os.environ["PATH"]:
 load_dotenv(dotenv_path=root_env_path, override=False)
 load_dotenv(dotenv_path=server_env_path, override=False)
 
+
+def _append_private_env(path: str, key: str, value: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(f'\n{key}="{value}"\n')
+    if os.name != "nt":
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+
+
+def remove_env_key(path: str, key: str) -> None:
+    if not os.path.exists(path):
+        return
+    prefix = f"{key}="
+    with open(path, "r", encoding="utf-8") as handle:
+        lines = [line for line in handle if not line.strip().startswith(prefix)]
+    temporary = f"{path}.tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.writelines(lines)
+    if os.name != "nt":
+        os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
+    os.replace(temporary, path)
+
 class Settings:
     BASE_DIR: str = base_dir
     ROOT_ENV_PATH: str = root_env_path
     SERVER_ENV_PATH: str = server_env_path
-    SETUP_COMPLETE: bool = os.getenv("SETUP", "true").lower() in ("true", "1", "yes")
+    # Missing configuration must fail closed into the setup gate.
+    SETUP_COMPLETE: bool = os.getenv("SETUP", "false").lower() in ("true", "1", "yes")
     WEB_PORT: int = env_int("WEB_PORT", 3000, 1, 65535)
     PUBLIC_URL: str = os.getenv("PUBLIC_URL", f"http://localhost:{WEB_PORT}").rstrip("/")
-    API_BEARER_TOKEN: str = os.getenv("API_BEARER_TOKEN", "secure-token-123")
+    API_BEARER_TOKEN: str = os.getenv("API_BEARER_TOKEN", "")
+    ALLOWED_ORIGINS: list[str] = [
+        origin.strip().rstrip("/")
+        for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
+        if origin.strip()
+    ]
+    TRUSTED_PROXY_CIDRS: list[str] = [
+        cidr.strip()
+        for cidr in os.getenv("TRUSTED_PROXY_CIDRS", "127.0.0.1/32,::1/128").split(",")
+        if cidr.strip()
+    ]
+    INGEST_TRUSTED_HOSTS: list[str] = [
+        host.strip().lower()
+        for host in os.getenv("INGEST_TRUSTED_HOSTS", "").split(",")
+        if host.strip()
+    ]
     TMDB_API_KEY: str = os.getenv("TMDB_API_KEY", "")
     TMDB_READ_ACCESS_TOKEN: str = os.getenv("TMDB_READ_ACCESS_TOKEN", "")
     db_path = os.path.abspath(os.path.join(config_dir, "database.db")).replace("\\", "/")
@@ -42,16 +83,21 @@ class Settings:
     # 2FA Authentication JWT settings
     JWT_SECRET = os.getenv("JWT_SECRET")
     if not JWT_SECRET:
-        import secrets
         generated_secret = secrets.token_hex(32)
         env_file = os.path.join(config_dir, ".env")
         try:
-            with open(env_file, "a") as f:
-                f.write(f'\nJWT_SECRET="{generated_secret}"\n')
+            _append_private_env(env_file, "JWT_SECRET", generated_secret)
         except Exception:
             pass
         os.environ["JWT_SECRET"] = generated_secret
         JWT_SECRET = generated_secret
+    SECRET_ENCRYPTION_KEY: str = os.getenv("SECRET_ENCRYPTION_KEY", "")
+    if not SECRET_ENCRYPTION_KEY:
+        SECRET_ENCRYPTION_KEY = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+        try:
+            _append_private_env(server_env_path, "SECRET_ENCRYPTION_KEY", SECRET_ENCRYPTION_KEY)
+        except Exception:
+            pass
     JWT_ALGORITHM: str = "HS256"
     SESSION_LIFETIME_DAYS: int = max(1, min(365, int(os.getenv("SESSION_LIFETIME_DAYS", "60"))))
     JWT_EXPIRATION_MINUTES: int = 60 * 24 * SESSION_LIFETIME_DAYS
@@ -66,6 +112,14 @@ class Settings:
     
     # Cloud storage configuration for rclone
     RCLONE_REMOTE_PATH: str = os.getenv("RCLONE_REMOTE_PATH", "gdrive:media")
+    RCLONE_CONFIG_PASS: str = os.getenv("RCLONE_CONFIG_PASS", "")
+    if not RCLONE_CONFIG_PASS:
+        RCLONE_CONFIG_PASS = secrets.token_urlsafe(36)
+        os.environ["RCLONE_CONFIG_PASS"] = RCLONE_CONFIG_PASS
+        try:
+            _append_private_env(server_env_path, "RCLONE_CONFIG_PASS", RCLONE_CONFIG_PASS)
+        except Exception:
+            pass
     GOOGLE_DRIVE_AUDIENCE: str = os.getenv("GOOGLE_DRIVE_AUDIENCE", "external")
     GOOGLE_DRIVE_PUBLISHING_STATUS: str = os.getenv("GOOGLE_DRIVE_PUBLISHING_STATUS", "production")
 
@@ -74,6 +128,8 @@ class Settings:
 
     # Automated Update System
     AUTO_UPDATE_ENABLED: bool = os.getenv("AUTO_UPDATE_ENABLED", "False").lower() in ("true", "1", "yes")
+    UPDATE_BRANCH: str = os.getenv("UPDATE_BRANCH", "main").strip() or "main"
+    UPDATE_REQUIRE_SIGNED_COMMITS: bool = os.getenv("UPDATE_REQUIRE_SIGNED_COMMITS", "true").lower() in ("true", "1", "yes")
 
     # Library Optimization System
     HEVC_COMPRESSION_MODE: str = os.getenv("HEVC_COMPRESSION_MODE", "auto")

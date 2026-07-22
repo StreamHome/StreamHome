@@ -154,7 +154,7 @@ export function AccountSecurityPage() {
     event.preventDefault(); setBusy(true); setError(""); setMessage("");
     try {
       const result = await updateAccountEmail(email, emailPassword);
-      setToken(result.accessToken, result.email); setEmailPassword(""); setMessage(`${result.message} Other signed-in devices were revoked.`); await load();
+      setToken("", result.email); setEmailPassword(""); setMessage(`${result.message} Other signed-in devices were revoked.`); await load();
     } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "The account email could not be updated."); }
     finally { setBusy(false); }
   };

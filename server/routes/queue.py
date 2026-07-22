@@ -5,42 +5,25 @@ import asyncio
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Security, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import StreamingResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from db import engine
-from models import DownloadTask, DownloadAddRequest, Movie, Episode
-from config import settings
+from models import AuthSession, DownloadTask, DownloadAddRequest, Movie, Episode, IntegrationCredential
 from services.queue import queue_manager
 from services.state import ACTIVE_DOWNLOAD_METRICS, cancel_and_kill_process
 from services.tmdb import tmdb_client
 from services.vibe_analysis import compute_trope_vectors
 
 from services.logger import logger
-from routes.auth import get_current_user
+from routes.auth import get_current_user, require_recent_reauth
+from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
+from services.integration_auth import require_integration_scope
+from services.request_security import address_is_loopback, client_ip
 
 router = APIRouter()
-
-# Authentication dependency
-security = HTTPBearer()
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
-    if credentials.credentials != settings.API_BEARER_TOKEN:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API Bearer token."
-        )
-    return credentials.credentials
-
-def is_safe_url(url: Optional[str]) -> bool:
-    if not url:
-        return True
-    url_lower = url.lower()
-    return url_lower.startswith("http://") or url_lower.startswith("https://")
-
 
 def is_local_playable_url(url: Optional[str]) -> bool:
     return bool(url and url.startswith("/media/"))
@@ -48,25 +31,25 @@ def is_local_playable_url(url: Optional[str]) -> bool:
 # ----------------- Ingestion Endpoint -----------------
 
 @router.post("/api/add-movie", status_code=status.HTTP_201_CREATED)
-async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_token)):
+async def add_movie(
+    payload: DownloadAddRequest,
+    request: Request,
+    credential: IntegrationCredential = Depends(require_integration_scope("ingest")),
+):
     """Ingests media stream payload from browser extension and registers it in SQLite."""
-    if not is_safe_url(payload.video_url):
+    del credential
+    try:
+        source_client = client_ip(request)
+        await validate_url(payload.video_url, client_address=source_client)
+        await validate_url(payload.audio_url, client_address=source_client)
+        for subtitle in payload.subtitles or []:
+            await validate_url(subtitle.url, client_address=source_client)
+        headers_dict = validate_headers(payload.headers)
+    except UnsafeIngestionSource as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Forbidden URL protocol. Only HTTP and HTTPS are allowed."
-        )
-    if payload.audio_url and not is_safe_url(payload.audio_url):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Forbidden URL protocol. Only HTTP and HTTPS are allowed."
-        )
-    if payload.subtitles:
-        for sub in payload.subtitles:
-            if not is_safe_url(sub.url):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Forbidden URL protocol. Only HTTP and HTTPS are allowed."
-                )
+            detail={"code": "unsafe_ingestion_source", "message": str(exc)},
+        ) from exc
 
     logger.info(f"[API] Received media ingestion payload for TMDB ID: {payload.tmdb_id}")
     
@@ -91,7 +74,6 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
     
     # Save the task to SQLite database using AsyncSession
     async with AsyncSession(engine) as db:
-        headers_dict = payload.headers or {}
         subtitles_list = [{"language": s.language, "url": s.url} for s in payload.subtitles] if payload.subtitles else []
         new_task = DownloadTask(
             id=task_id,
@@ -103,6 +85,7 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
             video_url=payload.video_url,
             audio_url=payload.audio_url,
             headers_str=json.dumps(headers_dict),
+            private_source_allowed=address_is_loopback(source_client),
             status="PENDING",
             subtitles_str=json.dumps(subtitles_list),
             quality=payload.quality,
@@ -287,7 +270,6 @@ async def download_progress_generator():
                 download_list.append({
                     "id": t.id,
                     "title": t.title or f"TMDB {t.tmdb_id}",
-                    "sourceUrl": t.video_url,
                     "status": status_text,
                     "progress": progress,
                     "speed": metrics["speed"],
@@ -301,7 +283,6 @@ async def download_progress_generator():
                 download_list.append({
                     "id": t.id,
                     "title": t.title or f"TMDB {t.tmdb_id}",
-                    "sourceUrl": t.video_url,
                     "status": status_text,
                     "progress": progress,
                     "speed": "Finished" if t.status == "COMPLETED" else "Failed",
@@ -333,8 +314,9 @@ async def get_downloads_stream(user = Depends(get_current_user)):
 # ----------------- Task Deletion and Process Termination -----------------
 
 @router.delete("/api/downloads/{task_id}")
-async def delete_download(task_id: str, token: str = Depends(verify_token)):
+async def delete_download(task_id: str, session: AuthSession = Depends(require_recent_reauth)):
     """Deletes download task from DB and terminates active FFmpeg OS process (Fix 2)."""
+    del session
     # 1. Kill the active OS process registered in state.py if running
     killed = await cancel_and_kill_process(task_id)
     if killed:

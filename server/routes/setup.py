@@ -28,8 +28,14 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from db import get_session
-from models import AuthChallenge, DriveSetupJob, RecoveryCode, User
+from models import AuthChallenge, DriveSetupJob, IntegrationCredential, RecoveryCode, User
+from services.integration_auth import integration_token_hash
 from services.rclone import REMOTE_NAME_RE, rclone_service
+from services.request_security import client_ip, request_is_secure
+from services.secret_crypto import protect_secret
+from services.rate_limit import clear as clear_rate_limit
+from services.rate_limit import enforce as enforce_rate_limit
+from services.rate_limit import fail as fail_rate_limit
 
 router = APIRouter(prefix="/api/setup", tags=["Setup"])
 SETUP_COOKIE = "streamhome_setup"
@@ -102,10 +108,6 @@ def setup_required() -> bool:
 
 def _bootstrap_code() -> str:
     return os.getenv("STREAMHOME_SETUP_CODE", "")
-
-
-def _client_ip(request: Request) -> str:
-    return request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
 
 
 def _setup_token(session_id: str) -> str:
@@ -275,10 +277,11 @@ async def get_setup_status(request: Request, db: AsyncSession = Depends(get_sess
 
 
 @router.post("/unlock", status_code=204)
-async def unlock_setup(payload: UnlockRequest, request: Request, response: Response):
+async def unlock_setup(payload: UnlockRequest, request: Request, response: Response, db: AsyncSession = Depends(get_session)):
     if not setup_required():
         raise HTTPException(status_code=409, detail={"code": "setup_complete", "message": "StreamHome is already configured."})
-    ip = _client_ip(request)
+    ip = client_ip(request)
+    await enforce_rate_limit(db, "setup_unlock", ip)
     attempts, blocked_until = _failed_unlocks.get(ip, (0, 0))
     if blocked_until > time.time():
         retry = max(1, int(blocked_until - time.time()))
@@ -287,10 +290,12 @@ async def unlock_setup(payload: UnlockRequest, request: Request, response: Respo
     if not expected or not hmac.compare_digest(payload.code.strip(), expected):
         attempts += 1
         _failed_unlocks[ip] = (attempts, time.time() + 300 if attempts >= 5 else 0)
+        await fail_rate_limit(db, "setup_unlock", ip, limit=5, window_seconds=300)
         raise HTTPException(status_code=401, detail={"code": "invalid_setup_code", "message": "The bootstrap code was not accepted."})
     _failed_unlocks.pop(ip, None)
+    await clear_rate_limit(db, "setup_unlock", ip)
     session_id = secrets.token_urlsafe(24)
-    response.set_cookie(SETUP_COOKIE, _setup_token(session_id), max_age=SETUP_SESSION_SECONDS, httponly=True, samesite="lax", secure=request.headers.get("x-forwarded-proto") == "https", path="/")
+    response.set_cookie(SETUP_COOKIE, _setup_token(session_id), max_age=SETUP_SESSION_SECONDS, httponly=True, samesite="strict", secure=request_is_secure(request), path="/")
 
 
 @router.get("/readiness", dependencies=[Depends(require_setup_session)])
@@ -673,7 +678,7 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
         user = existing or User(email=email, password_hash="")
         user.email = email
         user.password_hash = bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode()
-        user.totp_secret = payload.totp_secret or None
+        user.totp_secret = protect_secret(payload.totp_secret)
         user.two_factor_enabled = bool(payload.totp_secret)
         user.failed_login_attempts = 0
         user.lockout_until = None
@@ -684,9 +689,16 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
         await db.execute(delete(AuthChallenge).where(AuthChallenge.user_id == user.id))
 
         ingestion_token = secrets.token_urlsafe(36)
+        await db.execute(delete(IntegrationCredential))
+        ingestion_credential = IntegrationCredential(
+            id=str(uuid.uuid4()),
+            name="MediaSender",
+            token_hash=integration_token_hash(ingestion_token),
+        )
+        ingestion_credential.scopes = ["ingest"]
+        db.add(ingestion_credential)
         _atomic_update_env(settings.SERVER_ENV_PATH, {
             "TMDB_READ_ACCESS_TOKEN": payload.tmdb_token.strip(),
-            "API_BEARER_TOKEN": ingestion_token,
             "STORAGE_ENGINE": storage,
             "RCLONE_REMOTE_PATH": remote_path,
             "GOOGLE_DRIVE_AUDIENCE": drive_job.audience if drive_job else settings.GOOGLE_DRIVE_AUDIENCE,
@@ -706,7 +718,6 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
         settings.WEB_PORT = payload.web_port
         settings.PUBLIC_URL = public_url
         settings.TMDB_READ_ACCESS_TOKEN = payload.tmdb_token.strip()
-        settings.API_BEARER_TOKEN = ingestion_token
         settings.STORAGE_ENGINE = storage
         settings.RCLONE_REMOTE_PATH = remote_path
         if drive_job:

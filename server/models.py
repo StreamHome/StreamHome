@@ -452,6 +452,37 @@ class SecurityEvent(SQLModel, table=True):
     session_id: Optional[str] = Field(default=None, index=True)
     details: Optional[str] = Field(default=None)
 
+class IntegrationCredential(SQLModel, table=True):
+    """Hashed, revocable machine credential with an explicit capability set."""
+    id: str = Field(primary_key=True)
+    name: str
+    token_hash: str = Field(unique=True, index=True)
+    scopes_str: str = Field(default='["ingest"]')
+    created_at: float = Field(default_factory=time.time, index=True)
+    expires_at: Optional[float] = Field(default=None, index=True)
+    revoked_at: Optional[float] = Field(default=None, index=True)
+    last_used_at: Optional[float] = Field(default=None)
+
+    @property
+    def scopes(self) -> List[str]:
+        try:
+            value = json.loads(self.scopes_str or "[]")
+            return [str(scope) for scope in value] if isinstance(value, list) else []
+        except Exception:
+            return []
+
+    @scopes.setter
+    def scopes(self, value: List[str]) -> None:
+        self.scopes_str = json.dumps(sorted(set(value or [])))
+
+class RateLimitBucket(SQLModel, table=True):
+    key_hash: str = Field(primary_key=True)
+    namespace: str = Field(index=True)
+    attempts: int = Field(default=0)
+    window_started_at: float
+    blocked_until: Optional[float] = Field(default=None, index=True)
+    updated_at: float = Field(index=True)
+
 class DriveSetupJob(SQLModel, table=True):
     id: str = Field(primary_key=True)
     session_hash: str = Field(index=True)
@@ -504,6 +535,7 @@ class DownloadTask(SQLModel, table=True):
     video_url: str
     audio_url: Optional[str] = None
     headers_str: Optional[str] = Field(default="{}")  # Serialized JSON headers
+    private_source_allowed: bool = Field(default=False)
     status: str = "PENDING"  # PENDING, DOWNLOADING, MERGING, COMPLETED, FAILED
     subtitles_str: Optional[str] = Field(default="[]")  # Serialized JSON List[Dict[str, str]]
     quality: Optional[str] = Field(default=None)

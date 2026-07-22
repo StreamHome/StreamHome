@@ -32,8 +32,10 @@ if os.path.exists(bin_path) and bin_path not in os.environ.get("PATH", ""):
     os.environ["PATH"] = bin_path + os.pathsep + os.environ.get("PATH", "")
 
 from config import settings, config_dir
-from models import User, DownloadTask, Movie, Episode
+from models import User, DownloadTask, Movie, Episode, IntegrationCredential
 from db import init_db
+from services.secret_crypto import protect_secret
+from services.integration_auth import integration_token_hash
 
 console = Console()
 
@@ -459,29 +461,55 @@ async def configure_settings():
                 if key_choice == 0:
                     console.print(Panel("[bold white]⚡ AUTONOMOUS API KEY GENERATION[/bold white]", border_style="bright_yellow", width=68))
                     console.print("\n[dim]   Generating a new cryptographically secure 32-character API key...[/dim]\n")
-                    new_key = secrets.token_hex(16)  # 32 characters hex
+                    new_key = secrets.token_urlsafe(36)
                     
-                    update_env_file("API_BEARER_TOKEN", new_key)
-                    console.print(f"   [bold bright_green][✓][/bold bright_green] [white]New API key generated and written directly to .env:[/white]")
+                    engine = create_async_engine(settings.DATABASE_URL)
+                    async with AsyncSession(engine) as session:
+                        existing = (await session.execute(select(IntegrationCredential))).scalars().all()
+                        for credential in existing:
+                            if "ingest" in credential.scopes and not credential.revoked_at:
+                                credential.revoked_at = __import__("time").time()
+                                session.add(credential)
+                        credential = IntegrationCredential(
+                            id=__import__("uuid").uuid4().hex,
+                            name="CLI MediaSender",
+                            token_hash=integration_token_hash(new_key),
+                        )
+                        credential.scopes = ["ingest"]
+                        session.add(credential)
+                        await session.commit()
+                    console.print(f"   [bold bright_green][✓][/bold bright_green] [white]New scoped ingestion key generated (shown once):[/white]")
                     console.print(f"   👉 [bold bright_yellow]{new_key}[/bold bright_yellow]\n")
-                    console.print("   [bold red]⚠️  IMPORTANT: COPY THIS KEY NOW. YOU CANNOT VIEW IT AGAIN EASILY.[/bold red]")
+                    console.print("   [bold red]⚠️  IMPORTANT: COPY THIS KEY NOW. IT CANNOT BE VIEWED AGAIN.[/bold red]")
                 
                 # Sub-Case 2: View Key
                 elif key_choice == 1:
                     console.print(Panel("[bold white]🔍 VIEW ACTIVE INGESTION API KEY[/bold white]", border_style="bright_yellow", width=68))
-                    active_key = settings.API_BEARER_TOKEN
-                    if active_key:
-                        console.print(f"\n   Current active API key in runtime memory:")
-                        console.print(f"   👉 [bold bright_yellow]{active_key}[/bold bright_yellow]\n")
+                    engine = create_async_engine(settings.DATABASE_URL)
+                    async with AsyncSession(engine) as session:
+                        credentials = (await session.execute(select(IntegrationCredential))).scalars().all()
+                        active = [item for item in credentials if "ingest" in item.scopes and not item.revoked_at]
+                    if active:
+                        console.print(f"\n   [bold bright_green]{len(active)} active scoped ingestion credential(s).[/bold bright_green]")
+                        for credential in active:
+                            console.print(f"   • {credential.name} ({credential.id})")
+                        console.print("   [dim]Raw keys are intentionally show-once and cannot be recovered.[/dim]\n")
                     else:
-                        console.print("\n   [bold bright_red][✗][/bold bright_red] [white]No active Ingestion API key found in config settings.[/white]\n")
+                        console.print("\n   [bold bright_red][✗][/bold bright_red] [white]No active ingestion credential exists.[/white]\n")
                         
                 # Sub-Case 3: Delete Key
                 elif key_choice == 2:
                     console.print(Panel("[bold white]🔥 REVOKE INGEST API KEY CONTROL[/bold white]", border_style="bright_red", width=68))
                     confirm = prompt_input("Are you absolutely sure you want to completely clear the active API key? (y/N)", "N")
                     if confirm.lower() == "y" and confirm != "ESC":
-                        update_env_file("API_BEARER_TOKEN", "")
+                        engine = create_async_engine(settings.DATABASE_URL)
+                        async with AsyncSession(engine) as session:
+                            existing = (await session.execute(select(IntegrationCredential))).scalars().all()
+                            for credential in existing:
+                                if "ingest" in credential.scopes and not credential.revoked_at:
+                                    credential.revoked_at = __import__("time").time()
+                                    session.add(credential)
+                            await session.commit()
                         console.print("\n   [bold bright_green][✓][/bold bright_green] [white]API key successfully deleted. Ingestion pipeline locked.[/white]")
                     else:
                         console.print("\n   [bold bright_yellow][!][/bold bright_yellow] [dim]Revocation cancelled.[/dim]")
@@ -662,7 +690,7 @@ async def configure_user_2fa():
                 
                 code = prompt_input("Enter current 6-digit verification code to confirm")
                 if code != "ESC" and totp.verify(code):
-                    user.totp_secret = secret
+                    user.totp_secret = protect_secret(secret)
                     user.two_factor_enabled = True
                     session.add(user)
                     await session.commit()
@@ -1400,14 +1428,14 @@ async def run_setup_wizard():
         if existing_user:
             existing_user.password_hash = hashed
             existing_user.two_factor_enabled = state["2fa_enabled"]
-            existing_user.totp_secret = state["totp_secret"] if state["2fa_enabled"] else None
+            existing_user.totp_secret = protect_secret(state["totp_secret"]) if state["2fa_enabled"] else None
             session.add(existing_user)
         else:
             new_user = User(
                 email=state["email"],
                 password_hash=hashed,
                 two_factor_enabled=state["2fa_enabled"],
-                totp_secret=state["totp_secret"] if state["2fa_enabled"] else None
+                totp_secret=protect_secret(state["totp_secret"]) if state["2fa_enabled"] else None
             )
             session.add(new_user)
         await session.commit()

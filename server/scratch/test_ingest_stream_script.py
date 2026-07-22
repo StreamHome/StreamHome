@@ -8,8 +8,9 @@ import httpx
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
+from starlette.requests import Request
 
-from models import DownloadAddRequest, DownloadTask, Movie
+from models import DownloadAddRequest, DownloadTask, IntegrationCredential, Movie
 from routes import queue as queue_routes
 from scratch.test_ingest_stream import LocalMediaBridge, build_payload, normalize_introdb_markers
 
@@ -108,7 +109,24 @@ class IngestionSmokeTestScriptTests(unittest.TestCase):
                     patch.object(queue_routes, "engine", engine),
                     patch.object(queue_routes.tmdb_client, "fetch_movie_metadata", AsyncMock(return_value=metadata)),
                 ):
-                    response = await queue_routes.add_movie(request, token="test-token")
+                    http_request = Request(
+                        {
+                            "type": "http",
+                            "method": "POST",
+                            "path": "/api/add-movie",
+                            "headers": [],
+                            "client": ("127.0.0.1", 54000),
+                            "server": ("127.0.0.1", 8000),
+                            "scheme": "http",
+                            "query_string": b"",
+                        }
+                    )
+                    credential = IntegrationCredential(
+                        name="ingestion regression",
+                        token_hash="test-token-hash",
+                        scopes_str="ingest",
+                    )
+                    response = await queue_routes.add_movie(request, http_request, credential)
 
                 async with AsyncSession(engine) as session:
                     task = await session.get(DownloadTask, response["taskId"])

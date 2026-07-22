@@ -41,6 +41,7 @@ from services.recommendation import (
     reset_media_preferences,
     persist_profile_pool,
 )
+from services.request_security import allowed_origins, same_origin_request
 from config import settings
 from services.logger import logger
 from services.queue import queue_manager
@@ -99,6 +100,12 @@ async def lifespan(app: FastAPI):
                 settings.SETUP_COMPLETE = False
     except Exception as setup_state_err:
         logger.error(f"[Lifespan Startup] Setup-state validation failed: {setup_state_err}")
+
+    try:
+        if not await rclone_service.ensure_config_encrypted():
+            logger.error("[Lifespan Startup] Rclone configuration encryption could not be verified.")
+    except Exception as rclone_security_err:
+        logger.error(f"[Lifespan Startup] Rclone configuration hardening failed: {rclone_security_err}")
 
     try:
         async with AsyncSession(engine) as db:
@@ -333,13 +340,34 @@ class SetupGateMiddleware(BaseHTTPMiddleware):
             )
         return await call_next(request)
 
+
+class SecurityBoundaryMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        cookie_authenticated = bool(
+            request.cookies.get("streamhome_session")
+            or request.cookies.get("streamhome_setup")
+        )
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and cookie_authenticated and not same_origin_request(request):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": {"code": "cross_site_request_blocked", "message": "Cross-site authenticated requests are not allowed."}},
+            )
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+        response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+        return response
+
 app = FastAPI(title="StreamHome Media Server", version=settings.APP_VERSION, lifespan=lifespan)
 
 app.add_middleware(ActivityTrackingMiddleware)
 app.add_middleware(SetupGateMiddleware)
+app.add_middleware(SecurityBoundaryMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=sorted(allowed_origins()),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

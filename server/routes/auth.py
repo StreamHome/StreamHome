@@ -10,17 +10,24 @@ from typing import Optional
 import bcrypt
 import jwt
 import pyotp
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
-from sqlalchemy import delete, func, text
+from sqlalchemy import delete, func, text, update
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from db import get_session
-from models import AuthChallenge, AuthSession, RecoveryCode, SecurityEvent, User
+from models import AuthChallenge, AuthSession, IntegrationCredential, RecoveryCode, SecurityEvent, User
 from services.logger import logger
+from services.request_security import client_ip, request_is_secure
+from services.secret_crypto import is_protected_secret, protect_secret, reveal_secret
+from services.rate_limit import clear as clear_rate_limit
+from services.rate_limit import enforce as enforce_rate_limit
+from services.rate_limit import fail as fail_rate_limit
+from services.integration_auth import integration_token_hash
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 health_router = APIRouter(tags=["System"])
@@ -31,6 +38,7 @@ LOCKOUT_SECONDS = 15 * 60
 SESSION_ACTIVITY_WRITE_INTERVAL = 5 * 60
 AUDIT_RETENTION_SECONDS = 180 * 24 * 60 * 60
 RECOVERY_CODE_COUNT = 10
+AUTH_COOKIE = "streamhome_session"
 
 
 class LoginRequest(BaseModel):
@@ -68,6 +76,10 @@ class UpdatePasswordRequest(BaseModel):
 
 class SessionPolicyRequest(BaseModel):
     session_lifetime_days: int
+
+
+class IntegrationCredentialRequest(BaseModel):
+    name: str = "MediaSender"
 
 
 def now() -> float:
@@ -116,13 +128,6 @@ async def revoke_other_user_sessions(user: User, current: AuthSession, db: Async
         db.add(item)
         revoked += 1
     return revoked
-
-
-def client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    if forwarded:
-        return forwarded[:64]
-    return request.client.host[:64] if request.client else "Unknown"
 
 
 def device_label(request: Request) -> str:
@@ -198,7 +203,19 @@ async def create_challenge(user: User, purpose: str, db: AsyncSession) -> str:
     return raw
 
 
-async def issue_session(user: User, db: AsyncSession, request: Request) -> dict:
+def set_session_cookie(response: Response, token: str, request: Request, max_age: int) -> None:
+    response.set_cookie(
+        AUTH_COOKIE,
+        token,
+        max_age=max_age,
+        httponly=True,
+        secure=request_is_secure(request),
+        samesite="strict",
+        path="/",
+    )
+
+
+async def issue_session(user: User, db: AsyncSession, request: Request) -> JSONResponse:
     timestamp = now()
     session_id = str(uuid.uuid4())
     expires_at = timestamp + settings.JWT_EXPIRATION_MINUTES * 60
@@ -223,18 +240,20 @@ async def issue_session(user: User, db: AsyncSession, request: Request) -> dict:
     db.add(session)
     await add_event(db, request, "login_success", "success", user.id, session_id)
     await db.commit()
+    await clear_rate_limit(db, "login_ip", client_ip(request))
     access_token = encode_session_token(user, session)
-    return {
-        "accessToken": access_token,
-        "tokenType": "bearer",
+    payload = {
         "email": user.email,
         "session": {"id": session_id, "expiresAt": expires_at},
         "previousLogin": previous,
     }
+    response = JSONResponse(payload)
+    set_session_cookie(response, access_token, request, max(1, int(expires_at - now())))
+    return response
 
 
 async def resolve_auth(request: Request, credentials: Optional[HTTPAuthorizationCredentials], db: AsyncSession) -> tuple[User, AuthSession]:
-    token = credentials.credentials if credentials else request.query_params.get("token")
+    token = credentials.credentials if credentials else request.cookies.get(AUTH_COOKIE)
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     try:
@@ -275,6 +294,11 @@ async def get_current_session(request: Request, user: User = Depends(get_current
     return request.state.auth_session
 
 
+@router.get("/session")
+async def browser_session(user: User = Depends(get_current_user), session: AuthSession = Depends(get_current_session)):
+    return {"authenticated": True, "email": user.email, "expiresAt": session.expires_at}
+
+
 async def require_recent_reauth(session: AuthSession = Depends(get_current_session)) -> AuthSession:
     if not session.reauthenticated_at or now() - session.reauthenticated_at > settings.REAUTHENTICATION_MINUTES * 60:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"code": "reauthentication_required", "message": "Confirm your password and authenticator code to continue."})
@@ -293,15 +317,18 @@ async def health(db: AsyncSession = Depends(get_session)):
 @router.post("/login")
 async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(get_session)):
     requested_email = req.email.strip().lower()
+    request_ip = client_ip(request)
+    await enforce_rate_limit(db, "login_ip", request_ip)
     result = await db.execute(select(User).where(func.lower(User.email) == requested_email))
     user = result.scalars().first()
     if not user:
         await add_event(db, request, "login_failure", "failure")
-        await db.commit()
+        await fail_rate_limit(db, "login_ip", request_ip, limit=30, window_seconds=LOCKOUT_SECONDS)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "invalid_credentials", "message": "Invalid email or password."})
     check_lockout(user)
     if not bcrypt.checkpw(req.password.encode("utf-8"), user.password_hash.encode("utf-8")):
         await register_failure(user, db, request, "login_failure")
+        await fail_rate_limit(db, "login_ip", request_ip, limit=30, window_seconds=LOCKOUT_SECONDS)
         if user.lockout_until:
             raise lockout_exception(user)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "invalid_credentials", "message": "Invalid email or password."})
@@ -326,7 +353,10 @@ async def verify(req: VerifyRequest, request: Request, credentials: Optional[HTT
     valid = False
     used_recovery: Optional[RecoveryCode] = None
     if method == "totp" and user.two_factor_enabled and user.totp_secret:
-        valid = pyotp.TOTP(user.totp_secret).verify(req.code, valid_window=1)
+        valid = pyotp.TOTP(reveal_secret(user.totp_secret)).verify(req.code, valid_window=1)
+        if valid and not is_protected_secret(user.totp_secret):
+            user.totp_secret = protect_secret(user.totp_secret)
+            db.add(user)
     elif method == "recovery" and user.two_factor_enabled:
         code_result = await db.execute(select(RecoveryCode).where(RecoveryCode.user_id == user.id, RecoveryCode.code_hash == recovery_hash(req.code), RecoveryCode.used_at == None))
         used_recovery = code_result.scalars().first()
@@ -338,14 +368,28 @@ async def verify(req: VerifyRequest, request: Request, credentials: Optional[HTT
         if user.lockout_until:
             raise lockout_exception(user)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "invalid_factor", "message": "The verification code was not accepted."})
-    challenge.used_at = now()
+
+    consumed_at = now()
+    challenge_claim = await db.execute(
+        update(AuthChallenge)
+        .where(AuthChallenge.id == challenge.id, AuthChallenge.used_at == None, AuthChallenge.attempts < LOCKOUT_ATTEMPTS)
+        .values(used_at=consumed_at)
+    )
+    if challenge_claim.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "challenge_expired", "message": "This verification request expired. Sign in again."})
     if used_recovery:
-        used_recovery.used_at = now()
-        db.add(used_recovery)
+        recovery_claim = await db.execute(
+            update(RecoveryCode)
+            .where(RecoveryCode.id == used_recovery.id, RecoveryCode.used_at == None)
+            .values(used_at=consumed_at)
+        )
+        if recovery_claim.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "invalid_factor", "message": "The verification code was not accepted."})
         await add_event(db, request, "recovery_code_used", "success", user.id)
     user.failed_login_attempts = 0
     user.lockout_until = None
-    db.add(challenge)
     db.add(user)
     if challenge.purpose == "login":
         return await issue_session(user, db, request)
@@ -386,11 +430,12 @@ async def reauthentication_status(session: AuthSession = Depends(get_current_ses
 
 
 @router.post("/logout", status_code=204)
-async def logout(request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(get_current_session), db: AsyncSession = Depends(get_session)):
+async def logout(response: Response, request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(get_current_session), db: AsyncSession = Depends(get_session)):
     session.revoked_at = now()
     db.add(session)
     await add_event(db, request, "logout", "success", user.id, session.id)
     await db.commit()
+    response.delete_cookie(AUTH_COOKIE, path="/", samesite="strict")
 
 
 @router.get("/security/summary")
@@ -410,7 +455,7 @@ async def security_summary(user: User = Depends(get_current_user), session: Auth
 
 
 @router.put("/security/email")
-async def update_email(req: UpdateEmailRequest, request: Request, user: User = Depends(get_current_user), current: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+async def update_email(req: UpdateEmailRequest, response: Response, request: Request, user: User = Depends(get_current_user), current: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
     if not bcrypt.checkpw(req.current_password.encode("utf-8"), user.password_hash.encode("utf-8")):
         await register_failure(user, db, request, "email_change_failure")
         if user.lockout_until:
@@ -432,11 +477,11 @@ async def update_email(req: UpdateEmailRequest, request: Request, user: User = D
         "otherSessionsRevoked": revoked,
     })
     await db.commit()
+    access_token = encode_session_token(user, current)
+    set_session_cookie(response, access_token, request, max(1, int(current.expires_at - now())))
     return {
         "message": "Account email updated.",
         "email": user.email,
-        "accessToken": encode_session_token(user, current),
-        "tokenType": "bearer",
         "otherSessionsRevoked": revoked,
     }
 
@@ -492,6 +537,59 @@ async def update_session_policy(req: SessionPolicyRequest, request: Request, use
 async def list_sessions(user: User = Depends(get_current_user), current: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
     result = await db.execute(select(AuthSession).where(AuthSession.user_id == user.id, AuthSession.revoked_at == None, AuthSession.expires_at > now()).order_by(AuthSession.last_seen_at.desc()))
     return [{"id": item.id, "createdAt": item.created_at, "lastSeenAt": item.last_seen_at, "expiresAt": item.expires_at, "ipAddress": item.ip_address, "deviceLabel": item.device_label, "current": item.id == current.id} for item in result.scalars().all()]
+
+
+@router.get("/integrations")
+async def list_integrations(user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    del user, session
+    result = await db.execute(select(IntegrationCredential).order_by(IntegrationCredential.created_at.desc()))
+    return [{
+        "id": item.id,
+        "name": item.name,
+        "scopes": item.scopes,
+        "createdAt": item.created_at,
+        "expiresAt": item.expires_at,
+        "revokedAt": item.revoked_at,
+        "lastUsedAt": item.last_used_at,
+    } for item in result.scalars().all()]
+
+
+@router.post("/integrations/rotate")
+async def rotate_ingestion_credential(req: IntegrationCredentialRequest, request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    name = req.name.strip()[:80]
+    if not name:
+        raise HTTPException(status_code=422, detail={"code": "invalid_integration_name", "message": "Enter a name for the integration credential."})
+    timestamp = now()
+    existing = (await db.execute(select(IntegrationCredential).where(IntegrationCredential.revoked_at == None))).scalars().all()
+    for item in existing:
+        if "ingest" in item.scopes:
+            item.revoked_at = timestamp
+            db.add(item)
+    raw_token = secrets.token_urlsafe(36)
+    credential = IntegrationCredential(
+        id=str(uuid.uuid4()),
+        name=name,
+        token_hash=integration_token_hash(raw_token),
+        created_at=timestamp,
+    )
+    credential.scopes = ["ingest"]
+    db.add(credential)
+    await add_event(db, request, "integration_credential_rotated", "success", user.id, session.id, {"credentialId": credential.id, "name": name})
+    await db.commit()
+    return {"credential": {"id": credential.id, "name": credential.name, "scopes": credential.scopes, "createdAt": credential.created_at}, "token": raw_token}
+
+
+@router.delete("/integrations/{credential_id}")
+async def revoke_integration_credential(credential_id: str, request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    credential = await db.get(IntegrationCredential, credential_id)
+    if not credential:
+        raise HTTPException(status_code=404, detail="Integration credential not found")
+    if not credential.revoked_at:
+        credential.revoked_at = now()
+        db.add(credential)
+        await add_event(db, request, "integration_credential_revoked", "success", user.id, session.id, {"credentialId": credential.id, "name": credential.name})
+        await db.commit()
+    return {"revoked": True}
 
 
 @router.delete("/sessions/{session_id}")
@@ -559,7 +657,7 @@ async def setup_totp(user: User = Depends(get_current_user), session: AuthSessio
     if user.two_factor_enabled:
         raise HTTPException(status_code=400, detail="TOTP is already enabled")
     secret = pyotp.random_base32()
-    user.totp_secret = secret
+    user.totp_secret = protect_secret(secret)
     user.two_factor_enabled = False
     db.add(user)
     await db.commit()
@@ -568,7 +666,7 @@ async def setup_totp(user: User = Depends(get_current_user), session: AuthSessio
 
 @router.post("/2fa/verify-setup")
 async def verify_totp_setup(req: TOTPVerifySetupRequest, request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
-    if not user.totp_secret or not pyotp.TOTP(user.totp_secret).verify(req.code, valid_window=1):
+    if not user.totp_secret or not pyotp.TOTP(reveal_secret(user.totp_secret)).verify(req.code, valid_window=1):
         raise HTTPException(status_code=400, detail="Invalid verification code")
     user.two_factor_enabled = True
     user.failed_login_attempts = 0
@@ -584,7 +682,7 @@ async def verify_totp_setup(req: TOTPVerifySetupRequest, request: Request, user:
 async def disable_totp(req: TOTPDisableRequest, request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
     if not user.two_factor_enabled or not user.totp_secret:
         return {"message": "TOTP is already disabled."}
-    if not pyotp.TOTP(user.totp_secret).verify(req.code, valid_window=1):
+    if not pyotp.TOTP(reveal_secret(user.totp_secret)).verify(req.code, valid_window=1):
         raise HTTPException(status_code=400, detail="Invalid verification code")
     user.two_factor_enabled = False
     user.totp_secret = None

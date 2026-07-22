@@ -12,14 +12,26 @@ async function startServer() {
   const requestedPort = Number.parseInt(process.env.WEB_PORT ?? "3000", 10);
   const PORT = Number.isInteger(requestedPort) && requestedPort >= 1 && requestedPort <= 65535 ? requestedPort : 3000;
 
+  app.disable("x-powered-by");
+  app.use((_req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()");
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    next();
+  });
+
   // Proxy /api and /media requests to the live Python FastAPI backend
   app.use("/api", createProxyMiddleware({
     target: "http://127.0.0.1:8000/api",
-    changeOrigin: true
+    changeOrigin: true,
+    xfwd: true
   }));
   app.use("/media", createProxyMiddleware({
     target: "http://127.0.0.1:8000/media",
-    changeOrigin: true
+    changeOrigin: true,
+    xfwd: true
   }));
 
   // Setup basic middlewares
@@ -39,6 +51,13 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
+    app.use((_req, res, next) => {
+      res.setHeader("Content-Security-Policy", "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob: https://image.tmdb.org; media-src 'self' blob:; connect-src 'self'; font-src 'self' data: https://fonts.gstatic.com; worker-src 'self' blob:");
+      if (process.env.PUBLIC_URL?.startsWith("https://")) {
+        res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+      }
+      next();
+    });
     const distPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "dist");
     console.log(`[StreamHome Server] Serving web assets from ${distPath}`);
     const indexDocument = readFileSync(path.join(distPath, "index.html"), "utf8");

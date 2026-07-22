@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as auth from "../api/auth";
+import { useAuthStore } from "../stores/authStore";
 import { AccountSecurityPage } from "./AccountSecurityPage";
 
 vi.mock("../api/auth", () => ({
@@ -53,16 +54,17 @@ describe("AccountSecurityPage", () => {
     expect(screen.getByText("60 days")).toBeTruthy();
   });
 
-  it("updates the administrator email and replaces the current browser token", async () => {
+  it("updates the administrator email without exposing the replacement cookie token", async () => {
     vi.mocked(auth.getReauthenticationStatus).mockResolvedValue({ reauthenticated: true, remainingSeconds: 500 });
-    vi.mocked(auth.updateAccountEmail).mockResolvedValue({ message: "Account email updated.", email: "new@example.test", accessToken: "replacement-token", tokenType: "bearer", otherSessionsRevoked: 1 });
+    vi.mocked(auth.updateAccountEmail).mockResolvedValue({ message: "Account email updated.", email: "new@example.test", otherSessionsRevoked: 1 });
     renderPage();
     fireEvent.change(await screen.findByLabelText("Email address"), { target: { value: "new@example.test" } });
     fireEvent.change(screen.getAllByLabelText("Current password")[0], { target: { value: "secret" } });
     fireEvent.click(screen.getByRole("button", { name: "Update email" }));
     await waitFor(() => expect(auth.updateAccountEmail).toHaveBeenCalledWith("new@example.test", "secret"));
-    expect(localStorage.getItem("streamhome_token")).toBe("replacement-token");
-    expect(localStorage.getItem("streamhome_email")).toBe("new@example.test");
+    expect(localStorage.getItem("streamhome_token")).toBeNull();
+    expect(localStorage.getItem("streamhome_email")).toBeNull();
+    expect(useAuthStore.getState()).toMatchObject({ token: null, email: "new@example.test", isAuthenticated: true });
   });
 
   it("validates password confirmation and saves the new-session lifetime", async () => {

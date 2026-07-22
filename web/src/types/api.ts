@@ -4,8 +4,6 @@ export interface LoginRequest {
 }
 
 export interface LoginResponse {
-  accessToken: string;
-  tokenType: string;
   email: string;
   session?: { id: string; expiresAt: number };
   previousLogin?: LoginRecord | null;
@@ -31,7 +29,7 @@ export interface LoginRecord { at: number; ipAddress?: string | null; deviceLabe
 export interface HealthResponse { status: "ready"; version: string; serverTime: number }
 export interface ReauthResponse { reauthenticated: true; validForSeconds: number }
 export interface SecuritySummary { email: string; twoFactorEnabled: boolean; recoveryCodesRemaining: number; sessionLifetimeDays: number; previousLogin: LoginRecord | null }
-export interface AccountEmailUpdateResponse { message: string; email: string; accessToken: string; tokenType: string; otherSessionsRevoked: number }
+export interface AccountEmailUpdateResponse { message: string; email: string; otherSessionsRevoked: number }
 export interface AccountSecurityUpdateResponse { message: string; otherSessionsRevoked: number }
 export interface SessionPolicyUpdateResponse { message: string; sessionLifetimeDays: number; existingSessionsChanged: false }
 export interface AuthSessionInfo { id: string; createdAt: number; lastSeenAt: number; expiresAt: number; ipAddress: string; deviceLabel: string; current: boolean }

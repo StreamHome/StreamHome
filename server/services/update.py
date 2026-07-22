@@ -6,6 +6,7 @@ import time
 from services.logger import logger
 from services.backup import is_database_idle
 import services.state as state
+from config import settings
 
 def get_git_path() -> str:
     """Find local system git binary."""
@@ -103,7 +104,7 @@ async def check_for_github_updates() -> bool:
         logger.error(f"[Update Service] Git fetch origin failed: {stderr}")
         return False
         
-    active_branch = await get_active_branch()
+    active_branch = settings.UPDATE_BRANCH
     
     # Get local and remote commit hashes
     ret_local, local_hash, _ = await run_git_cmd(["rev-parse", "HEAD"])
@@ -112,6 +113,12 @@ async def check_for_github_updates() -> bool:
     if ret_local != 0 or ret_remote != 0:
         logger.error(f"[Update Service] Failed to resolve commit hashes for branch {active_branch}.")
         return False
+
+    if settings.UPDATE_REQUIRE_SIGNED_COMMITS:
+        verified, _, signature_error = await run_git_cmd(["verify-commit", remote_hash])
+        if verified != 0:
+            logger.error(f"[Update Service] Refusing unsigned or unverifiable update commit: {signature_error}")
+            return False
         
     if local_hash != remote_hash:
         # Check if local is behind remote (i.e. is ancestor)
@@ -159,22 +166,39 @@ async def pull_and_install_updates() -> bool:
         logger.error("[Update Service] Aborting update: Local uncommitted changes detected in working directory.")
         return False
         
-    active_branch = await get_active_branch()
+    active_branch = settings.UPDATE_BRANCH
     logger.info(f"[Update Service] Pulling remote updates for branch: {active_branch}...")
-    
-    # Track files changed in the pull by running a diff simulation or checking pull output
-    ret, stdout, stderr = await run_git_cmd(["pull", "origin", active_branch])
-    if ret != 0:
-        logger.error(f"[Update Service] Git pull failed: {stderr}")
+
+    ret_old, old_hash, old_error = await run_git_cmd(["rev-parse", "HEAD"])
+    if ret_old != 0:
+        logger.error(f"[Update Service] Cannot identify the current release: {old_error}")
         return False
-        
-    logger.info(f"[Update Service] Git pull complete: {stdout}")
+    ret_fetch, _, fetch_error = await run_git_cmd(["fetch", "origin", active_branch])
+    if ret_fetch != 0:
+        logger.error(f"[Update Service] Git fetch failed: {fetch_error}")
+        return False
+    ret_remote, remote_hash, remote_error = await run_git_cmd(["rev-parse", f"origin/{active_branch}"])
+    if ret_remote != 0:
+        logger.error(f"[Update Service] Cannot identify the target release: {remote_error}")
+        return False
+    if settings.UPDATE_REQUIRE_SIGNED_COMMITS:
+        verified, _, signature_error = await run_git_cmd(["verify-commit", remote_hash])
+        if verified != 0:
+            logger.error(f"[Update Service] Refusing unsigned or unverifiable update commit: {signature_error}")
+            return False
+    ret, stdout, stderr = await run_git_cmd(["merge", "--ff-only", f"origin/{active_branch}"])
+    if ret != 0:
+        logger.error(f"[Update Service] Fast-forward update failed: {stderr}")
+        return False
+
+    logger.info(f"[Update Service] Verified fast-forward update complete: {stdout}")
+    _, changed_files, _ = await run_git_cmd(["diff", "--name-only", old_hash, remote_hash])
     
     # 2. Install dependencies if config files changed
     workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     
     # Check requirements.txt
-    if "requirements.txt" in stdout:
+    if "server/requirements.txt" in changed_files:
         logger.info("[Update Service] requirements.txt modified. Installing python requirements...")
         pip_bin = sys.executable
         try:
@@ -190,7 +214,7 @@ async def pull_and_install_updates() -> bool:
             logger.error(f"[Update Service] Failed to install requirements: {e}")
             
     # Check web package.json
-    if "package.json" in stdout:
+    if "web/package.json" in changed_files or "web/package-lock.json" in changed_files:
         logger.info("[Update Service] web/package.json modified. Running npm install & rebuild...")
         web_dir = os.path.join(workspace_root, "web")
         import shutil
@@ -199,7 +223,7 @@ async def pull_and_install_updates() -> bool:
             try:
                 # Run npm install
                 process_install = await asyncio.create_subprocess_exec(
-                    npm_bin, "install",
+                    npm_bin, "ci",
                     cwd=web_dir,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE

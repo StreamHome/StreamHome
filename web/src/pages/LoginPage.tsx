@@ -101,10 +101,10 @@ export function LoginPage() {
     if (apiError?.retryAfterSeconds) setLockedSeconds(apiError.retryAfterSeconds);
   };
 
-  const completeLogin = (accessToken: string, accountEmail: string) => {
+  const completeLogin = (accountEmail: string) => {
     if (rememberEmail) localStorage.setItem(REMEMBERED_EMAIL_KEY, accountEmail);
     else localStorage.removeItem(REMEMBERED_EMAIL_KEY);
-    setToken(accessToken, accountEmail);
+    setToken("", accountEmail);
     setProgressLabel("Opening profiles");
     setStage("success");
     navigationTimer.current = window.setTimeout(() => navigate("/profiles", { state: location.state }), reduced ? 220 : 900);
@@ -120,7 +120,7 @@ export function LoginPage() {
       if ("requires2fa" in response) {
         setEmail(response.email); setChallengeToken(response.challengeToken); setStage("factor"); setFactorMethod("totp"); setCode(""); setProgressLabel("");
         window.setTimeout(() => codeInput.current?.focus(), reduced ? 0 : 220);
-      } else completeLogin(response.accessToken, response.email);
+      } else completeLogin(response.email);
     } catch (requestError) { setProgressLabel(""); showRequestError(requestError, "Login failed."); }
     finally { controller.stop(); setIsLoading(false); }
   };
@@ -133,7 +133,7 @@ export function LoginPage() {
     const controller = requestController();
     try {
       const response = await verify2FA({ challengeToken, method: factorMethod, code }, controller.signal);
-      completeLogin(response.accessToken, response.email);
+      completeLogin(response.email);
     } catch (requestError) { setProgressLabel(""); showRequestError(requestError, "The code was not accepted."); setCode(""); codeInput.current?.focus(); }
     finally { controller.stop(); setIsLoading(false); }
   };

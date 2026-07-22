@@ -18,8 +18,6 @@ import type {
 } from "../types/api";
 
 type RawAuthResponse = {
-  accessToken?: string;
-  tokenType?: string;
   email: string;
   requires_2fa?: boolean;
   requires2fa?: boolean;
@@ -41,10 +39,7 @@ function normalizeAuthResponse(raw: RawAuthResponse): AuthResponse {
       message: raw.message ?? "TOTP code required.",
     };
   }
-  if (!raw.accessToken) throw new Error("Authentication response did not include an access token.");
   return {
-    accessToken: raw.accessToken,
-    tokenType: raw.tokenType ?? "bearer",
     email: raw.email,
     session: raw.session,
     previousLogin: raw.previousLogin,

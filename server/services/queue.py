@@ -19,6 +19,7 @@ from services.logger import logger
 from services.media_probe import probe_media_stream, notify_video_sender, probe_completed_media
 from services.ingestion_errors import IngestionFailure, IngestionTaskError, prune_task_diagnostics, write_task_diagnostics
 from services.rclone import rclone_service
+from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
 from services.media_source import MediaSourceError, catalog_path_from_storage, resolve_media_source
 from services.vibe_analysis import VIBE_ANALYSIS_VERSION, compute_trope_vectors, vibe_analysis_manager
 
@@ -195,6 +196,17 @@ class DownloadQueueManager:
                 subtitles_list = task.subtitles
                 quality = task.quality
                 language = task.language
+                private_source_allowed = task.private_source_allowed
+
+            try:
+                headers = validate_headers(headers)
+                validation_client = "127.0.0.1" if private_source_allowed else ""
+                await validate_url(video_url, client_address=validation_client)
+                await validate_url(audio_url, client_address=validation_client)
+                for subtitle in subtitles_list:
+                    await validate_url(subtitle.get("url"), client_address=validation_client)
+            except UnsafeIngestionSource as exc:
+                raise IngestionTaskError(IngestionFailure("UNSAFE_SOURCE", str(exc), False)) from exc
 
             # 1. Disk Space Check
             storage_root = settings.TEMP_DIR if settings.STORAGE_ENGINE == "CLOUD" else settings.MEDIA_DIR

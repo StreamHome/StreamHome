@@ -25,7 +25,7 @@ describe("LoginPage", () => {
   });
 
   it("submits local credentials, supports password visibility, and completes login", async () => {
-    vi.mocked(login).mockResolvedValue({ accessToken: "token", tokenType: "bearer", email: "admin@example.test" });
+    vi.mocked(login).mockResolvedValue({ email: "admin@example.test" });
     renderLogin();
 
     const password = screen.getByLabelText("Password");
@@ -38,12 +38,13 @@ describe("LoginPage", () => {
 
     await waitFor(() => expect(login).toHaveBeenCalledWith({ email: "admin@example.test", password: "secret" }, expect.any(AbortSignal)));
     expect(await screen.findByText("Profile gallery", {}, { timeout: 1500 })).toBeTruthy();
-    expect(useAuthStore.getState().token).toBe("token");
+    expect(useAuthStore.getState()).toMatchObject({ token: null, email: "admin@example.test", isAuthenticated: true });
+    expect(localStorage.getItem("streamhome_token")).toBeNull();
   });
 
   it("moves into TOTP verification and distributes a pasted six-digit code", async () => {
     vi.mocked(login).mockResolvedValue({ requires2fa: true, email: "admin@example.test", challengeToken: "challenge", expiresInSeconds: 300, message: "TOTP required" });
-    vi.mocked(verify2FA).mockResolvedValue({ accessToken: "verified", tokenType: "bearer", email: "admin@example.test" });
+    vi.mocked(verify2FA).mockResolvedValue({ email: "admin@example.test" });
     renderLogin();
 
     fireEvent.change(screen.getByLabelText("Email address"), { target: { value: "admin@example.test" } });
@@ -72,7 +73,7 @@ describe("LoginPage", () => {
   });
 
   it("remembers only an opted-in email and reports Caps Lock", async () => {
-    vi.mocked(login).mockResolvedValue({ accessToken: "token", tokenType: "bearer", email: "admin@example.test" });
+    vi.mocked(login).mockResolvedValue({ email: "admin@example.test" });
     renderLogin();
     fireEvent.change(screen.getByLabelText("Email address"), { target: { value: "admin@example.test" } });
     const password = screen.getByLabelText("Password");

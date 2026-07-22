@@ -1,9 +1,10 @@
 import os
 from typing import List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, status, Security
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from config import settings
+from models import AuthSession
+from routes.auth import require_recent_reauth
 from services.logger import logger
 from services.backup import (
     create_backup,
@@ -16,19 +17,10 @@ from services.backup import (
 
 router = APIRouter()
 
-security = HTTPBearer()
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
-    if credentials.credentials != settings.API_BEARER_TOKEN:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API Bearer token."
-        )
-    return credentials.credentials
-
 @router.post("/run", status_code=status.HTTP_201_CREATED)
-async def run_backup_endpoint(token: str = Depends(verify_token)):
+async def run_backup_endpoint(session: AuthSession = Depends(require_recent_reauth)):
     """Triggers a manual database backup and syncs it to the cloud if configured."""
+    del session
     try:
         logger.info("[API] Manual backup triggered via API.")
         backup_path = await create_backup()
@@ -52,8 +44,9 @@ async def run_backup_endpoint(token: str = Depends(verify_token)):
         )
 
 @router.get("/list", response_model=List[Dict[str, Any]])
-async def list_backups_endpoint(token: str = Depends(verify_token)):
+async def list_backups_endpoint(session: AuthSession = Depends(require_recent_reauth)):
     """Retrieve metadata of all local backup files."""
+    del session
     try:
         return get_local_backups()
     except Exception as e:
@@ -64,8 +57,9 @@ async def list_backups_endpoint(token: str = Depends(verify_token)):
         )
 
 @router.post("/restore/{filename}")
-async def restore_backup_endpoint(filename: str, token: str = Depends(verify_token)):
+async def restore_backup_endpoint(filename: str, session: AuthSession = Depends(require_recent_reauth)):
     """Restore the database from the specified backup file."""
+    del session
     try:
         success = await restore_backup(filename)
         if success:
@@ -88,20 +82,18 @@ async def restore_backup_endpoint(filename: str, token: str = Depends(verify_tok
         )
 
 @router.delete("/{filename}")
-async def delete_backup_endpoint(filename: str, token: str = Depends(verify_token)):
+async def delete_backup_endpoint(filename: str, session: AuthSession = Depends(require_recent_reauth)):
     """Delete a specific local backup file."""
+    del session
     try:
-        backup_dir = get_backup_dir()
-        file_path = os.path.join(backup_dir, filename)
-        
-        # Verify the file exists and is located inside the backup directory to prevent directory traversal
-        if not os.path.exists(file_path) or not os.path.abspath(file_path).startswith(os.path.abspath(backup_dir)):
+        from services.backup import resolve_backup_file
+        file_path = resolve_backup_file(filename, must_exist=True)
+        if not file_path:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Backup file '{filename}' not found."
             )
-            
-        os.remove(file_path)
+        file_path.unlink()
         logger.info(f"[API] Backup file deleted: {filename}")
         return {
             "status": "success",

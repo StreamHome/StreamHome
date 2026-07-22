@@ -13,6 +13,7 @@ from typing import AsyncIterator, Optional
 
 from config import settings
 from services.logger import logger
+from services.secret_crypto import protect_secret, reveal_secret
 
 
 REMOTE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
@@ -48,12 +49,16 @@ class RcloneService:
         candidate = self.root / "bin" / ("rclone.exe" if os.name == "nt" else "rclone")
         return str(candidate) if candidate.exists() else None
 
-    def command(self, *arguments: str, config_path: Optional[Path] = None) -> list[str]:
+    def command(self, *arguments: str, config_path: Optional[Path] = None, password_command: bool = False) -> list[str]:
         executable = self.executable()
         if not executable:
             raise FileNotFoundError("rclone is not installed")
         selected_config = Path(config_path or self.config_path).resolve()
-        return [executable, "--config", str(selected_config), *map(str, arguments)]
+        command = [executable, "--config", str(selected_config)]
+        if password_command:
+            reader = "cmd /d /c echo %RCLONE_CONFIG_PASS%" if os.name == "nt" else "sh -c 'printf %s \"$RCLONE_CONFIG_PASS\"'"
+            command.extend(["--password-command", reader])
+        return [*command, *map(str, arguments)]
 
     @staticmethod
     def classify(returncode: int, output: str) -> Optional[str]:
@@ -81,9 +86,10 @@ class RcloneService:
         timeout: float = 60,
         input_data: Optional[bytes] = None,
         output_limit: int = 8000,
+        password_command: bool = False,
     ) -> RcloneResult:
         try:
-            command = self.command(*arguments, config_path=config_path)
+            command = self.command(*arguments, config_path=config_path, password_command=password_command)
         except FileNotFoundError:
             return RcloneResult(127, error_code="rclone_unavailable")
         selected_config = Path(config_path or self.config_path)
@@ -169,12 +175,24 @@ class RcloneService:
         if os.name != "nt":
             os.chmod(directory, 0o700)
         target = directory / "oauth.json"
-        self._atomic_write(target, json.dumps(payload, separators=(",", ":")), 0o600)
+        protected = dict(payload)
+        for key in ("client_secret", "pkce_verifier", "token"):
+            if key in protected:
+                protected[key] = protect_secret(json.dumps(protected[key], separators=(",", ":")) if isinstance(protected[key], (dict, list)) else str(protected[key]))
+        self._atomic_write(target, json.dumps(protected, separators=(",", ":")), 0o600)
         return target
 
     def read_job_secret(self, job_id: str) -> dict:
         target = self.job_dir(job_id) / "oauth.json"
-        return json.loads(target.read_text(encoding="utf-8"))
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        for key in ("client_secret", "pkce_verifier", "token"):
+            if key in payload:
+                revealed = reveal_secret(payload[key])
+                if key == "token":
+                    payload[key] = json.loads(revealed)
+                else:
+                    payload[key] = revealed
+        return payload
 
     def write_drive_config(self, job_id: str, remote_name: str, payload: dict) -> Path:
         if not REMOTE_NAME_RE.fullmatch(remote_name):
@@ -210,20 +228,41 @@ class RcloneService:
             source_parser.read(source, encoding="utf-8")
             if not source_parser.has_section(remote_name):
                 raise ValueError("temporary Drive remote is missing")
-            target_parser = configparser.RawConfigParser()
-            if self.config_path.exists():
-                target_parser.read(self.config_path, encoding="utf-8")
-            if target_parser.has_section(remote_name):
-                target_parser.remove_section(remote_name)
-            target_parser.add_section(remote_name)
-            for key, value in source_parser.items(remote_name):
-                target_parser.set(remote_name, key, value)
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.config_dir, delete=False) as handle:
-                target_parser.write(handle)
+                source_parser.write(handle)
                 temporary = Path(handle.name)
             if os.name != "nt":
                 os.chmod(temporary, 0o600)
             os.replace(temporary, self.config_path)
+            result = await self.run(
+                "config",
+                "encryption",
+                "set",
+                config_path=self.config_path,
+                timeout=30,
+                password_command=True,
+            )
+            if not result.ok:
+                raise RuntimeError("The application-owned rclone configuration could not be encrypted.")
+
+    async def ensure_config_encrypted(self) -> bool:
+        if not self.config_path.is_file():
+            return True
+        try:
+            header = self.config_path.read_text(encoding="utf-8", errors="ignore")[:128]
+        except OSError:
+            return False
+        if "RCLONE_ENCRYPT_V" in header:
+            return True
+        result = await self.run(
+            "config",
+            "encryption",
+            "set",
+            config_path=self.config_path,
+            timeout=30,
+            password_command=True,
+        )
+        return result.ok
 
     def cleanup_job(self, job_id: str) -> None:
         directory = self.job_dir(job_id)

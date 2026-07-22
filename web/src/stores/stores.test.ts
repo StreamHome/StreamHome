@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Profile } from "../types/api";
 import { useAuthStore } from "./authStore";
 import { useProfileStore } from "./profileStore";
@@ -14,12 +14,17 @@ beforeEach(() => {
   document.documentElement.removeAttribute("data-theme");
 });
 
+afterEach(() => vi.unstubAllGlobals());
+
 describe("persisted client state", () => {
-  it("hydrates token and email before protected routing", () => {
+  it("hydrates the HttpOnly-cookie session and removes legacy browser tokens", async () => {
     localStorage.setItem("streamhome_token", "token");
     localStorage.setItem("streamhome_email", "admin@example.test");
-    useAuthStore.getState().hydrate();
-    expect(useAuthStore.getState()).toMatchObject({ token: "token", email: "admin@example.test", isAuthenticated: true, isHydrated: true });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ authenticated: true, email: "admin@example.test" }), { status: 200 })));
+    await useAuthStore.getState().hydrate();
+    expect(useAuthStore.getState()).toMatchObject({ token: null, email: "admin@example.test", isAuthenticated: true, isHydrated: true });
+    expect(localStorage.getItem("streamhome_token")).toBeNull();
+    expect(localStorage.getItem("streamhome_email")).toBeNull();
   });
 
   it("restores the selected profile and maps legacy values to Ember without changing the document root", () => {

@@ -11,7 +11,7 @@ class MockEventSource {
   onmessage: ((event: MessageEvent<string>) => void) | null = null;
   close = vi.fn();
 
-  constructor(readonly url: string) {
+  constructor(readonly url: string, readonly options?: EventSourceInit) {
     MockEventSource.instances.push(this);
   }
 
@@ -26,7 +26,7 @@ describe("download event stream", () => {
   beforeEach(() => {
     MockEventSource.instances = [];
     vi.stubGlobal("EventSource", MockEventSource);
-    useAuthStore.setState({ token: "token with spaces", isAuthenticated: true, isHydrated: true });
+    useAuthStore.setState({ token: null, isAuthenticated: true, isHydrated: true });
   });
 
   afterEach(() => {
@@ -45,7 +45,8 @@ describe("download event stream", () => {
   it("keeps the latest queue while EventSource reconnects and cleans up on unmount", () => {
     const { result, unmount } = renderHook(() => useDownloadStream());
     const source = MockEventSource.instances[0];
-    expect(source.url).toBe("/api/downloads/stream?token=token%20with%20spaces");
+    expect(source.url).toBe("/api/downloads/stream");
+    expect(source.options?.withCredentials).toBe(true);
     expect(result.current.connectionState).toBe("connecting");
 
     act(() => source.open());
