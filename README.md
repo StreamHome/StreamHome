@@ -1,75 +1,152 @@
 <div align="center">
   <img src="https://github.com/user-attachments/assets/4e188ccb-a419-444c-951c-391fc17c2a38" alt="StreamHome Media Server" width="100%">
 
-<div align="center">
   <br>
-  <img src="https://readme-typing-svg.demolab.com?font=Oswald&weight=700&size=50&color=E25822&center=true&vCenter=true&width=500&height=80&lines=StreamHome&repeat=false" alt="StreamHome">
-</div>
 
-<p><b>A modern, self-hosted VOD (Video on Demand) platform designed for seamless performance, ultimate personalization, and zero maintenance.</b></p>
+  <img src="https://readme-typing-svg.demolab.com?font=Oswald&weight=700&size=50&color=E25822&center=true&vCenter=true&width=500&height=80&lines=StreamHome&repeat=false" alt="StreamHome">
+
+  <p>
+    <b>A modern, self-hosted VOD platform built for seamless streaming, deep personalization, and minimal maintenance.</b>
+  </p>
 </div>
 
 ---
 
-StreamHome bridges the gap between premium VOD streaming experiences and the freedom of self-hosting. Built with a high-performance ASGI Python backend and a cutting-edge React 19 frontend, it brings your personal media library to life with intelligent TMDB cataloging, adaptive HLS playback, and a purely agnostic ingestion API. All without holding your media hostage—your files stay strictly in your control, backed up locally and synced natively with Google Drive.
+StreamHome bridges the gap between premium VOD streaming experiences and the freedom of self-hosting.
+
+Built with a high-performance ASGI Python backend and a modern React 19 frontend, StreamHome brings personal media libraries to life through intelligent TMDB cataloging, adaptive HLS playback, personalized recommendations, cloud storage integration, and a source-agnostic ingestion API.
+
+Your media remains under your control. StreamHome can store media locally, synchronize it with Google Drive, preserve portable metadata alongside media files, and automatically maintain local and cloud database backups.
+
+> [!IMPORTANT]
+> StreamHome is currently under active development and has not yet reached its first public alpha release. Features, APIs, installation steps, and system requirements may change before release.
+
 ## ✨ Core Features
 
-1. ☁️ **Google Drive & Rclone Integration:** Built-in cloud storage integration powered by Rclone and Google OAuth, working seamlessly without disrupting your local media folder structure.
-2. 🎨 **Multi-Theme UI Matrix:** A premium, dynamic React 19 web interface offering instant switching between high-end themes like Ember, Aurora, Cinema, and Gemini.
-3. 🧠 **Hybrid Recommendation Engine:** An advanced recommendation system that meticulously tracks and analyzes *every single step and interaction* across the platform (searches, clicks, watch times, and explicit preferences) to deliver highly personalized feeds.
-4. 🎬 **Automated TMDB Cataloging:** Intelligently fetches media metadata, posters, cast details, and plot summaries from TMDB, automatically saving them directly to your local directories.
-5. 🌊 **Adaptive HLS Streaming:** A robust fMP4 playback pipeline that segments media on the fly and dynamically adjusts resolution (from 1080p down to 240p) based on network speed for a buffer-free experience.
-6. 🔌 **Agnostic Ingestion API:** A powerful, extensible `/api/add-movie` endpoint that instantly accepts independent raw video/audio URLs from external sources (which can be easily captured and sent via our official [Chrome](https://github.com/WaqSea/StreamHome-Extension-Chrome) and [Firefox](https://github.com/WaqSea/StreamHome-Extension-Firefox) extensions) and queues them for background processing via FFmpeg.
-7. 🚀 **Sleek Web Setup Wizard & Security:** A complete, user-friendly `/setup` web wizard that eliminates the need for Linux terminal configurations, coupled with robust TOTP/2FA-backed administrator security.
-8. 🗜️ **Automated HEVC Optimization:** A smart background transcoding system that converts media to HEVC (H.265) to save server storage space. It strictly runs only when the system is idle and automatically pauses the moment a user connects to the web interface, ensuring zero performance impact.
-9. 🛡️ **Failsafe Recovery Architecture:** Guarantees zero data loss even in the event of total database corruption. Built around localized `metadata.json` records kept alongside media files, and an automated backup of the `database.db` file to both the local disk and Google Drive.
+1. ☁️ **Google Drive and Rclone Integration**
+   Built-in Google Drive storage powered by Rclone and native Google OAuth. StreamHome manages its own Rclone configuration and integrates cloud storage without altering the established local media directory structure.
 
-## ⚙️ How it Works
+2. 🎨 **Multi-Theme UI Matrix**
+   A premium React 19 interface with four distinct presentation systems: Ember, Aurora, Cinema, and Gemini. Each theme provides its own navigation, cards, details pages, visual language, and player styling.
 
-StreamHome is designed to deliver a zero-wait streaming experience while handling complex server-side processing completely in the background. 
+3. 🧠 **Personalized Recommendation Engine**
+   A profile-scoped recommendation system that uses viewing activity, watch time, explicit preferences, watchlist changes, selected search results, repeated viewing, exposure fatigue, availability, and catalog traits to generate personalized feeds and recommendation reasons.
 
-1. 📥 **Capture & Send:** Find a video/audio source anywhere on the web. Using our official [Chrome](https://github.com/WaqSea/StreamHome-Extension-Chrome) or [Firefox](https://github.com/WaqSea/StreamHome-Extension-Firefox) extensions, easily capture the raw URL and send it directly to your StreamHome server with a single click.
-2. ⚡ **Instant Playback (Zero Delay):** No need to wait for downloads! StreamHome instantly starts playing the media directly from the incoming source URL. You start watching immediately with absolutely zero delay.
-3. 🔀 **Seamless Handoff:** While you are enjoying the stream, the ASGI backend silently downloads the file in the background. The exact moment the download completes, the player flawlessly transitions playback to the local file—without a single interruption or buffering screen. You won't even notice the switch.
-4. ☁️ **Metadata & Cloud Sync:** Once the file is local, the system fetches rich TMDB metadata, organizes your catalog, and natively syncs the final media to your Google Drive via Rclone (with optional idle-time HEVC compression to save space).
+4. 🎬 **Automated TMDB Cataloging**
+   Automatically retrieves localized movie, series, and episode metadata, including posters, backdrops, cast information, production details, and plot summaries. Artwork and recovery metadata are stored alongside the relevant media directories.
+
+5. 🌊 **Adaptive HLS Streaming**
+   A secure fMP4 HLS playback pipeline that prepares media in four-second segments and provides a source-resolution-aware quality ladder from 1080p down to 240p when applicable.
+
+6. 🔌 **Source-Agnostic Ingestion API**
+   The extensible `/api/add-movie` endpoint accepts authorized HTTP media sources, including separate video and audio URLs, custom request headers, subtitles, language information, quality labels, and playback markers.
+
+   Media can be submitted through any compatible MediaSender client, including the official:
+
+   * [StreamHome Extension for Chrome](https://github.com/StreamHome/StreamHome-Extension-Chrome)
+   * [StreamHome Extension for Firefox](https://github.com/StreamHome/StreamHome-Extension-Firefox)
+
+7. 🚀 **Guided Web Setup and Security**
+   A protected `/setup` wizard handles administrator creation, TMDB configuration, ingestion-token generation, optional TOTP authentication, recovery codes, storage selection, and Google Drive connection without requiring manual Rclone configuration.
+
+8. 🗜️ **Automated HEVC Optimization**
+   An optional background optimization system can convert supported media to HEVC/H.265 to reduce storage usage. Optimization is designed to run during idle periods and pause when active users require server resources.
+
+9. 🛡️ **Failsafe Recovery Architecture**
+   Localized metadata records stored alongside media files allow StreamHome to rebuild catalog records if the primary database is lost or corrupted. The database can also be backed up automatically to local storage and Google Drive.
+
+10. 🔐 **Authenticated Playback Sessions**
+    Playback uses database-backed runs and renewable, short-lived tickets scoped to the authenticated session, profile, media item, playback run, and source fingerprint.
+
+11. 📱 **Installable Progressive Web App**
+    StreamHome can be installed as a PWA on supported desktop and mobile browsers, providing an application-like experience while remaining automatically synchronized with the server-delivered web client.
+
+## ⚙️ How It Works
+
+StreamHome handles complex ingestion, media processing, cataloging, cloud synchronization, and playback preparation in the background.
+
+1. 📥 **Capture and Send**
+   Select a video or audio source that you are authorized to access and use. Send it to StreamHome through an official browser extension or another compatible MediaSender client.
+
+2. ⚡ **Immediate Source Playback**
+   When supported, StreamHome can begin playback from the submitted source while the server processes and downloads the media in the background.
+
+3. 🔀 **Seamless Source Handoff**
+   After the local media becomes available, StreamHome can transition playback from the incoming source to the locally managed version while preserving the current playback position.
+
+4. 🎬 **Processing and Cataloging**
+   FFmpeg and FFprobe inspect the source, process compatible video, audio, and subtitle tracks, and create the final media structure.
+
+5. ☁️ **Metadata and Cloud Synchronization**
+   StreamHome retrieves TMDB metadata, downloads artwork, updates recovery records, and optionally uploads the finalized media to Google Drive through its application-managed Rclone configuration.
+
+6. 🍿 **Personalized Playback Experience**
+   The completed title becomes available through the selected StreamHome theme, with profile-specific progress, watchlist state, recommendations, subtitles, audio tracks, quality controls, and playback markers.
 
 ## 🖥️ Server Recommendations
 
-StreamHome is designed to be highly optimized, but running real-time FFmpeg processing and background HEVC compression performs best with the following specifications:
+StreamHome is designed to operate efficiently, but real-time FFmpeg processing, adaptive playback preparation, cloud transfers, and optional HEVC optimization benefit from additional resources.
 
-| Resource | Minimum Requirements | Recommended (Ideal Experience) |
-| :--- | :--- | :--- |
-| **OS** | Ubuntu 22.04 / Windows 10 | Ubuntu 24.04 / Debian 12 |
-| **CPU** | 2 vCores | 4+ vCores *(Crucial for fast HEVC encoding)* |
-| **RAM** | 2 GB | 4+ GB |
-| **Network** | 20 Mbps *(Lower is no problem)* | 1 Gbps *(For smooth fMP4 HLS & Rclone sync)* |
-| **Storage** | 20 GB *(For Database & Meta)* | 50+ GB SSD *(Media hosted on Google Drive)* |
+| Resource             | Minimum                                                   | Recommended                                                  |
+| :------------------- | :-------------------------------------------------------- | :----------------------------------------------------------- |
+| **Operating System** | Ubuntu 22.04 or Windows 10                                | Ubuntu 24.04 or Debian 12                                    |
+| **CPU**              | 2 vCPUs                                                   | 4+ vCPUs                                                     |
+| **RAM**              | 2 GB                                                      | 4+ GB                                                        |
+| **Network**          | 20 Mbps                                                   | 1 Gbps for high-bitrate streaming and cloud synchronization  |
+| **Local Storage**    | 20 GB for application data, metadata, and temporary files | 50+ GB SSD, especially when using Google Drive media storage |
+
+Actual requirements depend on catalog size, source quality, concurrent playback sessions, transcoding activity, and cloud configuration.
 
 ## 📦 Quick Installation
 
-StreamHome comes with one-click installation scripts that handle all dependencies (Python, FFmpeg, Node, Rclone) automatically. 
+StreamHome will provide installation scripts for supported platforms. These scripts are intended to install and configure the required dependencies, including Python, FFmpeg, Node.js, and Rclone.
 
-**For Linux (Ubuntu/Debian):**
+### Linux — Ubuntu and Debian
+
 ```bash
-not available
+# Installation command will be added before the public alpha release.
 ```
 
-**For Windows (PowerShell run as Administrator):**
+### Windows — PowerShell as Administrator
+
 ```powershell
-not available
+# Installation command will be added before the public alpha release.
 ```
 
-## 📚 Documentation & Support
+## 📚 Documentation and Support
 
-Facing any issues, need to configure a reverse proxy, or want to dive deeper into the API architecture? 
-Please check out our comprehensive documentation folder. Almost every problem and configuration step is solved there!
+Detailed documentation for installation, reverse proxies, MediaSender integration, cloud storage, security, recovery, troubleshooting, and API architecture will be published alongside the public alpha release.
 
-👉 **[not available](docs/README.md)**
+👉 **Documentation is not yet available.**
+
+## ⚠️ Responsible Use
+
+Users are solely responsible for ensuring that they have the necessary rights and permissions for every media file, stream, URL, subtitle, and external source they ingest, process, store, or stream with StreamHome.
+
+StreamHome:
+
+* does not provide or distribute media;
+* does not host a centralized content library;
+* does not endorse third-party content sources;
+* does not grant users rights to third-party content;
+* does not support unauthorized access to protected services;
+* does not support DRM circumvention or the bypassing of technological access controls.
+
+StreamHome is a general-purpose, self-hosted media processing, storage, cataloging, recommendation, and playback platform. It can be used with personal media, public-domain works, openly licensed content, and any other media the user is legally authorized to access and use.
+
+## 📄 License
+
+StreamHome is free and open-source software licensed under the **GNU General Public License v3.0**.
+
+You may use, study, modify, and redistribute StreamHome under the terms of the GPLv3. Modified versions distributed to others must remain licensed under the GPLv3 and include the corresponding source code as required by the license.
+
+See the [`LICENSE`](LICENSE) file for the complete license text.
 
 ## 📫 Contact
 
-Created and maintained by **waqsea**. 
+Created and maintained by **waqsea**.
 
-If you have any questions, business inquiries, or just want to suggest a feature:
-* **Email:** [contact@waqsea.com](mailto:streamhome@waqsea.com)
-* **GitHub:** [@waqsea](https://github.com/StreamHome)
+For questions, business inquiries, bug reports, or feature suggestions:
+
+* **Email:** [StreamHome@waqsea.com](mailto:StreamHome@waqsea.com)
+* **GitHub:** [@waqsea](https://github.com/WaqSea)
