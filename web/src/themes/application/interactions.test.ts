@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 const interactions = readFileSync(resolve("src/themes/application/interactions.css"), "utf8");
 const application = readFileSync(resolve("src/themes/application/application.css"), "utf8");
 const ember = readFileSync(resolve("src/themes/ember/ember-application.css"), "utf8");
+const index = readFileSync(resolve("src/index.css"), "utf8");
 
 describe("semantic hover interaction system", () => {
   it("removes the old blanket scale and competing card hover rules", () => {
@@ -73,6 +74,15 @@ describe("semantic hover interaction system", () => {
     expect(application).toContain("background: var(--billboard-progress-fill");
     expect(ember).toContain("background: var(--billboard-progress-fill");
     expect(interactions).toContain("background: var(--billboard-progress-fill");
+  });
+
+  it("keeps resume controls at the artwork bottom-right without vertical badge strips", () => {
+    expect(index).toContain("bottom: calc(74px + 0.75rem)");
+    expect(index).toContain(".ember-media-card__resume { bottom: calc(92px + 0.75rem); }");
+    expect(index).toContain('.catalog-card-shell[data-card-theme="poster"] .catalog-card__resume { bottom: .75rem;');
+    expect(index).not.toContain("box-shadow: inset 2px 0 #ff5f1f");
+    expect(ember).not.toContain("box-shadow: inset 2px 0 #ff5f1f");
+    expect(application).not.toContain("box-shadow: inset 2px 0 #e50914");
   });
 
   it("covers every major interactive surface", () => {

@@ -314,8 +314,9 @@
 .ember-media-card__resume {
   position: absolute;
   z-index: 8;
-  top: 0.75rem;
+  top: auto;
   right: 0.75rem;
+  bottom: calc(74px + 0.75rem);
   display: grid;
   width: 2.65rem;
   height: 2.65rem;
@@ -361,12 +362,13 @@
   border-color: rgba(255,95,31,.62);
   background: rgba(24,10,6,.88);
   color: #ff9b76;
-  box-shadow: inset 2px 0 #ff5f1f, 0 0 18px rgba(255,95,31,.18);
+  box-shadow: 0 0 18px rgba(255,95,31,.18),0 10px 26px rgba(0,0,0,.42);
 }
 
-.catalog-card-shell[data-card-theme="glass"] .catalog-card__resume { border-color: rgba(255,255,255,.3); background: rgba(21,19,29,.66); box-shadow: 0 12px 30px rgba(0,0,0,.32),0 0 24px rgba(216,199,255,.1),inset 0 1px rgba(255,255,255,.16); }
-.catalog-card-shell[data-card-theme="poster"] .catalog-card__resume { border-radius: 4px; border-color: rgba(240,59,69,.6); background: rgba(12,12,12,.86); color: #fff; box-shadow: inset 0 -2px #f03b45,0 10px 26px rgba(0,0,0,.55); }
-.catalog-card-shell[data-card-theme="module"] .catalog-card__resume { border-radius: .7rem; border-color: rgba(138,180,248,.42); background: rgba(16,22,34,.82); color: #c8d9ff; box-shadow: 0 10px 28px rgba(0,0,0,.38),inset 0 1px rgba(255,255,255,.08); }
+.ember-media-card__resume { bottom: calc(92px + 0.75rem); }
+.catalog-card-shell[data-card-theme="glass"] .catalog-card__resume { bottom: calc(82px + 0.75rem); border-color: rgba(255,255,255,.3); background: rgba(21,19,29,.66); box-shadow: 0 12px 30px rgba(0,0,0,.32),0 0 24px rgba(216,199,255,.1),inset 0 1px rgba(255,255,255,.16); }
+.catalog-card-shell[data-card-theme="poster"] .catalog-card__resume { bottom: .75rem; border-radius: 4px; border-color: rgba(240,59,69,.6); background: rgba(12,12,12,.86); color: #fff; box-shadow: 0 10px 26px rgba(0,0,0,.55),0 0 18px rgba(240,59,69,.12); }
+.catalog-card-shell[data-card-theme="module"] .catalog-card__resume { bottom: calc(83px + 0.75rem); border-radius: .7rem; border-color: rgba(138,180,248,.42); background: rgba(16,22,34,.82); color: #c8d9ff; box-shadow: 0 10px 28px rgba(0,0,0,.38),inset 0 1px rgba(255,255,255,.08); }
 
 .catalog-card__resume:hover,
 .ember-media-card__resume:hover,
