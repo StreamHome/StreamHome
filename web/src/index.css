@@ -85,7 +85,7 @@
   line-height: 1;
   backdrop-filter: blur(16px);
   box-shadow: inset 0 1px rgba(255, 255, 255, 0.035);
-  transition: border-color 180ms ease, background-color 180ms ease, color 180ms ease, transform 180ms ease, box-shadow 180ms ease;
+  transition: border-color 140ms cubic-bezier(.2, 0, 0, 1), background-color 140ms cubic-bezier(.2, 0, 0, 1), color 140ms cubic-bezier(.2, 0, 0, 1), transform 140ms cubic-bezier(.2, 0, 0, 1);
 }
 
 .player-control-button {
@@ -219,7 +219,7 @@
   padding: 0.5rem 0.58rem;
   text-align: left;
   font-size: 0.72rem;
-  transition: background-color 140ms ease, color 140ms ease, padding 140ms ease;
+  transition: background-color 120ms cubic-bezier(.2, 0, 0, 1), color 120ms cubic-bezier(.2, 0, 0, 1), transform 120ms cubic-bezier(.2, 0, 0, 1);
 }
 
 .player-control-menu__list > button:hover,
@@ -227,7 +227,7 @@
   outline: 0;
   background: var(--player-accent-soft);
   color: white;
-  padding-left: 0.75rem;
+  transform: translateX(0.16rem);
 }
 
 .player-control-menu__list > button[aria-selected="true"] {
@@ -263,7 +263,7 @@
   --player-progress: 0%;
   --player-buffered: 0%;
   background: linear-gradient(to right, var(--player-accent) 0 var(--player-progress), rgba(255, 255, 255, 0.4) var(--player-progress) var(--player-buffered), rgba(255, 255, 255, 0.18) var(--player-buffered) 100%);
-  transition: height 160ms ease, filter 160ms ease;
+  transition: height 120ms cubic-bezier(.2, 0, 0, 1);
 }
 
 .player-volume {
@@ -609,7 +609,7 @@
   padding: 0;
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.42), inset 0 1px rgba(255, 255, 255, 0.08);
   backdrop-filter: blur(12px);
-  transition: transform 220ms cubic-bezier(.16,1,.3,1), background-color 220ms ease, border-color 220ms ease, box-shadow 220ms ease;
+  transition: transform 140ms cubic-bezier(.2,0,0,1), background-color 140ms cubic-bezier(.2,0,0,1), border-color 140ms cubic-bezier(.2,0,0,1);
 }
 
 .catalog-card__resume .media-action-icon,

@@ -1,38 +1,38 @@
-import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import React, { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, MotionConfig, motion, type Variants } from "framer-motion";
 import type { ThemeId } from "../types/theme";
 
 export const MOTION_TIMINGS = {
-  instant: 0.12,
-  press: 0.14,
-  focus: 0.28,
-  menu: 0.26,
-  menuEnter: 0.26,
-  menuExit: 0.18,
-  menuItem: 0.22,
-  menuStagger: 0.045,
-  dialog: 0.42,
-  dialogEnter: 0.42,
-  dialogExit: 0.26,
-  viewExit: 0.28,
-  viewEnter: 0.52,
-  view: 0.8,
-  rail: 780,
-  billboardExit: 0.88,
-  billboardEnter: 1.12,
-  billboard: 2,
-  billboardCopy: 0.62,
-  profileMorph: 0.95,
-  profileEntry: 0.62,
-  artwork: 0.5,
-  list: 0.42,
-  notice: 0.32,
-  controlsEnter: 0.22,
-  controlsExit: 0.42,
-  reduced: 0.16,
+  instant: 0.07,
+  press: 0.08,
+  focus: 0.14,
+  menu: 0.16,
+  menuEnter: 0.17,
+  menuExit: 0.12,
+  menuItem: 0.14,
+  menuStagger: 0.018,
+  dialog: 0.22,
+  dialogEnter: 0.22,
+  dialogExit: 0.15,
+  viewExit: 0.14,
+  viewEnter: 0.24,
+  view: 0.24,
+  rail: 340,
+  billboardExit: 0.24,
+  billboardEnter: 0.38,
+  billboard: 0.38,
+  billboardCopy: 0.24,
+  profileMorph: 0.28,
+  profileEntry: 0.22,
+  artwork: 0.2,
+  list: 0.2,
+  notice: 0.18,
+  controlsEnter: 0.14,
+  controlsExit: 0.12,
+  reduced: 0.1,
 } as const;
 
-export const MOTION_EASE = [0.16, 1, 0.3, 1] as const;
+export const MOTION_EASE = [0.2, 0, 0, 1] as const;
 
 export interface ThemeMotionDefinition {
   view: Variants;
@@ -54,7 +54,6 @@ const viewVariants = (initial: Record<string, string | number>, exit: Record<str
     x: 0,
     y: 0,
     scale: 1,
-    filter: "blur(0px)",
     transition: { duration: MOTION_TIMINGS.viewEnter, ease: MOTION_EASE },
   },
   exit: (direction: number = 1) => ({ ...directional(exit, direction), transition: { duration: MOTION_TIMINGS.viewExit, ease: MOTION_EASE } }),
@@ -62,7 +61,7 @@ const viewVariants = (initial: Record<string, string | number>, exit: Record<str
 
 const billboardVariants = (initial: Record<string, string | number>, exit: Record<string, string | number>, timing: { enter: number; exit: number }): Variants => ({
   initial: (direction: number = 1) => ({ ...initial, x: typeof initial.x === "number" ? initial.x * direction : initial.x }),
-  animate: { opacity: 1, x: 0, y: 0, scale: 1, filter: "blur(0px)", transition: { duration: timing.enter, ease: MOTION_EASE } },
+  animate: { opacity: 1, x: 0, y: 0, scale: 1, transition: { duration: timing.enter, ease: MOTION_EASE } },
   exit: (direction: number = 1) => ({ ...exit, x: typeof exit.x === "number" ? exit.x * direction : exit.x, transition: { duration: timing.exit, ease: MOTION_EASE } }),
 });
 
@@ -74,24 +73,24 @@ export const REDUCED_BILLBOARD_MOTION: Variants = {
 
 export const THEME_MOTION: Record<ThemeId, ThemeMotionDefinition> = {
   ember: {
-    view: viewVariants({ opacity: 0, y: 26, scale: 1.012, filter: "blur(9px)" }, { opacity: 0, y: -16, scale: .992, filter: "blur(7px)" }),
-    billboardTiming: { enter: 1.08, exit: .84 },
-    billboard: billboardVariants({ opacity: 0, x: 34, scale: 1.022, filter: "blur(11px)" }, { opacity: 0, x: -26, scale: .99, filter: "blur(8px)" }, { enter: 1.08, exit: .84 }),
+    view: viewVariants({ opacity: 0, y: 8 }, { opacity: 0, y: -6 }),
+    billboardTiming: { enter: .34, exit: .2 },
+    billboard: billboardVariants({ opacity: 0, x: 14 }, { opacity: 0, x: -10 }, { enter: .34, exit: .2 }),
   },
   aurora: {
-    view: viewVariants({ opacity: 0, y: 34, scale: .985, filter: "blur(14px)" }, { opacity: 0, y: -22, scale: 1.008, filter: "blur(12px)" }),
-    billboardTiming: { enter: 1.24, exit: .96 },
-    billboard: billboardVariants({ opacity: 0, x: 18, y: 28, scale: .985, filter: "blur(16px)" }, { opacity: 0, x: -14, y: -20, scale: 1.012, filter: "blur(13px)" }, { enter: 1.24, exit: .96 }),
+    view: viewVariants({ opacity: 0, y: 10, scale: .995 }, { opacity: 0, y: -8 }),
+    billboardTiming: { enter: .4, exit: .24 },
+    billboard: billboardVariants({ opacity: 0, y: 12, scale: .995 }, { opacity: 0, y: -8 }, { enter: .4, exit: .24 }),
   },
   cinema: {
-    view: viewVariants({ opacity: 0, x: 24, scale: 1.018, filter: "blur(8px)" }, { opacity: 0, x: -20, scale: 1.026, filter: "blur(7px)" }),
-    billboardTiming: { enter: 1.16, exit: .92 },
-    billboard: billboardVariants({ opacity: 0, x: 42, scale: 1.028, filter: "blur(8px)" }, { opacity: 0, x: -34, scale: 1.012, filter: "blur(6px)" }, { enter: 1.16, exit: .92 }),
+    view: viewVariants({ opacity: 0, x: 12 }, { opacity: 0, x: -10 }),
+    billboardTiming: { enter: .42, exit: .26 },
+    billboard: billboardVariants({ opacity: 0, x: 18, scale: 1.008 }, { opacity: 0, x: -14 }, { enter: .42, exit: .26 }),
   },
   gemini: {
-    view: viewVariants({ opacity: 0, x: 30, y: 12, scale: .982, filter: "blur(10px)" }, { opacity: 0, x: -22, y: -8, scale: .99, filter: "blur(8px)" }),
-    billboardTiming: { enter: .98, exit: .76 },
-    billboard: billboardVariants({ opacity: 0, x: 36, y: 16, scale: .98, filter: "blur(12px)" }, { opacity: 0, x: -28, y: -10, scale: .99, filter: "blur(9px)" }, { enter: .98, exit: .76 }),
+    view: viewVariants({ opacity: 0, x: 10, y: 4 }, { opacity: 0, x: -8 }),
+    billboardTiming: { enter: .36, exit: .18 },
+    billboard: billboardVariants({ opacity: 0, x: 12, y: 4 }, { opacity: 0, x: -10 }, { enter: .36, exit: .18 }),
   },
 };
 
@@ -139,7 +138,7 @@ export function MotionProvider({ children }: { children: React.ReactNode }) {
     return () => { delete document.documentElement.dataset.motionPreference; };
   }, [preference]);
   const value = useMemo(() => ({ reduced, documentHidden, preference, setPreference }), [documentHidden, preference, reduced]);
-  return <MotionConfig reducedMotion={reduced ? "always" : "never"}><MotionContext.Provider value={value}>{children}</MotionContext.Provider></MotionConfig>;
+  return <MotionConfig reducedMotion={reduced ? "always" : "never"} transition={{ duration: MOTION_TIMINGS.list, ease: MOTION_EASE }}><MotionContext.Provider value={value}>{children}</MotionContext.Provider></MotionConfig>;
 }
 
 export function useAppMotion(): MotionContextValue {
@@ -166,24 +165,24 @@ function viewDirection(previous: string, next: string): -1 | 1 {
 
 export const CONTENT_STAGGER: Variants = {
   hidden: {},
-  shown: { transition: { delayChildren: 0.08, staggerChildren: 0.065 } },
+  shown: { transition: { delayChildren: 0.015, staggerChildren: MOTION_TIMINGS.menuStagger } },
 };
 
 export const CONTENT_REVEAL: Variants = {
-  hidden: { opacity: 0, y: 18, filter: "blur(7px)" },
-  shown: { opacity: 1, y: 0, filter: "blur(0px)", transition: { duration: MOTION_TIMINGS.list, ease: MOTION_EASE } },
-  exit: { opacity: 0, y: -8, filter: "blur(4px)", transition: { duration: MOTION_TIMINGS.viewExit, ease: MOTION_EASE } },
+  hidden: { opacity: 0, y: 8 },
+  shown: { opacity: 1, y: 0, transition: { duration: MOTION_TIMINGS.list, ease: MOTION_EASE } },
+  exit: { opacity: 0, y: -5, transition: { duration: MOTION_TIMINGS.viewExit, ease: MOTION_EASE } },
 };
 
 export function AnimatedState({ stateKey, className, children }: { stateKey: string; className?: string; children: React.ReactNode }) {
   const { reduced } = useAppMotion();
   const transition = { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.list, ease: MOTION_EASE };
-  return <AnimatePresence mode="wait" initial={false}><motion.div
+  return <AnimatePresence mode="sync" initial={false}><motion.div
     key={stateKey}
     className={className}
-    initial={reduced ? { opacity: 0 } : { opacity: 0, y: 12, filter: "blur(6px)" }}
-    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-    exit={reduced ? { opacity: 0 } : { opacity: 0, y: -8, filter: "blur(4px)" }}
+    initial={reduced ? { opacity: 0 } : { opacity: 0, y: 6 }}
+    animate={{ opacity: 1, y: 0 }}
+    exit={reduced ? { opacity: 0 } : { opacity: 0, y: -4 }}
     transition={transition}
   >{children}</motion.div></AnimatePresence>;
 }
@@ -194,12 +193,13 @@ export function AnimatedView({ theme, viewKey, children }: { theme: ThemeId; vie
   const previousKey = useRef(viewKey);
   const direction = viewDirection(previousKey.current, viewKey);
   useEffect(() => { previousKey.current = viewKey; }, [viewKey]);
+  useLayoutEffect(() => { resetApplicationScroll(); }, [viewKey]);
   const reducedVariants: Variants = {
     initial: { opacity: 0 },
     animate: { opacity: 1, transition: { duration: MOTION_TIMINGS.reduced, ease: MOTION_EASE } },
     exit: { opacity: 0, transition: { duration: MOTION_TIMINGS.reduced, ease: MOTION_EASE } },
   };
-  return <AnimatePresence mode="wait" custom={direction} onExitComplete={resetApplicationScroll}>
+  return <AnimatePresence mode="sync" custom={direction} initial={false}>
     <motion.div
       className="motion-view"
       key={viewKey}

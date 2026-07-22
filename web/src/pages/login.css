@@ -21,7 +21,7 @@
 .login-ambient { z-index: -2; inset: 0; overflow: hidden; background: radial-gradient(circle at 50% 42%,#26130d 0,#160b08 35%,#0c0605 74%); }
 .login-ambient::before { content: ""; position: absolute; inset: 0; opacity: .32; background-image: linear-gradient(rgba(255,126,78,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(255,126,78,.055) 1px,transparent 1px); background-size: 54px 54px; mask-image: radial-gradient(circle at center,#000 8%,transparent 72%); }
 .login-ambient::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg,rgba(5,2,1,.62),transparent 26% 74%,rgba(5,2,1,.62)),linear-gradient(0deg,rgba(5,2,1,.58),transparent 28% 75%,rgba(5,2,1,.42)); }
-.login-ambient > i { width: min(52vw,720px); aspect-ratio: 1; border-radius: 50%; filter: blur(90px); opacity: .18; animation: login-ember-drift 14s ease-in-out infinite alternate; }
+.login-ambient > i { width: min(52vw,720px); aspect-ratio: 1; border-radius: 50%; filter: blur(90px); opacity: .18; transform: translate3d(0,0,0); }
 .login-ambient > i:first-child { top: -32%; left: -12%; background: #ff5f1f; }
 .login-ambient > i:nth-child(2) { right: -18%; bottom: -40%; background: #b63813; animation-delay: -7s; }
 .login-ambient > span { inset: 0; opacity: .18; background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.95' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.35'/%3E%3C/svg%3E"); mix-blend-mode: soft-light; }
@@ -47,7 +47,7 @@
 .login-auth-form { display: grid; gap: 19px; }
 .login-field { display: grid; gap: 8px; }
 .login-field > label { color: rgba(255,232,224,.68); font-size: 12px; font-weight: 580; }
-.login-field input { width: 100%; height: 48px; border: 1px solid rgba(255,181,156,.13); border-radius: 9px; outline: 0; padding: 0 13px; background: rgba(7,3,2,.38); color: #fff9f6; font-size: 14px; box-shadow: 0 1px rgba(255,255,255,.018) inset; transition: border-color .2s ease,background-color .2s ease,box-shadow .2s ease; }
+.login-field input { width: 100%; height: 48px; border: 1px solid rgba(255,181,156,.13); border-radius: 9px; outline: 0; padding: 0 13px; background: rgba(7,3,2,.38); color: #fff9f6; font-size: 14px; box-shadow: 0 1px rgba(255,255,255,.018) inset; transition: border-color .14s cubic-bezier(.2,0,0,1),background-color .14s cubic-bezier(.2,0,0,1); }
 .login-field input::placeholder { color: rgba(255,215,201,.27); }
 .login-field input:hover:not(:disabled) { border-color: rgba(255,181,156,.25); background: rgba(10,4,3,.48); }
 .login-field input:focus { border-color: rgba(255,126,78,.82); background: rgba(13,6,4,.58); box-shadow: 0 0 0 3px rgba(255,95,31,.12),0 0 24px rgba(255,95,31,.07); }
@@ -82,7 +82,7 @@
 .login-code-layout { display: grid; grid-template-columns: 1fr 54px; align-items: center; gap: 14px; }
 .login-totp-inputs { position: relative; cursor: text; }
 .login-code-input { position: absolute; z-index: 2; inset: 0; width: 100%; opacity: .01; color: transparent; caret-color: transparent; }
-.login-totp-inputs > span { display: grid; place-items: center; min-width: 0; height: 58px; border: 1px solid rgba(255,181,156,.15); border-radius: 9px; background: rgba(7,3,2,.42); color: #fff8f4; font: 650 22px/1 var(--font-mono); transition: border-color .2s ease,background-color .2s ease,box-shadow .2s ease,transform .2s ease; }
+.login-totp-inputs > span { display: grid; place-items: center; min-width: 0; height: 58px; border: 1px solid rgba(255,181,156,.15); border-radius: 9px; background: rgba(7,3,2,.42); color: #fff8f4; font: 650 22px/1 var(--font-mono); transition: border-color .14s cubic-bezier(.2,0,0,1),background-color .14s cubic-bezier(.2,0,0,1),transform .14s cubic-bezier(.2,0,0,1); }
 .login-totp-inputs > span[data-filled="true"],.login-totp-inputs[data-focused="true"] > span { border-color: rgba(255,126,78,.76); background: rgba(255,95,31,.055); box-shadow: 0 0 0 2px rgba(255,95,31,.08); }
 .login-totp-ring { position: relative; width: 48px; height: 48px; display: grid; place-items: center; }
 .login-totp-ring svg { position: absolute; inset: 0; width: 100%; transform: rotate(-90deg); }

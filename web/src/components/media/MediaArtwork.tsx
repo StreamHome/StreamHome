@@ -132,8 +132,8 @@ export function MediaArtwork({ src, alt, className, media, episode }: MediaArtwo
     alt={alt}
     className={className}
     data-loaded={loaded ? "true" : "false"}
-    initial={{ opacity: 0, scale: reduced ? 1 : 1.018, filter: reduced ? "none" : "blur(7px)" }}
-    animate={{ opacity: loaded ? 1 : 0, scale: 1, filter: "blur(0px)" }}
+    initial={{ opacity: 0, scale: reduced ? 1 : 1.006 }}
+    animate={{ opacity: loaded ? 1 : 0, scale: 1 }}
     transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.artwork, ease: MOTION_EASE }}
     onLoad={() => setLoaded(true)}
     onError={() => {

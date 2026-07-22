@@ -16,31 +16,31 @@ function matchMedia(matches: boolean) {
   } as MediaQueryList;
 }
 
-describe("cinematic motion system", () => {
+describe("fluid motion system", () => {
   beforeEach(() => {
     window.localStorage.clear();
     delete document.documentElement.dataset.motionPreference;
     Object.defineProperty(window, "matchMedia", { configurable: true, value: () => matchMedia(false) });
   });
 
-  it("keeps interactions responsive and cinematic transitions deliberate", () => {
-    expect(MOTION_TIMINGS.menu).toBe(.26);
-    expect(MOTION_TIMINGS.menuItem).toBe(.22);
-    expect(MOTION_TIMINGS.dialog).toBe(.42);
-    expect(MOTION_TIMINGS.viewExit).toBe(.28);
-    expect(MOTION_TIMINGS.viewEnter).toBe(.52);
-    expect(MOTION_TIMINGS.view).toBe(.8);
-    expect(MOTION_TIMINGS.viewExit + MOTION_TIMINGS.viewEnter).toBe(MOTION_TIMINGS.view);
+  it("keeps every interaction inside a responsive motion budget", () => {
+    expect(MOTION_TIMINGS.menu).toBe(.16);
+    expect(MOTION_TIMINGS.menuItem).toBe(.14);
+    expect(MOTION_TIMINGS.dialog).toBe(.22);
+    expect(MOTION_TIMINGS.viewExit).toBe(.14);
+    expect(MOTION_TIMINGS.viewEnter).toBe(.24);
+    expect(MOTION_TIMINGS.view).toBe(.24);
+    expect(MOTION_TIMINGS.viewEnter).toBeLessThanOrEqual(.28);
     expect(MOTION_TIMINGS.menuExit).toBeLessThan(MOTION_TIMINGS.menuEnter);
     expect(MOTION_TIMINGS.dialogExit).toBeLessThan(MOTION_TIMINGS.dialogEnter);
-    expect(MOTION_TIMINGS.controlsEnter).toBeLessThan(MOTION_TIMINGS.controlsExit);
-    expect(MOTION_TIMINGS.rail).toBe(780);
-    expect(MOTION_TIMINGS.billboardExit).toBe(.88);
-    expect(MOTION_TIMINGS.billboardEnter).toBe(1.12);
-    expect(MOTION_TIMINGS.billboardExit + MOTION_TIMINGS.billboardEnter).toBe(MOTION_TIMINGS.billboard);
-    expect(MOTION_TIMINGS.profileMorph).toBe(.95);
-    expect(MOTION_TIMINGS.profileEntry).toBe(.62);
-    expect(MOTION_TIMINGS.reduced).toBeGreaterThanOrEqual(.16);
+    expect(MOTION_TIMINGS.controlsExit).toBeLessThan(MOTION_TIMINGS.controlsEnter);
+    expect(MOTION_TIMINGS.rail).toBe(340);
+    expect(MOTION_TIMINGS.billboardExit).toBe(.24);
+    expect(MOTION_TIMINGS.billboardEnter).toBe(.38);
+    expect(MOTION_TIMINGS.billboard).toBe(.38);
+    expect(MOTION_TIMINGS.profileMorph).toBe(.28);
+    expect(MOTION_TIMINGS.profileEntry).toBe(.22);
+    expect(MOTION_TIMINGS.reduced).toBeLessThanOrEqual(.1);
   });
 
   it("defines distinct view and billboard choreography for every theme", () => {
@@ -50,6 +50,8 @@ describe("cinematic motion system", () => {
     expect(new Set(definitions.map((definition) => JSON.stringify(resolve(definition.view.initial)))).size).toBe(4);
     expect(definitions.every((definition) => resolve(definition.billboard.initial))).toBe(true);
     expect(new Set(definitions.map((definition) => JSON.stringify(definition.billboardTiming))).size).toBe(4);
+    expect(definitions.every((definition) => !JSON.stringify(definition).includes("filter"))).toBe(true);
+    expect(definitions.every((definition) => definition.billboardTiming.enter <= .42)).toBe(true);
   });
 
   it("defaults to full motion instead of silently inheriting a false browser reduction", () => {

@@ -27,7 +27,6 @@ export function GenreCategoryGallery({
       {cards.map((card, index) => {
         const selected = card.value.toLocaleLowerCase() === active.toLocaleLowerCase();
         return <motion.button
-          layout="position"
           variants={CONTENT_REVEAL}
           key={card.value}
           type="button"

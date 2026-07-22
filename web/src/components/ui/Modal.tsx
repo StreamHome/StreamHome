@@ -41,9 +41,9 @@ export function Modal({ isOpen, onClose, children, className }: ModalProps) {
           
           {/* Content */}
           <motion.div
-            initial={reduced ? { opacity: 0 } : { opacity: 0, y: 28, scale: .94 }}
+            initial={reduced ? { opacity: 0 } : { opacity: 0, y: 10, scale: .985 }}
             animate={{ opacity: 1, y: 0, scale: 1, transition: { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.dialogEnter, ease: MOTION_EASE } }}
-            exit={reduced ? { opacity: 0 } : { opacity: 0, y: 18, scale: .97, transition: { duration: MOTION_TIMINGS.dialogExit, ease: MOTION_EASE } }}
+            exit={reduced ? { opacity: 0 } : { opacity: 0, y: 6, scale: .992, transition: { duration: MOTION_TIMINGS.dialogExit, ease: MOTION_EASE } }}
             className="relative z-10 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto"
           >
             <GlassPane className={cn("p-6", className)}>

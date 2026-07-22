@@ -65,9 +65,9 @@ export function Dropdown({ options, selected, onChange, label, className }: Drop
       <AnimatePresence>
         {isOpen && (
           <motion.div
-            initial={{ height: 0, opacity: 0, y: reduced ? 0 : -6 }}
-            animate={{ height: "auto", opacity: 1, y: 0, transition: { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.menuEnter, ease: MOTION_EASE } }}
-            exit={{ height: 0, opacity: 0, y: reduced ? 0 : -4, transition: { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.menuExit, ease: MOTION_EASE } }}
+            initial={{ opacity: 0, y: reduced ? 0 : -4, scale: reduced ? 1 : .99 }}
+            animate={{ opacity: 1, y: 0, scale: 1, transition: { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.menuEnter, ease: MOTION_EASE } }}
+            exit={{ opacity: 0, y: reduced ? 0 : -3, scale: reduced ? 1 : .995, transition: { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.menuExit, ease: MOTION_EASE } }}
             className="absolute top-full mt-1 w-full z-50 overflow-hidden"
           >
             <GlassPane spotlight={false} className="py-1 flex flex-col max-h-[250px] overflow-y-auto">

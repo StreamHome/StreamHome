@@ -3,8 +3,13 @@ import { MOTION_TIMINGS, useAppMotion } from "./motionSystem";
 
 export const cinematicRailEase = (progress: number): number => {
   const bounded = Math.min(1, Math.max(0, progress));
-  return .5 - Math.cos(Math.PI * bounded) / 2;
+  return 1 - Math.pow(1 - bounded, 3);
 };
+
+export function railMotionDuration(distance: number, viewportWidth: number): number {
+  const pageFraction = Math.abs(distance) / Math.max(1, viewportWidth);
+  return Math.round(Math.min(420, Math.max(240, MOTION_TIMINGS.rail - 140 + pageFraction * 200)));
+}
 
 export function fittedRailLayout(availableWidth: number, naturalCardWidth: number, minimumCardWidth: number, gap: number, itemCount: number) {
   if (availableWidth <= 0 || naturalCardWidth <= 0 || itemCount <= 0) return { columns: 1, cardWidth: Math.max(0, naturalCardWidth) };
@@ -88,10 +93,11 @@ export function useAnimatedRail() {
     const element = rail.current;
     if (!element) return;
     const current = element.scrollLeft;
-    setEdges({
+    const nextEdges = {
       previous: railTarget(metrics(element), -1) < current - 1,
       next: railTarget(metrics(element), 1) > current + 1,
-    });
+    };
+    setEdges((previous) => previous.previous === nextEdges.previous && previous.next === nextEdges.next ? previous : nextEdges);
   }, [metrics]);
 
   const fitCards = useCallback(() => {
@@ -149,10 +155,10 @@ export function useAnimatedRail() {
       return;
     }
     const startedAt = performance.now();
+    const duration = railMotionDuration(to - from, element.clientWidth);
     const tick = (now: number) => {
-      const progress = Math.min(1, (now - startedAt) / MOTION_TIMINGS.rail);
+      const progress = Math.min(1, (now - startedAt) / duration);
       element.scrollLeft = from + (to - from) * cinematicRailEase(progress);
-      updateEdges();
       if (progress < 1) frame.current = requestAnimationFrame(tick);
       else stop();
     };
@@ -171,10 +177,15 @@ export function useAnimatedRail() {
 
   const onPointerLeave = useCallback(() => setProximity("none"), []);
 
+  const handleNativeScroll = useCallback(() => {
+    if (frame.current !== null) return;
+    updateEdges();
+  }, [updateEdges]);
+
   useEffect(() => {
     const element = rail.current;
     if (!element) return;
-    element.addEventListener("scroll", updateEdges, { passive: true });
+    element.addEventListener("scroll", handleNativeScroll, { passive: true });
     element.addEventListener("wheel", stop, { passive: true });
     element.addEventListener("pointerdown", stop, { passive: true });
     element.addEventListener("touchstart", stop, { passive: true });
@@ -184,7 +195,7 @@ export function useAnimatedRail() {
     mutationObserver?.observe(element, { childList: true });
     fitCards();
     return () => {
-      element.removeEventListener("scroll", updateEdges);
+      element.removeEventListener("scroll", handleNativeScroll);
       element.removeEventListener("wheel", stop);
       element.removeEventListener("pointerdown", stop);
       element.removeEventListener("touchstart", stop);
@@ -192,7 +203,7 @@ export function useAnimatedRail() {
       mutationObserver?.disconnect();
       if (frame.current !== null) cancelAnimationFrame(frame.current);
     };
-  }, [fitCards, stop, updateEdges]);
+  }, [fitCards, handleNativeScroll, stop]);
 
   return {
     rail,

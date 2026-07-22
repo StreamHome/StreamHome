@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo } from "react";
+import React, { useLayoutEffect, useMemo } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useLocation } from "react-router-dom";
 import { parseAppQuery } from "../navigation/queryState";
@@ -13,12 +13,10 @@ export function AuthenticatedApp() {
   const query = useMemo(() => parseAppQuery(location.search), [location.search]);
   const theme = useThemeStore((state) => state.activeTheme);
   const { reduced } = useAppMotion();
-  useEffect(() => {
-    if (query.view === "watch" || query.view === "admin") resetApplicationScroll();
-  }, [query.section, query.view]);
   const surface = query.view === "watch" ? "watch" : query.view === "admin" ? "admin" : "dashboard";
+  useLayoutEffect(() => { resetApplicationScroll(); }, [surface]);
   const reducedVariants = { initial: { opacity: 0 }, animate: { opacity: 1, transition: { duration: MOTION_TIMINGS.reduced } }, exit: { opacity: 0, transition: { duration: MOTION_TIMINGS.reduced } } };
-  return <AnimatePresence mode="wait" onExitComplete={resetApplicationScroll}>
+  return <AnimatePresence mode="sync" initial={false}>
     <motion.div
       key={surface}
       className={surface === "dashboard" ? "application-motion-surface" : "standalone-motion-view"}

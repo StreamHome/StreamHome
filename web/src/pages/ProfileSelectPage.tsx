@@ -52,7 +52,7 @@ function ThemeChoices({ value, onChange }: { value: ThemeId; onChange: (theme: T
 function ProfileAmbient({ theme }: { theme: ThemeId }) {
   const Background = theme === "aurora" ? AuroraBackground : theme === "cinema" ? CinemaBackground : GeminiBackground;
   const { reduced } = useAppMotion();
-  return <AnimatePresence initial={false} mode="sync"><motion.div className="profile-gallery__ambient" data-ambient-theme={theme} key={theme} initial={reduced ? { opacity: 0 } : { opacity: 0, scale: 1.035, filter: "blur(18px)" }} animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }} exit={reduced ? { opacity: 0 } : { opacity: 0, scale: .985, filter: "blur(14px)" }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileMorph, ease: MOTION_EASE }}>{theme === "ember" ? <ScanLines /> : <Background />}</motion.div></AnimatePresence>;
+  return <AnimatePresence initial={false} mode="sync"><motion.div className="profile-gallery__ambient" data-ambient-theme={theme} key={theme} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileMorph, ease: MOTION_EASE }}>{theme === "ember" ? <ScanLines /> : <Background />}</motion.div></AnimatePresence>;
 }
 
 export function ProfileSelectPage() {
@@ -121,7 +121,7 @@ export function ProfileSelectPage() {
   };
 
   return (
-    <motion.main className={`profile-gallery profile-gallery--${ambientTheme}`} data-entering={Boolean(enteringProfile)} animate={enteringProfile ? { opacity: 0, scale: 1.025, filter: "blur(10px)" } : { opacity: 1, scale: 1, filter: "blur(0px)" }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileEntry, ease: MOTION_EASE }}>
+    <motion.main className={`profile-gallery profile-gallery--${ambientTheme}`} data-entering={Boolean(enteringProfile)} animate={enteringProfile ? { opacity: 0, scale: 1.008 } : { opacity: 1, scale: 1 }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileEntry, ease: MOTION_EASE }}>
       <ProfileAmbient theme={ambientTheme} />
       <section className="profile-gallery__content">
         <motion.header className="profile-gallery__header" initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileEntry, ease: MOTION_EASE }}><BrandLogo className="brand-logo--profiles" showWordmark={false} /><p>STREAMHOME / PROFILE MATRIX</p><h1>Who is watching?</h1><span>Select a server profile. Its theme shapes the complete workspace.</span></motion.header>
@@ -129,10 +129,10 @@ export function ProfileSelectPage() {
         {state?.message && <p className="profile-gallery__notice" role="status">{state.message}</p>}
         {loading && <div className="profile-gallery__state">Loading profiles from the server...</div>}
         {error && <div className="profile-gallery__state profile-gallery__state--error"><p>{error}</p><button onClick={() => void loadProfiles()}>Retry</button></div>}
-        {!loading && !error && <motion.div className="profile-gallery__grid" initial="hidden" animate="shown" variants={{ hidden: {}, shown: { transition: { staggerChildren: .12, delayChildren: .2 } } }}>
+        {!loading && !error && <motion.div className="profile-gallery__grid" initial="hidden" animate="shown" variants={{ hidden: {}, shown: { transition: { staggerChildren: .025, delayChildren: .02 } } }}>
           {profiles.map((profile) => {
             const profileTheme = normalizeTheme(profile.theme);
-            return <motion.article key={profile.id} className="profile-tile" data-selected={enteringProfile === profile.id} variants={{ hidden: { opacity: 0, y: 34, scale: .94 }, shown: { opacity: 1, y: 0, scale: 1, transition: { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileEntry, ease: MOTION_EASE } } }} onMouseEnter={() => previewTheme(profileTheme)} onMouseLeave={clearPreview} onFocus={() => previewTheme(profileTheme)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) clearPreview(); }}>
+            return <motion.article key={profile.id} className="profile-tile" data-selected={enteringProfile === profile.id} variants={{ hidden: { opacity: 0, y: 10 }, shown: { opacity: 1, y: 0, transition: { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileEntry, ease: MOTION_EASE } } }} onMouseEnter={() => previewTheme(profileTheme)} onMouseLeave={clearPreview} onFocus={() => previewTheme(profileTheme)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) clearPreview(); }}>
               <button className="profile-tile__select" onClick={() => chooseProfile(profile)}><span className={`profile-preview profile-preview--${profileTheme}`} aria-hidden="true"><i /><i /><i /></span><strong>{profile.name}</strong><small>{THEME_LABELS[profileTheme]}{profile.id === "1" ? " / administrator" : " / profile"}</small></button>
               <button className="profile-tile__edit" onClick={() => navigate(profileEditUrl(profile.id), { state: { returnTo: "/profiles" } })}>Edit profile</button>
             </motion.article>;

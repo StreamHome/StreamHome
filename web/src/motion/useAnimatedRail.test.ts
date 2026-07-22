@@ -1,13 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { cinematicRailEase, fittedRailLayout, railTarget } from "./useAnimatedRail";
+import { cinematicRailEase, fittedRailLayout, railMotionDuration, railTarget } from "./useAnimatedRail";
 
 describe("controlled category rail motion", () => {
-  it("uses a smooth monotonic cinematic easing curve", () => {
+  it("uses a responsive monotonic ease-out curve", () => {
     expect(cinematicRailEase(0)).toBe(0);
-    expect(cinematicRailEase(.25)).toBeLessThan(.25);
+    expect(cinematicRailEase(.25)).toBeGreaterThan(.25);
     expect(cinematicRailEase(.75)).toBeGreaterThan(cinematicRailEase(.25));
-    expect(cinematicRailEase(.5)).toBeCloseTo(.5);
     expect(cinematicRailEase(1)).toBe(1);
+  });
+
+  it("adapts duration to travel distance without becoming sluggish", () => {
+    expect(railMotionDuration(200, 1_000)).toBe(240);
+    expect(railMotionDuration(800, 1_000)).toBe(360);
+    expect(railMotionDuration(2_000, 1_000)).toBe(420);
   });
 
   it("scales a partially visible final card into an exact complete group", () => {
