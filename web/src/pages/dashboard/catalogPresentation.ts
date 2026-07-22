@@ -26,6 +26,7 @@ export interface CatalogSection {
   title: string;
   items: Movie[];
   showReasons: boolean;
+  kind: "standard" | "vibe";
 }
 
 export interface CatalogPresentationModel {
@@ -66,8 +67,8 @@ export function genreCategoryCards(categories: RecommendationCategory[], ranked:
     .filter((card): card is GenreCategoryCard => Boolean(card.representative));
 }
 
-function section(id: string, label: string, title: string, items: Movie[], showReasons: boolean): CatalogSection | null {
-  return items.length ? { id, label, title, items, showReasons } : null;
+function section(id: string, label: string, title: string, items: Movie[], showReasons: boolean, kind: "standard" | "vibe" = "standard"): CatalogSection | null {
+  return items.length ? { id, label, title, items, showReasons, kind } : null;
 }
 
 function compact(items: Array<CatalogSection | null>): CatalogSection[] {
@@ -126,11 +127,14 @@ export function buildCatalogPresentation({
     section("continue-watching", "RESUME INDEX", "Continue Watching", continueWatching, false),
     section("watch-again", "RECENT REWATCH HISTORY", "Watch Again", watchAgain, false),
     section("top-picks", "PERSONALIZED / PROFILE", "Top Picks For You", topPicks, true),
-    section("recommended-movies", "PERSONALIZED MOVIES", "Movies For You", sourceItems.filter((movie) => movie.type === "movie"), true),
-    section("recommended-series", "PERSONALIZED SERIES", "Series For You", sourceItems.filter((movie) => movie.type === "series"), true),
   ]) : compact([
     section("watch-again", "RECENT REWATCH HISTORY", "Watch Again", watchAgain, false),
     section("top-picks", "PERSONALIZED / PROFILE", "Top Picks For You", topPicks, true),
   ]);
-  return { ...common, mode: "recommended", sections: [...leading, ...personalizedGenreSections(categories, sourceItems, view)], gridItems: [] };
+  const vibeSections = (feed.vibeRails ?? []).map((rail) => section(rail.id, `VIBE VECTOR / ${(feed.algorithmVersion ?? "v2").toUpperCase()}`, rail.label, rail.items.map((item) => item.media), true, "vibe")).filter((item): item is CatalogSection => item !== null);
+  const personalized = view === "home" ? compact([
+    section("recommended-movies", "PERSONALIZED MOVIES", "Movies For You", sourceItems.filter((movie) => movie.type === "movie"), true),
+    section("recommended-series", "PERSONALIZED SERIES", "Series For You", sourceItems.filter((movie) => movie.type === "series"), true),
+  ]) : [];
+  return { ...common, mode: "recommended", sections: [...leading, ...vibeSections, ...personalized, ...personalizedGenreSections(categories, sourceItems, view)], gridItems: [] };
 }

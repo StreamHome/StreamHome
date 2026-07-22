@@ -45,6 +45,18 @@ describe("server-driven catalog presentation", () => {
     expect(model.sections.find((section) => section.title === "Action")?.items).toEqual(ranked.filter((_, index) => index % 2 === 0));
   });
 
+  it("places server-authored vibe rails after Top Picks without turning them into filters", () => {
+    const ranked = [movie("ranked", ["Action"]), movie("second", ["Drama"])];
+    const vibeItems = [movie("vibe-1", ["Crime"]), movie("vibe-2", ["Comedy"]), movie("vibe-3", ["Action"])];
+    const recommendationFeed = { ...feed(ranked.map(item)), algorithmVersion: "v2.1", vibeRails: [{ id: "vibe-banter", label: "Witty Banter & Bullets", tropeIds: ["neo_noir_buddy_action"], reasonCode: "trope_match", items: vibeItems.map(item) }] };
+    const model = buildCatalogPresentation({ feed: recommendationFeed, fallbackMovies: ranked, continueWatching: [], view: "movies" });
+    const topPicksIndex = model.sections.findIndex((entry) => entry.id === "top-picks");
+    const vibeIndex = model.sections.findIndex((entry) => entry.id === "vibe-banter");
+    expect(vibeIndex).toBeGreaterThan(topPicksIndex);
+    expect(model.sections[vibeIndex]).toMatchObject({ title: "Witty Banter & Bullets", kind: "vibe", items: vibeItems });
+    expect(model.categories.some((category) => category.value === "neo_noir_buddy_action")).toBe(false);
+  });
+
   it("places Watch Again before Top Picks without sorting or reasons", () => {
     const ranked = [movie("ranked", ["Drama"])];
     const recent = movie("recent", ["Drama"]);

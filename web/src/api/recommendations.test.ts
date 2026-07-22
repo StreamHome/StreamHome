@@ -18,6 +18,10 @@ describe("recommendation API", () => {
         { media: { id: "recent", title: "Recent", type: "movie" }, source: "server", availability: "available", score: 1, reasons: ["ignored"] },
         { media: { id: "older", title: "Older", type: "movie" }, source: "server", availability: "available", score: 100, reasons: [] },
       ],
+      algorithmVersion: "v2.1",
+      vibeRails: [{ id: "vibe-banter", label: "Witty Banter & Bullets", tropeIds: ["neo_noir_buddy_action"], reasonCode: "trope_match", items: [
+        { media: { id: "vibe", title: "Vibe", type: "movie" }, source: "server", availability: "available", score: 4, reasons: ["A match"], reasonDetails: [{ code: "trope_match", subject: "Neo-Noir Buddy Action", fallbackText: "A match" }] },
+      ] }],
     };
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(response), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
@@ -26,6 +30,9 @@ describe("recommendation API", () => {
     expect(fetchMock.mock.calls[0][1].signal).toBe(signal);
     expect(result.items.map((entry) => entry.media.id)).toEqual(["first", "second"]);
     expect(result.watchAgain.map((entry) => entry.media.id)).toEqual(["recent", "older"]);
+    expect(result.algorithmVersion).toBe("v2.1");
+    expect(result.vibeRails?.[0]).toMatchObject({ label: "Witty Banter & Bullets", tropeIds: ["neo_noir_buddy_action"] });
+    expect(result.vibeRails?.[0].items[0].media.recommendationReasonDetails?.[0].code).toBe("trope_match");
     expect(result.items[0].media).toMatchObject({ source: "tmdb_cache", availability: "cached", recommendationScore: 2, recommendationReasons: ["First reason"] });
   });
 
@@ -36,6 +43,8 @@ describe("recommendation API", () => {
     expect(result.categories[0]).toMatchObject({ serverCount: 2, cachedCount: 3 });
     expect(result.items).toEqual([]);
     expect(result.watchAgain).toEqual([]);
+    expect(result.vibeRails).toEqual([]);
+    expect(result.algorithmVersion).toBe("v1");
   });
 
   it("uses explicit preference and diagnostics contracts", async () => {

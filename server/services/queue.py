@@ -20,6 +20,7 @@ from services.media_probe import probe_media_stream, notify_video_sender, probe_
 from services.ingestion_errors import IngestionFailure, IngestionTaskError, prune_task_diagnostics, write_task_diagnostics
 from services.rclone import rclone_service
 from services.media_source import MediaSourceError, catalog_path_from_storage, resolve_media_source
+from services.vibe_analysis import VIBE_ANALYSIS_VERSION, compute_trope_vectors, vibe_analysis_manager
 
 def srt_to_vtt(srt_path: str, vtt_path: str) -> bool:
     """
@@ -430,6 +431,9 @@ class DownloadQueueManager:
                 task.error_message = None
                 db.add(task)
                 await db.commit()
+                analysis_type = "movie" if media_type == "movie" else "episode"
+                analysis_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"
+                await vibe_analysis_manager.enqueue(analysis_type, analysis_id)
                 created_artifacts.clear()
                     
         except IngestionTaskError as err:
@@ -650,6 +654,10 @@ class DownloadQueueManager:
                 )
                 movie.genres = meta.get("genres", [])
                 movie.cast = meta.get("cast", [])
+                movie.crew = meta.get("crew", [])
+                movie.keywords = meta.get("keywords", [])
+                movie.collection_name = meta.get("collectionName") or meta.get("collection_name")
+                movie.trope_vectors = meta.get("tropeVectors") or meta.get("trope_vectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
                 movie.quality = movie_quality
                 movie.languages = movie_languages
                 movie.subtitles = subs_on_disk
@@ -673,6 +681,10 @@ class DownloadQueueManager:
                 movie.director = meta.get("director", movie.director)
                 movie.cast = meta.get("cast", movie.cast)
                 movie.genres = meta.get("genres", movie.genres)
+                movie.crew = meta.get("crew", movie.crew)
+                movie.keywords = meta.get("keywords", movie.keywords)
+                movie.collection_name = meta.get("collectionName") or meta.get("collection_name") or movie.collection_name
+                movie.trope_vectors = meta.get("tropeVectors") or meta.get("trope_vectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
                 movie.original_language = language or meta.get("originalLanguage", movie.original_language)
                 movie.quality = movie_quality
                 movie.languages = movie_languages
@@ -689,9 +701,16 @@ class DownloadQueueManager:
                 movie.frame_rate = frame_rate
                 movie.source_fingerprint = source_fingerprint
                 movie.audio_metadata = audio_meta_list
+                movie.vibe_analysis_status = "queued" if subs_on_disk else "unavailable"
+                movie.vibe_analysis_version = 0 if subs_on_disk else VIBE_ANALYSIS_VERSION
                 db.add(movie)
                 await db.flush()
                 logger.info(f"[Queue Manager] Updated existing movie details: {movie.title}")
+
+            movie.vibe_analysis_status = "queued" if subs_on_disk else "unavailable"
+            movie.vibe_analysis_version = 0 if subs_on_disk else VIBE_ANALYSIS_VERSION
+            db.add(movie)
+            await db.flush()
 
             movie_metadata_dir = os.path.join(movie_folder_abs, ".metadata")
             os.makedirs(movie_metadata_dir, exist_ok=True)
@@ -719,7 +738,16 @@ class DownloadQueueManager:
                 "height": height,
                 "frame_rate": frame_rate,
                 "source_fingerprint": source_fingerprint,
-                "audio_metadata": audio_meta_list
+                "audio_metadata": audio_meta_list,
+                "genres": movie.genres,
+                "cast": movie.cast,
+                "director": movie.director,
+                "crew": movie.crew,
+                "keywords": movie.keywords,
+                "collection_name": movie.collection_name,
+                "trope_vectors": movie.trope_vectors,
+                "vibe_analysis_status": movie.vibe_analysis_status,
+                "vibe_analysis_version": movie.vibe_analysis_version,
             }
             with open(movie_metadata_file, "w", encoding="utf-8") as f:
                 json.dump(movie_metadata_content, f, indent=2, ensure_ascii=False)
@@ -739,6 +767,10 @@ class DownloadQueueManager:
                 )
                 show.genres = meta.get("genres", [])
                 show.cast = meta.get("cast", [])
+                show.crew = meta.get("crew", [])
+                show.keywords = meta.get("keywords", [])
+                show.collection_name = meta.get("collectionName") or meta.get("collection_name")
+                show.trope_vectors = meta.get("tropeVectors") or meta.get("trope_vectors") or compute_trope_vectors(show.genres, show.keywords, show.description)
                 db.add(show)
                 await db.flush()
                 logger.info(f"[Queue Manager] Cataloged new TV show: {meta.get('title', 'Unknown Show')}")
@@ -753,6 +785,10 @@ class DownloadQueueManager:
                 show.director = meta.get("director", show.director)
                 show.cast = meta.get("cast", show.cast)
                 show.genres = meta.get("genres", show.genres)
+                show.crew = meta.get("crew", show.crew)
+                show.keywords = meta.get("keywords", show.keywords)
+                show.collection_name = meta.get("collectionName") or meta.get("collection_name") or show.collection_name
+                show.trope_vectors = meta.get("tropeVectors") or meta.get("trope_vectors") or compute_trope_vectors(show.genres, show.keywords, show.description)
                 show.original_language = language or meta.get("originalLanguage", show.original_language)
                 show.vote_average = meta.get("vote_average", show.vote_average)
                 show.vote_count = meta.get("vote_count", show.vote_count)
@@ -824,6 +860,8 @@ class DownloadQueueManager:
                 ep_entry.subtitles = subs_on_disk
                 ep_entry.skip_markers = ep_skip_data
                 ep_entry.audio_metadata = audio_meta_list
+                ep_entry.vibe_analysis_status = "queued" if subs_on_disk else "unavailable"
+                ep_entry.vibe_analysis_version = 0 if subs_on_disk else VIBE_ANALYSIS_VERSION
                 db.add(ep_entry)
                 logger.info(f"[Queue Manager] Cataloged new episode: S{season_num}E{episode_num}")
             else:
@@ -845,6 +883,8 @@ class DownloadQueueManager:
                 ep_entry.frame_rate = frame_rate
                 ep_entry.source_fingerprint = source_fingerprint
                 ep_entry.audio_metadata = audio_meta_list
+                ep_entry.vibe_analysis_status = "queued" if subs_on_disk else "unavailable"
+                ep_entry.vibe_analysis_version = 0 if subs_on_disk else VIBE_ANALYSIS_VERSION
                 db.add(ep_entry)
                 logger.info(f"[Queue Manager] Updated episode: S{season_num}E{episode_num}")
 
@@ -882,7 +922,16 @@ class DownloadQueueManager:
                 "height": height,
                 "frame_rate": frame_rate,
                 "source_fingerprint": source_fingerprint,
-                "audio_metadata": audio_meta_list
+                "audio_metadata": audio_meta_list,
+                "genres": show.genres,
+                "cast": show.cast,
+                "director": show.director,
+                "crew": show.crew,
+                "keywords": show.keywords,
+                "collection_name": show.collection_name,
+                "trope_vectors": show.trope_vectors,
+                "vibe_analysis_status": ep_entry.vibe_analysis_status,
+                "vibe_analysis_version": ep_entry.vibe_analysis_version,
             }
             with open(ep_metadata_file, "w", encoding="utf-8") as f:
                 json.dump(ep_metadata_content, f, indent=2, ensure_ascii=False)
@@ -1096,6 +1145,17 @@ class DownloadQueueManager:
                                     movie_id = f"m_{tmdb_id}"
                                     existing = await db.get(Movie, movie_id)
                                     if existing and not (existing.title.startswith("Captured ") or "credentials are not set" in (existing.description or "")):
+                                        existing.crew = data.get("crew", existing.crew)
+                                        existing.keywords = data.get("keywords", existing.keywords)
+                                        existing.collection_name = data.get("collection_name", existing.collection_name)
+                                        existing.trope_vectors = data.get("trope_vectors", existing.trope_vectors) or compute_trope_vectors(existing.genres, existing.keywords, existing.description)
+                                        existing.dialogue_wpm = data.get("dialogue_wpm", existing.dialogue_wpm)
+                                        existing.dialogue_word_count = int(data.get("dialogue_word_count", existing.dialogue_word_count) or 0)
+                                        existing.dialogue_language = data.get("dialogue_language", existing.dialogue_language)
+                                        existing.dialogue_confidence = float(data.get("dialogue_confidence", existing.dialogue_confidence) or 0.0)
+                                        existing.vibe_analysis_status = data.get("vibe_analysis_status", existing.vibe_analysis_status)
+                                        existing.vibe_analysis_version = int(data.get("vibe_analysis_version", existing.vibe_analysis_version) or 0)
+                                        existing.vibe_analyzed_at = data.get("vibe_analyzed_at", existing.vibe_analyzed_at)
                                         # Update probed metadata even if it exists
                                         if file_path:
                                             abs_video_path = os.path.abspath(os.path.join(server_root, file_path))
@@ -1119,6 +1179,13 @@ class DownloadQueueManager:
                                         ep_id = f"ep_{tmdb_id}_s{season}_e{episode}"
                                         existing = await db.get(Episode, ep_id)
                                         if existing and not (existing.title.startswith("Episode ") or "stream." in (existing.description or "")):
+                                            existing.dialogue_wpm = data.get("dialogue_wpm", existing.dialogue_wpm)
+                                            existing.dialogue_word_count = int(data.get("dialogue_word_count", existing.dialogue_word_count) or 0)
+                                            existing.dialogue_language = data.get("dialogue_language", existing.dialogue_language)
+                                            existing.dialogue_confidence = float(data.get("dialogue_confidence", existing.dialogue_confidence) or 0.0)
+                                            existing.vibe_analysis_status = data.get("vibe_analysis_status", existing.vibe_analysis_status)
+                                            existing.vibe_analysis_version = int(data.get("vibe_analysis_version", existing.vibe_analysis_version) or 0)
+                                            existing.vibe_analyzed_at = data.get("vibe_analyzed_at", existing.vibe_analyzed_at)
                                             # Update probed metadata even if it exists
                                             if file_path:
                                                 abs_video_path = os.path.abspath(os.path.join(server_root, file_path))
@@ -1184,6 +1251,10 @@ class DownloadQueueManager:
                                         )
                                         cached.genres = meta.get("genres", data.get("genres", []))
                                         cached.cast = meta.get("cast", data.get("cast", []))
+                                        cached.crew = meta.get("crew", data.get("crew", []))
+                                        cached.keywords = meta.get("keywords", data.get("keywords", []))
+                                        cached.collection_name = meta.get("collectionName") or data.get("collection_name")
+                                        cached.trope_vectors = meta.get("tropeVectors") or data.get("trope_vectors") or compute_trope_vectors(cached.genres, cached.keywords, cached.description)
                                     elif cached.availability != "available":
                                         cached.catalog_source = "tmdb_cache"
                                         cached.availability = "cached"

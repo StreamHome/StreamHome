@@ -61,6 +61,15 @@ class Movie(SQLModel, table=True):
     cache_state: Optional[str] = Field(default=None, index=True)
     keywords_str: Optional[str] = Field(default="[]")
     collection_name: Optional[str] = Field(default=None, index=True)
+    crew_str: Optional[str] = Field(default="[]")
+    trope_vectors_str: Optional[str] = Field(default="[]")
+    dialogue_wpm: Optional[float] = Field(default=None)
+    dialogue_word_count: int = Field(default=0)
+    dialogue_language: Optional[str] = Field(default=None)
+    dialogue_confidence: float = Field(default=0.0)
+    vibe_analysis_status: Optional[str] = Field(default=None, index=True)
+    vibe_analysis_version: int = Field(default=0)
+    vibe_analyzed_at: Optional[float] = Field(default=None)
 
     # Rich Media Probe Fields (Additive)
     probed_duration: Optional[float] = Field(default=None)
@@ -142,6 +151,30 @@ class Movie(SQLModel, table=True):
         self.keywords_str = json.dumps(val or [])
 
     @property
+    def crew(self) -> List[Dict[str, Any]]:
+        try:
+            value = json.loads(self.crew_str or "[]")
+            return value if isinstance(value, list) else []
+        except Exception:
+            return []
+
+    @crew.setter
+    def crew(self, val: List[Dict[str, Any]]):
+        self.crew_str = json.dumps(val or [])
+
+    @property
+    def trope_vectors(self) -> List[Dict[str, Any]]:
+        try:
+            value = json.loads(self.trope_vectors_str or "[]")
+            return value if isinstance(value, list) else []
+        except Exception:
+            return []
+
+    @trope_vectors.setter
+    def trope_vectors(self, val: List[Dict[str, Any]]):
+        self.trope_vectors_str = json.dumps(val or [])
+
+    @property
     def audio_metadata(self) -> List[Dict[str, Any]]:
         try:
             return json.loads(self.audio_metadata_str or "[]")
@@ -177,6 +210,13 @@ class Episode(SQLModel, table=True):
     frame_rate: Optional[float] = Field(default=None)
     source_fingerprint: Optional[str] = Field(default=None, index=True)
     audio_metadata_str: Optional[str] = Field(default="[]")
+    dialogue_wpm: Optional[float] = Field(default=None)
+    dialogue_word_count: int = Field(default=0)
+    dialogue_language: Optional[str] = Field(default=None)
+    dialogue_confidence: float = Field(default=0.0)
+    vibe_analysis_status: Optional[str] = Field(default=None, index=True)
+    vibe_analysis_version: int = Field(default=0)
+    vibe_analyzed_at: Optional[float] = Field(default=None)
 
     @property
     def languages(self) -> List[str]:
@@ -255,6 +295,15 @@ class ProfileTaste(SQLModel, table=True):
     score: float = Field(default=0.0)
     last_updated: float
 
+class ProfileVibeVector(SQLModel, table=True):
+    profile_id: str = Field(primary_key=True)
+    dialogue_wpm_mean: Optional[float] = Field(default=None)
+    dialogue_wpm_stddev: Optional[float] = Field(default=None)
+    dialogue_confidence: float = Field(default=0.0)
+    dialogue_sample_weight: float = Field(default=0.0)
+    algorithm_version: str = Field(default="v2")
+    updated_at: float = Field(default_factory=time.time)
+
 class ProfileMediaPreference(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("profile_id", "movie_id", name="uq_profile_media_preference"),)
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -311,6 +360,7 @@ class ProfileRecommendation(SQLModel, table=True):
     media_type: str = Field(index=True)
     score: float = Field(default=0.0)
     reasons_str: str = Field(default="[]")
+    reason_details_str: str = Field(default="[]")
     generated_at: float = Field(index=True)
     candidate_source: str = Field(default="ranked", index=True)
     source_confidence: float = Field(default=0.5)
@@ -325,6 +375,18 @@ class ProfileRecommendation(SQLModel, table=True):
     @reasons.setter
     def reasons(self, val: List[str]):
         self.reasons_str = json.dumps(val or [])
+
+    @property
+    def reason_details(self) -> List[Dict[str, Any]]:
+        try:
+            value = json.loads(self.reason_details_str or "[]")
+            return value if isinstance(value, list) else []
+        except Exception:
+            return []
+
+    @reason_details.setter
+    def reason_details(self, val: List[Dict[str, Any]]):
+        self.reason_details_str = json.dumps(val or [])
 
 class RecommendationRefreshState(SQLModel, table=True):
     profile_id: str = Field(primary_key=True)
@@ -512,6 +574,8 @@ class EpisodeResponse(APIModel):
     languages: List[str] = ["en"]
     subtitles: List[Dict[str, str]] = []
     skip_markers: Dict[str, Any] = {}
+    dialogue_wpm: Optional[float] = None
+    dialogue_confidence: float = 0.0
 
 class MovieResponse(APIModel):
     id: str
@@ -541,6 +605,10 @@ class MovieResponse(APIModel):
     cache_state: Optional[str] = None
     source: str = "server"
     availability: str = "available"
+    crew: List[Dict[str, Any]] = []
+    trope_vectors: List[Dict[str, Any]] = []
+    dialogue_wpm: Optional[float] = None
+    dialogue_confidence: float = 0.0
 
     @classmethod
     def from_db(cls, movie: Movie, episodes: Optional[List[Episode]] = None) -> "MovieResponse":
@@ -577,7 +645,9 @@ class MovieResponse(APIModel):
                     quality=e.quality or "Source",
                     languages=e.languages,
                     subtitles=e.subtitles,
-                    skip_markers=e.skip_markers
+                    skip_markers=e.skip_markers,
+                    dialogue_wpm=e.dialogue_wpm,
+                    dialogue_confidence=e.dialogue_confidence,
                 )
                 for e in episodes
             ] if episodes else None,
@@ -588,6 +658,10 @@ class MovieResponse(APIModel):
             cache_state=movie.cache_state,
             source=movie.catalog_source,
             availability=movie.availability,
+            crew=movie.crew,
+            trope_vectors=movie.trope_vectors,
+            dialogue_wpm=movie.dialogue_wpm,
+            dialogue_confidence=movie.dialogue_confidence,
         )
 
 class DiscoverMovieResponse(APIModel):
@@ -627,9 +701,17 @@ class RecommendationItemResponse(APIModel):
     availability: str
     score: float
     reasons: List[str] = []
+    reason_details: List[Dict[str, Any]] = []
     viewer_preference: Optional[str] = None
     candidate_source: str = "ranked"
     source_confidence: float = 0.5
+
+class RecommendationVibeRailResponse(APIModel):
+    id: str
+    label: str
+    trope_ids: List[str] = []
+    reason_code: str = "trope_match"
+    items: List[RecommendationItemResponse] = []
 
 class RecommendationFeedResponse(APIModel):
     profile_id: str
@@ -643,6 +725,8 @@ class RecommendationFeedResponse(APIModel):
     categories: List[RecommendationCategoryResponse] = []
     items: List[RecommendationItemResponse] = []
     watch_again: List[RecommendationItemResponse] = []
+    vibe_rails: List[RecommendationVibeRailResponse] = []
+    algorithm_version: str = "v2"
 
 class PlaybackSessionResponse(APIModel):
     movie_id: str

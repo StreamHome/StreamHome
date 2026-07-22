@@ -2,7 +2,7 @@ import React from "react";
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { Movie } from "../../types/api";
-import { AvailabilityBadge } from "./RecommendationMeta";
+import { AvailabilityBadge, RecommendationReason } from "./RecommendationMeta";
 
 const movie = (availability: Movie["availability"]): Movie => ({
   id: "m_1",
@@ -41,5 +41,18 @@ describe("AvailabilityBadge", () => {
     expect(badge.getAttribute("title")).toBe(label);
     expect(container.querySelector("svg")).not.toBeNull();
     expect(container.textContent).not.toMatch(/server|cache|processing/i);
+  });
+});
+
+describe("RecommendationReason", () => {
+  it("renders structured auteur explanations and preserves fallback text", () => {
+    const auteur = movie("available");
+    auteur.recommendationReasons = ["Legacy reason"];
+    auteur.recommendationReasonDetails = [{ code: "auteur_director", subject: "Guy Ritchie", fallbackText: "Fallback" }];
+    const { rerender } = render(<RecommendationReason movie={auteur} />);
+    expect(screen.getByText("Because you love Guy Ritchie's directing style.").getAttribute("data-reason-code")).toBe("auteur_director");
+    auteur.recommendationReasonDetails = [{ code: "pacing_match", fallbackText: "Based on your preference for fast-paced, witty dialogue." }];
+    rerender(<RecommendationReason movie={auteur} />);
+    expect(screen.getByText("Based on your preference for fast-paced, witty dialogue.")).not.toBeNull();
   });
 });

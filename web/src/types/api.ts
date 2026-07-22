@@ -89,7 +89,13 @@ export interface Episode {
   languages: string[];
   subtitles: SubtitleInfo[];
   skipMarkers: Record<string, unknown>;
+  dialogueWpm?: number | null;
+  dialogueConfidence?: number;
 }
+
+export interface MediaCrewMember { name: string; roles: string[] }
+export interface MediaTropeVector { id: string; label: string; railLabel: string; confidence: number; registryVersion?: number }
+export interface RecommendationReasonDetail { code: string; subject?: string; strength?: number; fallbackText: string }
 
 export interface Movie {
   id: string;
@@ -122,6 +128,11 @@ export interface Movie {
   localBannerUrl?: string | null;
   cacheState?: MediaCacheState | null;
   viewerPreference?: MediaPreference;
+  crew?: MediaCrewMember[];
+  tropeVectors?: MediaTropeVector[];
+  dialogueWpm?: number | null;
+  dialogueConfidence?: number;
+  recommendationReasonDetails?: RecommendationReasonDetail[];
 }
 
 export type MediaSource = "server" | "tmdb_cache" | string;
@@ -143,9 +154,18 @@ export interface RecommendationItem {
   availability: MediaAvailability;
   score: number;
   reasons: string[];
-    viewerPreference?: MediaPreference;
-    candidateSource?: string;
-    sourceConfidence?: number;
+  reasonDetails?: RecommendationReasonDetail[];
+  viewerPreference?: MediaPreference;
+  candidateSource?: string;
+  sourceConfidence?: number;
+}
+
+export interface RecommendationVibeRail {
+  id: string;
+  label: string;
+  tropeIds: string[];
+  reasonCode: string;
+  items: RecommendationItem[];
 }
 
 export interface RecommendationFeed {
@@ -160,6 +180,8 @@ export interface RecommendationFeed {
   categories: RecommendationCategory[];
   items: RecommendationItem[];
   watchAgain: RecommendationItem[];
+  vibeRails?: RecommendationVibeRail[];
+  algorithmVersion?: string;
 }
 
 export interface RecommendationDiagnostics {
@@ -176,6 +198,7 @@ export interface RecommendationDiagnostics {
   candidateSources: Record<string, number>;
   catalog: { total: number; available: number; cached: number };
   topTastes: Array<{ kind: string; value: string; score: number }>;
+  vibeAnalysis?: { algorithmVersion: string; analyzerVersion: number; crewCoverage: number; tropeCoverage: number; pacingCoverage: number };
 }
 
 export interface PlaybackSession {

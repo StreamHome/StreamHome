@@ -211,6 +211,7 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
     baseMovies.forEach(add);
     recommendation?.items.forEach((item) => add(item.media));
     recommendation?.watchAgain.forEach((item) => add(item.media));
+    recommendation?.vibeRails?.forEach((rail) => rail.items.forEach((item) => add(item.media)));
     results.forEach((result) => { if (!byId.has(discoverId(result))) add(discoverAsMovie(result)); });
     Object.values(retainedMovies).forEach((movie) => {
       const existing = byId.get(movie.id);
@@ -258,6 +259,12 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
       ...current,
       items: current.items.filter((item) => preference !== "dislike" || item.media.id !== movieId).map((item) => item.media.id === movieId ? { ...item, viewerPreference: preference, media: { ...item.media, viewerPreference: preference } } : item),
       watchAgain: current.watchAgain.map((item) => item.media.id === movieId ? { ...item, viewerPreference: preference, media: { ...item.media, viewerPreference: preference } } : item),
+      vibeRails: current.vibeRails?.map((rail) => ({
+        ...rail,
+        items: rail.items
+          .filter((item) => preference !== "dislike" || item.media.id !== movieId)
+          .map((item) => item.media.id === movieId ? { ...item, viewerPreference: preference, media: { ...item.media, viewerPreference: preference } } : item),
+      })),
     } : current);
     try {
       await setMediaPreference(profile.id, movieId, preference);

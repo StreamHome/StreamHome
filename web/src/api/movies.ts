@@ -16,6 +16,8 @@ function normalizeEpisode(raw: Partial<Episode>): Episode {
     languages: Array.isArray(raw.languages) ? raw.languages : [],
     subtitles: Array.isArray(raw.subtitles) ? raw.subtitles : [],
     skipMarkers: raw.skipMarkers && typeof raw.skipMarkers === "object" ? raw.skipMarkers : {},
+    dialogueWpm: raw.dialogueWpm ?? null,
+    dialogueConfidence: raw.dialogueConfidence ?? 0,
   };
 }
 
@@ -51,6 +53,11 @@ export function normalizeMovie(raw: Partial<Movie>): Movie {
     localBannerUrl: raw.localBannerUrl ?? null,
     cacheState: raw.cacheState ?? null,
     viewerPreference: raw.viewerPreference ?? null,
+    crew: Array.isArray(raw.crew) ? raw.crew : [],
+    tropeVectors: Array.isArray(raw.tropeVectors) ? raw.tropeVectors : [],
+    dialogueWpm: raw.dialogueWpm ?? null,
+    dialogueConfidence: raw.dialogueConfidence ?? 0,
+    recommendationReasonDetails: Array.isArray(raw.recommendationReasonDetails) ? raw.recommendationReasonDetails : [],
   };
 }
 

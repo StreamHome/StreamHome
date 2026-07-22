@@ -58,6 +58,8 @@ class Settings:
     AUTH_CHALLENGE_MINUTES: int = 5
     REAUTHENTICATION_MINUTES: int = 10
     APP_VERSION: str = os.getenv("STREAMHOME_VERSION", "1.0.0")
+    RECOMMENDATION_V2_ENABLED: bool = os.getenv("RECOMMENDATION_V2_ENABLED", "true").lower() in ("true", "1", "yes")
+    RECOMMENDATION_V2_SHADOW: bool = os.getenv("RECOMMENDATION_V2_SHADOW", "false").lower() in ("true", "1", "yes")
 
     # Storage engine configuration: "LOCAL" or "CLOUD"
     STORAGE_ENGINE: str = os.getenv("STORAGE_ENGINE", "LOCAL")

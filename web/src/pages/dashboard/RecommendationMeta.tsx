@@ -19,6 +19,16 @@ export function AvailabilityBadge({ movie, variant = "shared" }: { movie: Movie;
 }
 
 export function RecommendationReason({ movie }: { movie: Movie }) {
-  const reason = movie.recommendationReasons?.[0];
-  return reason ? <span className="recommendation-reason">{reason}</span> : null;
+  const detail = movie.recommendationReasonDetails?.[0];
+  const fallback = detail?.fallbackText || movie.recommendationReasons?.[0];
+  if (!fallback) return null;
+  const subject = detail?.subject?.trim();
+  const reason = detail?.code === "auteur_director" && subject
+    ? `Because you love ${subject}${subject.endsWith("s") ? "'" : "'s"} directing style.`
+    : detail?.code === "auteur_writer" && subject
+      ? `Because you love ${subject}${subject.endsWith("s") ? "'" : "'s"} writing.`
+      : detail?.code === "trope_match" && subject
+        ? `A ${subject.toLocaleLowerCase()} matching your taste.`
+        : fallback;
+  return <span className="recommendation-reason" data-reason-code={detail?.code ?? "legacy"}>{reason}</span>;
 }

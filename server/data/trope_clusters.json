@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "tropes": [
+    {
+      "id": "neo_noir_buddy_action",
+      "label": "Neo-Noir Buddy Action",
+      "rail_label": "Witty Banter & Bullets",
+      "required_any": [["buddy", "buddy cop", "odd couple"], ["police", "cop", "detective", "private detective"]],
+      "supporting": ["dark comedy", "neo-noir", "crime", "witty", "murder mystery"],
+      "genres": ["action", "comedy", "crime", "mystery"],
+      "exclusions": []
+    },
+    {
+      "id": "cerebral_scifi_mystery",
+      "label": "Cerebral Science-Fiction Mystery",
+      "rail_label": "Reality-Bending Mysteries",
+      "required_any": [["mind bending", "alternate reality", "time travel", "simulation", "memory"], ["mystery", "conspiracy", "investigation", "philosophy"]],
+      "supporting": ["science fiction", "space", "dystopia", "dream", "artificial intelligence"],
+      "genres": ["sci-fi", "science fiction", "mystery", "thriller"],
+      "exclusions": []
+    },
+    {
+      "id": "slow_burn_psychological_thriller",
+      "label": "Slow-Burn Psychological Thriller",
+      "rail_label": "Quiet Dread & Dark Secrets",
+      "required_any": [["psychological", "psychological thriller", "paranoia", "obsession"], ["slow burn", "mystery", "secret", "isolation"]],
+      "supporting": ["unreliable narrator", "atmospheric", "surreal", "crime"],
+      "genres": ["thriller", "mystery", "drama", "horror"],
+      "exclusions": ["slapstick"]
+    },
+    {
+      "id": "found_family_adventure",
+      "label": "Found-Family Adventure",
+      "rail_label": "Adventures Become Family",
+      "required_any": [["found family", "friendship", "unlikely friendship", "team"], ["adventure", "journey", "quest", "road trip"]],
+      "supporting": ["coming of age", "heartwarming", "rescue", "survival"],
+      "genres": ["adventure", "family", "animation", "comedy"],
+      "exclusions": []
+    },
+    {
+      "id": "political_power_drama",
+      "label": "Political Power Drama",
+      "rail_label": "Power, Loyalty & Betrayal",
+      "required_any": [["politics", "political", "government", "royalty"], ["betrayal", "power struggle", "corruption", "conspiracy"]],
+      "supporting": ["war", "family conflict", "historical", "espionage"],
+      "genres": ["drama", "history", "war & politics", "thriller"],
+      "exclusions": []
+    },
+    {
+      "id": "high_stakes_heist",
+      "label": "High-Stakes Heist",
+      "rail_label": "Impossible Plans, Perfect Crews",
+      "required_any": [["heist", "robbery", "caper", "con artist"], ["team", "crew", "master plan", "double cross"]],
+      "supporting": ["safecracker", "casino", "crime", "twist"],
+      "genres": ["crime", "action", "thriller", "comedy"],
+      "exclusions": []
+    },
+    {
+      "id": "romantic_wit",
+      "label": "Sharp-Witted Romance",
+      "rail_label": "Chemistry, Conflict & Comebacks",
+      "required_any": [["romance", "falling in love", "relationship"], ["witty", "banter", "enemies to lovers", "romantic comedy"]],
+      "supporting": ["workplace", "second chance", "opposites attract"],
+      "genres": ["romance", "comedy", "drama"],
+      "exclusions": []
+    },
+    {
+      "id": "survival_against_odds",
+      "label": "Survival Against the Odds",
+      "rail_label": "No Way Out but Through",
+      "required_any": [["survival", "stranded", "disaster", "wilderness"], ["against the odds", "rescue", "escape", "isolation"]],
+      "supporting": ["nature", "space", "ocean", "mountain", "post-apocalyptic"],
+      "genres": ["adventure", "thriller", "drama", "sci-fi"],
+      "exclusions": []
+    }
+  ]
+}

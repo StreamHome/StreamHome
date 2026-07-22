@@ -146,6 +146,15 @@ async def init_db():
                     "cache_state": "TEXT",
                     "keywords_str": "TEXT DEFAULT '[]'",
                     "collection_name": "TEXT",
+                    "crew_str": "TEXT DEFAULT '[]'",
+                    "trope_vectors_str": "TEXT DEFAULT '[]'",
+                    "dialogue_wpm": "FLOAT",
+                    "dialogue_word_count": "INTEGER DEFAULT 0",
+                    "dialogue_language": "TEXT",
+                    "dialogue_confidence": "FLOAT DEFAULT 0",
+                    "vibe_analysis_status": "TEXT",
+                    "vibe_analysis_version": "INTEGER DEFAULT 0",
+                    "vibe_analyzed_at": "FLOAT",
                 }
                 for column, sql_type in recommendation_columns.items():
                     if column not in movie_cols:
@@ -198,6 +207,7 @@ async def init_db():
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_cache_state ON movie (cache_state)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_collection_name ON movie (collection_name)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_source_fingerprint ON movie (source_fingerprint)")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_vibe_analysis_status ON movie (vibe_analysis_status)")
                 sync_conn.exec_driver_sql(
                     "UPDATE movie SET cache_state = CASE "
                     "WHEN catalog_source = 'tmdb_cache' THEN 'ready' ELSE NULL END "
@@ -215,12 +225,20 @@ async def init_db():
                     "frame_rate": "FLOAT",
                     "source_fingerprint": "TEXT",
                     "audio_metadata_str": "TEXT DEFAULT '[]'",
+                    "dialogue_wpm": "FLOAT",
+                    "dialogue_word_count": "INTEGER DEFAULT 0",
+                    "dialogue_language": "TEXT",
+                    "dialogue_confidence": "FLOAT DEFAULT 0",
+                    "vibe_analysis_status": "TEXT",
+                    "vibe_analysis_version": "INTEGER DEFAULT 0",
+                    "vibe_analyzed_at": "FLOAT",
                 }
                 for column, sql_type in probe_columns.items():
                     if column not in ep_cols:
                         logger.info(f"[Database] Migrating: Adding '{column}' column to 'episode' table...")
                         sync_conn.exec_driver_sql(f"ALTER TABLE episode ADD COLUMN {column} {sql_type}")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_episode_source_fingerprint ON episode (source_fingerprint)")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_episode_vibe_analysis_status ON episode (vibe_analysis_status)")
 
             if "playbackrun" in inspector.get_table_names():
                 playback_run_cols = [col["name"] for col in inspector.get_columns("playbackrun")]
@@ -235,6 +253,8 @@ async def init_db():
                     sync_conn.exec_driver_sql("ALTER TABLE profilerecommendation ADD COLUMN candidate_source TEXT DEFAULT 'ranked'")
                 if "source_confidence" not in recommendation_cols:
                     sync_conn.exec_driver_sql("ALTER TABLE profilerecommendation ADD COLUMN source_confidence FLOAT DEFAULT 0.5")
+                if "reason_details_str" not in recommendation_cols:
+                    sync_conn.exec_driver_sql("ALTER TABLE profilerecommendation ADD COLUMN reason_details_str TEXT DEFAULT '[]'")
 
             if "telemetryevent" in inspector.get_table_names():
                 telemetry_cols = [col["name"] for col in inspector.get_columns("telemetryevent")]

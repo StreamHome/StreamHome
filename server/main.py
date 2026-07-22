@@ -46,6 +46,7 @@ from services.logger import logger
 from services.queue import queue_manager
 from services.hevc_compressor import hevc_compressor
 from services.playback_prep import playback_prep_service
+from services.vibe_analysis import vibe_analysis_manager
 import services.state as state
 from routes.queue import router as queue_router
 from routes.auth import router as auth_router, health_router, get_current_user
@@ -182,6 +183,7 @@ async def lifespan(app: FastAPI):
         try:
             await queue_manager.sync_media_from_disk()
             await playback_prep_service.schedule_catalog_baselines()
+            await vibe_analysis_manager.start()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -282,6 +284,11 @@ async def lifespan(app: FastAPI):
         await queue_manager.stop()
     except Exception as q_stop_err:
         logger.error(f"[Lifespan Shutdown] Error stopping queue manager: {q_stop_err}")
+
+    try:
+        await vibe_analysis_manager.stop()
+    except Exception as vibe_stop_err:
+        logger.error(f"[Lifespan Shutdown] Error stopping vibe analyzer: {vibe_stop_err}")
         
     try:
         hevc_compressor.stop()

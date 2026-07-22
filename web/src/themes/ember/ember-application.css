@@ -58,6 +58,8 @@
 .ember-rail header p,.ember-page-heading p { margin-bottom: 8px; color: #ffb59c; font: 500 9px/1 var(--font-mono); letter-spacing: .16em; }
 .ember-rail header h2 { font: 700 31px/1.05 var(--font-headline); }
 .ember-rail header > span,.ember-page-heading > span { color: #c18d7e; font: 500 8px/1 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; }
+.ember-rail[data-section-kind="vibe"] { border-top: 1px dashed rgba(255,95,31,.42); padding-top: 18px; }
+.ember-rail[data-section-kind="vibe"] header p::before { content: "◇ "; color: #ff5f1f; }
 .ember-rail__frame { position: relative; }
 .ember-rail__track { display: flex; gap: clamp(12px,1vw,18px); overflow-x: auto; overflow-y: hidden; padding: 7px clamp(4px,.7vw,12px) 22px; scroll-padding-inline: clamp(4px,.7vw,12px); scroll-snap-type: x mandatory; scrollbar-width: none; -ms-overflow-style: none; }
 .ember-rail__track::-webkit-scrollbar { display: none; }

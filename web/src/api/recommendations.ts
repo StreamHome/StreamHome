@@ -1,6 +1,6 @@
 import { apiDelete, apiGet, apiPost, apiPut } from "./client";
 import { normalizeMovie } from "./movies";
-import type { MediaPreference, RecommendationCategory, RecommendationDiagnostics, RecommendationFeed, RecommendationItem } from "../types/api";
+import type { MediaPreference, RecommendationCategory, RecommendationDiagnostics, RecommendationFeed, RecommendationItem, RecommendationReasonDetail, RecommendationVibeRail } from "../types/api";
 import type { CatalogView } from "../navigation/queryState";
 
 type RawRecommendationCategory = Partial<RecommendationCategory> & {
@@ -10,15 +10,25 @@ type RawRecommendationCategory = Partial<RecommendationCategory> & {
 
 type RawRecommendationItem = Partial<RecommendationItem> & {
   media?: Parameters<typeof normalizeMovie>[0];
+  reason_details?: RecommendationReasonDetail[];
 };
 
-type RawRecommendationFeed = Partial<Omit<RecommendationFeed, "categories" | "items" | "watchAgain">> & {
+type RawRecommendationVibeRail = Partial<Omit<RecommendationVibeRail, "items">> & {
+  trope_ids?: string[];
+  reason_code?: string;
+  items?: RawRecommendationItem[];
+};
+
+type RawRecommendationFeed = Partial<Omit<RecommendationFeed, "categories" | "items" | "watchAgain" | "vibeRails">> & {
   profile_id?: string;
   generated_at?: number;
   categories?: RawRecommendationCategory[];
   items?: RawRecommendationItem[];
   watchAgain?: RawRecommendationItem[];
   watch_again?: RawRecommendationItem[];
+  vibeRails?: RawRecommendationVibeRail[];
+  vibe_rails?: RawRecommendationVibeRail[];
+  algorithm_version?: string;
 };
 
 export interface RecommendationRequest {
@@ -44,14 +54,26 @@ function normalizeItem(raw: RawRecommendationItem): RecommendationItem {
   const source = raw.source ?? "tmdb_cache";
   const availability = raw.availability ?? "cached";
   const reasons = Array.isArray(raw.reasons) ? raw.reasons : [];
+  const reasonDetails = Array.isArray(raw.reasonDetails) ? raw.reasonDetails : Array.isArray(raw.reason_details) ? raw.reason_details : [];
   const media = normalizeMovie(raw.media ?? {});
   media.source = source;
   media.availability = availability;
   media.recommendationScore = raw.score ?? 0;
   media.recommendationReasons = reasons;
+  media.recommendationReasonDetails = reasonDetails;
   const viewerPreference = raw.viewerPreference ?? null;
   media.viewerPreference = viewerPreference;
-  return { media, source, availability, score: raw.score ?? 0, reasons, viewerPreference, candidateSource: raw.candidateSource ?? "ranked", sourceConfidence: raw.sourceConfidence ?? 0.5 };
+  return { media, source, availability, score: raw.score ?? 0, reasons, reasonDetails, viewerPreference, candidateSource: raw.candidateSource ?? "ranked", sourceConfidence: raw.sourceConfidence ?? 0.5 };
+}
+
+function normalizeVibeRail(raw: RawRecommendationVibeRail): RecommendationVibeRail {
+  return {
+    id: raw.id ?? "",
+    label: raw.label ?? "Matched to Your Vibe",
+    tropeIds: Array.isArray(raw.tropeIds) ? raw.tropeIds : Array.isArray(raw.trope_ids) ? raw.trope_ids : [],
+    reasonCode: raw.reasonCode ?? raw.reason_code ?? "trope_match",
+    items: Array.isArray(raw.items) ? raw.items.map(normalizeItem).filter((item) => item.media.id) : [],
+  };
 }
 
 export async function getMediaPreferences(profileId: string, signal?: AbortSignal): Promise<Record<string, Exclude<MediaPreference, null>>> {
@@ -84,6 +106,7 @@ export async function getRecommendationDiagnostics(profileId: string): Promise<R
     candidateSources: (raw.candidateSources ?? raw.candidate_sources ?? {}) as Record<string, number>,
     catalog: (raw.catalog ?? { total: 0, available: 0, cached: 0 }) as RecommendationDiagnostics["catalog"],
     topTastes: (raw.topTastes ?? raw.top_tastes ?? []) as RecommendationDiagnostics["topTastes"],
+    vibeAnalysis: (raw.vibeAnalysis ?? raw.vibe_analysis) as RecommendationDiagnostics["vibeAnalysis"],
   };
 }
 export const rebuildRecommendations = (profileId: string) => apiPost(`/api/recommendations/${encodeURIComponent(profileId)}/rebuild`);
@@ -105,6 +128,7 @@ export async function getRecommendations({
   const params = new URLSearchParams({ scope, category, limit: String(limit), offset: String(offset) });
   const raw = await apiGet<RawRecommendationFeed>(`/api/recommendations/${encodeURIComponent(profileId)}?${params.toString()}`, { signal });
   const watchAgain = raw.watchAgain ?? raw.watch_again;
+  const vibeRails = raw.vibeRails ?? raw.vibe_rails;
   return {
     profileId: raw.profileId ?? raw.profile_id ?? profileId,
     scope: raw.scope === "movies" || raw.scope === "series" ? raw.scope : "home",
@@ -117,5 +141,7 @@ export async function getRecommendations({
     categories: Array.isArray(raw.categories) ? raw.categories.map(normalizeCategory).filter((item) => item.value) : [],
     items: Array.isArray(raw.items) ? raw.items.map(normalizeItem).filter((item) => item.media.id) : [],
     watchAgain: Array.isArray(watchAgain) ? watchAgain.map(normalizeItem).filter((item) => item.media.id) : [],
+    vibeRails: Array.isArray(vibeRails) ? vibeRails.map(normalizeVibeRail).filter((rail) => rail.id && rail.items.length) : [],
+    algorithmVersion: raw.algorithmVersion ?? raw.algorithm_version ?? "v1",
   };
 }

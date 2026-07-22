@@ -15,6 +15,7 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from db import engine
+from config import settings
 from models import (
     Episode,
     Movie,
@@ -25,6 +26,7 @@ from models import (
     ProfileOnboardingPreference,
     RecommendationExposure,
     ProfileTaste,
+    ProfileVibeVector,
     RecommendationRefreshState,
     TelemetryEvent,
     TelemetryRequest,
@@ -32,6 +34,7 @@ from models import (
     MovieResponse,
 )
 from services.logger import logger
+from services.vibe_analysis import VIBE_ANALYSIS_VERSION, crew_names
 
 TASTE_HALF_LIFE_DAYS = 90.0
 DECAY_RATE = math.log(2.0) / TASTE_HALF_LIFE_DAYS
@@ -40,6 +43,8 @@ TMDB_REFRESH_SECONDS = 6 * 60 * 60
 TMDB_STALE_SECONDS = 24 * 60 * 60
 ATTEMPT_GAP_SECONDS = 30 * 60
 REWATCH_COOLDOWN_SECONDS = 24 * 60 * 60
+ALGORITHM_VERSION = "v2.1"
+SHADOW_METRICS: Dict[str, Dict[str, Any]] = {}
 
 EVENT_WEIGHTS = {
     "card_click": 0.35,
@@ -101,18 +106,26 @@ def _movie_tags(movie: Movie) -> List[Tuple[str, str, float]]:
     genres = [normalize_tag(value) for value in movie.genres if normalize_tag(value)]
     cast = [normalize_tag(value) for value in movie.cast[:5] if normalize_tag(value)]
     if genres:
-        tags.extend(("genre", value, 0.60 / len(genres)) for value in genres)
+        tags.extend(("genre", value, 0.45 / len(genres)) for value in genres)
     if cast:
-        tags.extend(("actor", value, 0.25 / len(cast)) for value in cast)
-    director = normalize_tag(movie.director or "")
-    if director and not director.startswith("unknown") and director not in {"various", "various directors"}:
-        tags.append(("director", director, 0.15))
+        tags.extend(("actor", value, 0.15 / len(cast)) for value in cast)
+    directors = crew_names(movie.crew, {"Director"}) or ([movie.director] if movie.director else [])
+    clean_directors = [normalize_tag(value) for value in directors if normalize_tag(value) and not normalize_tag(value).startswith("unknown") and normalize_tag(value) not in {"various", "various directors"}]
+    if clean_directors:
+        tags.extend(("director", value, 0.20 / len(clean_directors)) for value in clean_directors)
+    writers = [normalize_tag(value) for value in crew_names(movie.crew, {"Writer", "Screenplay", "Story", "Teleplay", "Creator"}) if normalize_tag(value)]
+    if writers:
+        tags.extend(("writer", value, 0.14 / len(writers)) for value in writers)
     keywords = [normalize_tag(value) for value in movie.keywords[:8] if normalize_tag(value)]
     if keywords:
-        tags.extend(("keyword", value, 0.20 / len(keywords)) for value in keywords)
+        tags.extend(("keyword", value, 0.12 / len(keywords)) for value in keywords)
+    tropes = [(normalize_tag(str(value.get("id") or "")), float(value.get("confidence") or 0.0)) for value in movie.trope_vectors if value.get("id")]
+    if tropes:
+        total_confidence = sum(max(0.05, confidence) for _, confidence in tropes)
+        tags.extend(("trope", value, 0.30 * max(0.05, confidence) / total_confidence) for value, confidence in tropes)
     collection = normalize_tag(movie.collection_name or "")
     if collection:
-        tags.append(("collection", collection, 0.20))
+        tags.append(("collection", collection, 0.12))
     return tags
 
 
@@ -315,6 +328,9 @@ async def get_recommendation_diagnostics(profile_id: str) -> Dict[str, Any]:
         movies = await db.exec(select(Movie))
         movie_rows = list(movies.all())
         available = sum(1 for movie in movie_rows if movie.availability == "available" or bool((movie.video_url or "").strip()))
+        crew_coverage = sum(1 for movie in movie_rows if movie.crew)
+        trope_coverage = sum(1 for movie in movie_rows if movie.trope_vectors)
+        pacing_coverage = sum(1 for movie in movie_rows if movie.dialogue_wpm and movie.dialogue_confidence >= 0.15)
         details_opens = sum(1 for event in event_rows if event.event_type in {"card_click", "search_click", "search_result_select"})
         playback_starts = sum(1 for event in event_rows if event.event_type == "playback_10")
         completions = sum(1 for event in event_rows if event.event_type in {"playback_80", "playback_95"})
@@ -332,6 +348,16 @@ async def get_recommendation_diagnostics(profile_id: str) -> Dict[str, Any]:
             "candidate_pool": len(pool_rows),
             "candidate_sources": dict((source, sum(1 for item in pool_rows if item.candidate_source == source)) for source in sorted({item.candidate_source for item in pool_rows})),
             "catalog": {"total": len(movie_rows), "available": available, "cached": len(movie_rows) - available},
+            "vibe_analysis": {
+                "algorithm_version": ALGORITHM_VERSION,
+                "analyzer_version": VIBE_ANALYSIS_VERSION,
+                "crew_coverage": crew_coverage,
+                "trope_coverage": trope_coverage,
+                "pacing_coverage": pacing_coverage,
+                "enabled": settings.RECOMMENDATION_V2_ENABLED,
+                "shadow": settings.RECOMMENDATION_V2_SHADOW,
+                "shadow_metrics": SHADOW_METRICS.get(profile_id),
+            },
             "top_tastes": top_tastes,
         }
 
@@ -479,18 +505,23 @@ async def record_playback_progress(
 async def _taste_map(db: AsyncSession, profile_id: str, now: float) -> Dict[Tuple[str, str], float]:
     result = await db.exec(select(ProfileTaste).where(ProfileTaste.profile_id == profile_id))
     values = {(taste.tag_type, taste.tag_value): decayed_score(taste, now) for taste in result.all()}
-    onboarding = await db.exec(select(ProfileOnboardingPreference).where(ProfileOnboardingPreference.profile_id == profile_id))
-    for item in onboarding.all():
+    onboarding = list((await db.exec(select(ProfileOnboardingPreference).where(ProfileOnboardingPreference.profile_id == profile_id))).all())
+    explicit = list((await db.exec(select(ProfileMediaPreference).where(ProfileMediaPreference.profile_id == profile_id))).all())
+    title_ids = {item.value for item in onboarding if item.kind == "title"} | {item.movie_id for item in explicit}
+    movie_by_id: Dict[str, Movie] = {}
+    if title_ids:
+        movie_rows = await db.exec(select(Movie).where(Movie.id.in_(title_ids)))
+        movie_by_id = {movie.id: movie for movie in movie_rows.all()}
+    for item in onboarding:
         if item.kind == "genre":
             values[("genre", normalize_tag(item.value))] = values.get(("genre", normalize_tag(item.value)), 0.0) + 4.0
         elif item.kind == "title":
-            movie = await db.get(Movie, item.value)
+            movie = movie_by_id.get(item.value)
             if movie:
                 for kind, tag, share in _movie_tags(movie):
                     values[(kind, tag)] = values.get((kind, tag), 0.0) + 3.0 * share
-    explicit = await db.exec(select(ProfileMediaPreference).where(ProfileMediaPreference.profile_id == profile_id))
-    for item in explicit.all():
-        movie = await db.get(Movie, item.movie_id)
+    for item in explicit:
+        movie = movie_by_id.get(item.movie_id)
         if not movie:
             continue
         strength = {"like": 3.0, "love": 6.0, "dislike": -1.0}.get(item.preference, 0.0)
@@ -517,16 +548,99 @@ def _recency(movie: Movie, current_year: int) -> float:
     return math.exp(-age / 12.0)
 
 
+async def _profile_pacing_vector(
+    db: AsyncSession,
+    profile_id: str,
+    movies: Sequence[Movie],
+    preferences: Dict[str, str],
+    attempts: Sequence[ViewingAttempt],
+) -> Optional[Dict[str, float]]:
+    movie_by_id = {movie.id: movie for movie in movies}
+    weights: Dict[str, float] = defaultdict(float)
+    for movie_id, preference in preferences.items():
+        if preference == "love":
+            weights[movie_id] += 6.0
+        elif preference == "like":
+            weights[movie_id] += 3.0
+    completed_ids: set[str] = set()
+    for attempt in attempts:
+        if attempt.max_completion < 0.80:
+            continue
+        completed_ids.add(attempt.movie_id)
+        weights[attempt.movie_id] += 1.5 + min(2.0, float(attempt.rewatch_reward or 0.0) * 2.0)
+    samples: List[Tuple[float, float]] = []
+    for movie_id, weight in weights.items():
+        movie = movie_by_id.get(movie_id)
+        if not movie or not movie.dialogue_wpm or float(movie.dialogue_confidence or 0.0) < 0.15:
+            continue
+        samples.append((float(movie.dialogue_wpm), weight * float(movie.dialogue_confidence or 0.0)))
+    distinct = len(samples)
+    total_weight = sum(weight for _, weight in samples)
+    if distinct < 2 or total_weight <= 0:
+        vector = await db.get(ProfileVibeVector, profile_id)
+        if vector:
+            vector.dialogue_wpm_mean = None
+            vector.dialogue_wpm_stddev = None
+            vector.dialogue_confidence = 0.0
+            vector.dialogue_sample_weight = total_weight
+            vector.algorithm_version = ALGORITHM_VERSION
+            vector.updated_at = time.time()
+            db.add(vector)
+        return None
+    mean = sum(value * weight for value, weight in samples) / total_weight
+    variance = sum(weight * (value - mean) ** 2 for value, weight in samples) / total_weight
+    stddev = max(12.0, math.sqrt(max(0.0, variance)))
+    confidence = min(1.0, distinct / 5.0) * min(1.0, total_weight / 12.0)
+    vector = await db.get(ProfileVibeVector, profile_id) or ProfileVibeVector(profile_id=profile_id)
+    vector.dialogue_wpm_mean = mean
+    vector.dialogue_wpm_stddev = stddev
+    vector.dialogue_confidence = confidence
+    vector.dialogue_sample_weight = total_weight
+    vector.algorithm_version = ALGORITHM_VERSION
+    vector.updated_at = time.time()
+    db.add(vector)
+    return {"mean": mean, "stddev": stddev, "confidence": confidence}
+
+
+def _possessive(name: str) -> str:
+    return f"{name}'" if name.casefold().endswith("s") else f"{name}'s"
+
+
+def _reason_detail(text: str) -> Dict[str, Any]:
+    if text.startswith("Because you love ") and text.endswith(" directing style."):
+        subject = text[len("Because you love "):].removesuffix(" directing style.").removesuffix("'s").removesuffix("'")
+        return {"code": "auteur_director", "subject": subject, "fallbackText": text}
+    if text.startswith("Because you love ") and text.endswith(" writing."):
+        subject = text[len("Because you love "):].removesuffix(" writing.").removesuffix("'s").removesuffix("'")
+        return {"code": "auteur_writer", "subject": subject, "fallbackText": text}
+    if "dialogue" in text.casefold() or "slow-burn" in text.casefold():
+        return {"code": "pacing_match", "fallbackText": text}
+    if text.startswith("A ") and text.endswith(" matching your taste."):
+        return {"code": "trope_match", "subject": text[2:].removesuffix(" matching your taste."), "fallbackText": text}
+    if text == "You love this title":
+        return {"code": "explicit_love", "fallbackText": text}
+    if text == "You liked this title":
+        return {"code": "explicit_like", "fallbackText": text}
+    if text == "Available on your server":
+        return {"code": "server_available", "fallbackText": text}
+    return {"code": "taste_affinity", "fallbackText": text}
+
+
+def reason_details(reasons: Sequence[str]) -> List[Dict[str, Any]]:
+    return [_reason_detail(reason) for reason in reasons[:2]]
+
+
 def score_movie(
     movie: Movie,
     tastes: Dict[Tuple[str, str], float],
     available: bool,
     completion: float = 0.0,
     now: Optional[float] = None,
+    pacing_profile: Optional[Dict[str, float]] = None,
 ) -> Tuple[float, List[str]]:
     now = now or time.time()
     tag_values = [(kind, value, share, tastes.get((kind, value), 0.0)) for kind, value, share in _movie_tags(movie)]
-    affinity_raw = sum(share * value for kind, tag, share, value in tag_values)
+    affinity_raw = sum(share * value for _, _, share, value in tag_values)
     affinity = (math.tanh(affinity_raw / 4.0) + 1.0) / 2.0
     quality = _bayesian_quality(movie)
     popularity = math.tanh(max(0.0, float(movie.popularity or 0.0)) / 100.0)
@@ -535,14 +649,55 @@ def score_movie(
     novelty = max(0.0, 1.0 - max(0.0, min(1.0, completion)))
 
     if tastes:
-        total = 0.60 * affinity + 0.15 * quality_popularity + 0.10 * recency + 0.10 * novelty + 0.05 * float(available)
+        total = 0.48 * affinity + 0.15 * quality_popularity + 0.10 * recency + 0.10 * novelty + 0.05 * float(available)
     else:
         total = 0.45 * quality + 0.30 * popularity + 0.15 * recency + 0.10 * float(available)
 
     reasons: List[str] = []
+    directors = crew_names(movie.crew, {"Director"}) or ([movie.director] if movie.director else [])
+    writers = crew_names(movie.crew, {"Writer", "Screenplay", "Story", "Teleplay", "Creator"})
+    director_match = max(((tastes.get(("director", normalize_tag(name)), 0.0), name) for name in directors if normalize_tag(name)), default=(0.0, ""))
+    writer_match = max(((tastes.get(("writer", normalize_tag(name)), 0.0), name) for name in writers if normalize_tag(name)), default=(0.0, ""))
+    auteur_score, auteur_name, auteur_kind = max((director_match[0], director_match[1], "director"), (writer_match[0], writer_match[1], "writer"))
+    auteur_strength = min(1.0, max(0.0, auteur_score) / 1.2)
+    if auteur_strength > 0:
+        total *= 1.0 + 0.55 * auteur_strength
+        if auteur_strength >= 0.25 and auteur_name:
+            reason = f"Because you love {_possessive(auteur_name)} directing style." if auteur_kind == "director" else f"Because you love {_possessive(auteur_name)} writing."
+            reasons.append(reason)
+
+    pacing_match = 0.0
+    if pacing_profile and movie.dialogue_wpm and float(movie.dialogue_confidence or 0.0) >= 0.15:
+        deviation = abs(float(movie.dialogue_wpm) - pacing_profile["mean"])
+        pacing_match = math.exp(-(deviation ** 2) / (2.0 * pacing_profile["stddev"] ** 2))
+        pacing_strength = pacing_match * pacing_profile["confidence"] * float(movie.dialogue_confidence or 0.0)
+        total += 0.14 * pacing_strength
+        if pacing_strength >= 0.25 and not reasons:
+            if pacing_profile["mean"] >= 105:
+                reasons.append("Based on your preference for fast-paced, witty dialogue.")
+            elif pacing_profile["mean"] <= 65:
+                reasons.append("A measured, atmospheric slow-burn matching your pace.")
+            else:
+                reasons.append("A dialogue-driven story matching your preferred pace.")
+
+    trope_matches = []
+    for trope in movie.trope_vectors:
+        trope_id = normalize_tag(str(trope.get("id") or ""))
+        taste = max(0.0, tastes.get(("trope", trope_id), 0.0))
+        if trope_id and taste:
+            trope_matches.append((taste * float(trope.get("confidence") or 0.0), trope))
+    trope_overlap = sum(value for value, _ in trope_matches)
+    trope_strength = 1.0 - math.exp(-0.9 * trope_overlap) if trope_overlap > 0 else 0.0
+    if trope_strength:
+        total += 0.20 * trope_strength
+        total *= 1.0 + 0.20 * trope_strength
+        if trope_strength >= 0.20 and not reasons:
+            best_trope = max(trope_matches, key=lambda row: row[0])[1]
+            reasons.append(f"A {str(best_trope.get('label') or 'specific vibe').casefold()} matching your taste.")
+
     positives = sorted((entry for entry in tag_values if entry[3] > 0.05), key=lambda entry: entry[3], reverse=True)
-    if positives:
-        kind, tag, _, _ = positives[0]
+    if positives and not reasons:
+        _, tag, _, _ = positives[0]
         label = next((value for value in movie.genres + movie.cast if normalize_tag(value) == tag), movie.director or tag)
         reasons.append(f"Because you like {label}")
     if available:
@@ -550,6 +705,30 @@ def score_movie(
     elif not reasons:
         reasons.append("A highly rated discovery")
     return total, reasons[:2]
+
+
+def _legacy_score_movie(movie: Movie, tastes: Dict[Tuple[str, str], float], available: bool, completion: float = 0.0) -> Tuple[float, List[str]]:
+    tags: List[Tuple[str, str, float]] = []
+    genres = [normalize_tag(value) for value in movie.genres if normalize_tag(value)]
+    cast = [normalize_tag(value) for value in movie.cast[:5] if normalize_tag(value)]
+    if genres:
+        tags.extend(("genre", value, 0.60 / len(genres)) for value in genres)
+    if cast:
+        tags.extend(("actor", value, 0.25 / len(cast)) for value in cast)
+    director = normalize_tag(movie.director or "")
+    if director and not director.startswith("unknown") and director not in {"various", "various directors"}:
+        tags.append(("director", director, 0.15))
+    values = [(kind, tag, share, tastes.get((kind, tag), 0.0)) for kind, tag, share in tags]
+    affinity_raw = sum(share * value for _, _, share, value in values)
+    affinity = (math.tanh(affinity_raw / 4.0) + 1.0) / 2.0
+    quality = _bayesian_quality(movie)
+    popularity = math.tanh(max(0.0, float(movie.popularity or 0.0)) / 100.0)
+    recency = _recency(movie, datetime.now().year)
+    novelty = max(0.0, 1.0 - max(0.0, min(1.0, completion)))
+    total = 0.60 * affinity + 0.15 * (0.75 * quality + 0.25 * popularity) + 0.10 * recency + 0.10 * novelty + 0.05 * float(available) if tastes else 0.45 * quality + 0.30 * popularity + 0.15 * recency + 0.10 * float(available)
+    positives = sorted((entry for entry in values if entry[3] > 0.05), key=lambda entry: entry[3], reverse=True)
+    reasons = [f"Because you like {positives[0][1]}"] if positives else (["Available on your server"] if available else ["A highly rated discovery"])
+    return total, reasons
 
 
 async def rank_movies_for_profile(
@@ -562,8 +741,10 @@ async def rank_movies_for_profile(
     tastes = await _taste_map(db, profile_id, now)
     preferences = await _preference_map(db, profile_id)
     playback = await db.exec(select(ViewingAttempt).where(ViewingAttempt.profile_id == profile_id))
+    playback_rows = list(playback.all())
+    pacing_profile = await _profile_pacing_vector(db, profile_id, movies, preferences, playback_rows)
     completion_by_movie: Dict[str, float] = defaultdict(float)
-    for attempt in playback.all():
+    for attempt in playback_rows:
         completion_by_movie[attempt.movie_id] = max(completion_by_movie[attempt.movie_id], attempt.max_completion)
     exposure_result = await db.exec(select(RecommendationExposure).where(RecommendationExposure.profile_id == profile_id, RecommendationExposure.shown_at >= now - 14 * 86400))
     exposure_counts: Dict[str, int] = defaultdict(int)
@@ -579,25 +760,48 @@ async def rank_movies_for_profile(
         elif event.event_type == "card_click":
             title_signals[event.movie_id] = max(title_signals[event.movie_id], 0.025)
     ranked = []
+    v2_ranked: List[Tuple[float, str]] = []
+    legacy_ranked: List[Tuple[float, str]] = []
     for movie in movies:
         episodes = (episode_map or {}).get(movie.id, ())
         source, availability = source_for(movie, episodes)
-        score, reasons = score_movie(movie, tastes, availability == "available", completion_by_movie[movie.id], now)
+        v2_score, v2_reasons = score_movie(movie, tastes, availability == "available", completion_by_movie[movie.id], now, pacing_profile)
+        legacy_score, legacy_reasons = _legacy_score_movie(movie, tastes, availability == "available", completion_by_movie[movie.id])
         preference = preferences.get(movie.id)
         if preference == "love":
-            score += 0.45
-            reasons.insert(0, "You love this title")
+            v2_score += 0.45
+            legacy_score += 0.45
+            v2_reasons.insert(0, "You love this title")
+            legacy_reasons.insert(0, "You love this title")
         elif preference == "like":
-            score += 0.25
-            reasons.insert(0, "You liked this title")
+            v2_score += 0.25
+            legacy_score += 0.25
+            v2_reasons.insert(0, "You liked this title")
+            legacy_reasons.insert(0, "You liked this title")
         elif preference == "dislike":
-            score -= 10.0
-        score += title_signals[movie.id]
-        score -= min(0.18, max(0, exposure_counts[movie.id] - 2) * 0.025)
+            v2_score -= 10.0
+            legacy_score -= 10.0
+        v2_score += title_signals[movie.id]
+        legacy_score += title_signals[movie.id]
+        v2_score -= min(0.18, max(0, exposure_counts[movie.id] - 2) * 0.025)
+        legacy_score -= min(0.18, max(0, exposure_counts[movie.id] - 2) * 0.025)
         if availability == "available":
-            score += 0.10
+            v2_score += 0.10
+            legacy_score += 0.10
+        score, reasons = (v2_score, v2_reasons) if settings.RECOMMENDATION_V2_ENABLED else (legacy_score, legacy_reasons)
         ranked.append((score, movie, reasons, source, availability))
+        v2_ranked.append((v2_score, movie.id))
+        legacy_ranked.append((legacy_score, movie.id))
     ranked.sort(key=lambda row: (-row[0], -int(row[1].release_year or 0), row[1].title.casefold(), row[1].id))
+    if settings.RECOMMENDATION_V2_SHADOW:
+        v2_ranked.sort(key=lambda row: (-row[0], row[1]))
+        legacy_ranked.sort(key=lambda row: (-row[0], row[1]))
+        visible_ids = [row[1] for row in v2_ranked[:20]]
+        legacy_ids = [row[1] for row in legacy_ranked[:20]]
+        overlap = len(set(visible_ids) & set(legacy_ids))
+        legacy_positions = {movie_id: index for index, movie_id in enumerate(legacy_ids)}
+        displacement = [abs(index - legacy_positions[movie_id]) for index, movie_id in enumerate(visible_ids) if movie_id in legacy_positions]
+        SHADOW_METRICS[profile_id] = {"top20Overlap": overlap, "meanDisplacement": round(sum(displacement) / len(displacement), 3) if displacement else 0.0, "generatedAt": now}
     return ranked
 
 
@@ -610,7 +814,7 @@ async def calculate_movie_recommendation_score(movie: Movie, profile_id: str) ->
 
 async def get_profile_preferences(profile_id: str) -> Dict[str, List[str]]:
     now = time.time()
-    prefs: Dict[str, List[str]] = {"genre": [], "actor": [], "director": []}
+    prefs: Dict[str, List[str]] = {"genre": [], "actor": [], "director": [], "writer": [], "trope": []}
     async with AsyncSession(engine) as db:
         values = await _taste_map(db, profile_id, now)
     ordered = sorted(((kind, tag, score) for (kind, tag), score in values.items() if score > 0.05), key=lambda row: row[2], reverse=True)
@@ -626,6 +830,8 @@ def diversify_ranked(rows: Sequence[Tuple[float, Movie, List[str], str, str]]) -
     genre_counts: Dict[str, int] = defaultdict(int)
     collection_counts: Dict[str, int] = defaultdict(int)
     actor_counts: Dict[str, int] = defaultdict(int)
+    auteur_counts: Dict[str, int] = defaultdict(int)
+    trope_counts: Dict[str, int] = defaultdict(int)
     while remaining:
         window = remaining[:12]
         chosen = max(
@@ -633,13 +839,17 @@ def diversify_ranked(rows: Sequence[Tuple[float, Movie, List[str], str, str]]) -
             key=lambda row: row[0]
             - 0.055 * genre_counts[normalize_tag((row[1].genres or ["uncategorized"])[0])]
             - 0.07 * collection_counts[normalize_tag(row[1].collection_name or "")]
-            - 0.025 * actor_counts[normalize_tag((row[1].cast or [""])[0])],
+            - 0.025 * actor_counts[normalize_tag((row[1].cast or [""])[0])]
+            - 0.035 * auteur_counts[normalize_tag((crew_names(row[1].crew, {"Director", "Writer", "Screenplay", "Creator"}) or [row[1].director or ""])[0])]
+            - 0.04 * trope_counts[normalize_tag(str((row[1].trope_vectors or [{"id": ""}])[0].get("id") or ""))],
         )
         remaining.remove(chosen)
         output.append(chosen)
         genre_counts[normalize_tag((chosen[1].genres or ["uncategorized"])[0])] += 1
         collection_counts[normalize_tag(chosen[1].collection_name or "")] += 1
         actor_counts[normalize_tag((chosen[1].cast or [""])[0])] += 1
+        auteur_counts[normalize_tag((crew_names(chosen[1].crew, {"Director", "Writer", "Screenplay", "Creator"}) or [chosen[1].director or ""])[0])] += 1
+        trope_counts[normalize_tag(str((chosen[1].trope_vectors or [{"id": ""}])[0].get("id") or ""))] += 1
     return output
 
 
@@ -671,6 +881,7 @@ async def persist_profile_pool(db: AsyncSession, profile_id: str) -> None:
         item = existing.get(movie.id) or ProfileRecommendation(profile_id=profile_id, movie_id=movie.id, media_type=movie.type or "movie", generated_at=now)
         item.score = score
         item.reasons = reasons
+        item.reason_details = reason_details(reasons)
         item.generated_at = now
         preference = preferences.get(movie.id)
         item.candidate_source = "explicit_love" if preference == "love" else "explicit_like" if preference == "like" else "taste_affinity"
@@ -747,19 +958,57 @@ async def build_recommendation_payload(
     pool_result = await db.exec(select(ProfileRecommendation).where(ProfileRecommendation.profile_id == profile_id))
     pool_by_id = {item.movie_id: item for item in pool_result.all()}
 
-    def serialize(row):
+    def serialize(row, include_reasons: bool = True):
         score, movie, reasons, source, availability = row
         pool = pool_by_id.get(movie.id)
+        visible_reasons = reasons if include_reasons else []
         return {
             "media": MovieResponse.from_db(movie, episode_map.get(movie.id)),
             "source": source,
             "availability": availability,
             "score": round(score, 6),
-            "reasons": reasons,
+            "reasons": visible_reasons,
+            "reason_details": reason_details(visible_reasons),
             "viewer_preference": preferences.get(movie.id),
             "candidate_source": pool.candidate_source if pool else "server_catalog" if availability == "available" else "ranked_cache",
             "source_confidence": pool.source_confidence if pool else 0.7 if availability == "available" else 0.5,
         }
+
+    vibe_rails: List[Dict[str, Any]] = []
+    if requested == "recommended" and settings.RECOMMENDATION_V2_ENABLED:
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for row in eligible_ranked:
+            movie = row[1]
+            for trope in movie.trope_vectors:
+                trope_id = normalize_tag(str(trope.get("id") or ""))
+                affinity = max(0.0, tastes.get(("trope", trope_id), 0.0))
+                if not trope_id or affinity <= 0.05 or float(trope.get("confidence") or 0.0) < 0.60:
+                    continue
+                group = grouped.setdefault(trope_id, {
+                    "id": f"vibe-{trope_id.replace(' ', '-')}",
+                    "label": trope.get("railLabel") or trope.get("label") or "Matched to Your Vibe",
+                    "trope_ids": [trope_id],
+                    "reason_code": "trope_match",
+                    "affinity": affinity,
+                    "rows": [],
+                })
+                group["affinity"] = max(group["affinity"], affinity)
+                group["rows"].append(row)
+        used_ids: set[str] = set()
+        for group in sorted(grouped.values(), key=lambda item: (-item["affinity"], item["label"].casefold())):
+            rows = [row for row in group["rows"] if row[1].id not in used_ids][:8]
+            if len(rows) < 3:
+                continue
+            used_ids.update(row[1].id for row in rows)
+            vibe_rails.append({
+                "id": group["id"],
+                "label": group["label"],
+                "trope_ids": group["trope_ids"],
+                "reason_code": group["reason_code"],
+                "items": [serialize(row) for row in rows],
+            })
+            if len(vibe_rails) >= 3:
+                break
 
     attempt_result = await db.exec(
         select(ViewingAttempt).where(
@@ -777,7 +1026,7 @@ async def build_recommendation_payload(
     state = await db.get(RecommendationRefreshState, profile_id)
     generated_at = state.last_ranked_at if state and state.last_ranked_at else now
     stale = not state or not state.last_tmdb_refresh_at or now - state.last_tmdb_refresh_at >= TMDB_STALE_SECONDS
-    return {
+    payload = {
         "profile_id": profile_id,
         "scope": scope,
         "category": category or "recommended",
@@ -788,8 +1037,12 @@ async def build_recommendation_payload(
         "limit": limit,
         "categories": categories,
         "items": [serialize(row) for row in filtered[offset:offset + limit]],
-        "watch_again": [serialize(row) for row in watch_again_rows[:20]],
+        "watch_again": [serialize(row, include_reasons=False) for row in watch_again_rows[:20]],
+        "vibe_rails": vibe_rails,
+        "algorithm_version": ALGORITHM_VERSION if settings.RECOMMENDATION_V2_ENABLED else "v1",
     }
+    await db.commit()
+    return payload
 
 
 async def refresh_profile_cache(profile_id: str, force: bool = False) -> bool:
@@ -860,6 +1113,8 @@ async def recommendation_worker(stop_event) -> None:
     """Coalesced hourly worker; callers own lifecycle and cancellation."""
     while not stop_event.is_set():
         try:
+            from services.vibe_analysis import backfill_catalog_vibes
+            await backfill_catalog_vibes()
             async with AsyncSession(engine) as db:
                 profile_result = await db.exec(select(Profile))
                 profile_ids = [profile.id for profile in profile_result.all()]

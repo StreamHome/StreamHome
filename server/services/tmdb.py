@@ -5,6 +5,7 @@ import asyncio
 from typing import Dict, Any, List, Optional
 from config import settings
 from services.logger import logger
+from services.vibe_analysis import compute_trope_vectors, relevant_crew
 
 GENRES_MAP = {
     28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime",
@@ -122,6 +123,7 @@ class TMDBClient:
                 "rating": movie.rating,
                 "cast": movie.cast,
                 "director": movie.director,
+                "crew": movie.crew,
                 "type": movie.type,
                 "vote_average": movie.vote_average,
                 "vote_count": movie.vote_count,
@@ -129,6 +131,7 @@ class TMDBClient:
                 "original_language": movie.original_language,
                 "keywords": movie.keywords,
                 "collection_name": movie.collection_name,
+                "trope_vectors": movie.trope_vectors,
             }
             poster = movie.remote_thumbnail_url or (movie.thumbnail_url if movie.thumbnail_url.startswith("http") else "")
             backdrop = movie.remote_banner_url or (movie.banner_url if movie.banner_url and movie.banner_url.startswith("http") else "")
@@ -193,6 +196,7 @@ class TMDBClient:
                 "releaseYear": 2026,
                 "rating": "PG-13",
                 "director": "Unknown Director",
+                "crew": [],
                 "cast": ["Unknown Actor"],
                 "vote_average": 7.5,
                 "vote_count": 100
@@ -228,7 +232,7 @@ class TMDBClient:
                         rating = cert
                         break
 
-        # Parse director and cast
+        # Parse directors, writers, screenplay credits, and cast.
         director = "Unknown Director"
         cast_list = []
         credits = data.get("credits", {})
@@ -241,6 +245,7 @@ class TMDBClient:
                     break
             # Cast
             cast_list = [actor.get("name") for actor in credits.get("cast", [])[:5]]
+        crew = relevant_crew(credits)
 
         return {
             "title": data.get("title") or f"Movie {tmdb_id}",
@@ -252,12 +257,14 @@ class TMDBClient:
             "releaseYear": release_year,
             "rating": rating,
             "director": director,
+            "crew": crew,
             "cast": cast_list or ["Unknown Actor"],
             "originalLanguage": data.get("original_language", "en"),
             "vote_average": data.get("vote_average", 7.5),
             "vote_count": data.get("vote_count", 100),
             "keywords": [item.get("name") for item in data.get("keywords", {}).get("keywords", [])[:12] if item.get("name")],
-            "collectionName": (data.get("belongs_to_collection") or {}).get("name")
+            "collectionName": (data.get("belongs_to_collection") or {}).get("name"),
+            "tropeVectors": compute_trope_vectors(genres, [item.get("name") for item in data.get("keywords", {}).get("keywords", []) if item.get("name")], data.get("overview") or "")
         }
 
     async def fetch_show_metadata(self, tmdb_id: int) -> Dict[str, Any]:
@@ -276,6 +283,7 @@ class TMDBClient:
                 "releaseYear": 2026,
                 "rating": "TV-MA",
                 "director": "Various Directors",
+                "crew": [],
                 "cast": ["Cast Member"],
                 "vote_average": 7.5,
                 "vote_count": 100
@@ -312,6 +320,7 @@ class TMDBClient:
 
         created_by = data.get("created_by", [])
         director = created_by[0].get("name") if created_by else "Unknown Creator"
+        crew = relevant_crew(credits, created_by)
 
         return {
             "title": data.get("name") or f"Show {tmdb_id}",
@@ -323,12 +332,14 @@ class TMDBClient:
             "releaseYear": release_year,
             "rating": rating,
             "director": director,
+            "crew": crew,
             "cast": cast_list or ["Unknown Actor"],
             "originalLanguage": data.get("original_language", "en"),
             "vote_average": data.get("vote_average", 7.5),
             "vote_count": data.get("vote_count", 100),
             "keywords": [item.get("name") for item in data.get("keywords", {}).get("results", [])[:12] if item.get("name")],
-            "collectionName": None
+            "collectionName": None,
+            "tropeVectors": compute_trope_vectors(genres, [item.get("name") for item in data.get("keywords", {}).get("results", []) if item.get("name")], data.get("overview") or "")
         }
 
     async def fetch_episode_metadata(self, tmdb_id: int, season: int, episode: int) -> Dict[str, Any]:
@@ -369,7 +380,7 @@ class TMDBClient:
 
                 tmdb_id = int(item_dict.get("tmdb_id"))
                 media_type = "series" if item_dict.get("type") in ("series", "tv") else "movie"
-                if not item_dict.get("cast") or (item_dict.get("director") or "").casefold() in {"", "various", "unknown"}:
+                if not item_dict.get("cast") or not item_dict.get("crew") or not item_dict.get("keywords") or (item_dict.get("director") or "").casefold() in {"", "various", "unknown"}:
                     details = await (self.fetch_show_metadata(tmdb_id) if media_type == "series" else self.fetch_movie_metadata(tmdb_id))
                     item_dict = {**item_dict, **{key: value for key, value in details.items() if value not in (None, "", [])}}
                 title = item_dict.get("title", f"Media_{tmdb_id}")
@@ -422,6 +433,7 @@ class TMDBClient:
                     "genres": item_dict.get("genres", []),
                     "cast": item_dict.get("cast", []),
                     "director": item_dict.get("director"),
+                    "crew": item_dict.get("crew", []),
                     "original_language": item_dict.get("original_language", "en"),
                     "catalog_source": "tmdb_cache",
                     "availability": "cached",
@@ -431,6 +443,8 @@ class TMDBClient:
                     "subtitles": item_dict.get("subtitles", []),
                     "keywords": item_dict.get("keywords", []),
                     "collection_name": item_dict.get("collection_name") or item_dict.get("collectionName"),
+                    "trope_vectors": item_dict.get("trope_vectors") or item_dict.get("tropeVectors", []),
+                    "vibe_analysis_version": 1,
                 }
                 metadata_file = os.path.join(metadata_dir, "metadata.json")
                 with open(metadata_file, "w", encoding="utf-8") as file:
@@ -471,6 +485,8 @@ class TMDBClient:
                         movie.genres = item_dict.get("genres", [])
                         movie.cast = item_dict.get("cast", [])
                         movie.keywords = item_dict.get("keywords", [])
+                        movie.crew = item_dict.get("crew", [])
+                        movie.trope_vectors = item_dict.get("trope_vectors") or item_dict.get("tropeVectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
                         movie.collection_name = item_dict.get("collection_name") or item_dict.get("collectionName")
                     elif movie.availability != "available":
                         movie.title = title
@@ -493,6 +509,8 @@ class TMDBClient:
                         movie.local_banner_url = f"/media/{library_name}/{folder_name}/backdrop.jpg" if raw_backdrop_url else movie.local_banner_url
                         movie.cache_state = "ready"
                         movie.keywords = item_dict.get("keywords", movie.keywords)
+                        movie.crew = item_dict.get("crew", movie.crew)
+                        movie.trope_vectors = item_dict.get("trope_vectors") or item_dict.get("tropeVectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
                         movie.collection_name = item_dict.get("collection_name") or item_dict.get("collectionName") or movie.collection_name
                     db.add(movie)
                     await db.commit()

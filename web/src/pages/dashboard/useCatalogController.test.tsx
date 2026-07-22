@@ -108,6 +108,24 @@ describe("useCatalogController recommendations", () => {
     await waitFor(() => expect(result.current.resolveMovie("m_42")?.cacheState).toBe("ready"));
   });
 
+  it("resolves titles that are supplied only through a personalized vibe rail", async () => {
+    const recommendation = feed("recommended", ["top-pick"]);
+    recommendation.algorithmVersion = "v2.1";
+    recommendation.vibeRails = [{
+      id: "vibe-banter",
+      label: "Witty Banter & Bullets",
+      tropeIds: ["neo_noir_buddy_action"],
+      reasonCode: "trope_match",
+      items: [{ media: movie("vibe-only"), source: "server", availability: "available", score: 88, reasons: ["Matches your taste for witty action"] }],
+    }];
+    mocks.getRecommendations.mockResolvedValue(recommendation);
+
+    const query: AppQueryState = { profile: profile.id, view: "home" };
+    const { result } = renderHook(() => useCatalogController(profile, query));
+
+    await waitFor(() => expect(result.current.resolveMovie("vibe-only")?.title).toBe("vibe-only"));
+  });
+
   it("optimistically removes a disliked title without reordering Watch Again", async () => {
     mocks.getRecommendations
       .mockResolvedValueOnce(feed("recommended", ["liked", "hidden"], 2, ["hidden", "liked"]))

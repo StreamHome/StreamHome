@@ -14,7 +14,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 import services.recommendation as recommendation
 import db as db_module
 from config import settings
-from models import Episode, Movie, Profile, ProfileMediaPreference, ProfileTaste, RecommendationExposure, RecommendationExposureInput, TelemetryRequest, ViewingAttempt
+from models import Episode, Movie, Profile, ProfileMediaPreference, ProfileTaste, RecommendationExposure, RecommendationExposureInput, RecommendationFeedResponse, TelemetryRequest, ViewingAttempt
 from services.tmdb import tmdb_client
 
 
@@ -115,6 +115,8 @@ async def main() -> None:
             genre_payload = await recommendation.build_recommendation_payload(db, "profile", "home", "drama", 50, 0)
             assert genre_payload["total"] == 0, "disliked titles must leave personalized genre feeds"
             recommended = await recommendation.build_recommendation_payload(db, "profile", "home", "recommended", 50, 0)
+            validated = RecommendationFeedResponse.model_validate(recommended)
+            assert validated.algorithm_version.startswith("v2") and isinstance(validated.vibe_rails, list)
             assert all(item["media"].id != "m_2" for item in recommended["items"])
             assert len(list((await db.exec(select(ProfileMediaPreference))).all())) == 1, "preference transitions must update one row"
             assert len(list((await db.exec(select(RecommendationExposure))).all())) == 1

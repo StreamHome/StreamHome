@@ -17,6 +17,7 @@ from config import settings
 from services.queue import queue_manager
 from services.state import ACTIVE_DOWNLOAD_METRICS, cancel_and_kill_process
 from services.tmdb import tmdb_client
+from services.vibe_analysis import compute_trope_vectors
 
 from services.logger import logger
 from routes.auth import get_current_user
@@ -138,6 +139,10 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
                 )
                 movie.genres = meta.get("genres", [])
                 movie.cast = meta.get("cast", [])
+                movie.crew = meta.get("crew", [])
+                movie.keywords = meta.get("keywords", [])
+                movie.collection_name = meta.get("collectionName") or meta.get("collection_name")
+                movie.trope_vectors = meta.get("tropeVectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
                 movie.skip_markers = payload.skip_markers or {}
                 db.add(movie)
             else:
@@ -175,6 +180,10 @@ async def add_movie(payload: DownloadAddRequest, token: str = Depends(verify_tok
                 )
                 show.genres = meta.get("genres", [])
                 show.cast = meta.get("cast", [])
+                show.crew = meta.get("crew", [])
+                show.keywords = meta.get("keywords", [])
+                show.collection_name = meta.get("collectionName") or meta.get("collection_name")
+                show.trope_vectors = meta.get("tropeVectors") or compute_trope_vectors(show.genres, show.keywords, show.description)
                 db.add(show)
                 
             if payload.season is not None and payload.episode is not None:
