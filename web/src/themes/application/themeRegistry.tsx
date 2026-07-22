@@ -1,6 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import type { AppView } from "../../navigation/queryState";
 import { EmberDashboard } from "../../pages/dashboard/ember/EmberDashboard";
 import { LegacyThemeAdapter } from "../../pages/dashboard/ThemeDashboard";
 import type { ThemeId } from "../../types/theme";
@@ -12,9 +11,10 @@ import { GeminiBackground } from "../gemini/GeminiBackground";
 import type { ThemeApplicationProps, ThemeInteractionProfile, ThemeNavigationProps, ThemePresentation } from "./contracts";
 import { MOTION_EASE, MOTION_TIMINGS, THEME_MOTION, useAppMotion, type MotionPreference } from "../../motion/motionSystem";
 import { BrandLogo } from "../../components/brand/BrandLogo";
+import { MobileNavigationIcon, type MobileNavigationView } from "../../components/navigation/MobileNavigationIcon";
 export type { ThemeNavigationProps } from "./contracts";
 
-const NAV_ITEMS: Array<{ view: AppView; label: string }> = [
+const NAV_ITEMS: Array<{ view: MobileNavigationView; label: string }> = [
   { view: "home", label: "Home" },
   { view: "movies", label: "Movies" },
   { view: "series", label: "Series" },
@@ -54,9 +54,9 @@ function ProfileControl({ profile, onProfiles, onEditProfile, onLogout, placemen
 }
 
 function MobileCatalogNav({ activeView, onView, isAdmin }: Pick<ThemeNavigationProps, "activeView" | "onView" | "isAdmin">) {
-  const items: Array<{ view: AppView; label: string }> = [...NAV_ITEMS, { view: "search", label: "Search" }];
+  const items: Array<{ view: MobileNavigationView; label: string }> = [...NAV_ITEMS, { view: "search", label: "Search" }];
   if (isAdmin) items.push({ view: "admin", label: "Admin" });
-  return <nav className="mobile-app-nav" aria-label="Catalog mobile">{items.map((item) => <button key={item.view} data-active={activeView === item.view} onClick={() => onView(item.view)}>{item.label}</button>)}</nav>;
+  return <nav className="mobile-app-nav" aria-label="Catalog mobile">{items.map((item) => <button key={item.view} type="button" data-active={activeView === item.view} aria-label={item.label} aria-current={activeView === item.view ? "page" : undefined} onClick={() => onView(item.view)}><MobileNavigationIcon view={item.view} /></button>)}</nav>;
 }
 
 function EmberNavigation(props: ThemeNavigationProps) {

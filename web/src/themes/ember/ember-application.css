@@ -147,7 +147,7 @@
 }
 
 @media (max-width: 760px) {
-  .ember-app .theme-main.ember-main { padding-top: 64px; padding-bottom: 70px; }
+  .ember-app .theme-main.ember-main { padding-top: 64px; padding-bottom: calc(70px + env(safe-area-inset-bottom)); }
   .ember-app .theme-nav--ember { grid-template-columns: 1fr auto; padding-inline: 17px; }
   .ember-app .theme-nav--ember .theme-nav__tools { display: flex; }
   .ember-app .theme-nav--ember .theme-nav__tools > :not(.theme-profile-menu) { display: none; }
@@ -210,4 +210,24 @@
 
 @media (prefers-reduced-motion: reduce) {
   .ember-feed-status > i { animation: none; }
+}
+
+/* Compact, artwork-first phone billboard */
+@media (max-width: 760px) {
+  .ember-hero { min-height: 430px; align-items: end; padding: 0; }
+  .ember-hero__art { inset: 0; opacity: .86; }
+  .ember-hero__art > img { object-position: center 30%; }
+  .ember-hero__shade { background: linear-gradient(to top,#1e100b 0%,rgba(30,16,11,.78) 38%,rgba(30,16,11,.08) 74%),linear-gradient(to bottom,rgba(20,8,5,.3),transparent 24%); }
+  .ember-hero__copy { width: 100%; margin: 0; border: 0; border-top: 1px solid rgba(255,95,31,.16); padding: 150px 16px 46px; background: linear-gradient(to top,rgba(30,16,11,.97),rgba(30,16,11,.58) 58%,transparent); box-shadow: none; backdrop-filter: none; }
+  .ember-hero__copy > p { display: none; }
+  .ember-hero__copy > small { font-size: 8px; }
+  .ember-hero__copy h1 { margin-top: 9px; font-size: clamp(31px,10vw,40px); line-height: .98; }
+  .ember-meta { gap: 6px; margin-top: 12px; }
+  .ember-meta span { padding: 5px 7px; font-size: 7px; }
+  .ember-actions { gap: 8px; margin-top: 14px; }
+  .ember-action { min-height: 34px; padding: 0 12px; font-size: 8px; }
+  .ember-billboard__pagination { top: 14px; right: 14px; bottom: auto; gap: 5px; }
+  .ember-billboard__pagination button { width: 12px; height: 4px; }
+  .ember-billboard__pagination button[data-active="true"] { width: 54px; }
+  .ember-hero > .media-availability { top: 48px; right: 14px; }
 }

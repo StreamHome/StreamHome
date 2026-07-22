@@ -88,4 +88,22 @@ describe("theme definition registry", () => {
     expect(navigation?.getAttribute("data-scrolled")).toBe("true");
     Object.defineProperty(window, "scrollY", { configurable: true, value: 0 });
   });
+
+  it("renders every phone navigation as accessible icon-only controls", () => {
+    for (const definition of Object.values(THEME_DEFINITIONS)) {
+      const onView = vi.fn();
+      const { container, unmount } = render(React.createElement(definition.Navigation, { ...navigationProps, onView }));
+      const mobileNavigation = container.querySelector(".mobile-app-nav");
+      const home = mobileNavigation?.querySelector<HTMLButtonElement>('button[aria-label="Home"]');
+      const movies = mobileNavigation?.querySelector<HTMLButtonElement>('button[aria-label="Movies"]');
+      expect(mobileNavigation).not.toBeNull();
+      expect(home?.getAttribute("aria-current")).toBe("page");
+      expect(home?.querySelector(".mobile-navigation-icon")).not.toBeNull();
+      expect(home?.textContent).toBe("");
+      expect(movies?.querySelector(".mobile-navigation-icon")).not.toBeNull();
+      fireEvent.click(movies!);
+      expect(onView).toHaveBeenCalledWith("movies");
+      unmount();
+    }
+  });
 });
