@@ -31,7 +31,7 @@ from config import settings
 from db import get_session
 from models import AuthChallenge, DriveSetupJob, IntegrationCredential, RecoveryCode, User
 from services.integration_auth import integration_token_hash
-from services.rclone import REMOTE_NAME_RE, rclone_service
+from services.rclone import REMOTE_NAME_RE, RcloneConfigEncryptionError, rclone_service
 from services.request_security import client_ip, normalize_origin, request_is_secure, trusted_proxy_origin
 from services.secret_crypto import protect_secret
 from services.rate_limit import clear as clear_rate_limit
@@ -392,6 +392,11 @@ async def verify_totp(payload: TOTPVerifyRequest):
 
 @router.post("/rclone/drive/oauth/start", dependencies=[Depends(require_setup_session)])
 async def start_drive_oauth(payload: DriveOAuthStartRequest, request: Request, db: AsyncSession = Depends(get_session)):
+    if not rclone_service.encryption_supported():
+        raise HTTPException(status_code=422, detail={
+            "code": "rclone_upgrade_required",
+            "message": f"Google Drive requires Rclone 1.68 or newer. Installed version: {rclone_service.version_label()}. Run setup.sh again to upgrade it.",
+        })
     client_id = payload.client_id.strip()
     client_secret = payload.client_secret.strip()
     remote_name = payload.remote_name.strip().lower()
@@ -656,11 +661,25 @@ async def activate_drive(job_id: str, request: Request, db: AsyncSession = Depen
     job = await _drive_job(db, request, job_id)
     if job.status != "ready" or not job.selected_path:
         raise HTTPException(status_code=409, detail={"code": "drive_not_ready", "message": "Test Google Drive before activating it."})
-    job.progress = "Google Drive is ready to activate when setup is finalized."
+    try:
+        await rclone_service.activate_remote(rclone_service.job_dir(job.id) / "rclone.conf", job.remote_name)
+    except RcloneConfigEncryptionError as exc:
+        raise HTTPException(status_code=422, detail={
+            "code": "rclone_config_encryption_failed",
+            "message": str(exc),
+        }) from exc
+    remote_path = f"{job.remote_name}:{job.selected_path}"
+    remote_result = await rclone_service.run("lsjson", remote_path, "--dirs-only", "--max-depth", "1", timeout=30)
+    if not remote_result.ok:
+        raise HTTPException(status_code=422, detail={
+            "code": remote_result.error_code or "drive_test_failed",
+            "message": "The activated Google Drive remote could not be reached.",
+        })
+    job.progress = "Google Drive is encrypted, verified, and ready for setup."
     job.updated_at = time.time()
     db.add(job)
     await db.commit()
-    return {"valid": True, "remotePath": f"{job.remote_name}:{job.selected_path}", "job": _drive_job_response(job)}
+    return {"valid": True, "remotePath": remote_path, "job": _drive_job_response(job)}
 
 
 async def _restart_after_response() -> None:
@@ -704,7 +723,13 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
             if drive_job.status != "ready" or not drive_job.selected_path:
                 raise HTTPException(status_code=422, detail={"code": "drive_not_ready", "message": "Google Drive must pass its read and write test."})
             remote_path = f"{drive_job.remote_name}:{drive_job.selected_path}"
-            await rclone_service.activate_remote(rclone_service.job_dir(drive_job.id) / "rclone.conf", drive_job.remote_name)
+            try:
+                await rclone_service.activate_remote(rclone_service.job_dir(drive_job.id) / "rclone.conf", drive_job.remote_name)
+            except RcloneConfigEncryptionError as exc:
+                raise HTTPException(status_code=422, detail={
+                    "code": "rclone_config_encryption_failed",
+                    "message": str(exc),
+                }) from exc
             remote_result = await rclone_service.run("lsjson", remote_path, "--dirs-only", "--max-depth", "1", timeout=30)
             if not remote_result.ok:
                 raise HTTPException(status_code=422, detail={"code": remote_result.error_code or "drive_test_failed", "message": "The activated Google Drive remote could not be reached."})

@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NO_START=false
 SKIP_SYSTEM_PACKAGES=false
 CURRENT_STEP="initialization"
+MIN_RCLONE_VERSION="1.68"
 
 usage() {
     cat <<'EOF'
@@ -51,6 +52,68 @@ run_privileged() {
     fi
 }
 
+rclone_binary() {
+    if [[ -x "$ROOT_DIR/bin/rclone" ]]; then
+        printf '%s\n' "$ROOT_DIR/bin/rclone"
+    else
+        command -v rclone 2>/dev/null || true
+    fi
+}
+
+rclone_version_supported() {
+    local binary version
+    binary="$(rclone_binary)"
+    [[ -n "$binary" ]] || return 1
+    version="$("$binary" version 2>/dev/null | sed -n 's/^rclone v\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1)"
+    [[ -n "$version" ]] || return 1
+    python3 - "$version" "$MIN_RCLONE_VERSION" <<'PY'
+import sys
+current = tuple(map(int, sys.argv[1].split(".")))
+minimum = tuple(map(int, sys.argv[2].split(".")))
+raise SystemExit(0 if current >= minimum else 1)
+PY
+}
+
+install_app_rclone() {
+    CURRENT_STEP="Rclone compatibility installation"
+    local os_name arch archive_name archive_url temporary checksum_file extracted binary
+    case "$(uname -s)" in
+        Linux) os_name="linux" ;;
+        Darwin) os_name="osx" ;;
+        *) fail "Rclone $MIN_RCLONE_VERSION or newer must be installed manually on this operating system." ;;
+    esac
+    case "$(uname -m)" in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        armv7l) arch="arm-v7" ;;
+        armv6l) arch="arm-v6" ;;
+        i386|i686) arch="386" ;;
+        *) fail "Unsupported Rclone architecture: $(uname -m)." ;;
+    esac
+    archive_name="rclone-current-${os_name}-${arch}.zip"
+    archive_url="https://downloads.rclone.org/${archive_name}"
+    temporary="$(mktemp -d)"
+    checksum_file="$temporary/${archive_name}.sha256"
+    log "Installing a current application-owned Rclone"
+    curl -fsSL "$archive_url" -o "$temporary/$archive_name"
+    curl -fsSL "${archive_url}.sha256" -o "$checksum_file"
+    (
+        cd "$temporary"
+        if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c "$(basename "$checksum_file")"
+        else
+            shasum -a 256 -c "$(basename "$checksum_file")"
+        fi
+    )
+    python3 -m zipfile -e "$temporary/$archive_name" "$temporary/unpacked"
+    extracted="$(find "$temporary/unpacked" -type f -name rclone -print -quit)"
+    [[ -n "$extracted" ]] || fail "The official Rclone archive did not contain the expected executable."
+    mkdir -p "$ROOT_DIR/bin"
+    binary="$ROOT_DIR/bin/rclone"
+    install -m 0755 "$extracted" "$binary"
+    rm -rf "$temporary"
+}
+
 missing_commands() {
     local missing=()
     command -v python3 >/dev/null 2>&1 || missing+=(python)
@@ -58,7 +121,7 @@ missing_commands() {
     command -v npm >/dev/null 2>&1 || missing+=(npm)
     command -v ffmpeg >/dev/null 2>&1 || missing+=(ffmpeg)
     command -v ffprobe >/dev/null 2>&1 || missing+=(ffprobe)
-    command -v rclone >/dev/null 2>&1 || missing+=(rclone)
+    [[ -n "$(rclone_binary)" ]] || missing+=(rclone)
     command -v git >/dev/null 2>&1 || missing+=(git)
     if ! command -v lsof >/dev/null 2>&1 \
         && ! command -v ss >/dev/null 2>&1 \
@@ -104,7 +167,7 @@ validate_versions() {
     command -v npm >/dev/null 2>&1 || fail "npm is unavailable after dependency installation."
     command -v ffmpeg >/dev/null 2>&1 || fail "ffmpeg is unavailable after dependency installation."
     command -v ffprobe >/dev/null 2>&1 || fail "ffprobe is unavailable after dependency installation."
-    command -v rclone >/dev/null 2>&1 || fail "rclone is unavailable after dependency installation."
+    [[ -n "$(rclone_binary)" ]] || fail "rclone is unavailable after dependency installation."
     if ! command -v lsof >/dev/null 2>&1 \
         && ! command -v ss >/dev/null 2>&1 \
         && ! command -v fuser >/dev/null 2>&1; then
@@ -117,6 +180,10 @@ validate_versions() {
     node_major="$(node -p 'Number(process.versions.node.split(".")[0])')"
     [[ "$node_major" =~ ^[0-9]+$ && "$node_major" -ge 18 ]] \
         || fail "Node.js 18 or newer is required."
+    if ! rclone_version_supported; then
+        install_app_rclone
+    fi
+    rclone_version_supported || fail "Rclone $MIN_RCLONE_VERSION or newer is required."
 }
 
 prepare_virtual_environment() {

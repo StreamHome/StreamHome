@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,11 @@ from services.secret_crypto import protect_secret, reveal_secret
 
 
 REMOTE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
+MINIMUM_ENCRYPTION_VERSION = (1, 68)
+
+
+class RcloneConfigEncryptionError(RuntimeError):
+    pass
 
 
 @dataclass(slots=True)
@@ -43,11 +49,37 @@ class RcloneService:
         self._config_lock = asyncio.Lock()
 
     def executable(self) -> Optional[str]:
-        found = shutil.which("rclone")
-        if found:
-            return found
         candidate = self.root / "bin" / ("rclone.exe" if os.name == "nt" else "rclone")
-        return str(candidate) if candidate.exists() else None
+        if candidate.exists():
+            return str(candidate)
+        return shutil.which("rclone")
+
+    def version(self) -> Optional[tuple[int, int, int]]:
+        executable = self.executable()
+        if not executable:
+            return None
+        try:
+            result = subprocess.run(
+                [executable, "version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        match = re.search(r"rclone v(\d+)\.(\d+)(?:\.(\d+))?", result.stdout)
+        if not match:
+            return None
+        return tuple(int(part or 0) for part in match.groups())
+
+    def encryption_supported(self) -> bool:
+        version = self.version()
+        return bool(version and version[:2] >= MINIMUM_ENCRYPTION_VERSION)
+
+    def version_label(self) -> str:
+        version = self.version()
+        return ".".join(map(str, version)) if version else "unknown"
 
     def command(self, *arguments: str, config_path: Optional[Path] = None, password_command: bool = False) -> list[str]:
         executable = self.executable()
@@ -219,6 +251,47 @@ class RcloneService:
         os.replace(temporary, config_path)
         return config_path
 
+    async def _encrypted_candidate(self, source: Path) -> Path:
+        if not self.encryption_supported():
+            raise RcloneConfigEncryptionError(
+                f"Rclone 1.68 or newer is required for configuration encryption; found {self.version_label()}."
+            )
+        with tempfile.NamedTemporaryFile("wb", dir=self.config_dir, delete=False) as handle:
+            temporary = Path(handle.name)
+        try:
+            shutil.copyfile(source, temporary)
+            if os.name != "nt":
+                os.chmod(temporary, 0o600)
+            result = await self.run(
+                "config",
+                "encryption",
+                "set",
+                config_path=temporary,
+                timeout=30,
+                password_command=True,
+            )
+            if not result.ok:
+                raise RcloneConfigEncryptionError(
+                    "Rclone could not encrypt its application-owned configuration."
+                )
+            header = temporary.read_text(encoding="utf-8", errors="ignore")[:128]
+            if "RCLONE_ENCRYPT_V" not in header:
+                raise RcloneConfigEncryptionError("Rclone reported success without encrypting its configuration.")
+            check = await self.run(
+                "config",
+                "encryption",
+                "check",
+                config_path=temporary,
+                timeout=30,
+                password_command=True,
+            )
+            if not check.ok:
+                raise RcloneConfigEncryptionError("The encrypted Rclone configuration could not be verified.")
+            return temporary
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
     async def activate_remote(self, source: Path, remote_name: str) -> None:
         async with self._config_lock:
             self.config_dir.mkdir(parents=True, exist_ok=True)
@@ -228,22 +301,8 @@ class RcloneService:
             source_parser.read(source, encoding="utf-8")
             if not source_parser.has_section(remote_name):
                 raise ValueError("temporary Drive remote is missing")
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.config_dir, delete=False) as handle:
-                source_parser.write(handle)
-                temporary = Path(handle.name)
-            if os.name != "nt":
-                os.chmod(temporary, 0o600)
+            temporary = await self._encrypted_candidate(source)
             os.replace(temporary, self.config_path)
-            result = await self.run(
-                "config",
-                "encryption",
-                "set",
-                config_path=self.config_path,
-                timeout=30,
-                password_command=True,
-            )
-            if not result.ok:
-                raise RuntimeError("The application-owned rclone configuration could not be encrypted.")
 
     async def ensure_config_encrypted(self) -> bool:
         if not self.config_path.is_file():
@@ -254,15 +313,13 @@ class RcloneService:
             return False
         if "RCLONE_ENCRYPT_V" in header:
             return True
-        result = await self.run(
-            "config",
-            "encryption",
-            "set",
-            config_path=self.config_path,
-            timeout=30,
-            password_command=True,
-        )
-        return result.ok
+        try:
+            async with self._config_lock:
+                temporary = await self._encrypted_candidate(self.config_path)
+                os.replace(temporary, self.config_path)
+            return True
+        except (OSError, RcloneConfigEncryptionError):
+            return False
 
     def cleanup_job(self, job_id: str) -> None:
         directory = self.job_dir(job_id)

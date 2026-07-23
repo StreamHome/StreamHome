@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 from starlette.requests import Request
@@ -19,7 +19,7 @@ from routes.setup import (
     _setup_status_urls,
     drive_oauth_callback,
 )
-from services.rclone import RcloneService
+from services.rclone import RcloneConfigEncryptionError, RcloneResult, RcloneService
 
 
 class DriveSetupContractTests(unittest.TestCase):
@@ -97,6 +97,19 @@ class DriveSetupContractTests(unittest.TestCase):
         self.assertEqual(RcloneService.classify(1, "oauth2: invalid_grant"), "drive_unauthorized")
         self.assertEqual(RcloneService.classify(1, "storageQuotaExceeded"), "drive_quota_exceeded")
         self.assertEqual(RcloneService.classify(1, "user rate limit exceeded"), "drive_rate_limited")
+
+    def test_rclone_encryption_requires_version_1_68(self):
+        service = RcloneService()
+        with patch.object(service, "executable", return_value="rclone"), patch(
+            "services.rclone.subprocess.run",
+            return_value=SimpleNamespace(stdout="rclone v1.67.0\n"),
+        ):
+            self.assertFalse(service.encryption_supported())
+        with patch.object(service, "executable", return_value="rclone"), patch(
+            "services.rclone.subprocess.run",
+            return_value=SimpleNamespace(stdout="rclone v1.68.0\n"),
+        ):
+            self.assertTrue(service.encryption_supported())
 
 
 class _ScalarResult:
@@ -183,6 +196,27 @@ class DriveCallbackFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(job.status, "selecting_folder")
         self.assertEqual(database.commits, 0)
+
+
+class RcloneActivationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_encryption_failure_never_installs_plaintext_config(self):
+        service = RcloneService()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service.config_dir = root / "active"
+            service.config_path = service.config_dir / "rclone.conf"
+            service.config_dir.mkdir()
+            source = root / "source.conf"
+            source.write_text("[drive]\ntype = drive\ntoken = secret\n", encoding="utf-8")
+            with patch.object(service, "encryption_supported", return_value=True), patch.object(
+                service,
+                "run",
+                new=AsyncMock(return_value=RcloneResult(1, stderr="unsupported command")),
+            ):
+                with self.assertRaises(RcloneConfigEncryptionError):
+                    await service.activate_remote(source, "drive")
+            self.assertFalse(service.config_path.exists())
+            self.assertTrue(source.exists())
 
 
 if __name__ == "__main__":
