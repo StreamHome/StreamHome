@@ -247,9 +247,7 @@ Multiple profiles can use the same authenticated environment while keeping viewi
 
 No.
 
-Administrator access should only be given to trusted users who need to manage the server.
-
-Viewing preferences should normally be separated through profiles rather than additional administrator accounts.
+Administrator access is only possible through the administrator profile initially created by the system, which cannot be deleted.
 
 ### Does StreamHome support two-factor authentication?
 
