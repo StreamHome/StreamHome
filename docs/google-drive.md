@@ -10,6 +10,8 @@ Copy the exact **Authorized redirect URI** shown in StreamHome setup into the Go
 https://your-streamhome-domain.example/api/setup/rclone/drive/callback
 ```
 
-Then copy the client ID and client secret into `/setup`. If the OAuth application is External and still in Testing, add the Google account you will authorize as a test user. StreamHome will open Google's own consent page, then let you choose or create a Drive folder and run a temporary read/write/delete health check.
+Do not open that callback URI yourself. Google opens it after authorization and includes the required one-time `code` and `state` values.
+
+Then copy the client ID and client secret into `/setup`. If the OAuth application is External and still in Testing, add the Google account you will authorize as a test user. StreamHome opens Google's consent page in a separate window so the original setup tab keeps its progress. After authorization, return to that original tab to choose or create a Drive folder and run a temporary read/write/delete health check.
 
 Never publish your client secret, Rclone configuration, authorization code, refresh token, setup cookie, or ingestion token.

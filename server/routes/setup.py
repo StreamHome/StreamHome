@@ -181,6 +181,14 @@ def _setup_status_urls(public_url: str) -> tuple[str, str]:
     return origin, callback
 
 
+def _drive_callback_landing_url(request: Request) -> str:
+    browser_origin = trusted_proxy_origin(request)
+    request_origin = normalize_origin(str(request.base_url))
+    configured_origin = normalize_origin(settings.PUBLIC_URL)
+    origin = browser_origin or request_origin or configured_origin or settings.PUBLIC_URL.rstrip("/")
+    return f"{origin}/setup?drive=callback"
+
+
 def _safe_drive_path(value: str, *, allow_empty: bool = True) -> str:
     normalized = value.strip().replace("\\", "/").strip("/")
     if not normalized and allow_empty:
@@ -444,11 +452,11 @@ async def drive_oauth_callback(request: Request, db: AsyncSession = Depends(get_
     state_hash = _hash_value(state_value) if state_value else ""
     result = await db.execute(select(DriveSetupJob).where(DriveSetupJob.state_hash == state_hash))
     job = result.scalars().first()
-    fallback_url = settings.PUBLIC_URL
     if not job:
-        return RedirectResponse(f"{fallback_url}/setup?drive=error&code=drive_state_mismatch", status_code=303)
-    session_id = _setup_session_id(request)
-    if not session_id or not hmac.compare_digest(job.session_hash, _hash_value(session_id)) or job.expires_at < time.time() or job.status != "authorizing":
+        return RedirectResponse(_drive_callback_landing_url(request), status_code=303)
+    if job.status in {"selecting_folder", "testing", "ready"}:
+        return RedirectResponse(f"{job.public_url}/setup?driveJob={job.id}&drive=connected", status_code=303)
+    if job.expires_at < time.time() or job.status != "authorizing":
         job.status = "failed"
         job.error_code = "drive_state_mismatch"
         job.progress = "Google authorization could not be verified."

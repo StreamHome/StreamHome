@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   activateDrive,
   beginSetupTOTP,
@@ -22,6 +22,12 @@ import {
 } from "../api/setup";
 import { ApiError } from "../api/client";
 import { BrandLogo } from "../components/brand/BrandLogo";
+import {
+  clearSetupCheckpoint,
+  copySetupText,
+  readSetupCheckpoint,
+  writeSetupCheckpoint,
+} from "./setupResume";
 import "./setup.css";
 
 const STEPS = ["Unlock", "System", "Account", "Security", "TMDB", "Server", "Storage", "Review"] as const;
@@ -41,17 +47,20 @@ function formatBytes(value?: number) {
 }
 
 export function SetupPage() {
+  const [initialCheckpoint] = useState(() => readSetupCheckpoint());
   const [step, setStep] = useState(0);
   const [openStep, setOpenStep] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [resumeNotice, setResumeNotice] = useState("");
+  const [checkpointReady, setCheckpointReady] = useState(false);
   const [bootstrapCode, setBootstrapCode] = useState("");
   const [checks, setChecks] = useState<ReadinessCheck[]>([]);
   const [paths, setPaths] = useState({ media: "server/media", database: "server/database.db" });
-  const [publicUrl, setPublicUrl] = useState(window.location.origin);
+  const [publicUrl, setPublicUrl] = useState(initialCheckpoint?.publicUrl || window.location.origin);
   const [driveCallbackUrl, setDriveCallbackUrl] = useState(`${window.location.origin}/api/setup/rclone/drive/callback`);
   const [driveGuideUrl, setDriveGuideUrl] = useState("https://github.com/WaqSea/StreamHome/blob/main/docs/google-drive.md");
-  const [email, setEmail] = useState("");
+  const [email, setEmail] = useState(initialCheckpoint?.email ?? "");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [totpEnabled, setTotpEnabled] = useState(false);
@@ -61,18 +70,19 @@ export function SetupPage() {
   const [totpVerified, setTotpVerified] = useState(false);
   const [tmdbToken, setTmdbToken] = useState("");
   const [tmdbValid, setTmdbValid] = useState(false);
-  const [webPort, setWebPort] = useState(3000);
-  const [hevc, setHevc] = useState<"auto" | "on" | "off">("auto");
-  const [backups, setBackups] = useState(false);
-  const [updates, setUpdates] = useState(false);
-  const [storage, setStorage] = useState<"LOCAL" | "CLOUD">("LOCAL");
+  const [webPort, setWebPort] = useState(initialCheckpoint?.webPort ?? 3000);
+  const [hevc, setHevc] = useState<"auto" | "on" | "off">(initialCheckpoint?.hevc ?? "auto");
+  const [backups, setBackups] = useState(initialCheckpoint?.backups ?? false);
+  const [updates, setUpdates] = useState(initialCheckpoint?.updates ?? false);
+  const [storage, setStorage] = useState<"LOCAL" | "CLOUD">(initialCheckpoint?.storage ?? "LOCAL");
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
-  const [remoteName, setRemoteName] = useState("streamhome-drive");
-  const [audience, setAudience] = useState<"external" | "internal">("external");
-  const [publishingStatus, setPublishingStatus] = useState<"testing" | "production">("production");
+  const [remoteName, setRemoteName] = useState(initialCheckpoint?.remoteName ?? "streamhome-drive");
+  const [audience, setAudience] = useState<"external" | "internal">(initialCheckpoint?.audience ?? "external");
+  const [publishingStatus, setPublishingStatus] = useState<"testing" | "production">(initialCheckpoint?.publishingStatus ?? "production");
   const [driveJob, setDriveJob] = useState<DriveSetupJob | null>(null);
-  const [drivePath, setDrivePath] = useState("");
+  const [resumeDriveJobId, setResumeDriveJobId] = useState(initialCheckpoint?.driveJobId ?? "");
+  const [drivePath, setDrivePath] = useState(initialCheckpoint?.drivePath ?? "");
   const [folderPath, setFolderPath] = useState("");
   const [folders, setFolders] = useState<DriveFolder[]>([]);
   const [newFolder, setNewFolder] = useState("StreamHome");
@@ -82,32 +92,61 @@ export function SetupPage() {
   const [quota, setQuota] = useState<{ total?: number; used?: number; free?: number } | null>(null);
   const [result, setResult] = useState<SetupCompleteResponse | null>(null);
   const [secretsSaved, setSecretsSaved] = useState(false);
+  const [callbackCopyStatus, setCallbackCopyStatus] = useState<"" | "copied" | "failed">("");
+  const [secretsCopyStatus, setSecretsCopyStatus] = useState<"" | "copied" | "failed">("");
+  const oauthWindowRef = useRef<Window | null>(null);
+  const oauthJobIdRef = useRef("");
 
-  const queryDriveJob = useMemo(() => new URLSearchParams(window.location.search).get("driveJob"), []);
-  const oauthPopup = queryDriveJob && window.name === "streamhome-google-drive";
+  const setupQuery = useMemo(() => new URLSearchParams(window.location.search), []);
+  const queryDriveJob = setupQuery.get("driveJob");
+  const queryDriveState = setupQuery.get("drive");
+  const oauthPopup = Boolean(queryDriveJob && window.name === "streamhome-google-drive");
+  const directCallbackVisit = queryDriveState === "callback";
+  const driveJobIdToLoad = queryDriveJob || resumeDriveJobId;
+  const callbackUrl = publicUrl
+    ? `${publicUrl.replace(/\/$/, "")}/api/setup/rclone/drive/callback`
+    : driveCallbackUrl;
 
   useEffect(() => {
     getSetupStatus().then((status) => {
-      setWebPort(status.webPort || 3000);
+      if (!initialCheckpoint) setWebPort(status.webPort || 3000);
       setPaths({ media: status.mediaPath, database: status.databasePath });
-      setPublicUrl(status.publicUrl || window.location.origin);
+      if (!initialCheckpoint?.publicUrl) setPublicUrl(status.publicUrl || window.location.origin);
       setDriveCallbackUrl(status.driveCallbackUrl || `${window.location.origin}/api/setup/rclone/drive/callback`);
       setDriveGuideUrl(status.driveGuideUrl || "https://github.com/WaqSea/StreamHome/blob/main/docs/google-drive.md");
       if (status.unlocked) {
-        const nextStep = queryDriveJob ? 6 : 1;
+        let nextStep = 1;
+        if (queryDriveJob || directCallbackVisit) {
+          nextStep = 6;
+        } else if (initialCheckpoint) {
+          nextStep = initialCheckpoint.step > 2 ? 2 : Math.max(1, initialCheckpoint.step);
+          if (initialCheckpoint.step > 2) {
+            setResumeNotice("Your saved setup choices and Google Drive connection were restored. Re-enter the password and service credentials, which are never stored in the browser.");
+          }
+        }
         setStep(nextStep);
         setOpenStep(nextStep);
+        if (queryDriveJob || directCallbackVisit) setStorage("CLOUD");
       }
-    }).catch(() => undefined);
-  }, [queryDriveJob]);
+      setCheckpointReady(true);
+    }).catch(() => setCheckpointReady(true));
+  }, [directCallbackVisit, initialCheckpoint, queryDriveJob]);
 
   useEffect(() => {
-    if (!queryDriveJob) return;
-    getDriveJob(queryDriveJob).then((job) => {
+    if (!driveJobIdToLoad || oauthPopup) return;
+    getDriveJob(driveJobIdToLoad).then((job) => {
       setDriveJob(job);
+      setResumeDriveJobId(job.id);
       setDrivePath(job.selectedPath);
-    }).catch((reason) => setError(errorMessage(reason)));
-  }, [queryDriveJob]);
+      setRemoteName(job.remoteName);
+      setAudience(job.audience);
+      setPublishingStatus(job.publishingStatus);
+      setStorage("CLOUD");
+    }).catch((reason) => {
+      setResumeDriveJobId("");
+      setError(errorMessage(reason));
+    });
+  }, [driveJobIdToLoad, oauthPopup]);
 
   useEffect(() => {
     if (!driveJob || TERMINAL_DRIVE_STATES.has(driveJob.status)) return;
@@ -118,7 +157,91 @@ export function SetupPage() {
       }).catch(() => undefined);
     }, 1500);
     return () => window.clearInterval(timer);
-  }, [driveJob]);
+  }, [driveJob?.id, driveJob?.status]);
+
+  useEffect(() => {
+    if (!checkpointReady || oauthPopup || directCallbackVisit || result) return;
+    writeSetupCheckpoint({
+      version: 1,
+      step,
+      email,
+      publicUrl,
+      webPort,
+      hevc,
+      backups,
+      updates,
+      storage,
+      remoteName,
+      audience,
+      publishingStatus,
+      driveJobId: driveJob?.id || resumeDriveJobId,
+      drivePath,
+    });
+  }, [
+    audience,
+    backups,
+    checkpointReady,
+    directCallbackVisit,
+    driveJob?.id,
+    drivePath,
+    email,
+    hevc,
+    oauthPopup,
+    publicUrl,
+    publishingStatus,
+    remoteName,
+    result,
+    resumeDriveJobId,
+    step,
+    storage,
+    updates,
+    webPort,
+  ]);
+
+  useEffect(() => {
+    const receiveOAuthResult = (event: MessageEvent) => {
+      const data = event.data as { type?: unknown; jobId?: unknown } | null;
+      if (
+        !data
+        || data.type !== "streamhome:drive-oauth-complete"
+        || typeof data.jobId !== "string"
+        || data.jobId !== oauthJobIdRef.current
+        || event.source !== oauthWindowRef.current
+      ) return;
+      const configuredOrigin = (() => {
+        try { return new URL(publicUrl).origin; } catch { return ""; }
+      })();
+      if (event.origin !== window.location.origin && event.origin !== configuredOrigin) return;
+      setStep(6);
+      setOpenStep(6);
+      setStorage("CLOUD");
+      setResumeDriveJobId(data.jobId);
+      void getDriveJob(data.jobId).then((job) => {
+        setDriveJob(job);
+        if (job.selectedPath) setDrivePath(job.selectedPath);
+      }).catch((reason) => setError(errorMessage(reason)));
+    };
+    window.addEventListener("message", receiveOAuthResult);
+    return () => window.removeEventListener("message", receiveOAuthResult);
+  }, [publicUrl]);
+
+  useEffect(() => {
+    if (!oauthPopup || !queryDriveJob || !queryDriveState) return;
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage({
+        type: "streamhome:drive-oauth-complete",
+        jobId: queryDriveJob,
+        result: queryDriveState,
+      }, "*");
+      const closeTimer = window.setTimeout(() => window.close(), 900);
+      return () => window.clearTimeout(closeTimer);
+    }
+  }, [oauthPopup, queryDriveJob, queryDriveState]);
+
+  useEffect(() => {
+    if (!result) return;
+    clearSetupCheckpoint();
+  }, [result]);
 
   const run = async (action: () => Promise<void>) => {
     setBusy(true);
@@ -139,7 +262,12 @@ export function SetupPage() {
     setPaths({ media: status.mediaPath, database: status.databasePath });
     setPublicUrl(status.publicUrl || window.location.origin);
     setDriveCallbackUrl(status.driveCallbackUrl || `${window.location.origin}/api/setup/rclone/drive/callback`);
-    goToStep(1);
+    if (directCallbackVisit) {
+      setStorage("CLOUD");
+      goToStep(6);
+    } else {
+      goToStep(1);
+    }
   });
 
   const inspect = () => run(async () => {
@@ -153,6 +281,7 @@ export function SetupPage() {
     if (!email.includes("@")) return setError("Enter a valid administrator email.");
     if (password.length < 6 || new TextEncoder().encode(password).length > 72) return setError("Use a password between 6 characters and 72 UTF-8 bytes.");
     if (password !== confirmPassword) return setError("The passwords do not match.");
+    setResumeNotice("");
     goToStep(3);
   };
 
@@ -188,18 +317,29 @@ export function SetupPage() {
 
   const startOAuth = async () => {
     const popup = window.open("about:blank", "streamhome-google-drive", "popup,width=620,height=760");
+    if (!popup) {
+      setError("Google authorization needs a pop-up so this setup page can keep your progress. Allow pop-ups for StreamHome, then try again.");
+      return;
+    }
+    oauthWindowRef.current = popup;
     setBusy(true);
     setError("");
     try {
       const started = await startDriveOAuth({ clientId, clientSecret, remoteName, audience, publishingStatus, publicUrl });
+      oauthJobIdRef.current = started.jobId;
+      setResumeDriveJobId(started.jobId);
       const job = await getDriveJob(started.jobId);
       setDriveJob(job);
       setDriveActivated(false);
       setRemotePath("");
-      if (popup) popup.location.assign(started.authorizationUrl);
-      else window.location.assign(started.authorizationUrl);
+      if (popup.closed) {
+        throw new Error("The Google authorization window was closed. Start the connection again.");
+      }
+      popup.location.replace(started.authorizationUrl);
     } catch (reason) {
-      popup?.close();
+      popup.close();
+      oauthWindowRef.current = null;
+      oauthJobIdRef.current = "";
       setError(errorMessage(reason));
     } finally {
       setBusy(false);
@@ -209,9 +349,13 @@ export function SetupPage() {
   const cancelOAuth = () => run(async () => {
     if (driveJob) await cancelDriveJob(driveJob.id);
     setDriveJob(null);
+    setResumeDriveJobId("");
     setDrivePath("");
     setFolders([]);
     setDriveActivated(false);
+    oauthWindowRef.current?.close();
+    oauthWindowRef.current = null;
+    oauthJobIdRef.current = "";
   });
 
   const createFolder = () => run(async () => {
@@ -292,6 +436,27 @@ export function SetupPage() {
     URL.revokeObjectURL(url);
   };
 
+  const copyCallback = async () => {
+    setCallbackCopyStatus("");
+    const copied = await copySetupText(callbackUrl);
+    setCallbackCopyStatus(copied ? "copied" : "failed");
+  };
+
+  const copySecrets = async () => {
+    setSecretsCopyStatus("");
+    const copied = await copySetupText(secretsText);
+    setSecretsCopyStatus(copied ? "copied" : "failed");
+  };
+
+  const returnToSetupProgress = () => {
+    if (window.history.length > 1) {
+      window.history.back();
+      return;
+    }
+    const target = new URL("/setup", window.location.origin);
+    window.location.assign(target.toString());
+  };
+
   const openLogin = () => {
     const target = new URL(window.location.href);
     target.pathname = "/login";
@@ -302,10 +467,10 @@ export function SetupPage() {
   };
 
   if (oauthPopup) return <main className="setup-page setup-page--complete"><section className="setup-complete-panel setup-oauth-return">
-    <span className="setup-success-mark" aria-hidden="true">{driveJob?.status === "selecting_folder" || driveJob?.status === "ready" ? "✓" : "…"}</span>
+    <span className="setup-success-mark" aria-hidden="true">{queryDriveState === "connected" ? "✓" : "!"}</span>
     <p className="setup-eyebrow">GOOGLE DRIVE AUTHORIZATION</p>
-    <h1>{driveJob?.status === "selecting_folder" || driveJob?.status === "ready" ? "Drive connected" : "Returning to setup"}</h1>
-    <p>{driveJob?.progress || "StreamHome is verifying the Google authorization. Return to the original setup tab to choose a folder."}</p>
+    <h1>{queryDriveState === "connected" ? "Drive connected" : "Authorization needs attention"}</h1>
+    <p>{queryDriveState === "connected" ? "Your original setup page is continuing at the Drive folder step. This window will close automatically." : "Return to the original setup page to review the Google authorization error and retry without losing your setup progress."}</p>
     <button className="setup-primary" onClick={() => window.close()}>Close this window</button>
   </section></main>;
 
@@ -315,7 +480,8 @@ export function SetupPage() {
     <h1>StreamHome is restarting</h1>
     <p>Save these values now. They will not be shown again.</p>
     <pre>{secretsText}</pre>
-    <div className="setup-actions"><button onClick={() => navigator.clipboard.writeText(secretsText)}>Copy</button><button onClick={downloadSecrets}>Download</button></div>
+    <div className="setup-actions"><button onClick={copySecrets}>Copy</button><button onClick={downloadSecrets}>Download</button></div>
+    {secretsCopyStatus && <p className="setup-copy-feedback" data-state={secretsCopyStatus} role="status">{secretsCopyStatus === "copied" ? "Secrets copied." : "Copy was blocked. Select the text above and copy it manually."}</p>}
     <label className="setup-check"><input type="checkbox" checked={secretsSaved} onChange={(event) => setSecretsSaved(event.target.checked)} /> I saved the ingestion token{result.recoveryCodes.length ? " and recovery codes" : ""}.</label>
     <button className="setup-primary" disabled={!secretsSaved} onClick={openLogin}>Open StreamHome</button>
   </section></main>;
@@ -343,6 +509,7 @@ export function SetupPage() {
     <section className="setup-workspace">
       <header><p className="setup-eyebrow">STEP {step + 1} OF {STEPS.length}</p><span>{STEPS[step]}</span></header>
       <div className="setup-panel">
+        {resumeNotice && <div className="setup-resume-notice" role="status"><i aria-hidden="true">↻</i><div><strong>Setup progress restored</strong><span>{resumeNotice}</span></div></div>}
         {step === 0 && <><h2>Unlock this installation</h2><p>Enter the one-time bootstrap code printed by <code>./start.sh</code>.</p><label>Bootstrap code<input autoFocus type="password" autoComplete="off" value={bootstrapCode} onChange={(event) => setBootstrapCode(event.target.value)} onKeyDown={(event) => event.key === "Enter" && void unlock()} /></label><button className="setup-primary" disabled={!bootstrapCode || busy} onClick={unlock}>Unlock setup</button></>}
 
         {step === 1 && <><h2>System readiness</h2><p>StreamHome checks its runtime without changing the established media layout.</p>{checks.length > 0 && <div className="setup-check-grid">{checks.map((check) => <article key={check.id} data-ready={check.ready}><i>{check.ready ? "✓" : "!"}</i><div><strong>{check.id.replace(/_/g, " ")}</strong><span>{check.detail}</span></div></article>)}</div>}<button className="setup-primary" disabled={busy} onClick={inspect}>{checks.length ? "Check again" : "Run system checks"}</button></>}
@@ -356,10 +523,11 @@ export function SetupPage() {
         {step === 5 && <><h2>Server behavior</h2><p>Database and media locations remain standardized for reliable recovery.</p><div className="setup-paths"><span><b>Database</b>{paths.database}</span><span><b>Media</b>{paths.media}</span></div><div className="setup-form-grid"><label>Public StreamHome URL<input type="url" value={publicUrl} onChange={(event) => setPublicUrl(event.target.value.trim())} placeholder="https://watch.example.com" /></label><label>Web port<input type="number" min={1} max={65535} value={webPort} onChange={(event) => setWebPort(Number(event.target.value))} /></label><label>HEVC compression<select value={hevc} onChange={(event) => setHevc(event.target.value as typeof hevc)}><option value="auto">Automatic</option><option value="on">Always</option><option value="off">Never</option></select></label></div><small className="setup-field-note">The public origin creates the exact Google OAuth callback and must not include a path.</small><label className="setup-check"><input type="checkbox" checked={backups} onChange={(event) => setBackups(event.target.checked)} /> Enable automatic database backups</label><label className="setup-check"><input type="checkbox" checked={updates} onChange={(event) => setUpdates(event.target.checked)} /> Enable automatic updates</label><div className="setup-footer-actions"><button onClick={() => goToStep(4)}>Back</button><button className="setup-primary" disabled={webPort < 1 || webPort > 65535 || !publicUrl} onClick={() => goToStep(6)}>Continue</button></div></>}
 
         {step === 6 && <><h2>Storage</h2><p>Keep media on this server, or connect Google Drive without installing Rclone on another computer.</p>
+          {directCallbackVisit && <div className="setup-callback-notice" role="status"><i aria-hidden="true">↩</i><div><strong>This address belongs in Google Cloud</strong><span>It is an OAuth return address, not a page you need to open. Return to the setup tab you were using; its progress is still there.</span></div><button type="button" onClick={returnToSetupProgress}>Return to setup progress</button></div>}
           <div className="setup-choice"><button data-selected={storage === "LOCAL"} onClick={() => setStorage("LOCAL")}><strong>Local storage</strong><span>Use the standard server/media catalog.</span></button><button data-selected={storage === "CLOUD"} onClick={() => setStorage("CLOUD")}><strong>Google Drive</strong><span>Authorize Drive directly in this browser.</span></button></div>
           {storage === "CLOUD" && <div className="setup-drive-config">
             <a className="setup-guide-link" href={driveGuideUrl} target="_blank" rel="noreferrer"><span>GOOGLE CLOUD GUIDE</span><strong>Learn how to create the required Client ID and OAuth application</strong><i>↗</i></a>
-            <div className="setup-callback"><span>Authorized redirect URI</span><code>{publicUrl ? `${publicUrl.replace(/\/$/, "")}/api/setup/rclone/drive/callback` : driveCallbackUrl}</code><button type="button" onClick={() => navigator.clipboard.writeText(`${publicUrl.replace(/\/$/, "")}/api/setup/rclone/drive/callback`)}>Copy</button></div>
+            <div className="setup-callback"><span>Authorized redirect URI · copy this into Google Cloud; do not open it directly</span><code>{callbackUrl}</code><button type="button" className="setup-copy-button" onClick={copyCallback} aria-label="Copy authorized redirect URI"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" /></svg><span>{callbackCopyStatus === "copied" ? "Copied" : "Copy"}</span></button>{callbackCopyStatus && <small className="setup-copy-feedback" data-state={callbackCopyStatus} role="status">{callbackCopyStatus === "copied" ? "Callback URL copied." : "Copy was blocked. Select the URL and copy it manually."}</small>}</div>
             {!driveJob && <div className="setup-secret setup-drive-credentials"><div className="setup-form-grid"><label>Google client ID<input value={clientId} onChange={(event) => setClientId(event.target.value.trim())} autoComplete="off" placeholder="….apps.googleusercontent.com" /></label><label>Google client secret<input type="password" value={clientSecret} onChange={(event) => setClientSecret(event.target.value.trim())} autoComplete="new-password" /></label><label>Rclone remote name<input value={remoteName} onChange={(event) => setRemoteName(event.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 32))} /></label></div><div className="setup-form-grid"><label>OAuth audience<select value={audience} onChange={(event) => setAudience(event.target.value as typeof audience)}><option value="external">External</option><option value="internal">Internal workspace</option></select></label><label>Publishing status<select value={publishingStatus} onChange={(event) => setPublishingStatus(event.target.value as typeof publishingStatus)}><option value="production">Production</option><option value="testing">Testing</option></select></label></div>{audience === "external" && publishingStatus === "testing" && <div className="setup-notice">Add this Google account as an OAuth test user. Testing-mode authorization may require reconnecting later.</div>}<button className="setup-primary setup-drive-connect" disabled={busy || !clientId || !clientSecret || remoteName.length < 2} onClick={startOAuth}>Continue with Google</button><small>Google consent opens in a separate window. The client secret is sent to this server and is never saved in browser storage.</small></div>}
             {driveJob && <div className="setup-drive-job" data-status={driveJob.status}><header><span className="setup-drive-status-dot" /><div><strong>{driveJob.status === "ready" ? "Google Drive verified" : "Google Drive connection"}</strong><small>{driveJob.progress}</small></div><button onClick={cancelOAuth}>Start over</button></header>
               {driveJob.errorCode && <div className="setup-error" role="alert"><i>!</i>{driveJob.errorCode.replace(/_/g, " ")}</div>}

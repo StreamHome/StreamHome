@@ -29,4 +29,21 @@ describe("Google Drive setup presentation", () => {
     const setup = read("src/pages/SetupPage.tsx");
     expect(setup).toContain("standard server/media catalog");
   });
+
+  it("keeps OAuth outside the setup tab and resumes through a validated popup message", () => {
+    const setup = read("src/pages/SetupPage.tsx");
+    expect(setup).toContain('window.open("about:blank", "streamhome-google-drive"');
+    expect(setup).toContain("streamhome:drive-oauth-complete");
+    expect(setup).toContain("event.source !== oauthWindowRef.current");
+    expect(setup).not.toContain("else window.location.assign(started.authorizationUrl)");
+    expect(setup).toContain("Allow pop-ups for StreamHome");
+  });
+
+  it("labels the callback as a value to copy and provides an icon button", () => {
+    const setup = read("src/pages/SetupPage.tsx");
+    expect(setup).toContain("copy this into Google Cloud; do not open it directly");
+    expect(setup).toContain('className="setup-copy-button"');
+    expect(setup).toContain("copySetupText(callbackUrl)");
+    expect(setup).toContain("Return to setup progress");
+  });
 });

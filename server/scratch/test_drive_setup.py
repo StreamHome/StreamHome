@@ -1,13 +1,24 @@
 import configparser
+import hashlib
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from starlette.requests import Request
 
-from routes.setup import _drive_callback_url, _normalize_public_url, _safe_drive_path, _setup_status_urls
+from routes.setup import (
+    _drive_callback_landing_url,
+    _drive_callback_url,
+    _normalize_public_url,
+    _safe_drive_path,
+    _setup_status_urls,
+    drive_oauth_callback,
+)
 from services.rclone import RcloneService
 
 
@@ -35,6 +46,22 @@ class DriveSetupContractTests(unittest.TestCase):
             ("http://8.8.8.8:3000", "http://8.8.8.8:3000/api/setup/rclone/drive/callback"),
         )
         self.assertEqual(_setup_status_urls("not a URL"), ("", ""))
+
+    def test_manual_callback_returns_to_the_browser_facing_setup(self):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "scheme": "https",
+            "server": ("watch.example.com", 443),
+            "path": "/api/setup/rclone/drive/callback",
+            "query_string": b"",
+            "headers": [],
+            "client": ("203.0.113.10", 43000),
+        })
+        self.assertEqual(
+            _drive_callback_landing_url(request),
+            "https://watch.example.com/setup?drive=callback",
+        )
 
     def test_drive_paths_reject_remote_and_parent_syntax(self):
         self.assertEqual(_safe_drive_path("/StreamHome/Media/"), "StreamHome/Media")
@@ -70,6 +97,92 @@ class DriveSetupContractTests(unittest.TestCase):
         self.assertEqual(RcloneService.classify(1, "oauth2: invalid_grant"), "drive_unauthorized")
         self.assertEqual(RcloneService.classify(1, "storageQuotaExceeded"), "drive_quota_exceeded")
         self.assertEqual(RcloneService.classify(1, "user rate limit exceeded"), "drive_rate_limited")
+
+
+class _ScalarResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalars(self):
+        return self
+
+    def first(self):
+        return self.value
+
+
+class _DriveCallbackDatabase:
+    def __init__(self, job):
+        self.job = job
+        self.commits = 0
+
+    async def execute(self, _statement):
+        return _ScalarResult(self.job)
+
+    def add(self, _value):
+        return None
+
+    async def commit(self):
+        self.commits += 1
+
+
+class DriveCallbackFlowTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def callback_request(state: str) -> Request:
+        return Request({
+            "type": "http",
+            "method": "GET",
+            "scheme": "https",
+            "server": ("watch.example.com", 443),
+            "path": "/api/setup/rclone/drive/callback",
+            "query_string": f"state={state}".encode("ascii"),
+            "headers": [],
+            "client": ("203.0.113.10", 43000),
+        })
+
+    async def test_valid_single_use_state_does_not_require_the_setup_cookie(self):
+        state = "oauth-state-with-256-bits-of-randomness"
+        job = SimpleNamespace(
+            id="drive-job-id",
+            state_hash=hashlib.sha256(state.encode("utf-8")).hexdigest(),
+            status="authorizing",
+            expires_at=time.time() + 300,
+            public_url="https://watch.example.com",
+            error_code=None,
+            progress="Waiting for Google",
+            updated_at=time.time(),
+        )
+        database = _DriveCallbackDatabase(job)
+
+        with patch("routes.setup.rclone_service.cleanup_job"):
+            response = await drive_oauth_callback(self.callback_request(state), database)
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(job.error_code, "drive_authorization_failed")
+        self.assertEqual(database.commits, 1)
+
+    async def test_completed_callback_replay_is_idempotent(self):
+        state = "completed-oauth-state"
+        job = SimpleNamespace(
+            id="drive-job-id",
+            state_hash=hashlib.sha256(state.encode("utf-8")).hexdigest(),
+            status="selecting_folder",
+            expires_at=time.time() + 300,
+            public_url="https://watch.example.com",
+            error_code=None,
+            progress="Google Drive connected",
+            updated_at=time.time(),
+        )
+        database = _DriveCallbackDatabase(job)
+
+        response = await drive_oauth_callback(self.callback_request(state), database)
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(
+            response.headers["location"],
+            "https://watch.example.com/setup?driveJob=drive-job-id&drive=connected",
+        )
+        self.assertEqual(job.status, "selecting_folder")
+        self.assertEqual(database.commits, 0)
 
 
 if __name__ == "__main__":
