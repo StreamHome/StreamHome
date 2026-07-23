@@ -16,7 +16,7 @@ read_env() {
 mkdir -p "$RUN_DIR"
 WEB_PORT="$(read_env WEB_PORT 3000)"
 SETUP="$(read_env SETUP false)"
-PUBLIC_URL="$(read_env PUBLIC_URL "http://localhost:${WEB_PORT}")"
+CONFIGURED_PUBLIC_URL="$(read_env PUBLIC_URL "")"
 if ! [[ "$WEB_PORT" =~ ^[0-9]+$ ]] || (( WEB_PORT < 1 || WEB_PORT > 65535 )); then
     echo "Invalid WEB_PORT in .env: $WEB_PORT" >&2
     exit 1
@@ -26,9 +26,11 @@ if [[ "$WEB_PORT" == "8000" ]]; then
     exit 1
 fi
 
-export WEB_PORT SETUP PUBLIC_URL
 SETUP_NORMALIZED="$(printf '%s' "$SETUP" | tr '[:upper:]' '[:lower:]')"
 SETUP_ACTIVE=false
+if [[ "$SETUP_NORMALIZED" != "true" && "$SETUP" != "1" ]]; then
+    SETUP_ACTIVE=true
+fi
 if [[ -x "$ROOT_DIR/venv/bin/python" ]]; then
     BACKEND_PYTHON="$ROOT_DIR/venv/bin/python"
 elif command -v python3 >/dev/null 2>&1; then
@@ -38,8 +40,72 @@ else
     exit 1
 fi
 
+public_url_is_loopback() {
+    "$BACKEND_PYTHON" - "$1" <<'PY'
+import ipaddress
+import sys
+from urllib.parse import urlsplit
+
+hostname = (urlsplit(sys.argv[1]).hostname or "").strip().lower()
+if hostname == "localhost":
+    raise SystemExit(0)
+try:
+    raise SystemExit(0 if ipaddress.ip_address(hostname).is_loopback else 1)
+except ValueError:
+    raise SystemExit(1)
+PY
+}
+
+detect_server_ip() {
+    "$BACKEND_PYTHON" - <<'PY'
+import ipaddress
+import socket
+
+candidates = []
+probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    probe.connect(("1.1.1.1", 80))
+    candidates.append(probe.getsockname()[0])
+except OSError:
+    pass
+finally:
+    probe.close()
+
+try:
+    candidates.extend(
+        entry[4][0]
+        for entry in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    )
+except OSError:
+    pass
+
+for candidate in candidates:
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        continue
+    if not address.is_loopback and not address.is_link_local and not address.is_unspecified:
+        print(str(address))
+        break
+PY
+}
+
+PUBLIC_URL="$CONFIGURED_PUBLIC_URL"
+STREAMHOME_PUBLIC_URL_EXPLICIT=true
+if [[ -z "$PUBLIC_URL" ]] || { [[ "$SETUP_ACTIVE" == true ]] && public_url_is_loopback "$PUBLIC_URL"; }; then
+    SERVER_IP="$(detect_server_ip)"
+    if [[ -n "$SERVER_IP" ]]; then
+        PUBLIC_URL="http://${SERVER_IP}:${WEB_PORT}"
+    else
+        PUBLIC_URL="http://localhost:${WEB_PORT}"
+        echo "Warning: no reachable server IP was detected. Set PUBLIC_URL in .env before opening setup remotely." >&2
+    fi
+    STREAMHOME_PUBLIC_URL_EXPLICIT=false
+fi
+PUBLIC_URL="${PUBLIC_URL%/}"
+export WEB_PORT SETUP PUBLIC_URL STREAMHOME_PUBLIC_URL_EXPLICIT
+
 if [[ "$SETUP_NORMALIZED" != "true" && "$SETUP" != "1" ]]; then
-    SETUP_ACTIVE=true
     STREAMHOME_SETUP_CODE="$($BACKEND_PYTHON -c 'import secrets; print(secrets.token_urlsafe(18))')"
     export STREAMHOME_SETUP_CODE
 fi
@@ -97,10 +163,10 @@ if ! kill -0 "$BACKEND_PID" 2>/dev/null || ! kill -0 "$WEB_PID" 2>/dev/null; the
     exit 1
 fi
 
-echo "StreamHome is running at http://localhost:${WEB_PORT}"
+echo "StreamHome is running at ${PUBLIC_URL}"
 if [[ "$SETUP_ACTIVE" == true ]]; then
     echo "First-run setup is active."
-    echo "Setup URL: http://localhost:${WEB_PORT}/setup"
+    echo "Setup URL: ${PUBLIC_URL}/setup"
     echo "One-time bootstrap code: ${STREAMHOME_SETUP_CODE}"
 fi
 echo "Logs: backend.log and frontend.log"

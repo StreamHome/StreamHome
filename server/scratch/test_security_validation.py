@@ -7,8 +7,9 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from config import settings
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
-from services.request_security import client_ip
+from services.request_security import client_ip, normalize_origin, same_origin_request, trusted_proxy_origin
 from services.rate_limit import _key as rate_limit_key
 from services.rate_limit import fail as record_rate_limit_failure
 from services.secret_crypto import protect_secret, reveal_secret
@@ -25,6 +26,34 @@ async def expect_blocked(url: str, client_address: str = "198.51.100.10") -> Non
     except UnsafeIngestionSource:
         return
     raise AssertionError(f"Expected the source to be blocked: {url}")
+
+
+def browser_request(
+    *,
+    origin: str,
+    client: str,
+    path: str = "/api/setup/tmdb/validate",
+    forwarded_proto: str = "",
+    forwarded_host: str = "",
+    setup_cookie: bool = True,
+) -> Request:
+    headers = [(b"origin", origin.encode())]
+    if forwarded_proto:
+        headers.append((b"x-forwarded-proto", forwarded_proto.encode()))
+    if forwarded_host:
+        headers.append((b"x-forwarded-host", forwarded_host.encode()))
+    if setup_cookie:
+        headers.append((b"cookie", b"streamhome_setup=test-session"))
+    return Request({
+        "type": "http",
+        "method": "POST",
+        "path": path,
+        "headers": headers,
+        "client": (client, 5000),
+        "scheme": "http",
+        "server": ("127.0.0.1", 8000),
+        "query_string": b"",
+    })
 
 
 async def run() -> None:
@@ -56,6 +85,65 @@ async def run() -> None:
     trusted = Request({"type": "http", "method": "GET", "path": "/", "headers": [(b"x-forwarded-for", b"198.51.100.30")], "client": ("127.0.0.1", 5000), "scheme": "http", "server": ("test", 80), "query_string": b""})
     assert client_ip(untrusted) == "198.51.100.20"
     assert client_ip(trusted) == "198.51.100.30"
+
+    previous_public_url = settings.PUBLIC_URL
+    previous_allowed_origins = settings.ALLOWED_ORIGINS
+    previous_setup_complete = settings.SETUP_COMPLETE
+    try:
+        settings.PUBLIC_URL = "http://localhost:3000"
+        settings.ALLOWED_ORIGINS = []
+        settings.SETUP_COMPLETE = False
+        setup_origin = "http://192.168.1.25:3000"
+        trusted_setup = browser_request(
+            origin=setup_origin,
+            client="127.0.0.1",
+            forwarded_proto="http",
+            forwarded_host="192.168.1.25:3000",
+        )
+        assert normalize_origin("HTTP://192.168.1.25:3000/") == setup_origin
+        assert trusted_proxy_origin(trusted_setup) == setup_origin
+        assert same_origin_request(trusted_setup)
+
+        forged_forwarding = browser_request(
+            origin=setup_origin,
+            client="198.51.100.20",
+            forwarded_proto="http",
+            forwarded_host="192.168.1.25:3000",
+        )
+        assert trusted_proxy_origin(forged_forwarding) is None
+        assert not same_origin_request(forged_forwarding)
+
+        mismatched_origin = browser_request(
+            origin="http://attacker.example",
+            client="127.0.0.1",
+            forwarded_proto="http",
+            forwarded_host="192.168.1.25:3000",
+        )
+        assert not same_origin_request(mismatched_origin)
+
+        missing_setup_cookie = browser_request(
+            origin=setup_origin,
+            client="127.0.0.1",
+            forwarded_proto="http",
+            forwarded_host="192.168.1.25:3000",
+            setup_cookie=False,
+        )
+        assert not same_origin_request(missing_setup_cookie)
+
+        settings.SETUP_COMPLETE = True
+        assert not same_origin_request(trusted_setup)
+        settings.PUBLIC_URL = "https://watch.example.com"
+        configured_origin = browser_request(
+            origin="https://watch.example.com",
+            client="198.51.100.20",
+            path="/api/auth/logout",
+            setup_cookie=False,
+        )
+        assert same_origin_request(configured_origin)
+    finally:
+        settings.PUBLIC_URL = previous_public_url
+        settings.ALLOWED_ORIGINS = previous_allowed_origins
+        settings.SETUP_COMPLETE = previous_setup_complete
 
     encrypted = protect_secret("TOTP-TEST-SECRET")
     assert encrypted != "TOTP-TEST-SECRET" and reveal_secret(encrypted) == "TOTP-TEST-SECRET"

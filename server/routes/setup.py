@@ -31,7 +31,7 @@ from db import get_session
 from models import AuthChallenge, DriveSetupJob, IntegrationCredential, RecoveryCode, User
 from services.integration_auth import integration_token_hash
 from services.rclone import REMOTE_NAME_RE, rclone_service
-from services.request_security import client_ip, request_is_secure
+from services.request_security import client_ip, normalize_origin, request_is_secure, trusted_proxy_origin
 from services.secret_crypto import protect_secret
 from services.rate_limit import clear as clear_rate_limit
 from services.rate_limit import enforce as enforce_rate_limit
@@ -263,6 +263,14 @@ async def get_setup_status(request: Request, db: AsyncSession = Depends(get_sess
     if required and settings.SETUP_COMPLETE:
         settings.SETUP_COMPLETE = False
     unlocked = _is_unlocked(request)
+    public_url = settings.PUBLIC_URL
+    configured_origin = normalize_origin(public_url)
+    configured_host = urlsplit(configured_origin).hostname if configured_origin else None
+    configured_loopback = configured_host in {"localhost", "127.0.0.1", "::1"}
+    public_url_explicit = os.getenv("STREAMHOME_PUBLIC_URL_EXPLICIT", "false").lower() in {"true", "1", "yes"}
+    browser_origin = trusted_proxy_origin(request)
+    if required and browser_origin and (configured_loopback or not public_url_explicit):
+        public_url = browser_origin
     return {
         "required": required,
         "unlocked": unlocked,
@@ -270,8 +278,8 @@ async def get_setup_status(request: Request, db: AsyncSession = Depends(get_sess
         "serverVersion": settings.APP_VERSION,
         "mediaPath": str((Path(settings.BASE_DIR) / "server" / "media").resolve()) if unlocked else "",
         "databasePath": settings.db_path if unlocked else "",
-        "publicUrl": settings.PUBLIC_URL,
-        "driveCallbackUrl": _drive_callback_url(settings.PUBLIC_URL),
+        "publicUrl": public_url,
+        "driveCallbackUrl": _drive_callback_url(public_url),
         "driveGuideUrl": GOOGLE_DRIVE_GUIDE_URL,
     }
 
