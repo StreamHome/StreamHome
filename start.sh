@@ -28,6 +28,7 @@ fi
 
 export WEB_PORT SETUP PUBLIC_URL
 SETUP_NORMALIZED="$(printf '%s' "$SETUP" | tr '[:upper:]' '[:lower:]')"
+SETUP_ACTIVE=false
 if [[ -x "$ROOT_DIR/venv/bin/python" ]]; then
     BACKEND_PYTHON="$ROOT_DIR/venv/bin/python"
 elif command -v python3 >/dev/null 2>&1; then
@@ -38,15 +39,13 @@ else
 fi
 
 if [[ "$SETUP_NORMALIZED" != "true" && "$SETUP" != "1" ]]; then
+    SETUP_ACTIVE=true
     STREAMHOME_SETUP_CODE="$($BACKEND_PYTHON -c 'import secrets; print(secrets.token_urlsafe(18))')"
     export STREAMHOME_SETUP_CODE
-    echo "First-run setup is active."
-    echo "Setup URL: http://localhost:${WEB_PORT}/setup"
-    echo "One-time bootstrap code: ${STREAMHOME_SETUP_CODE}"
 fi
 
 if [[ -x "$ROOT_DIR/stop.sh" ]]; then
-    "$ROOT_DIR/stop.sh" --quiet || true
+    "$ROOT_DIR/stop.sh" --startup || true
 fi
 
 port_available() {
@@ -65,11 +64,13 @@ PY
 }
 
 if ! port_available 8000; then
-    echo "API port 8000 is already in use. Stop the conflicting service and retry." >&2
+    echo "API port 8000 is still in use by an unrelated or uninspectable service." >&2
+    echo "StreamHome did not stop that service. Resolve the conflict, then run ./start.sh; setup and dependencies do not need to be repeated." >&2
     exit 1
 fi
 if ! port_available "$WEB_PORT"; then
-    echo "Web port $WEB_PORT is already in use. Stop the conflicting service and retry." >&2
+    echo "Web port $WEB_PORT is still in use by an unrelated or uninspectable service." >&2
+    echo "StreamHome did not stop that service. Resolve the conflict, then run ./start.sh; setup and dependencies do not need to be repeated." >&2
     exit 1
 fi
 
@@ -97,4 +98,9 @@ if ! kill -0 "$BACKEND_PID" 2>/dev/null || ! kill -0 "$WEB_PID" 2>/dev/null; the
 fi
 
 echo "StreamHome is running at http://localhost:${WEB_PORT}"
+if [[ "$SETUP_ACTIVE" == true ]]; then
+    echo "First-run setup is active."
+    echo "Setup URL: http://localhost:${WEB_PORT}/setup"
+    echo "One-time bootstrap code: ${STREAMHOME_SETUP_CODE}"
+fi
 echo "Logs: backend.log and frontend.log"

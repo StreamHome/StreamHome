@@ -32,7 +32,11 @@ fail() {
 on_error() {
     local exit_code=$?
     printf '\n[StreamHome Setup] ERROR: %s failed near line %s (exit %s).\n' "$CURRENT_STEP" "$1" "$exit_code" >&2
-    printf '[StreamHome Setup] Fix the reported problem and run ./setup.sh again; existing data was not removed.\n' >&2
+    if [[ "$CURRENT_STEP" == "StreamHome startup" ]]; then
+        printf '[StreamHome Setup] Dependencies and assets are ready. Fix the startup problem and run ./start.sh; do not repeat setup.\n' >&2
+    else
+        printf '[StreamHome Setup] Fix the reported problem and run ./setup.sh again; existing data was not removed.\n' >&2
+    fi
     exit "$exit_code"
 }
 trap 'on_error $LINENO' ERR
@@ -56,6 +60,11 @@ missing_commands() {
     command -v ffprobe >/dev/null 2>&1 || missing+=(ffprobe)
     command -v rclone >/dev/null 2>&1 || missing+=(rclone)
     command -v git >/dev/null 2>&1 || missing+=(git)
+    if ! command -v lsof >/dev/null 2>&1 \
+        && ! command -v ss >/dev/null 2>&1 \
+        && ! command -v fuser >/dev/null 2>&1; then
+        missing+=(listener-inspector)
+    fi
     printf '%s\n' "${missing[@]}"
 }
 
@@ -68,20 +77,20 @@ install_system_packages() {
 
     log "Installing missing system dependencies: ${missing[*]}"
     if command -v apt-get >/dev/null 2>&1; then
-        packages=(ca-certificates curl git python3 python3-pip python3-venv nodejs npm ffmpeg rclone)
+        packages=(ca-certificates curl git python3 python3-pip python3-venv nodejs npm ffmpeg rclone lsof)
         run_privileged apt-get update
         run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
-        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg rclone)
+        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg rclone lsof)
         run_privileged dnf install -y "${packages[@]}"
     elif command -v yum >/dev/null 2>&1; then
-        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg rclone)
+        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg rclone lsof)
         run_privileged yum install -y "${packages[@]}"
     elif command -v pacman >/dev/null 2>&1; then
-        packages=(ca-certificates curl git python python-pip nodejs npm ffmpeg rclone)
+        packages=(ca-certificates curl git python python-pip nodejs npm ffmpeg rclone lsof)
         run_privileged pacman -Sy --needed --noconfirm "${packages[@]}"
     elif command -v brew >/dev/null 2>&1; then
-        packages=(git python node ffmpeg rclone)
+        packages=(git python node ffmpeg rclone lsof)
         brew install "${packages[@]}"
     else
         fail "No supported package manager was found. Install Python 3.11+, Node.js 18+, FFmpeg, FFprobe, and rclone manually."
@@ -96,6 +105,11 @@ validate_versions() {
     command -v ffmpeg >/dev/null 2>&1 || fail "ffmpeg is unavailable after dependency installation."
     command -v ffprobe >/dev/null 2>&1 || fail "ffprobe is unavailable after dependency installation."
     command -v rclone >/dev/null 2>&1 || fail "rclone is unavailable after dependency installation."
+    if ! command -v lsof >/dev/null 2>&1 \
+        && ! command -v ss >/dev/null 2>&1 \
+        && ! command -v fuser >/dev/null 2>&1; then
+        fail "A listener inspector (lsof, ss, or fuser) is required for safe process recovery."
+    fi
 
     python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
         || fail "Python 3.11 or newer is required."
