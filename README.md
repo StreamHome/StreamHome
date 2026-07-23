@@ -247,7 +247,7 @@ StreamHome is designed to operate efficiently, but FFmpeg processing, adaptive p
 | **Operating System** | Ubuntu 22.04 or Windows 10                                       | Ubuntu 24.04, Debian 12, or Windows 11                                    |
 | **CPU**              | 2 vCPUs                                                          | 4+ vCPUs                                                                  |
 | **RAM**              | 2 GB                                                             | 4–6+ GB                                                                   |
-| **Network**          | 20 Mbps                                                          | Faster upload for multiple high-bitrate streams and cloud synchronization |
+| **Network**          | 20 Mbps (lower is no problem)                                    | Faster upload for multiple high-bitrate streams and cloud synchronization |
 | **Local Storage**    | 20 GB for application data, metadata, cache, and temporary files | 50+ GB SSD, especially when using Google Drive media storage              |
 
 Actual requirements depend on catalog size, source quality, concurrent playback sessions, cloud configuration, and active media-processing jobs.
