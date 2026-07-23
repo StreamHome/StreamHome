@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 
-from routes.setup import _drive_callback_url, _normalize_public_url, _safe_drive_path
+from routes.setup import _drive_callback_url, _normalize_public_url, _safe_drive_path, _setup_status_urls
 from services.rclone import RcloneService
 
 
@@ -15,14 +15,26 @@ class DriveSetupContractTests(unittest.TestCase):
     def test_public_url_and_callback_contract(self):
         self.assertEqual(_normalize_public_url("https://watch.example.com/"), "https://watch.example.com")
         self.assertEqual(_normalize_public_url("http://localhost:3000"), "http://localhost:3000")
+        self.assertEqual(_normalize_public_url("http://192.168.1.25:3000"), "http://192.168.1.25:3000")
+        self.assertEqual(_normalize_public_url("http://10.20.30.40:3000"), "http://10.20.30.40:3000")
+        self.assertEqual(_normalize_public_url("http://172.20.0.5:3000"), "http://172.20.0.5:3000")
+        self.assertEqual(_normalize_public_url("http://[fd12:3456::20]:3000"), "http://[fd12:3456::20]:3000")
         self.assertEqual(
             _drive_callback_url("https://watch.example.com"),
             "https://watch.example.com/api/setup/rclone/drive/callback",
         )
-        with self.assertRaises(HTTPException):
-            _normalize_public_url("http://watch.example.com")
+        for insecure_public_url in ("http://watch.example.com", "http://8.8.8.8:3000"):
+            with self.assertRaises(HTTPException):
+                _normalize_public_url(insecure_public_url)
         with self.assertRaises(HTTPException):
             _normalize_public_url("https://watch.example.com/setup")
+
+    def test_status_urls_do_not_apply_final_public_https_policy(self):
+        self.assertEqual(
+            _setup_status_urls("http://8.8.8.8:3000"),
+            ("http://8.8.8.8:3000", "http://8.8.8.8:3000/api/setup/rclone/drive/callback"),
+        )
+        self.assertEqual(_setup_status_urls("not a URL"), ("", ""))
 
     def test_drive_paths_reject_remote_and_parent_syntax(self):
         self.assertEqual(_safe_drive_path("/StreamHome/Media/"), "StreamHome/Media")

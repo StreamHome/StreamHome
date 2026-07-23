@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -147,16 +148,37 @@ def _normalize_public_url(value: str) -> str:
         parsed = urlsplit(raw)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail={"code": "invalid_public_url", "message": "Enter a valid public StreamHome URL."}) from exc
-    localhost = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-    if parsed.scheme not in ({"http", "https"} if localhost else {"https"}):
-        raise HTTPException(status_code=422, detail={"code": "invalid_public_url", "message": "The public URL must use HTTPS outside localhost."})
     if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
         raise HTTPException(status_code=422, detail={"code": "invalid_public_url", "message": "Use only the public origin without a path, query, or credentials."})
+    hostname = parsed.hostname.rstrip(".").lower()
+    private_network = hostname == "localhost"
+    try:
+        address = ipaddress.ip_address(hostname)
+        private_network = (
+            address.is_loopback
+            or address in ipaddress.ip_network("10.0.0.0/8")
+            or address in ipaddress.ip_network("172.16.0.0/12")
+            or address in ipaddress.ip_network("192.168.0.0/16")
+            or address in ipaddress.ip_network("fc00::/7")
+        )
+    except ValueError:
+        pass
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and private_network):
+        raise HTTPException(status_code=422, detail={
+            "code": "invalid_public_url",
+            "message": "Public IP addresses and domain names require HTTPS. HTTP is allowed only for localhost or private-network IPs.",
+        })
     return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
 
 def _drive_callback_url(public_url: str) -> str:
     return f"{_normalize_public_url(public_url)}/api/setup/rclone/drive/callback"
+
+
+def _setup_status_urls(public_url: str) -> tuple[str, str]:
+    origin = normalize_origin(public_url) or ""
+    callback = f"{origin}/api/setup/rclone/drive/callback" if origin else ""
+    return origin, callback
 
 
 def _safe_drive_path(value: str, *, allow_empty: bool = True) -> str:
@@ -271,6 +293,7 @@ async def get_setup_status(request: Request, db: AsyncSession = Depends(get_sess
     browser_origin = trusted_proxy_origin(request)
     if required and browser_origin and (configured_loopback or not public_url_explicit):
         public_url = browser_origin
+    public_url, drive_callback_url = _setup_status_urls(public_url)
     return {
         "required": required,
         "unlocked": unlocked,
@@ -279,7 +302,7 @@ async def get_setup_status(request: Request, db: AsyncSession = Depends(get_sess
         "mediaPath": str((Path(settings.BASE_DIR) / "server" / "media").resolve()) if unlocked else "",
         "databasePath": settings.db_path if unlocked else "",
         "publicUrl": public_url,
-        "driveCallbackUrl": _drive_callback_url(public_url),
+        "driveCallbackUrl": drive_callback_url,
         "driveGuideUrl": GOOGLE_DRIVE_GUIDE_URL,
     }
 
