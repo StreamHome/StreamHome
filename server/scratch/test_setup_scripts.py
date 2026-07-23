@@ -60,6 +60,12 @@ def bash_path(path: Path) -> str:
     return f"/{drive[0].lower()}{tail.replace(os.sep, '/')}"
 
 
+def unused_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
 class SetupScriptContracts(unittest.TestCase):
     def test_documented_bootstrap_contracts_and_safe_runtime_rules(self) -> None:
         install_sh = (ROOT / "install.sh").read_text(encoding="utf-8")
@@ -128,6 +134,26 @@ class SetupScriptContracts(unittest.TestCase):
             self.assertIn("local changes", (second.stdout + second.stderr).lower())
             self.assertEqual(local_change.read_text(encoding="utf-8"), "preserve me")
 
+    def test_unix_stop_executes_without_pid_records_under_nounset(self) -> None:
+        bash = shutil.which("bash")
+        if os.name == "nt":
+            candidate = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "bin" / "bash.exe"
+            bash = str(candidate) if candidate.is_file() else bash
+        if not bash:
+            self.skipTest("Bash is not installed")
+
+        with tempfile.TemporaryDirectory(dir=ROOT / "temp") as temporary:
+            fixture = Path(temporary)
+            script = fixture / "stop.sh"
+            shutil.copy2(ROOT / "stop.sh", script)
+            (fixture / ".env").write_text("WEB_PORT=3000\n", encoding="utf-8")
+            result = run(
+                [bash, "-lc", f"'{bash_path(script)}' --quiet --recover-port {unused_port()}"],
+                cwd=fixture,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("unbound variable", (result.stdout + result.stderr).lower())
+
     @unittest.skipIf(os.name == "nt", "Unix listener ownership uses /proc or lsof")
     def test_unix_stop_recovers_owned_orphan_and_preserves_unrelated_listener(self) -> None:
         bash = shutil.which("bash")
@@ -135,11 +161,6 @@ class SetupScriptContracts(unittest.TestCase):
             self.skipTest("Bash is not installed")
         if not any(shutil.which(command) for command in ("lsof", "ss", "fuser")):
             self.skipTest("No supported listener-inspection command is installed")
-
-        def unused_port() -> int:
-            with socket.socket() as probe:
-                probe.bind(("127.0.0.1", 0))
-                return int(probe.getsockname()[1])
 
         def wait_for_listener(port: int) -> None:
             deadline = time.monotonic() + 5

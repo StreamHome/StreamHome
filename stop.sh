@@ -174,7 +174,9 @@ recover_port() {
 }
 
 stop_recorded_process() {
-    local name="$1" pid_file="$RUN_DIR/$name.pid" pid
+    local name="$1"
+    local pid_file="$RUN_DIR/$name.pid"
+    local pid
     [[ -f "$pid_file" ]] || return 0
     pid="$(cat "$pid_file" 2>/dev/null || true)"
     if [[ "$pid" =~ ^[0-9]+$ ]] && process_is_running "$pid"; then
