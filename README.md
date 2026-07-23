@@ -325,7 +325,7 @@ Created and maintained by **waqsea**.
 
 For questions, business inquiries, bug reports, or feature suggestions:
 
-* **Email:** [StreamHome@waqsea.com](mailto:StreamHome@waqsea.com)
+* **Email:** [streamhome@waqsea.com](mailto:streamhome@waqsea.com)
 * **GitHub:** [@waqsea](https://github.com/WaqSea)
 
 ---
