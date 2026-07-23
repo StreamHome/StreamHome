@@ -41,7 +41,7 @@ Your media remains under your control. StreamHome can store it locally, synchron
 
 ## ✨ StreamHome at a Glance
 
-<img width="1919" height="840" alt="StreamHome personalized home screen with cinematic hero section" src="https://github.com/user-attachments/assets/025339b7-668a-4159-843e-78d819c8ec1d">
+<img width="1919" height="915" alt="StreamHome media details experience" src="https://github.com/user-attachments/assets/c2325c5d-d953-4082-8881-d9b3db9fec8b">
 
 <p align="center">
   <i>A cinematic home experience personalized around the way you watch.</i>
@@ -49,7 +49,7 @@ Your media remains under your control. StreamHome can store it locally, synchron
 
 <br>
 
-<img width="1919" height="915" alt="StreamHome media details experience" src="https://github.com/user-attachments/assets/c2325c5d-d953-4082-8881-d9b3db9fec8b">
+<img width="1919" height="840" alt="StreamHome personalized home screen with cinematic hero section" src="https://github.com/user-attachments/assets/025339b7-668a-4159-843e-78d819c8ec1d">
 
 <p align="center">
   <i>Rich metadata, personalized discovery, and playback controls in one unified experience.</i>
