@@ -379,6 +379,8 @@ Never:
 
 Return to the StreamHome setup wizard.
 
+Rclone runs only on the StreamHome server through StreamHome's encrypted application-owned configuration. Do not run `rclone config` for this workflow.
+
 Enter:
 
 * **Google OAuth Client ID**
@@ -393,7 +395,7 @@ Select the button used to connect or authorize Google Drive.
 
 ## 17. Authorize the Google Account
 
-StreamHome redirects the browser to Google.
+StreamHome opens Google authorization in a separate browser window while the original setup page polls the server-side job.
 
 Select the same Google account that was added under:
 
@@ -403,43 +405,9 @@ Review the permissions and approve the connection.
 
 Google will then redirect the browser back to StreamHome's registered callback endpoint.
 
-Continue with the existing section for selecting or creating the Google Drive folder.
+StreamHome validates the OAuth state, resumes the original setup page, and stores the resulting authorization only in its protected setup job.
 
-## 18. Enter the Credentials in StreamHome
-
-Return to the StreamHome setup wizard.
-
-On the Google Drive configuration step, enter:
-
-* **Google OAuth Client ID**
-* **Google OAuth Client Secret**
-
-Confirm that StreamHome displays the same redirect URI that was registered in Google Cloud.
-
-Select the button used to continue or test the Google connection.
-
-## 19. Sign In With Google
-
-StreamHome redirects the browser to Google.
-
-Select the Google account that was added as a test user.
-
-Review the permissions requested by StreamHome.
-
-Approve the connection only when:
-
-* the application name is correct;
-* the selected Google account is correct;
-* the requested Drive access matches your intended configuration;
-* the redirect domain belongs to your StreamHome installation.
-
-Google will redirect the browser back to:
-
-`/api/setup/rclone/drive/callback`
-
-StreamHome validates the OAuth state and stores the resulting Drive authorization securely in its managed Rclone configuration.
-
-## 20. Select or Create a Drive Folder
+## 18. Select or Create a Drive Folder
 
 After authorization succeeds, StreamHome displays the Google Drive folder browser.
 
@@ -457,7 +425,7 @@ StreamHome may create its own media and backup structure inside the selected fol
 
 Avoid selecting a folder that contains unrelated important data unless you understand how the current release manages files.
 
-## 21. Run the Storage Health Check
+## 19. Run the Storage Health Check
 
 StreamHome performs a Drive health check before completing configuration.
 
@@ -477,7 +445,7 @@ Do not continue when the health check reports a failure.
 
 Open the error details and correct the affected configuration first.
 
-## 22. Complete Setup
+## 20. Complete Setup
 
 After the Drive health check succeeds:
 
@@ -677,7 +645,6 @@ Before completing Google Drive setup, verify:
 
 * [Getting Started](getting-started.md)
 * [Initial Setup](setup.md)
-* [Storage Overview](storage.md)
 * [Backup and Recovery](backup-and-recovery.md)
 * [Troubleshooting](troubleshooting.md)
 * [Security](security.md)

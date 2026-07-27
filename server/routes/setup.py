@@ -31,6 +31,7 @@ from config import settings
 from db import get_session
 from models import AuthChallenge, DriveSetupJob, IntegrationCredential, RecoveryCode, User
 from services.integration_auth import integration_token_hash
+from services.logger import logger
 from services.rclone import REMOTE_NAME_RE, RcloneConfigEncryptionError, rclone_service
 from services.request_security import client_ip, normalize_origin, request_is_secure, trusted_proxy_origin
 from services.secret_crypto import protect_secret
@@ -40,10 +41,10 @@ from services.rate_limit import fail as fail_rate_limit
 
 router = APIRouter(prefix="/api/setup", tags=["Setup"])
 SETUP_COOKIE = "streamhome_setup"
-SETUP_SESSION_SECONDS = 30 * 60
+SETUP_SESSION_SECONDS = 2 * 60 * 60
 _failed_unlocks: dict[str, tuple[int, float]] = {}
 _completion_lock = asyncio.Lock()
-GOOGLE_DRIVE_GUIDE_URL = "https://github.com/WaqSea/StreamHome/blob/main/docs/google-drive.md"
+GOOGLE_DRIVE_GUIDE_URL = "https://github.com/WaqSea/StreamHome/blob/v0.1.0-alpha.1/docs/google-drive.md"
 GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
@@ -51,6 +52,7 @@ DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 
 class UnlockRequest(BaseModel):
     code: str
+    drive_job_id: Optional[str] = None
 
 
 class TMDBValidationRequest(BaseModel):
@@ -87,6 +89,7 @@ class CompleteRequest(BaseModel):
     email: str
     password: str
     tmdb_token: str
+    tmdb_validation_token: str
     web_port: int = 3000
     totp_secret: Optional[str] = None
     totp_code: Optional[str] = None
@@ -113,6 +116,35 @@ def _bootstrap_code() -> str:
 
 def _setup_token(session_id: str) -> str:
     return jwt.encode({"purpose": "setup", "sid": session_id, "iat": _now(), "exp": _now() + SETUP_SESSION_SECONDS}, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+
+def _tmdb_validation_token(session_id: str, tmdb_token: str) -> str:
+    return jwt.encode(
+        {
+            "purpose": "setup_tmdb",
+            "sid": session_id,
+            "token_hash": _hash_value(tmdb_token.strip()),
+            "iat": _now(),
+            "exp": _now() + SETUP_SESSION_SECONDS,
+        },
+        settings.JWT_SECRET,
+        algorithm=settings.JWT_ALGORITHM,
+    )
+
+
+def _tmdb_validation_is_current(request: Request, tmdb_token: str, validation_token: str) -> bool:
+    session_id = _setup_session_id(request)
+    if not session_id or not validation_token:
+        return False
+    try:
+        payload = jwt.decode(validation_token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+        return (
+            payload.get("purpose") == "setup_tmdb"
+            and hmac.compare_digest(str(payload.get("sid", "")), session_id)
+            and hmac.compare_digest(str(payload.get("token_hash", "")), _hash_value(tmdb_token.strip()))
+        )
+    except Exception:
+        return False
 
 
 def _setup_session_id(request: Request) -> Optional[str]:
@@ -234,8 +266,12 @@ def _drive_job_response(job: DriveSetupJob) -> dict[str, Any]:
 
 
 def _atomic_update_env(path: str, updates: dict[str, str]) -> None:
+    target, temporary = _stage_env_update(path, updates)
+    os.replace(temporary, target)
+
+
+def _updated_env_contents(path: str, updates: dict[str, str]) -> str:
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
     existing = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
     remaining = dict(updates)
     output: list[str] = []
@@ -251,9 +287,38 @@ def _atomic_update_env(path: str, updates: dict[str, str]) -> None:
     for key, raw_value in remaining.items():
         value = raw_value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "")
         output.append(f'{key}="{value}"')
-    temporary = target.with_suffix(target.suffix + ".tmp")
-    temporary.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
-    os.replace(temporary, target)
+    return "\n".join(output).rstrip() + "\n"
+
+
+def _stage_env_update(path: str, updates: dict[str, str]) -> tuple[Path, Path]:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.pending")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(_updated_env_contents(path, updates))
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        return target, temporary
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _restore_file_snapshot(path: Path, snapshot: Optional[bytes]) -> None:
+    if snapshot is None:
+        path.unlink(missing_ok=True)
+        return
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.restore")
+    try:
+        temporary.write_bytes(snapshot)
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _recovery_hash(value: str) -> str:
@@ -334,6 +399,13 @@ async def unlock_setup(payload: UnlockRequest, request: Request, response: Respo
     _failed_unlocks.pop(ip, None)
     await clear_rate_limit(db, "setup_unlock", ip)
     session_id = secrets.token_urlsafe(24)
+    if payload.drive_job_id:
+        job = await db.get(DriveSetupJob, payload.drive_job_id)
+        if job and job.status not in {"failed", "cancelled", "expired"} and job.expires_at >= time.time():
+            job.session_hash = _hash_value(session_id)
+            job.updated_at = time.time()
+            db.add(job)
+            await db.commit()
     response.set_cookie(SETUP_COOKIE, _setup_token(session_id), max_age=SETUP_SESSION_SECONDS, httponly=True, samesite="strict", secure=request_is_secure(request), path="/")
 
 
@@ -355,7 +427,7 @@ async def readiness(db: AsyncSession = Depends(get_session)):
 
 
 @router.post("/tmdb/validate", dependencies=[Depends(require_setup_session)])
-async def validate_tmdb(payload: TMDBValidationRequest):
+async def validate_tmdb(payload: TMDBValidationRequest, request: Request):
     token = payload.token.strip()
     if not token:
         raise HTTPException(status_code=422, detail={"code": "tmdb_required", "message": "A TMDB read-access token is required."})
@@ -364,7 +436,10 @@ async def validate_tmdb(payload: TMDBValidationRequest):
             response = await client.get("https://api.themoviedb.org/3/configuration", headers={"Authorization": f"Bearer {token}"})
         if response.status_code != 200:
             raise HTTPException(status_code=422, detail={"code": "invalid_tmdb_token", "message": "TMDB did not accept this read-access token."})
-        return {"valid": True}
+        session_id = _setup_session_id(request)
+        if not session_id:
+            raise HTTPException(status_code=401, detail={"code": "setup_locked", "message": "Unlock setup again."})
+        return {"valid": True, "validationToken": _tmdb_validation_token(session_id, token)}
     except HTTPException:
         raise
     except httpx.TimeoutException:
@@ -707,13 +782,16 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
         public_url = _normalize_public_url(payload.public_url or settings.PUBLIC_URL)
         if not payload.tmdb_token.strip():
             raise HTTPException(status_code=422, detail={"code": "tmdb_required", "message": "A validated TMDB token is required."})
-        await validate_tmdb(TMDBValidationRequest(token=payload.tmdb_token))
+        if not _tmdb_validation_is_current(request, payload.tmdb_token, payload.tmdb_validation_token):
+            raise HTTPException(status_code=422, detail={"code": "tmdb_validation_expired", "message": "Validate the TMDB token again before completing setup."})
         hevc_mode = payload.hevc_compression_mode.lower()
         if hevc_mode not in {"auto", "on", "off"}:
             raise HTTPException(status_code=422, detail={"code": "invalid_hevc_mode", "message": "Choose auto, on, or off."})
         storage = payload.storage_engine.upper()
         if storage not in {"LOCAL", "CLOUD"}:
             raise HTTPException(status_code=422, detail={"code": "invalid_storage_engine", "message": "Choose local or cloud storage."})
+        if payload.auto_update_enabled:
+            raise HTTPException(status_code=422, detail={"code": "automatic_updates_unavailable", "message": "Automatic updates are unavailable in this alpha. Update only to an explicit release tag."})
         drive_job: Optional[DriveSetupJob] = None
         remote_path = settings.RCLONE_REMOTE_PATH
         if storage == "CLOUD":
@@ -736,32 +814,8 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
         if payload.totp_secret and (not payload.totp_code or not pyotp.TOTP(payload.totp_secret).verify(payload.totp_code, valid_window=1)):
             raise HTTPException(status_code=422, detail={"code": "invalid_totp", "message": "Verify TOTP again before completing setup."})
 
-        existing = (await db.execute(select(User).where(func.lower(User.email) == email))).scalars().first()
-        if not existing:
-            existing = (await db.execute(select(User).order_by(User.id).limit(1))).scalars().first()
-        user = existing or User(email=email, password_hash="")
-        user.email = email
-        user.password_hash = bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode()
-        user.totp_secret = protect_secret(payload.totp_secret)
-        user.two_factor_enabled = bool(payload.totp_secret)
-        user.failed_login_attempts = 0
-        user.lockout_until = None
-        db.add(user)
-        await db.flush()
-        await db.execute(delete(RecoveryCode).where(RecoveryCode.user_id == user.id))
-        recovery_codes = _make_recovery_codes(user.id, db) if user.two_factor_enabled else []
-        await db.execute(delete(AuthChallenge).where(AuthChallenge.user_id == user.id))
-
         ingestion_token = secrets.token_urlsafe(36)
-        await db.execute(delete(IntegrationCredential))
-        ingestion_credential = IntegrationCredential(
-            id=str(uuid.uuid4()),
-            name="MediaSender",
-            token_hash=integration_token_hash(ingestion_token),
-        )
-        ingestion_credential.scopes = ["ingest"]
-        db.add(ingestion_credential)
-        _atomic_update_env(settings.SERVER_ENV_PATH, {
+        server_updates = {
             "TMDB_READ_ACCESS_TOKEN": payload.tmdb_token.strip(),
             "STORAGE_ENGINE": storage,
             "RCLONE_REMOTE_PATH": remote_path,
@@ -770,13 +824,59 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
             "BACKUP_ENABLED": str(payload.backup_enabled).lower(),
             "AUTO_UPDATE_ENABLED": str(payload.auto_update_enabled).lower(),
             "HEVC_COMPRESSION_MODE": hevc_mode,
-        })
+        }
+        root_updates = {"WEB_PORT": str(payload.web_port), "PUBLIC_URL": public_url, "SETUP": "true"}
+        staged_files: list[tuple[Path, Path]] = []
+        snapshots: dict[Path, Optional[bytes]] = {}
         try:
+            staged_files.append(_stage_env_update(settings.SERVER_ENV_PATH, server_updates))
+            staged_files.append(_stage_env_update(settings.ROOT_ENV_PATH, root_updates))
+            snapshots = {
+                target: target.read_bytes() if target.exists() else None
+                for target, _temporary in staged_files
+            }
+
+            existing = (await db.execute(select(User).where(func.lower(User.email) == email))).scalars().first()
+            if not existing:
+                existing = (await db.execute(select(User).order_by(User.id).limit(1))).scalars().first()
+            user = existing or User(email=email, password_hash="")
+            user.email = email
+            user.password_hash = bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode()
+            user.totp_secret = protect_secret(payload.totp_secret)
+            user.two_factor_enabled = bool(payload.totp_secret)
+            user.failed_login_attempts = 0
+            user.lockout_until = None
+            db.add(user)
+            await db.flush()
+            await db.execute(delete(RecoveryCode).where(RecoveryCode.user_id == user.id))
+            recovery_codes = _make_recovery_codes(user.id, db) if user.two_factor_enabled else []
+            await db.execute(delete(AuthChallenge).where(AuthChallenge.user_id == user.id))
+            await db.execute(delete(IntegrationCredential))
+            ingestion_credential = IntegrationCredential(
+                id=str(uuid.uuid4()),
+                name="MediaSender",
+                token_hash=integration_token_hash(ingestion_token),
+            )
+            ingestion_credential.scopes = ["ingest"]
+            db.add(ingestion_credential)
+
+            for target, temporary in staged_files:
+                os.replace(temporary, target)
             await db.commit()
-            _atomic_update_env(settings.ROOT_ENV_PATH, {"WEB_PORT": str(payload.web_port), "PUBLIC_URL": public_url, "SETUP": "true"})
-        except Exception:
+        except Exception as exc:
             await db.rollback()
-            raise HTTPException(status_code=500, detail={"code": "setup_save_failed", "message": "Setup could not be saved. No installation flag was activated."})
+            restore_error: Optional[Exception] = None
+            for target, snapshot in snapshots.items():
+                try:
+                    _restore_file_snapshot(target, snapshot)
+                except Exception as candidate:
+                    restore_error = candidate
+            for _target, temporary in staged_files:
+                temporary.unlink(missing_ok=True)
+            message = "Setup could not be saved; staged configuration and database changes were rolled back."
+            if restore_error:
+                message = "Setup could not be saved and configuration recovery needs administrator attention. Review the server logs before retrying."
+            raise HTTPException(status_code=500, detail={"code": "setup_save_failed", "message": message}) from exc
 
         settings.SETUP_COMPLETE = True
         settings.WEB_PORT = payload.web_port
@@ -790,7 +890,10 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
         settings.BACKUP_ENABLED = payload.backup_enabled
         settings.AUTO_UPDATE_ENABLED = payload.auto_update_enabled
         settings.HEVC_COMPRESSION_MODE = hevc_mode
-        settings.save_to_json()
+        try:
+            settings.save_to_json()
+        except OSError as exc:
+            logger.warning(f"[Setup] Core configuration completed, but settings.json could not be refreshed: {exc}")
         if drive_job:
             rclone_service.cleanup_job(drive_job.id)
         response.delete_cookie(SETUP_COOKIE, path="/")

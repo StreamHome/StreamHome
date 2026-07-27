@@ -24,7 +24,7 @@ class Profile(SQLModel, table=True):
     avatar_color: str = Field(default="from-blue-600 to-indigo-600")
     theme: Optional[str] = "netflix"
     pin_enabled: Optional[bool] = Field(default=False)
-    pin: Optional[str] = None
+    pin_hash: Optional[str] = None
 
 class Movie(SQLModel, table=True):
     id: str = Field(primary_key=True)
@@ -595,7 +595,6 @@ class ProfileResponse(APIModel):
     avatar_color: Optional[str] = "from-blue-600 to-indigo-650"
     theme: Optional[str]
     pin_enabled: Optional[bool]
-    pin: Optional[str]
 
 class EpisodeResponse(APIModel):
     id: str

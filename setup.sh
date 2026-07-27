@@ -123,6 +123,7 @@ missing_commands() {
     command -v ffprobe >/dev/null 2>&1 || missing+=(ffprobe)
     [[ -n "$(rclone_binary)" ]] || missing+=(rclone)
     command -v git >/dev/null 2>&1 || missing+=(git)
+    command -v curl >/dev/null 2>&1 || missing+=(curl)
     if ! command -v lsof >/dev/null 2>&1 \
         && ! command -v ss >/dev/null 2>&1 \
         && ! command -v fuser >/dev/null 2>&1; then
@@ -206,7 +207,9 @@ prepare_virtual_environment() {
 
     CURRENT_STEP="server dependency installation"
     "$ROOT_DIR/venv/bin/python" -m pip install --upgrade pip
-    "$ROOT_DIR/venv/bin/python" -m pip install -r "$ROOT_DIR/server/requirements.txt"
+    "$ROOT_DIR/venv/bin/python" -m pip install \
+        -c "$ROOT_DIR/server/requirements.lock" \
+        -r "$ROOT_DIR/server/requirements.txt"
 }
 
 prepare_web() {

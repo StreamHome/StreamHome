@@ -3,6 +3,7 @@ import os
 import sqlite3
 from datetime import datetime
 
+import bcrypt
 from sqlmodel import SQLModel, select
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -66,6 +67,21 @@ async def init_db():
         def migrate(sync_conn):
             from sqlalchemy import inspect
             inspector = inspect(sync_conn)
+            if "profile" in inspector.get_table_names():
+                profile_columns = [col["name"] for col in inspector.get_columns("profile")]
+                if "pin_hash" not in profile_columns:
+                    sync_conn.exec_driver_sql("ALTER TABLE profile ADD COLUMN pin_hash TEXT")
+                if "pin" in profile_columns:
+                    legacy_pins = sync_conn.exec_driver_sql(
+                        "SELECT id, pin FROM profile WHERE pin IS NOT NULL AND TRIM(pin) != ''"
+                    ).fetchall()
+                    for profile_id, legacy_pin in legacy_pins:
+                        pin_hash = bcrypt.hashpw(str(legacy_pin).encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+                        sync_conn.exec_driver_sql(
+                            "UPDATE profile SET pin_hash = ? WHERE id = ?",
+                            (pin_hash, profile_id),
+                        )
+                    sync_conn.exec_driver_sql("UPDATE profile SET pin = NULL WHERE pin IS NOT NULL")
             if "downloadtask" in inspector.get_table_names():
                 columns = [col["name"] for col in inspector.get_columns("downloadtask")]
                 if "language" not in columns:

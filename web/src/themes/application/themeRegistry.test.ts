@@ -5,7 +5,7 @@ import { THEME_DEFINITIONS } from "./themeRegistry";
 import { MotionProvider } from "../../motion/motionSystem";
 
 const navigationProps = {
-  profile: { id: "1", name: "Admin", avatarColor: "#ff5f1f", theme: "gemini", pinEnabled: false, pin: null },
+  profile: { id: "1", name: "Admin", avatarColor: "#ff5f1f", theme: "gemini", pinEnabled: false },
   activeView: "home" as const,
   isAdmin: true,
   onView: () => undefined,

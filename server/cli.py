@@ -40,27 +40,12 @@ from services.integration_auth import integration_token_hash
 console = Console()
 
 def get_default_rclone_remote() -> str:
-    rclone_path = shutil.which("rclone")
-    if not rclone_path:
-        fallback_exe = "rclone.exe" if sys.platform == "win32" else "rclone"
-        fallback_path = os.path.join(bin_path, fallback_exe)
-        if os.path.exists(fallback_path):
-            rclone_path = fallback_path
-            
-    if rclone_path:
-        import subprocess
-        try:
-            proc = subprocess.run([rclone_path, "listremotes"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3)
-            if proc.returncode == 0:
-                remotes = [r.strip() for r in proc.stdout.splitlines() if r.strip()]
-                if remotes:
-                    first = remotes[0]
-                    if not first.endswith(":"):
-                        first += ":"
-                    return f"{first}media"
-        except Exception:
-            pass
-    return "gdrive:media"
+    """Returns only the application-managed remote path.
+
+    Rclone discovery and configuration must stay inside services.rclone so the
+    application-owned encrypted config and password command are always used.
+    """
+    return settings.RCLONE_REMOTE_PATH or "streamhome-drive:media"
 
 # ─────────────────────────── Input Utilities ───────────────────────────
 
@@ -373,14 +358,12 @@ async def configure_settings():
                 
                 storage_options = [
                     f"Storage Engine Mode     : [cyan]{settings.STORAGE_ENGINE}[/cyan]",
-                    f"Rclone Remote Path      : [cyan]{settings.RCLONE_REMOTE_PATH}[/cyan]",
-                    "Run Rclone Configuration Wizard (rclone config)",
                     "Back to Config Menu"
                 ]
-                storage_icons = ["⚙️", "📂", "⚡", "↩️"]
+                storage_icons = ["⚙️", "↩️"]
                 
                 sel = arrow_menu(storage_options, storage_icons, is_sub_menu=True)
-                if sel == -1 or sel == 3:
+                if sel == -1 or sel == 1:
                     break
                     
                 clear_screen()
@@ -391,52 +374,16 @@ async def configure_settings():
                     console.print()
                     val = prompt_input("Select Storage Engine Mode (LOCAL/CLOUD)", settings.STORAGE_ENGINE)
                     if val != "ESC" and val.upper() in ["LOCAL", "CLOUD"]:
-                        settings.STORAGE_ENGINE = val.upper()
-                        update_env_file("STORAGE_ENGINE", val.upper())
-                        settings.save_to_json()
-                        console.print("\n   [bold bright_green][✓][/bold bright_green] [white]Storage Engine Mode updated and saved![/white]")
+                        if val.upper() == "CLOUD" and settings.STORAGE_ENGINE != "CLOUD":
+                            console.print("\n   [bold bright_yellow][!][/bold bright_yellow] [white]Connect and test Google Drive through the StreamHome Admin storage page before enabling cloud storage.[/white]")
+                        else:
+                            settings.STORAGE_ENGINE = val.upper()
+                            update_env_file("STORAGE_ENGINE", val.upper())
+                            settings.save_to_json()
+                            console.print("\n   [bold bright_green][✓][/bold bright_green] [white]Storage Engine Mode updated and saved![/white]")
                     else:
                         console.print("\n   [bold bright_red][✗][/bold bright_red] [dim]Invalid value or operation cancelled.[/dim]")
                     console.print("   [dim]Press Enter to continue...[/dim]", end="")
-                    get_text_input("", default_val="")
-                    
-                elif sel == 1:
-                    console.print(Panel("[bold white]📂 EDIT RCLONE REMOTE PATH[/bold white]", border_style="bright_yellow", width=68))
-                    console.print()
-                    val = prompt_input("Enter Rclone Remote Path", settings.RCLONE_REMOTE_PATH)
-                    if val != "ESC" and val.strip():
-                        settings.RCLONE_REMOTE_PATH = val.strip()
-                        update_env_file("RCLONE_REMOTE_PATH", val.strip())
-                        settings.save_to_json()
-                        console.print("\n   [bold bright_green][✓][/bold bright_green] [white]Rclone Remote Path updated and saved![/white]")
-                    else:
-                        console.print("\n   [bold bright_red][✗][/bold bright_red] [dim]Operation cancelled.[/dim]")
-                    console.print("   [dim]Press Enter to continue...[/dim]", end="")
-                    get_text_input("", default_val="")
-
-                elif sel == 2:
-                    rclone_path = shutil.which("rclone")
-                    if not rclone_path:
-                        bin_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin"))
-                        rclone_exe = "rclone.exe" if os.name == "nt" else "rclone"
-                        fallback_path = os.path.join(bin_path, rclone_exe)
-                        if os.path.exists(fallback_path):
-                            rclone_path = fallback_path
-                            
-                    if rclone_path:
-                        clear_screen()
-                        console.print(Panel("[bold white]⚡ RUNNING INTERACTIVE RCLONE CONFIGURATION[/bold white]", border_style="bright_yellow", width=68))
-                        console.print("Starting `rclone config`... Please follow the prompts to configure your cloud remote.\n")
-                        import subprocess
-                        try:
-                            # Run it interactively directly in the current terminal process
-                            subprocess.run([rclone_path, "config"], check=True)
-                        except Exception as e:
-                            console.print(f"\n[bold red][✗] Error running rclone config: {e}[/bold red]")
-                    else:
-                        console.print("\n[bold red][✗] Rclone binary not found. Please run setup first.[/bold red]")
-                        
-                    console.print("\n   [dim]Press Enter to continue...[/dim]", end="")
                     get_text_input("", default_val="")
             
         # ─── CASE 2: INTERACTIVE INGEST API KEY PANEL (FULLY DETACHED AS REQUESTED) ───
@@ -1817,7 +1764,8 @@ async def main():
     await init_db()
     
     if "--setup" in sys.argv:
-        await run_setup_wizard()
+        console.print("[bold yellow]The legacy terminal setup wizard has been retired.[/bold yellow]")
+        console.print(f"Start StreamHome with ./start.sh and open [cyan]{settings.PUBLIC_URL}/setup[/cyan].")
         return
         
     menu_options = [

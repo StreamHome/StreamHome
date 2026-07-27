@@ -197,21 +197,33 @@ async def pull_and_install_updates() -> bool:
     # 2. Install dependencies if config files changed
     workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     
-    # Check requirements.txt
-    if "server/requirements.txt" in changed_files:
-        logger.info("[Update Service] requirements.txt modified. Installing python requirements...")
+    # Check the pinned server dependency inputs.
+    if "server/requirements.txt" in changed_files or "server/requirements.lock" in changed_files:
+        logger.info("[Update Service] Server dependency lock modified. Installing pinned requirements...")
         pip_bin = sys.executable
+        server_dir = os.path.join(workspace_root, "server")
         try:
             process = await asyncio.create_subprocess_exec(
-                pip_bin, "-m", "pip", "install", "-r", "requirements.txt",
-                cwd=workspace_root,
+                pip_bin,
+                "-m",
+                "pip",
+                "install",
+                "-c",
+                "requirements.lock",
+                "-r",
+                "requirements.txt",
+                cwd=server_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            await process.communicate()
+            _, dependency_error = await process.communicate()
+            if process.returncode != 0:
+                logger.error(f"[Update Service] Python dependency installation failed: {dependency_error.decode(errors='ignore')}")
+                return False
             logger.info("[Update Service] Python dependencies updated.")
         except Exception as e:
             logger.error(f"[Update Service] Failed to install requirements: {e}")
+            return False
             
     # Check web package.json
     if "web/package.json" in changed_files or "web/package-lock.json" in changed_files:

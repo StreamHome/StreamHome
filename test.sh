@@ -6,16 +6,22 @@ PYTHON="python3"
 [[ -x "$ROOT_DIR/venv/bin/python" ]] && PYTHON="$ROOT_DIR/venv/bin/python"
 
 SERVER_CHECKS=(
+  scratch/test_2fa.py
+  scratch/test_auth_security.py
+  scratch/test_auth_validation.py
+  scratch/test_backup_security.py
   scratch/test_cloud_streaming.py
   scratch/test_drive_setup.py
   scratch/test_ffmpeg_headers.py
   scratch/test_ingest_stream_script.py
   scratch/test_playback_contract.py
   scratch/test_playback_pipeline.py
+  scratch/test_profile_security.py
   scratch/test_queue_failure_handling.py
   scratch/test_rclone_fallback.py
   scratch/test_recommendation_system.py
   scratch/test_search_caching.py
+  scratch/test_security_validation.py
   scratch/test_setup_scripts.py
   scratch/test_vibe_analysis.py
 )
@@ -33,4 +39,4 @@ npm run test
 npm run lint
 npm run build
 
-echo "All non-security release checks passed."
+echo "All release checks passed."

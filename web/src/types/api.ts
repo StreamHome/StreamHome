@@ -52,7 +52,6 @@ export interface Profile {
   avatarColor: string;
   theme: string | null;
   pinEnabled: boolean;
-  pin: string | null;
 }
 
 export interface CreateProfileRequest {

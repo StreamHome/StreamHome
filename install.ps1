@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
 $RepositoryUrl = "https://github.com/WaqSea/StreamHome.git"
-$InstallRef = if ($env:STREAMHOME_REF) { $env:STREAMHOME_REF } else { "main" }
+$InstallRef = if ($env:STREAMHOME_REF) { $env:STREAMHOME_REF } else { "v0.1.0-alpha.1" }
 $InstallDirectory = if ($env:STREAMHOME_INSTALL_DIR) {
     $env:STREAMHOME_INSTALL_DIR
 } else {
@@ -14,11 +14,11 @@ function Show-Usage {
 StreamHome bootstrap installer
 
 Usage:
-  irm https://raw.githubusercontent.com/WaqSea/StreamHome/main/install.ps1 | iex
+  irm https://raw.githubusercontent.com/WaqSea/StreamHome/v0.1.0-alpha.1/install.ps1 | iex
 
 Environment overrides:
   STREAMHOME_INSTALL_DIR  Installation directory (default: ~/StreamHome)
-  STREAMHOME_REF          Git branch or tag (default: main)
+  STREAMHOME_REF          Git branch or tag (default: v0.1.0-alpha.1)
 
 The installer clones or safely fast-forwards StreamHome and runs setup.bat.
 "@ | Write-Host

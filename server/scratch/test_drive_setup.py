@@ -4,20 +4,31 @@ import json
 import tempfile
 import time
 import unittest
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
+from starlette.responses import Response
 from starlette.requests import Request
 
 from routes.setup import (
+    TMDBValidationRequest,
+    UnlockRequest,
     _drive_callback_landing_url,
     _drive_callback_url,
     _normalize_public_url,
+    _restore_file_snapshot,
     _safe_drive_path,
+    _setup_token,
     _setup_status_urls,
+    _stage_env_update,
+    _tmdb_validation_is_current,
+    _tmdb_validation_token,
     drive_oauth_callback,
+    unlock_setup,
+    validate_tmdb,
 )
 from services.rclone import RcloneConfigEncryptionError, RcloneResult, RcloneService
 
@@ -111,6 +122,38 @@ class DriveSetupContractTests(unittest.TestCase):
         ):
             self.assertTrue(service.encryption_supported())
 
+    def test_tmdb_validation_receipt_is_bound_to_setup_session_and_token(self):
+        session_id = "setup-session"
+        setup_cookie = _setup_token(session_id)
+        request = Request({
+            "type": "http",
+            "method": "POST",
+            "scheme": "https",
+            "server": ("watch.example.com", 443),
+            "path": "/api/setup/complete",
+            "query_string": b"",
+            "headers": [(b"cookie", f"streamhome_setup={setup_cookie}".encode("ascii"))],
+            "client": ("203.0.113.10", 43000),
+        })
+        receipt = _tmdb_validation_token(session_id, "tmdb-token")
+
+        self.assertTrue(_tmdb_validation_is_current(request, "tmdb-token", receipt))
+        self.assertFalse(_tmdb_validation_is_current(request, "different-token", receipt))
+
+    def test_staged_environment_update_can_be_restored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / ".env"
+            target.write_text('SETUP="false"\nKEEP="value"\n', encoding="utf-8")
+            snapshot = target.read_bytes()
+            staged_target, temporary = _stage_env_update(str(target), {"SETUP": "true", "WEB_PORT": "3001"})
+
+            self.assertEqual(staged_target, target)
+            self.assertEqual(target.read_bytes(), snapshot)
+            os.replace(temporary, target)
+            self.assertIn('SETUP="true"', target.read_text(encoding="utf-8"))
+            _restore_file_snapshot(target, snapshot)
+            self.assertEqual(target.read_bytes(), snapshot)
+
 
 class _ScalarResult:
     def __init__(self, value):
@@ -130,6 +173,21 @@ class _DriveCallbackDatabase:
 
     async def execute(self, _statement):
         return _ScalarResult(self.job)
+
+    def add(self, _value):
+        return None
+
+    async def commit(self):
+        self.commits += 1
+
+
+class _UnlockDatabase:
+    def __init__(self, job):
+        self.job = job
+        self.commits = 0
+
+    async def get(self, _model, _identifier):
+        return self.job
 
     def add(self, _value):
         return None
@@ -196,6 +254,72 @@ class DriveCallbackFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(job.status, "selecting_folder")
         self.assertEqual(database.commits, 0)
+
+
+class TMDBValidationFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_successful_validation_returns_a_current_session_bound_receipt(self):
+        session_id = "setup-session"
+        setup_cookie = _setup_token(session_id)
+        request = Request({
+            "type": "http",
+            "method": "POST",
+            "scheme": "https",
+            "server": ("watch.example.com", 443),
+            "path": "/api/setup/tmdb/validate",
+            "query_string": b"",
+            "headers": [(b"cookie", f"streamhome_setup={setup_cookie}".encode("ascii"))],
+            "client": ("203.0.113.10", 43000),
+        })
+        response = SimpleNamespace(status_code=200)
+
+        with patch("routes.setup.httpx.AsyncClient") as client_class:
+            client_class.return_value.__aenter__.return_value.get = AsyncMock(return_value=response)
+            result = await validate_tmdb(TMDBValidationRequest(token="tmdb-token"), request)
+
+        self.assertTrue(result["valid"])
+        self.assertTrue(_tmdb_validation_is_current(request, "tmdb-token", result["validationToken"]))
+
+
+class SetupUnlockResumeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_correct_bootstrap_code_rebinds_an_active_drive_job(self):
+        old_hash = hashlib.sha256(b"old-session").hexdigest()
+        job = SimpleNamespace(
+            id="drive-job-id",
+            session_hash=old_hash,
+            status="ready",
+            expires_at=time.time() + 600,
+            updated_at=time.time(),
+        )
+        database = _UnlockDatabase(job)
+        response = Response()
+        request = Request({
+            "type": "http",
+            "method": "POST",
+            "scheme": "https",
+            "server": ("watch.example.com", 443),
+            "path": "/api/setup/unlock",
+            "query_string": b"",
+            "headers": [],
+            "client": ("203.0.113.10", 43000),
+        })
+
+        with patch("routes.setup.setup_required", return_value=True), patch(
+            "routes.setup._bootstrap_code",
+            return_value="bootstrap",
+        ), patch(
+            "routes.setup.enforce_rate_limit",
+            new=AsyncMock(),
+        ), patch("routes.setup.clear_rate_limit", new=AsyncMock()):
+            await unlock_setup(
+                UnlockRequest(code="bootstrap", drive_job_id=job.id),
+                request,
+                response,
+                database,
+            )
+
+        self.assertNotEqual(job.session_hash, old_hash)
+        self.assertEqual(database.commits, 1)
+        self.assertIn("streamhome_setup=", response.headers["set-cookie"])
 
 
 class RcloneActivationTests(unittest.IsolatedAsyncioTestCase):

@@ -19,6 +19,7 @@ export interface SetupCompleteRequest {
   email: string;
   password: string;
   tmdb_token: string;
+  tmdb_validation_token: string;
   web_port: number;
   public_url: string;
   totp_secret?: string;
@@ -73,9 +74,9 @@ export interface DriveTestResult {
 const setupOptions = { credentials: "same-origin" as const };
 
 export const getSetupStatus = () => apiGet<SetupStatus>("/api/setup/status", setupOptions);
-export const unlockSetup = (code: string) => apiPost<void>("/api/setup/unlock", { code }, setupOptions);
+export const unlockSetup = (code: string, driveJobId?: string) => apiPost<void>("/api/setup/unlock", { code, drive_job_id: driveJobId || undefined }, setupOptions);
 export const getSetupReadiness = () => apiGet<SetupReadiness>("/api/setup/readiness", setupOptions);
-export const validateSetupTMDB = (token: string) => apiPost<{ valid: true }>("/api/setup/tmdb/validate", { token }, setupOptions);
+export const validateSetupTMDB = (token: string) => apiPost<{ valid: true; validationToken: string }>("/api/setup/tmdb/validate", { token }, setupOptions);
 export const beginSetupTOTP = (email: string) => apiPost<{ secret: string; provisioningUri: string }>("/api/setup/totp/begin", { email }, setupOptions);
 export const verifySetupTOTP = (secret: string, code: string) => apiPost<{ valid: true }>("/api/setup/totp/verify", { secret, code }, setupOptions);
 

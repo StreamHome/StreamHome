@@ -28,10 +28,19 @@ load_dotenv(dotenv_path=server_env_path, override=False)
 
 def _append_private_env(path: str, key: str, value: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as handle:
+    existing = ""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            existing = handle.read()
+    temporary = f"{path}.{secrets.token_hex(8)}.tmp"
+    with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(existing.rstrip())
         handle.write(f'\n{key}="{value}"\n')
+        handle.flush()
+        os.fsync(handle.fileno())
     if os.name != "nt":
-        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
+    os.replace(temporary, path)
 
 
 def remove_env_key(path: str, key: str) -> None:
@@ -74,8 +83,8 @@ class Settings:
     TMDB_API_KEY: str = os.getenv("TMDB_API_KEY", "")
     TMDB_READ_ACCESS_TOKEN: str = os.getenv("TMDB_READ_ACCESS_TOKEN", "")
     db_path = os.path.abspath(os.path.join(config_dir, "database.db")).replace("\\", "/")
-    DATABASE_URL: str = os.getenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
-    MEDIA_DIR: str = os.path.abspath(os.getenv("MEDIA_DIR", os.path.join(config_dir, "media")))
+    DATABASE_URL: str = f"sqlite+aiosqlite:///{db_path}"
+    MEDIA_DIR: str = os.path.abspath(os.path.join(config_dir, "media"))
     TEMP_DIR: str = os.path.abspath(os.getenv("TEMP_DIR", os.path.join(config_dir, "temp")))
     PLAYBACK_CACHE_GB: float = max(0.25, min(500.0, float(os.getenv("PLAYBACK_CACHE_GB", "20"))))
     PLAYBACK_TRANSCODE_CONCURRENCY: int = env_int("PLAYBACK_TRANSCODE_CONCURRENCY", 2, 1, 8)
@@ -85,25 +94,19 @@ class Settings:
     if not JWT_SECRET:
         generated_secret = secrets.token_hex(32)
         env_file = os.path.join(config_dir, ".env")
-        try:
-            _append_private_env(env_file, "JWT_SECRET", generated_secret)
-        except Exception:
-            pass
+        _append_private_env(env_file, "JWT_SECRET", generated_secret)
         os.environ["JWT_SECRET"] = generated_secret
         JWT_SECRET = generated_secret
     SECRET_ENCRYPTION_KEY: str = os.getenv("SECRET_ENCRYPTION_KEY", "")
     if not SECRET_ENCRYPTION_KEY:
         SECRET_ENCRYPTION_KEY = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
-        try:
-            _append_private_env(server_env_path, "SECRET_ENCRYPTION_KEY", SECRET_ENCRYPTION_KEY)
-        except Exception:
-            pass
+        _append_private_env(server_env_path, "SECRET_ENCRYPTION_KEY", SECRET_ENCRYPTION_KEY)
     JWT_ALGORITHM: str = "HS256"
     SESSION_LIFETIME_DAYS: int = max(1, min(365, int(os.getenv("SESSION_LIFETIME_DAYS", "60"))))
     JWT_EXPIRATION_MINUTES: int = 60 * 24 * SESSION_LIFETIME_DAYS
     AUTH_CHALLENGE_MINUTES: int = 5
     REAUTHENTICATION_MINUTES: int = 10
-    APP_VERSION: str = os.getenv("STREAMHOME_VERSION", "1.0.0")
+    APP_VERSION: str = os.getenv("STREAMHOME_VERSION", "0.1.0-alpha.1")
     RECOMMENDATION_V2_ENABLED: bool = os.getenv("RECOMMENDATION_V2_ENABLED", "true").lower() in ("true", "1", "yes")
     RECOMMENDATION_V2_SHADOW: bool = os.getenv("RECOMMENDATION_V2_SHADOW", "false").lower() in ("true", "1", "yes")
 
@@ -116,10 +119,7 @@ class Settings:
     if not RCLONE_CONFIG_PASS:
         RCLONE_CONFIG_PASS = secrets.token_urlsafe(36)
         os.environ["RCLONE_CONFIG_PASS"] = RCLONE_CONFIG_PASS
-        try:
-            _append_private_env(server_env_path, "RCLONE_CONFIG_PASS", RCLONE_CONFIG_PASS)
-        except Exception:
-            pass
+        _append_private_env(server_env_path, "RCLONE_CONFIG_PASS", RCLONE_CONFIG_PASS)
     GOOGLE_DRIVE_AUDIENCE: str = os.getenv("GOOGLE_DRIVE_AUDIENCE", "external")
     GOOGLE_DRIVE_PUBLISHING_STATUS: str = os.getenv("GOOGLE_DRIVE_PUBLISHING_STATUS", "production")
 
@@ -158,21 +158,23 @@ class Settings:
 
     def save_to_json(self):
         json_path = os.path.join(config_dir, "settings.json")
-        try:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "storage_engine": self.STORAGE_ENGINE,
-                    "rclone_remote_path": self.RCLONE_REMOTE_PATH,
-                    "public_url": self.PUBLIC_URL,
-                    "google_drive_audience": getattr(self, "GOOGLE_DRIVE_AUDIENCE", "external"),
-                    "google_drive_publishing_status": getattr(self, "GOOGLE_DRIVE_PUBLISHING_STATUS", "production"),
-                    "backup_enabled": self.BACKUP_ENABLED,
-                    "auto_update_enabled": self.AUTO_UPDATE_ENABLED,
-                    "hevc_compression_mode": self.HEVC_COMPRESSION_MODE,
-                    "session_lifetime_days": self.SESSION_LIFETIME_DAYS
-                }, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"Error saving settings.json: {e}")
+        temporary = f"{json_path}.{secrets.token_hex(8)}.tmp"
+        with open(temporary, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({
+                "storage_engine": self.STORAGE_ENGINE,
+                "rclone_remote_path": self.RCLONE_REMOTE_PATH,
+                "public_url": self.PUBLIC_URL,
+                "google_drive_audience": getattr(self, "GOOGLE_DRIVE_AUDIENCE", "external"),
+                "google_drive_publishing_status": getattr(self, "GOOGLE_DRIVE_PUBLISHING_STATUS", "production"),
+                "backup_enabled": self.BACKUP_ENABLED,
+                "auto_update_enabled": self.AUTO_UPDATE_ENABLED,
+                "hevc_compression_mode": self.HEVC_COMPRESSION_MODE,
+                "session_lifetime_days": self.SESSION_LIFETIME_DAYS
+            }, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, json_path)
 
     def get_system_profile(self) -> dict:
         profile_path = os.path.join(config_dir, "system_profile.json")

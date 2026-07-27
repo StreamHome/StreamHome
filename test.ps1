@@ -10,16 +10,22 @@ $web = Join-Path $root "web"
 $env:PYTHONPATH = "."
 
 $serverChecks = @(
+    "scratch/test_2fa.py",
+    "scratch/test_auth_security.py",
+    "scratch/test_auth_validation.py",
+    "scratch/test_backup_security.py",
     "scratch/test_cloud_streaming.py",
     "scratch/test_drive_setup.py",
     "scratch/test_ffmpeg_headers.py",
     "scratch/test_ingest_stream_script.py",
     "scratch/test_playback_contract.py",
     "scratch/test_playback_pipeline.py",
+    "scratch/test_profile_security.py",
     "scratch/test_queue_failure_handling.py",
     "scratch/test_rclone_fallback.py",
     "scratch/test_recommendation_system.py",
     "scratch/test_search_caching.py",
+    "scratch/test_security_validation.py",
     "scratch/test_setup_scripts.py",
     "scratch/test_vibe_analysis.py"
 )
@@ -47,4 +53,4 @@ try {
 }
 finally { Pop-Location }
 
-Write-Host "All non-security release checks passed."
+Write-Host "All release checks passed."

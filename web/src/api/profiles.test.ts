@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { deleteProfile, saveProfile } from "./profiles";
+import { deleteProfile, saveProfile, unlockProfile } from "./profiles";
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe("profile management API", () => {
   it("saves canonical profile settings through the existing upsert endpoint", async () => {
-    const response = { id: "2", name: "Viewer", avatarColor: "#fff", theme: "gemini", pinEnabled: false, pin: null };
+    const response = { id: "2", name: "Viewer", avatarColor: "#fff", theme: "gemini", pinEnabled: false };
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(response), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
     await expect(saveProfile(response)).resolves.toEqual(response);
@@ -21,5 +21,13 @@ describe("profile management API", () => {
     await deleteProfile("profile 2");
     expect(fetchMock.mock.calls[0][0]).toBe("/api/profiles/profile%202");
     expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe("DELETE");
+  });
+
+  it("verifies profile PINs through a server endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ verified: true }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(unlockProfile("profile 2", "4815")).resolves.toEqual({ verified: true });
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/profiles/profile%202/unlock");
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({ pin: "4815" });
   });
 });

@@ -46,4 +46,18 @@ describe("Google Drive setup presentation", () => {
     expect(setup).toContain("copySetupText(callbackUrl)");
     expect(setup).toContain("Return to setup progress");
   });
+
+  it("keeps setup-specific 401 responses on the setup page", () => {
+    const client = read("src/api/client.ts");
+    expect(client).toContain("authenticationFailure");
+    expect(client).not.toContain('!["invalid_credentials", "invalid_factor", "challenge_expired"].includes(errorCode)');
+    expect(client).not.toContain('"invalid_setup_code", "setup_locked"');
+  });
+
+  it("rebinds resumable Drive work when setup is unlocked again", () => {
+    const setup = read("src/pages/SetupPage.tsx");
+    const api = read("src/api/setup.ts");
+    expect(setup).toContain("unlockSetup(bootstrapCode, driveJobIdToLoad)");
+    expect(api).toContain("drive_job_id: driveJobId || undefined");
+  });
 });

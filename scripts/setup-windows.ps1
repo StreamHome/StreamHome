@@ -145,7 +145,11 @@ function Prepare-VirtualEnvironment {
 
     Write-Step "Installing server dependencies"
     Invoke-Checked $venvPython @("-m", "pip", "install", "--upgrade", "pip") "pip upgrade"
-    Invoke-Checked $venvPython @("-m", "pip", "install", "-r", (Join-Path $RootDirectory "server\requirements.txt")) "server dependency installation"
+    Invoke-Checked $venvPython @(
+        "-m", "pip", "install",
+        "-c", (Join-Path $RootDirectory "server\requirements.lock"),
+        "-r", (Join-Path $RootDirectory "server\requirements.txt")
+    ) "server dependency installation"
 }
 
 function Prepare-Web {

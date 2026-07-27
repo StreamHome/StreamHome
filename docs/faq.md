@@ -23,7 +23,7 @@ It combines:
 * automatic backup and recovery;
 * multiple user profiles;
 * four distinct interface themes;
-* Progressive Web App support.
+* a responsive desktop and mobile browser client.
 
 StreamHome is designed to provide a premium streaming experience while keeping the server, media, profiles, and catalog data under the user's control.
 
@@ -90,7 +90,7 @@ StreamHome is intended for users who want:
 
 ### How do I install StreamHome?
 
-Open the [StreamHome Releases](https://github.com/StreamHome/StreamHome/releases) page and follow the installation instructions included with the exact release you want to install.
+Open the [StreamHome Releases](https://github.com/WaqSea/StreamHome/releases) page and follow the installation instructions included with the exact release you want to install.
 
 Do not use installation scripts from the mutable development branch unless the release documentation explicitly instructs you to do so.
 
@@ -734,50 +734,33 @@ A backup should not be considered reliable until its creation and restoration pr
 
 See [Backup and Recovery](backup-and-recovery.md).
 
-## PWA and Offline Use
+## Mobile and Offline Use
 
 ### Can StreamHome be installed like an application?
 
-Yes.
-
-On supported browsers, StreamHome can be installed as a Progressive Web App.
-
-The option may appear as:
-
-* Install app;
-* Add to Home Screen;
-* Create shortcut;
-* Install StreamHome.
+Not in `v0.1.0-alpha.1`. StreamHome provides a responsive browser client, but this alpha does not include a web app manifest or service worker and therefore does not promise installable PWA behavior.
 
 ### Does StreamHome have native mobile applications?
 
-StreamHome primarily uses its responsive PWA experience instead of maintaining separate native applications for every mobile and desktop platform.
+StreamHome does not currently ship native mobile applications. Use the responsive web client in a supported browser.
 
-### Does the PWA update automatically?
+### Does the browser client update automatically?
 
 The interface is delivered by the StreamHome server, so users normally receive the client version associated with their installed server release.
 
 Browser caching behavior may temporarily retain an older interface until the application refreshes.
 
-### Does the PWA support offline downloads?
+### Does StreamHome support offline downloads?
 
-StreamHome provides supported offline-download functionality.
-
-Availability and behavior may depend on:
-
-* browser;
-* operating system;
-* storage permissions;
-* media format;
-* selected StreamHome release.
+No. Offline playback and offline downloads are outside the `v0.1.0-alpha.1` support contract.
 
 ### Can I add StreamHome to a television home screen?
 
-Some smart TV browsers allow websites or PWAs to be added to the home screen.
+Some smart TV browsers allow websites to be bookmarked or added to a home screen.
 
 Support depends entirely on the TV operating system and browser.
 
-See [Progressive Web App](pwa.md).
+See [Browser Client](pwa.md).
 
 ## Updates
 
@@ -861,7 +844,7 @@ Integration credentials should be scoped, revocable, and kept separate from admi
 
 Do not report security vulnerabilities through public GitHub Issues.
 
-Follow the private reporting instructions in [`SECURITY.md`](../SECURITY.md).
+Contact the repository owner privately. Do not publish credentials, exploit details, or personal information in a public issue.
 
 ### What information should never be posted publicly?
 
@@ -967,12 +950,12 @@ Check:
 
 ### Why am I seeing an old interface after updating?
 
-The browser or installed PWA may still be using cached assets.
+The browser may still be using cached assets.
 
 Try:
 
 1. Refreshing the page
-2. Closing and reopening the PWA
+2. Closing and reopening the browser tab
 3. Clearing the site's cached data
 4. Restarting the current production service
 
@@ -1035,7 +1018,7 @@ Use the following order:
 4. [Adding Media](adding-media.md)
 5. [Playback](playback.md)
 6. [Troubleshooting](troubleshooting.md)
-7. Existing [GitHub Issues](https://github.com/StreamHome/StreamHome/issues)
+7. Existing [GitHub Issues](https://github.com/WaqSea/StreamHome/issues)
 
 When opening an issue, include:
 

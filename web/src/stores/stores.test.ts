@@ -4,7 +4,7 @@ import { useAuthStore } from "./authStore";
 import { useProfileStore } from "./profileStore";
 import { useThemeStore } from "./themeStore";
 
-const profile: Profile = { id: "1", name: "Admin", avatarColor: "", theme: "netflix", pinEnabled: false, pin: null };
+const profile: Profile = { id: "1", name: "Admin", avatarColor: "", theme: "netflix", pinEnabled: false };
 
 beforeEach(() => {
   localStorage.clear();

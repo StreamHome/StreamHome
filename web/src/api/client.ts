@@ -37,7 +37,8 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
       // Ignore if not JSON
     }
     
-    if (response.status === 401 && !["invalid_credentials", "invalid_factor", "challenge_expired"].includes(errorCode)) {
+    const authenticationFailure = ["request_failed", "not_authenticated", "session_expired", "invalid_session"].includes(errorCode);
+    if (response.status === 401 && authenticationFailure) {
       if (window.location.pathname !== "/login") {
         window.location.href = "/login";
       }

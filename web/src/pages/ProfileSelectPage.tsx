@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useLocation, useNavigate } from "react-router-dom";
-import { createProfile, getProfiles } from "../api/profiles";
+import { createProfile, getProfiles, unlockProfile } from "../api/profiles";
 import { profileEditUrl } from "../navigation/profileEditing";
 import { appUrl, parseAppQuery } from "../navigation/queryState";
 import { useProfileStore } from "../stores/profileStore";
@@ -73,6 +73,10 @@ export function ProfileSelectPage() {
   const [theme, setNewTheme] = useState<ThemeId>("ember");
   const [saving, setSaving] = useState(false);
   const [dialogError, setDialogError] = useState("");
+  const [pinProfile, setPinProfile] = useState<Profile | null>(null);
+  const [profilePin, setProfilePin] = useState("");
+  const [pinBusy, setPinBusy] = useState(false);
+  const [pinError, setPinError] = useState("");
   const navigationTimer = useRef<number | null>(null);
 
   const loadProfiles = useCallback(async () => {
@@ -94,13 +98,41 @@ export function ProfileSelectPage() {
     else cancelPreview("ember");
   };
 
-  const chooseProfile = (profile: Profile) => {
+  const enterProfile = (profile: Profile) => {
     if (enteringProfile) return;
     selectProfile(profile);
     setTheme(profile.theme);
     setAmbientTheme(normalizeTheme(profile.theme));
     setEnteringProfile(profile.id);
     navigationTimer.current = window.setTimeout(() => navigate(destinationFor(profile, state?.from)), reduced ? 180 : MOTION_TIMINGS.profileEntry * 1000);
+  };
+
+  const chooseProfile = (profile: Profile) => {
+    if (profile.pinEnabled) {
+      setPinProfile(profile);
+      setProfilePin("");
+      setPinError("");
+      return;
+    }
+    enterProfile(profile);
+  };
+
+  const submitProfilePin = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!pinProfile || !/^[0-9]{4,8}$/.test(profilePin)) return;
+    setPinBusy(true);
+    setPinError("");
+    try {
+      await unlockProfile(pinProfile.id, profilePin);
+      const verifiedProfile = pinProfile;
+      setPinProfile(null);
+      setProfilePin("");
+      enterProfile(verifiedProfile);
+    } catch (requestError) {
+      setPinError(requestError instanceof Error ? requestError.message : "The profile PIN was not accepted.");
+    } finally {
+      setPinBusy(false);
+    }
   };
 
   const submitProfile = async (event: React.FormEvent) => {
@@ -143,6 +175,7 @@ export function ProfileSelectPage() {
 
       <AnimatePresence>
         {showCreate && <motion.div key="create" className="profile-dialog" role="dialog" aria-modal="true" aria-label="Create profile" initial={{ opacity: 0, backdropFilter: "blur(0px)" }} animate={{ opacity: 1, backdropFilter: "blur(20px)" }} exit={{ opacity: 0, backdropFilter: "blur(0px)" }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.dialog, ease: MOTION_EASE }}><motion.form className="profile-dialog__panel" onSubmit={submitProfile} initial={{ opacity: 0, y: 28, scale: .94 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 18, scale: .97 }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.dialog, ease: MOTION_EASE }}><p>NEW PROFILE</p><h2>Create a profile</h2><label><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} minLength={1} maxLength={40} required autoFocus /></label><ThemeChoices value={theme} onChange={setNewTheme} />{dialogError && <p className="profile-dialog__error" role="alert">{dialogError}</p>}<div className="profile-dialog__actions"><button type="submit" disabled={saving}>{saving ? "Creating..." : "Create"}</button><button type="button" onClick={() => setShowCreate(false)}>Cancel</button></div></motion.form></motion.div>}
+        {pinProfile && <motion.div key="pin" className="profile-dialog" role="dialog" aria-modal="true" aria-label={`Unlock ${pinProfile.name}`} initial={{ opacity: 0, backdropFilter: "blur(0px)" }} animate={{ opacity: 1, backdropFilter: "blur(20px)" }} exit={{ opacity: 0, backdropFilter: "blur(0px)" }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.dialog, ease: MOTION_EASE }}><motion.form className="profile-dialog__panel" onSubmit={submitProfilePin} initial={{ opacity: 0, y: 28, scale: .94 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 18, scale: .97 }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.dialog, ease: MOTION_EASE }}><p>PROTECTED PROFILE</p><h2>Unlock {pinProfile.name}</h2><label><span>Profile PIN</span><input value={profilePin} onChange={(event) => { setProfilePin(event.target.value.replace(/\D/g, "").slice(0, 8)); setPinError(""); }} inputMode="numeric" autoComplete="off" minLength={4} maxLength={8} required autoFocus type="password" /></label>{pinError && <p className="profile-dialog__error" role="alert">{pinError}</p>}<div className="profile-dialog__actions"><button type="submit" disabled={pinBusy || !/^[0-9]{4,8}$/.test(profilePin)}>{pinBusy ? "Verifying..." : "Unlock"}</button><button type="button" onClick={() => { setPinProfile(null); setProfilePin(""); setPinError(""); }}>Cancel</button></div></motion.form></motion.div>}
       </AnimatePresence>
     </motion.main>
   );

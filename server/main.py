@@ -41,7 +41,11 @@ from services.recommendation import (
     reset_media_preferences,
     persist_profile_pool,
 )
-from services.request_security import allowed_origins, same_origin_request
+from services.request_security import allowed_origins, client_ip, same_origin_request
+from services.profile_security import hash_profile_pin, verify_profile_pin
+from services.rate_limit import clear as clear_rate_limit
+from services.rate_limit import enforce as enforce_rate_limit
+from services.rate_limit import fail as fail_rate_limit
 from config import settings
 from services.logger import logger
 from services.queue import queue_manager
@@ -50,7 +54,7 @@ from services.playback_prep import playback_prep_service
 from services.vibe_analysis import vibe_analysis_manager
 import services.state as state
 from routes.queue import router as queue_router
-from routes.auth import router as auth_router, health_router, get_current_user
+from routes.auth import router as auth_router, health_router, get_current_user, require_recent_reauth
 from routes.stream import router as stream_router
 from routes.backup import router as backup_router
 from routes.update import router as update_router
@@ -179,7 +183,7 @@ async def lifespan(app: FastAPI):
                     avatar_color="from-blue-600 to-indigo-600",
                     theme="netflix",
                     pin_enabled=False,
-                    pin=None
+                    pin_hash=None,
                 )
                 db.add(admin_profile)
                 await db.commit()
@@ -856,6 +860,11 @@ class ProfileSaveRequest(APIModel):
     pin_enabled: Optional[bool] = False
     pin: Optional[str] = None
 
+
+class ProfileUnlockRequest(APIModel):
+    pin: str
+
+
 @app.get("/api/profiles", response_model=List[ProfileResponse])
 async def get_profiles(user = Depends(get_current_user)):
     """Retrieves all profile records from the database."""
@@ -869,8 +878,7 @@ async def get_profiles(user = Depends(get_current_user)):
                 name=p.name,
                 avatar_color=p.avatar_color,
                 theme=p.theme,
-                pin_enabled=p.pin_enabled,
-                pin=p.pin
+                pin_enabled=bool(p.pin_enabled and p.pin_hash)
             )
             for p in profiles
         ]
@@ -882,25 +890,40 @@ async def save_profile(req: ProfileSaveRequest, user = Depends(get_current_user)
         stmt = select(Profile).where(Profile.id == req.id)
         result = await db.exec(stmt)
         profile = result.first()
-        
+
+        clean_name = req.name.strip()
+        if not clean_name or len(clean_name) > 40:
+            raise HTTPException(status_code=422, detail={"code": "invalid_profile_name", "message": "Profile names must contain between 1 and 40 characters."})
+        pin_hash: Optional[str] = profile.pin_hash if profile else None
+        if req.pin_enabled:
+            if req.pin:
+                try:
+                    pin_hash = hash_profile_pin(req.pin)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail={"code": "invalid_profile_pin", "message": str(exc)}) from exc
+            elif not pin_hash:
+                raise HTTPException(status_code=422, detail={"code": "profile_pin_required", "message": "Enter a 4 to 8 digit PIN before enabling profile protection."})
+        else:
+            pin_hash = None
+
         if not profile:
             profile = Profile(
                 id=req.id,
-                name=req.name,
+                name=clean_name,
                 avatar_color=req.avatar_color,
                 theme=req.theme,
                 pin_enabled=req.pin_enabled,
-                pin=req.pin
+                pin_hash=pin_hash,
             )
             db.add(profile)
         else:
-            profile.name = req.name
+            profile.name = clean_name
             profile.avatar_color = req.avatar_color
             profile.theme = req.theme
             profile.pin_enabled = req.pin_enabled
-            profile.pin = req.pin
+            profile.pin_hash = pin_hash
             db.add(profile)
-            
+
         await db.commit()
         await db.refresh(profile)
         return ProfileResponse(
@@ -908,9 +931,32 @@ async def save_profile(req: ProfileSaveRequest, user = Depends(get_current_user)
             name=profile.name,
             avatar_color=profile.avatar_color,
             theme=profile.theme,
-            pin_enabled=profile.pin_enabled,
-            pin=profile.pin
+            pin_enabled=bool(profile.pin_enabled and profile.pin_hash),
         )
+
+
+@app.post("/api/profiles/{profile_id}/unlock")
+async def unlock_profile(
+    profile_id: str,
+    req: ProfileUnlockRequest,
+    request: Request,
+    user = Depends(get_current_user),
+):
+    """Verifies a protected profile PIN without returning or exposing the stored hash."""
+    identity = f"{user.id}:{profile_id}:{client_ip(request)}"
+    async with AsyncSession(engine) as db:
+        await enforce_rate_limit(db, "profile_pin", identity)
+        profile = await db.get(Profile, profile_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail={"code": "profile_not_found", "message": "That profile does not exist."})
+        if not profile.pin_enabled or not profile.pin_hash:
+            await clear_rate_limit(db, "profile_pin", identity)
+            return {"verified": True}
+        if not verify_profile_pin(req.pin, profile.pin_hash):
+            await fail_rate_limit(db, "profile_pin", identity, limit=5, window_seconds=300)
+            raise HTTPException(status_code=401, detail={"code": "invalid_profile_pin", "message": "The profile PIN was not accepted."})
+        await clear_rate_limit(db, "profile_pin", identity)
+        return {"verified": True}
 
 @app.delete("/api/profiles/{profile_id}")
 async def delete_profile(profile_id: str, user = Depends(get_current_user)):
@@ -966,7 +1012,7 @@ async def get_system_settings(user = Depends(get_current_user)):
     )
 
 @app.post("/api/system/settings", response_model=SystemSettingsResponse)
-async def save_system_settings(req: SystemSettingsRequest, user = Depends(get_current_user)):
+async def save_system_settings(req: SystemSettingsRequest, session = Depends(require_recent_reauth)):
     """Updates server storage engine settings and persists them to settings.json."""
     if req.storage_engine not in ["LOCAL", "CLOUD"]:
         raise HTTPException(status_code=400, detail="Invalid storage engine value. Must be LOCAL or CLOUD.")
@@ -980,10 +1026,15 @@ async def save_system_settings(req: SystemSettingsRequest, user = Depends(get_cu
         if not configured or not reachable:
             raise HTTPException(status_code=422, detail={"code": error_code or "drive_not_configured", "message": "Connect and test Google Drive before enabling cloud storage."})
     
+    previous = (settings.STORAGE_ENGINE, settings.RCLONE_REMOTE_PATH, settings.HEVC_COMPRESSION_MODE)
     settings.STORAGE_ENGINE = req.storage_engine
     settings.RCLONE_REMOTE_PATH = req.rclone_remote_path
     settings.HEVC_COMPRESSION_MODE = req.hevc_compression_mode
-    settings.save_to_json()
+    try:
+        settings.save_to_json()
+    except OSError as exc:
+        settings.STORAGE_ENGINE, settings.RCLONE_REMOTE_PATH, settings.HEVC_COMPRESSION_MODE = previous
+        raise HTTPException(status_code=500, detail={"code": "settings_save_failed", "message": "Server settings could not be saved."}) from exc
     drive_configured, drive_reachable, drive_error_code = await _drive_settings_status()
     return SystemSettingsResponse(
         storage_engine=settings.STORAGE_ENGINE,
@@ -997,7 +1048,7 @@ async def save_system_settings(req: SystemSettingsRequest, user = Depends(get_cu
     )
 
 @app.post("/api/system/drive/test")
-async def test_system_drive(user = Depends(get_current_user)):
+async def test_system_drive(session = Depends(require_recent_reauth)):
     configured, reachable, error_code = await _drive_settings_status()
     if not configured:
         raise HTTPException(status_code=409, detail={"code": "drive_not_configured", "message": "Google Drive has not been configured."})

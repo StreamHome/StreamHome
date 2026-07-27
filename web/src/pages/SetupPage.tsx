@@ -54,12 +54,13 @@ export function SetupPage() {
   const [error, setError] = useState("");
   const [resumeNotice, setResumeNotice] = useState("");
   const [checkpointReady, setCheckpointReady] = useState(false);
+  const [setupUnlocked, setSetupUnlocked] = useState(false);
   const [bootstrapCode, setBootstrapCode] = useState("");
   const [checks, setChecks] = useState<ReadinessCheck[]>([]);
   const [paths, setPaths] = useState({ media: "server/media", database: "server/database.db" });
   const [publicUrl, setPublicUrl] = useState(initialCheckpoint?.publicUrl || window.location.origin);
   const [driveCallbackUrl, setDriveCallbackUrl] = useState(`${window.location.origin}/api/setup/rclone/drive/callback`);
-  const [driveGuideUrl, setDriveGuideUrl] = useState("https://github.com/WaqSea/StreamHome/blob/main/docs/google-drive.md");
+  const [driveGuideUrl, setDriveGuideUrl] = useState("https://github.com/WaqSea/StreamHome/blob/v0.1.0-alpha.1/docs/google-drive.md");
   const [email, setEmail] = useState(initialCheckpoint?.email ?? "");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -70,10 +71,11 @@ export function SetupPage() {
   const [totpVerified, setTotpVerified] = useState(false);
   const [tmdbToken, setTmdbToken] = useState("");
   const [tmdbValid, setTmdbValid] = useState(false);
+  const [tmdbValidationToken, setTmdbValidationToken] = useState("");
   const [webPort, setWebPort] = useState(initialCheckpoint?.webPort ?? 3000);
   const [hevc, setHevc] = useState<"auto" | "on" | "off">(initialCheckpoint?.hevc ?? "auto");
   const [backups, setBackups] = useState(initialCheckpoint?.backups ?? false);
-  const [updates, setUpdates] = useState(initialCheckpoint?.updates ?? false);
+  const updates = false;
   const [storage, setStorage] = useState<"LOCAL" | "CLOUD">(initialCheckpoint?.storage ?? "LOCAL");
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
@@ -113,8 +115,9 @@ export function SetupPage() {
       setPaths({ media: status.mediaPath, database: status.databasePath });
       if (!initialCheckpoint?.publicUrl) setPublicUrl(status.publicUrl || window.location.origin);
       setDriveCallbackUrl(status.driveCallbackUrl || `${window.location.origin}/api/setup/rclone/drive/callback`);
-      setDriveGuideUrl(status.driveGuideUrl || "https://github.com/WaqSea/StreamHome/blob/main/docs/google-drive.md");
+      setDriveGuideUrl(status.driveGuideUrl || "https://github.com/WaqSea/StreamHome/blob/v0.1.0-alpha.1/docs/google-drive.md");
       if (status.unlocked) {
+        setSetupUnlocked(true);
         let nextStep = 1;
         if (queryDriveJob || directCallbackVisit) {
           nextStep = 6;
@@ -133,7 +136,7 @@ export function SetupPage() {
   }, [directCallbackVisit, initialCheckpoint, queryDriveJob]);
 
   useEffect(() => {
-    if (!driveJobIdToLoad || oauthPopup) return;
+    if (!setupUnlocked || !driveJobIdToLoad || oauthPopup) return;
     getDriveJob(driveJobIdToLoad).then((job) => {
       setDriveJob(job);
       setResumeDriveJobId(job.id);
@@ -146,7 +149,7 @@ export function SetupPage() {
       setResumeDriveJobId("");
       setError(errorMessage(reason));
     });
-  }, [driveJobIdToLoad, oauthPopup]);
+  }, [driveJobIdToLoad, oauthPopup, setupUnlocked]);
 
   useEffect(() => {
     if (!driveJob || TERMINAL_DRIVE_STATES.has(driveJob.status)) return;
@@ -257,8 +260,9 @@ export function SetupPage() {
   };
 
   const unlock = () => run(async () => {
-    await unlockSetup(bootstrapCode);
+    await unlockSetup(bootstrapCode, driveJobIdToLoad);
     const status = await getSetupStatus();
+    setSetupUnlocked(true);
     setPaths({ media: status.mediaPath, database: status.databasePath });
     setPublicUrl(status.publicUrl || window.location.origin);
     setDriveCallbackUrl(status.driveCallbackUrl || `${window.location.origin}/api/setup/rclone/drive/callback`);
@@ -301,7 +305,8 @@ export function SetupPage() {
   });
 
   const validateTmdb = () => run(async () => {
-    await validateSetupTMDB(tmdbToken);
+    const validation = await validateSetupTMDB(tmdbToken);
+    setTmdbValidationToken(validation.validationToken);
     setTmdbValid(true);
   });
 
@@ -397,12 +402,13 @@ export function SetupPage() {
       email,
       password,
       tmdb_token: tmdbToken,
+      tmdb_validation_token: tmdbValidationToken,
       web_port: webPort,
       public_url: publicUrl,
       totp_secret: totpEnabled ? totpSecret : undefined,
       totp_code: totpEnabled ? totpCode : undefined,
       backup_enabled: backups,
-      auto_update_enabled: updates,
+      auto_update_enabled: false,
       hevc_compression_mode: hevc,
       storage_engine: storage,
       rclone_remote_path: storage === "CLOUD" ? remotePath : undefined,
@@ -518,9 +524,9 @@ export function SetupPage() {
 
         {step === 3 && <><h2>Local account security</h2><p>TOTP is optional. When enabled, setup creates ten one-time recovery codes.</p><div className="setup-choice"><button data-selected={!totpEnabled} onClick={() => void toggleTotp(false)}><strong>Password only</strong><span>Enable TOTP later in Admin.</span></button><button data-selected={totpEnabled} onClick={() => void toggleTotp(true)}><strong>Password + TOTP</strong><span>Recommended for remotely accessible servers.</span></button></div>{totpEnabled && <div className="setup-secret"><label>Authenticator secret<input readOnly value={totpSecret} /></label><small>{totpUri}</small><label>Six-digit code<input inputMode="numeric" maxLength={6} value={totpCode} onChange={(event) => { setTotpCode(event.target.value.replace(/\D/g, "")); setTotpVerified(false); }} /></label><button onClick={verifyTotp} disabled={totpCode.length !== 6 || busy}>{totpVerified ? "Verified ✓" : "Verify code"}</button></div>}<div className="setup-footer-actions"><button onClick={() => goToStep(2)}>Back</button><button className="setup-primary" disabled={totpEnabled && !totpVerified} onClick={() => goToStep(4)}>Continue</button></div></>}
 
-        {step === 4 && <><h2>Connect TMDB</h2><p>A valid TMDB v4 read-access token is required for catalog metadata and artwork.</p><label>Read-access token<textarea value={tmdbToken} onChange={(event) => { setTmdbToken(event.target.value.trim()); setTmdbValid(false); }} rows={5} /></label><button onClick={validateTmdb} disabled={!tmdbToken || busy}>{tmdbValid ? "TMDB connected ✓" : "Validate token"}</button><div className="setup-footer-actions"><button onClick={() => goToStep(3)}>Back</button><button className="setup-primary" disabled={!tmdbValid} onClick={() => goToStep(5)}>Continue</button></div></>}
+        {step === 4 && <><h2>Connect TMDB</h2><p>A valid TMDB v4 read-access token is required for catalog metadata and artwork.</p><label>Read-access token<textarea value={tmdbToken} onChange={(event) => { setTmdbToken(event.target.value.trim()); setTmdbValid(false); setTmdbValidationToken(""); }} rows={5} /></label><button onClick={validateTmdb} disabled={!tmdbToken || busy}>{tmdbValid ? "TMDB connected ✓" : "Validate token"}</button><div className="setup-footer-actions"><button onClick={() => goToStep(3)}>Back</button><button className="setup-primary" disabled={!tmdbValid} onClick={() => goToStep(5)}>Continue</button></div></>}
 
-        {step === 5 && <><h2>Server behavior</h2><p>Database and media locations remain standardized for reliable recovery.</p><div className="setup-paths"><span><b>Database</b>{paths.database}</span><span><b>Media</b>{paths.media}</span></div><div className="setup-form-grid"><label>Public StreamHome URL<input type="url" value={publicUrl} onChange={(event) => setPublicUrl(event.target.value.trim())} placeholder="https://watch.example.com" /></label><label>Web port<input type="number" min={1} max={65535} value={webPort} onChange={(event) => setWebPort(Number(event.target.value))} /></label><label>HEVC compression<select value={hevc} onChange={(event) => setHevc(event.target.value as typeof hevc)}><option value="auto">Automatic</option><option value="on">Always</option><option value="off">Never</option></select></label></div><small className="setup-field-note">The public origin creates the exact Google OAuth callback and must not include a path.</small><label className="setup-check"><input type="checkbox" checked={backups} onChange={(event) => setBackups(event.target.checked)} /> Enable automatic database backups</label><label className="setup-check"><input type="checkbox" checked={updates} onChange={(event) => setUpdates(event.target.checked)} /> Enable automatic updates</label><div className="setup-footer-actions"><button onClick={() => goToStep(4)}>Back</button><button className="setup-primary" disabled={webPort < 1 || webPort > 65535 || !publicUrl} onClick={() => goToStep(6)}>Continue</button></div></>}
+        {step === 5 && <><h2>Server behavior</h2><p>Database and media locations remain standardized for reliable recovery.</p><div className="setup-paths"><span><b>Database</b>{paths.database}</span><span><b>Media</b>{paths.media}</span></div><div className="setup-form-grid"><label>Public StreamHome URL<input type="url" value={publicUrl} onChange={(event) => setPublicUrl(event.target.value.trim())} placeholder="https://watch.example.com" /></label><label>Web port<input type="number" min={1} max={65535} value={webPort} onChange={(event) => setWebPort(Number(event.target.value))} /></label><label>HEVC compression<select value={hevc} onChange={(event) => setHevc(event.target.value as typeof hevc)}><option value="auto">Automatic</option><option value="on">Always</option><option value="off">Never</option></select></label></div><small className="setup-field-note">The public origin creates the exact Google OAuth callback and must not include a path.</small><label className="setup-check"><input type="checkbox" checked={backups} onChange={(event) => setBackups(event.target.checked)} /> Enable automatic database backups</label><label className="setup-check"><input type="checkbox" checked={false} disabled /> Automatic updates are unavailable in this alpha; update only to an explicit release tag.</label><div className="setup-footer-actions"><button onClick={() => goToStep(4)}>Back</button><button className="setup-primary" disabled={webPort < 1 || webPort > 65535 || !publicUrl} onClick={() => goToStep(6)}>Continue</button></div></>}
 
         {step === 6 && <><h2>Storage</h2><p>Keep media on this server, or connect Google Drive without installing Rclone on another computer.</p>
           {directCallbackVisit && <div className="setup-callback-notice" role="status"><i aria-hidden="true">↩</i><div><strong>This address belongs in Google Cloud</strong><span>It is an OAuth return address, not a page you need to open. Return to the setup tab you were using; its progress is still there.</span></div><button type="button" onClick={returnToSetupProgress}>Return to setup progress</button></div>}
@@ -538,7 +544,7 @@ export function SetupPage() {
           </div>}
           <div className="setup-footer-actions"><button onClick={() => goToStep(5)}>Back</button><button className="setup-primary" disabled={storage === "CLOUD" && !driveActivated} onClick={() => goToStep(7)}>Review setup</button></div></>}
 
-        {step === 7 && <><h2>Ready to initialize</h2><p>Review the configuration. Finishing creates the account, writes server secrets, and restarts StreamHome.</p><dl className="setup-review"><div><dt>Administrator</dt><dd>{email}</dd></div><div><dt>Security</dt><dd>{totpEnabled ? "Password + TOTP" : "Password"}</dd></div><div><dt>TMDB</dt><dd>Validated</dd></div><div><dt>Public URL</dt><dd>{publicUrl}</dd></div><div><dt>Web</dt><dd>Port {webPort}</dd></div><div><dt>Storage</dt><dd>{storage === "LOCAL" ? "Local server/media" : `Google Drive / ${drivePath}`}</dd></div><div><dt>Automation</dt><dd>{backups ? "Backups on" : "Backups off"} · {updates ? "Updates on" : "Updates off"}</dd></div></dl><div className="setup-footer-actions"><button onClick={() => goToStep(6)}>Back</button><button className="setup-primary" disabled={busy} onClick={finish}>Initialize StreamHome</button></div></>}
+        {step === 7 && <><h2>Ready to initialize</h2><p>Review the configuration. Finishing creates the account, writes server secrets, and restarts StreamHome.</p><dl className="setup-review"><div><dt>Administrator</dt><dd>{email}</dd></div><div><dt>Security</dt><dd>{totpEnabled ? "Password + TOTP" : "Password"}</dd></div><div><dt>TMDB</dt><dd>Validated</dd></div><div><dt>Public URL</dt><dd>{publicUrl}</dd></div><div><dt>Web</dt><dd>Port {webPort}</dd></div><div><dt>Storage</dt><dd>{storage === "LOCAL" ? "Local server/media" : `Google Drive / ${drivePath}`}</dd></div><div><dt>Automation</dt><dd>{backups ? "Backups on" : "Backups off"} · tagged manual updates</dd></div></dl><div className="setup-footer-actions"><button onClick={() => goToStep(6)}>Back</button><button className="setup-primary" disabled={busy} onClick={finish}>Initialize StreamHome</button></div></>}
 
         {error && <div className="setup-error" role="alert"><i>!</i>{error}</div>}
         {busy && <div className="setup-busy" role="status"><span className="setup-spinner" />Working…</div>}

@@ -42,6 +42,9 @@ export function ProfileEditPage() {
   const [name, setName] = useState("");
   const [draftTheme, setDraftTheme] = useState<ThemeId>(activeTheme);
   const [avatarColor, setAvatarColor] = useState(PROFILE_AVATAR_PRESETS[0].background);
+  const [pinEnabled, setPinEnabled] = useState(false);
+  const [pin, setPin] = useState("");
+  const [pinConfirmation, setPinConfirmation] = useState("");
   const [confirmation, setConfirmation] = useState("");
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -66,11 +69,16 @@ export function ProfileEditPage() {
     setName(profile.name);
     setDraftTheme(normalizeTheme(profile.theme));
     setAvatarColor(avatarPresetBackground(profile));
+    setPinEnabled(profile.pinEnabled);
+    setPin("");
+    setPinConfirmation("");
   }, [profile]);
 
   const cleanName = name.trim();
-  const dirty = Boolean(profile && (cleanName !== profile.name || draftTheme !== normalizeTheme(profile.theme) || avatarColor !== avatarPresetBackground(profile)));
-  const valid = cleanName.length > 0 && cleanName.length <= 40;
+  const pinChanged = pin.length > 0;
+  const pinValid = !pinEnabled || (!pinChanged && profile?.pinEnabled) || (/^[0-9]{4,8}$/.test(pin) && pin === pinConfirmation);
+  const dirty = Boolean(profile && (cleanName !== profile.name || draftTheme !== normalizeTheme(profile.theme) || avatarColor !== avatarPresetBackground(profile) || pinEnabled !== profile.pinEnabled || pinChanged));
+  const valid = cleanName.length > 0 && cleanName.length <= 40 && Boolean(pinValid);
   const presentation = getThemeDefinition(profile ? draftTheme : activeTheme);
   const Background = presentation.Background;
 
@@ -92,7 +100,14 @@ export function ProfileEditPage() {
     setSaving(true);
     setFormError("");
     try {
-      const saved = await saveProfile({ ...profile, name: cleanName, theme: draftTheme, avatarColor });
+      const saved = await saveProfile({
+        ...profile,
+        name: cleanName,
+        theme: draftTheme,
+        avatarColor,
+        pinEnabled,
+        ...(pinChanged ? { pin } : {}),
+      });
       updateProfile(saved);
       if (activeProfile?.id === saved.id) setTheme(saved.theme);
       navigate(returnTarget, { replace: true });
@@ -123,9 +138,10 @@ export function ProfileEditPage() {
     <motion.form variants={CONTENT_STAGGER} className="profile-editor__layout" onSubmit={submit}>
       <motion.aside variants={CONTENT_REVEAL} className="profile-editor__summary"><motion.div className="profile-editor__avatar" layout style={{ background: avatarColor }}><span>{cleanName.slice(0, 1).toUpperCase() || "?"}</span></motion.div><h2>{cleanName || "Unnamed profile"}</h2><p>{THEME_LABELS[draftTheme]} presentation</p><dl><div><dt>Profile type</dt><dd>{profile.id === "1" ? "Administrator" : "Viewer"}</dd></div><div><dt>Profile ID</dt><dd>{profile.id}</dd></div></dl></motion.aside>
       <div className="profile-editor__sections">
-        <motion.section variants={CONTENT_REVEAL} className="profile-editor__panel"><header><p>01 / IDENTITY</p><h2>Profile identity</h2><span>Choose the name shown throughout StreamHome.</span></header><label><span>Profile name</span><input aria-label="Profile name" value={name} onChange={(event) => setName(event.target.value)} minLength={1} maxLength={40} required autoFocus /><small>{cleanName.length}/40 characters</small></label>{!valid && name.length > 0 && <p className="profile-editor__error">Profile name must contain between 1 and 40 characters.</p>}</motion.section>
+        <motion.section variants={CONTENT_REVEAL} className="profile-editor__panel"><header><p>01 / IDENTITY</p><h2>Profile identity</h2><span>Choose the name shown throughout StreamHome.</span></header><label><span>Profile name</span><input aria-label="Profile name" value={name} onChange={(event) => setName(event.target.value)} minLength={1} maxLength={40} required autoFocus /><small>{cleanName.length}/40 characters</small></label>{(cleanName.length === 0 || cleanName.length > 40) && name.length > 0 && <p className="profile-editor__error">Profile name must contain between 1 and 40 characters.</p>}</motion.section>
         <motion.section variants={CONTENT_REVEAL} className="profile-editor__panel"><header><p>02 / APPEARANCE</p><h2>Theme and avatar</h2><span>Preview changes here before saving them to the profile.</span></header><fieldset className="profile-editor__themes"><legend>Interface theme</legend><div>{THEMES.map((theme) => <button key={theme} type="button" data-active={draftTheme === theme} aria-pressed={draftTheme === theme} onClick={() => setDraftTheme(theme)}><ThemePreview theme={theme} /><strong>{THEME_LABELS[theme]}</strong></button>)}</div></fieldset><fieldset className="profile-editor__avatars"><legend>Avatar preset</legend><div>{PROFILE_AVATAR_PRESETS.map((preset) => <button key={preset.id} type="button" data-active={avatarColor === preset.background} aria-pressed={avatarColor === preset.background} aria-label={preset.label} onClick={() => setAvatarColor(preset.background)}><i style={{ background: preset.background }} /><span>{preset.label}</span></button>)}</div></fieldset></motion.section>
-        <motion.section variants={CONTENT_REVEAL} className="profile-editor__panel profile-editor__danger"><header><p>03 / DANGER ZONE</p><h2>Delete profile</h2></header>{profile.id === "1" ? <p>The administrator profile is permanent and cannot be deleted.</p> : <><p>Type <strong>{profile.name}</strong> to permanently remove this profile and its local selection.</p><label><span>Confirm profile name</span><input aria-label="Confirm profile name" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label><button type="button" disabled={saving || deleting || confirmation !== profile.name} onClick={() => void remove()}>{deleting ? "Deleting…" : "Delete profile"}</button></>}</motion.section>
+        <motion.section variants={CONTENT_REVEAL} className="profile-editor__panel"><header><p>03 / SECURITY</p><h2>Profile PIN</h2><span>Require a server-verified PIN before this profile can be selected.</span></header><label><span><input aria-label="Require profile PIN" type="checkbox" checked={pinEnabled} onChange={(event) => { setPinEnabled(event.target.checked); setPin(""); setPinConfirmation(""); }} /> Require a PIN</span></label>{pinEnabled && <><label><span>{profile.pinEnabled ? "New PIN (leave blank to keep current)" : "New PIN"}</span><input aria-label="Profile PIN" type="password" inputMode="numeric" autoComplete="new-password" value={pin} onChange={(event) => setPin(event.target.value.replace(/\D/g, "").slice(0, 8))} minLength={4} maxLength={8} required={!profile.pinEnabled} /></label>{pinChanged && <label><span>Confirm PIN</span><input aria-label="Confirm profile PIN" type="password" inputMode="numeric" autoComplete="new-password" value={pinConfirmation} onChange={(event) => setPinConfirmation(event.target.value.replace(/\D/g, "").slice(0, 8))} minLength={4} maxLength={8} required /></label>}{!pinValid && <p className="profile-editor__error">Use 4 to 8 matching digits.</p>}</>}</motion.section>
+        <motion.section variants={CONTENT_REVEAL} className="profile-editor__panel profile-editor__danger"><header><p>04 / DANGER ZONE</p><h2>Delete profile</h2></header>{profile.id === "1" ? <p>The administrator profile is permanent and cannot be deleted.</p> : <><p>Type <strong>{profile.name}</strong> to permanently remove this profile and its local selection.</p><label><span>Confirm profile name</span><input aria-label="Confirm profile name" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label><button type="button" disabled={saving || deleting || confirmation !== profile.name} onClick={() => void remove()}>{deleting ? "Deleting…" : "Delete profile"}</button></>}</motion.section>
         <AnimatePresence>{formError && <motion.p className="profile-editor__notice" role="alert" initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>{formError}</motion.p>}</AnimatePresence>
         <motion.footer variants={CONTENT_REVEAL} className="profile-editor__actions"><span>{dirty ? "Unsaved changes" : "Profile is up to date"}</span><div><button type="button" onClick={leave} disabled={saving || deleting}>Cancel</button><button type="submit" disabled={!dirty || !valid || saving || deleting}>{saving ? "Saving…" : "Save changes"}</button></div></motion.footer>
       </div>

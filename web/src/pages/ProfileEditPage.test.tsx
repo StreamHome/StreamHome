@@ -30,7 +30,6 @@ const profile: Profile = {
   avatarColor: PROFILE_AVATAR_PRESETS[0].background,
   theme: "ember",
   pinEnabled: true,
-  pin: "4815",
 };
 
 function renderEditor(entry: { pathname: string; state?: { returnTo?: string } } = { pathname: "/profiles/2/edit", state: { returnTo: "/profiles" } }) {
@@ -48,7 +47,7 @@ describe("ProfileEditPage", () => {
     useThemeStore.setState({ activeTheme: "ember" });
   });
 
-  it("saves valid changes, preserves PIN fields, and updates the active theme", async () => {
+  it("saves valid changes without returning or resending the existing PIN", async () => {
     vi.mocked(saveProfile).mockImplementation(async (payload) => ({ ...profile, ...payload }));
     renderEditor({ pathname: "/profiles/2/edit", state: { returnTo: "/?profile=2&view=movies#featured" } });
 
@@ -63,8 +62,8 @@ describe("ProfileEditPage", () => {
       theme: "gemini",
       avatarColor: PROFILE_AVATAR_PRESETS[1].background,
       pinEnabled: true,
-      pin: "4815",
     })));
+    expect(vi.mocked(saveProfile).mock.calls[0][0]).not.toHaveProperty("pin");
     expect(await screen.findByText("Catalog return")).toBeTruthy();
     expect(useThemeStore.getState().activeTheme).toBe("gemini");
     expect(useProfileStore.getState().activeProfile?.name).toBe("Movie Fan");
@@ -81,7 +80,7 @@ describe("ProfileEditPage", () => {
   });
 
   it("loads a missing store profile from the server and supports typed-name deletion", async () => {
-    const remote = { ...profile, id: "3", name: "Guest", pinEnabled: false, pin: null };
+    const remote = { ...profile, id: "3", name: "Guest", pinEnabled: false };
     useProfileStore.setState({ profiles: [profile], activeProfile: profile, isAdmin: false });
     vi.mocked(getProfiles).mockResolvedValue([profile, remote]);
     vi.mocked(deleteProfile).mockResolvedValue({ status: "ok" });
@@ -103,5 +102,21 @@ describe("ProfileEditPage", () => {
     renderEditor({ pathname: "/profiles/1/edit", state: { returnTo: "/profiles" } });
     expect(screen.getByText("The administrator profile is permanent and cannot be deleted.")).toBeTruthy();
     expect(screen.queryByLabelText("Confirm profile name")).toBeNull();
+  });
+
+  it("requires matching digits before replacing a profile PIN", async () => {
+    vi.mocked(saveProfile).mockImplementation(async (payload) => ({ ...profile, ...payload }));
+    renderEditor();
+
+    fireEvent.change(screen.getByLabelText("Profile PIN"), { target: { value: "1234" } });
+    expect(screen.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")).toBe(true);
+    fireEvent.change(screen.getByLabelText("Confirm profile PIN"), { target: { value: "1234" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(saveProfile).toHaveBeenCalledWith(expect.objectContaining({
+      id: "2",
+      pinEnabled: true,
+      pin: "1234",
+    })));
   });
 });

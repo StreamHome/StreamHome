@@ -13,7 +13,7 @@ vi.mock("../../api/playback", () => ({ getPlaybackSessions: mocks.getPlaybackSes
 vi.mock("../../api/watchlist", () => ({ getWatchlist: mocks.getWatchlist }));
 vi.mock("../../api/recommendations", () => ({ getRecommendations: mocks.getRecommendations, getMediaPreferences: mocks.getMediaPreferences, setMediaPreference: mocks.setMediaPreference }));
 
-const profile: Profile = { id: "profile one", name: "Viewer", avatarColor: "", theme: "ember", pinEnabled: false, pin: null };
+const profile: Profile = { id: "profile one", name: "Viewer", avatarColor: "", theme: "ember", pinEnabled: false };
 
 function movie(id: string): Movie {
   return { id, title: id, description: "", thumbnailUrl: "", bannerUrl: null, videoUrl: `/media/${id}`, genres: ["Drama"], duration: "", releaseYear: 2025, rating: null, cast: [], director: null, type: "movie", quality: "", languages: [], subtitles: [], voteAverage: 0, voteCount: 0, skipMarkers: {}, availability: "available" };

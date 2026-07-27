@@ -22,7 +22,7 @@ Google Drive is optional. StreamHome can operate using local storage only.
 
 ## 1. Install StreamHome
 
-Open the [StreamHome Releases](https://github.com/StreamHome/StreamHome/releases) page and select the release you want to install.
+Open the [StreamHome Releases](https://github.com/WaqSea/StreamHome/releases) page and select the release you want to install.
 
 Each release contains its own:
 
@@ -401,24 +401,11 @@ Before relying on a backup system, verify:
 
 For details, see [Backup and Recovery](backup-and-recovery.md).
 
-## 20. Install the Progressive Web App
+## 20. Use the Responsive Browser Client
 
-On supported browsers, StreamHome can be installed as a Progressive Web App.
+Open StreamHome in a current desktop or mobile browser. The `v0.1.0-alpha.1` client is responsive but does not provide a service worker, supported PWA installation, offline playback, or offline downloads.
 
-The exact installation option depends on the browser and operating system.
-
-It may appear as:
-
-* Install app;
-* Add to Home Screen;
-* Create shortcut;
-* Install StreamHome.
-
-After installation, StreamHome can open in a standalone application-style window while continuing to receive its interface from your server.
-
-Some offline functionality may be available depending on the feature, device, browser, and StreamHome release.
-
-For more information, see [Progressive Web App](pwa.md).
+For more information, see [Browser Client](pwa.md).
 
 ## Recommended First-Run Checklist
 
@@ -521,7 +508,7 @@ If the problem remains:
 
 1. Read the [FAQ](faq.md).
 2. Review [Troubleshooting](troubleshooting.md).
-3. Search existing [GitHub Issues](https://github.com/StreamHome/StreamHome/issues).
+3. Search existing [GitHub Issues](https://github.com/WaqSea/StreamHome/issues).
 4. Open a new issue with reproducible steps and sanitized logs.
 
 Include:

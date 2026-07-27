@@ -97,7 +97,7 @@ export function StoragePanel() {
               <strong>{draft.driveConfigured ? draft.driveReachable ? "Connected" : "Needs attention" : "Not configured"}</strong>
               <small>{draft.driveConfigured ? draft.rcloneRemotePath : "Connect Drive during setup before selecting cloud storage."}</small>
               {draft.driveConfigured && <Button type="button" variant="secondary" disabled={testingDrive} onClick={testDrive}>{testingDrive ? "Testing…" : "Test connection"}</Button>}
-              <a href="https://github.com/WaqSea/StreamHome/blob/main/docs/google-drive.md" target="_blank" rel="noreferrer">Google Drive setup guide ↗</a>
+              <a href="https://github.com/WaqSea/StreamHome/blob/v0.1.0-alpha.1/docs/google-drive.md" target="_blank" rel="noreferrer">Google Drive setup guide ↗</a>
             </div>
             <label className="admin-control">
               <span>HEVC compression</span>
