@@ -10,7 +10,7 @@ vi.mock("../api/auth", () => ({
   getReauthenticationStatus: vi.fn(), beginReauthentication: vi.fn(), verifyReauthentication: vi.fn(),
   getSecuritySummary: vi.fn(), getAuthSessions: vi.fn(), getSecurityEvents: vi.fn(),
   revokeAuthSession: vi.fn(), revokeOtherSessions: vi.fn(), regenerateRecoveryCodes: vi.fn(),
-  setup2FA: vi.fn(), verifySetup2FA: vi.fn(), disable2FA: vi.fn(),
+  setup2FA: vi.fn(), verifySetup2FA: vi.fn(), cancelSetup2FA: vi.fn(), disable2FA: vi.fn(),
   updateAccountEmail: vi.fn(), updateAccountPassword: vi.fn(), updateSessionPolicy: vi.fn(),
 }));
 
@@ -52,6 +52,26 @@ describe("AccountSecurityPage", () => {
     expect(screen.getByText("Login Failure")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Account and Security" })).toBeTruthy();
     expect(screen.getByText("60 days")).toBeTruthy();
+  });
+
+  it("shows the server-generated authenticator QR and verifies the bound enrollment", async () => {
+    vi.mocked(auth.getReauthenticationStatus).mockResolvedValue({ reauthenticated: true, remainingSeconds: 500 });
+    vi.mocked(auth.getSecuritySummary).mockResolvedValue({ ...summary, twoFactorEnabled: false, recoveryCodesRemaining: 0 });
+    vi.mocked(auth.setup2FA).mockResolvedValue({
+      enrollmentId: "enrollment-123",
+      manualKey: "ABCDEFGHIJKLMNOP",
+      qrImageUrl: "/api/auth/2fa/enrollments/enrollment-123/qr",
+      expiresAt: 1_900_000_000,
+    });
+    vi.mocked(auth.verifySetup2FA).mockResolvedValue({ message: "TOTP successfully enabled.", recoveryCodes: ["AAAA-BBBB-CCCC-DDDD"] });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Set up TOTP" }));
+    const qrCode = await screen.findByAltText("Scan this QR code to add StreamHome for admin@example.test to an authenticator app");
+    expect(qrCode.getAttribute("src")).toBe("/api/auth/2fa/enrollments/enrollment-123/qr");
+    expect(screen.getByText("ABCDEFGHIJKLMNOP")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("TOTP setup code"), { target: { value: "123456" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enable TOTP" }));
+    await waitFor(() => expect(auth.verifySetup2FA).toHaveBeenCalledWith("enrollment-123", "123456"));
   });
 
   it("updates the administrator email without exposing the replacement cookie token", async () => {

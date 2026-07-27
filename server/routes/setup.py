@@ -19,7 +19,6 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 import bcrypt
 import httpx
 import jwt
-import pyotp
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
@@ -29,12 +28,17 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from db import get_session
-from models import AuthChallenge, DriveSetupJob, IntegrationCredential, RecoveryCode, User
+from models import AuthChallenge, DriveSetupJob, IntegrationCredential, RecoveryCode, TOTPEnrollment, User
 from services.integration_auth import integration_token_hash
 from services.logger import logger
 from services.rclone import REMOTE_NAME_RE, RcloneConfigEncryptionError, rclone_service
 from services.request_security import client_ip, normalize_origin, request_is_secure, trusted_proxy_origin
-from services.secret_crypto import protect_secret
+from services.totp_enrollment import (
+    create_totp_enrollment,
+    qr_response_headers,
+    render_qr_svg,
+    verify_enrollment_code,
+)
 from services.rate_limit import clear as clear_rate_limit
 from services.rate_limit import enforce as enforce_rate_limit
 from services.rate_limit import fail as fail_rate_limit
@@ -64,7 +68,7 @@ class TOTPBeginRequest(BaseModel):
 
 
 class TOTPVerifyRequest(BaseModel):
-    secret: str
+    enrollment_id: str
     code: str
 
 
@@ -91,8 +95,7 @@ class CompleteRequest(BaseModel):
     tmdb_token: str
     tmdb_validation_token: str
     web_port: int = 3000
-    totp_secret: Optional[str] = None
-    totp_code: Optional[str] = None
+    totp_enrollment_id: Optional[str] = None
     backup_enabled: bool = False
     auto_update_enabled: bool = False
     hevc_compression_mode: str = "auto"
@@ -157,6 +160,34 @@ def _setup_session_id(request: Request) -> Optional[str]:
         return session_id if payload.get("purpose") == "setup" and isinstance(session_id, str) else None
     except Exception:
         return None
+
+
+async def _setup_totp_enrollment(
+    db: AsyncSession,
+    request: Request,
+    enrollment_id: str,
+    *,
+    require_verified: bool = False,
+) -> TOTPEnrollment:
+    session_id = _setup_session_id(request)
+    enrollment = await db.get(TOTPEnrollment, enrollment_id)
+    valid = bool(
+        session_id
+        and enrollment
+        and enrollment.owner_type == "setup"
+        and enrollment.setup_session_hash
+        and hmac.compare_digest(enrollment.setup_session_hash, _hash_value(session_id))
+        and enrollment.consumed_at is None
+    )
+    if not valid or not enrollment:
+        raise HTTPException(status_code=404, detail={"code": "totp_enrollment_not_found", "message": "Start TOTP enrollment again."})
+    if enrollment.expires_at <= time.time():
+        await db.delete(enrollment)
+        await db.commit()
+        raise HTTPException(status_code=410, detail={"code": "totp_enrollment_expired", "message": "TOTP enrollment expired. Start again."})
+    if require_verified and enrollment.verified_at is None:
+        raise HTTPException(status_code=422, detail={"code": "totp_not_verified", "message": "Verify the authenticator code before continuing."})
+    return enrollment
 
 
 def _is_unlocked(request: Request) -> bool:
@@ -449,20 +480,67 @@ async def validate_tmdb(payload: TMDBValidationRequest, request: Request):
 
 
 @router.post("/totp/begin", dependencies=[Depends(require_setup_session)])
-async def begin_totp(payload: TOTPBeginRequest):
-    email = payload.email.strip().lower()
-    if "@" not in email:
-        raise HTTPException(status_code=422, detail={"code": "invalid_email", "message": "Enter a valid administrator email."})
-    secret = pyotp.random_base32()
-    return {"secret": secret, "provisioningUri": pyotp.TOTP(secret).provisioning_uri(name=email, issuer_name="StreamHome")}
+async def begin_totp(payload: TOTPBeginRequest, request: Request, db: AsyncSession = Depends(get_session)):
+    session_id = _setup_session_id(request)
+    if not session_id:
+        raise HTTPException(status_code=401, detail={"code": "setup_locked", "message": "Unlock setup again."})
+    try:
+        enrollment, secret = create_totp_enrollment(
+            enrollment_id=str(uuid.uuid4()),
+            owner_type="setup",
+            email=payload.email,
+            setup_session_hash=_hash_value(session_id),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": "invalid_email", "message": str(exc)}) from exc
+    await db.execute(
+        delete(TOTPEnrollment).where(
+            TOTPEnrollment.owner_type == "setup",
+            TOTPEnrollment.setup_session_hash == enrollment.setup_session_hash,
+            TOTPEnrollment.consumed_at == None,
+        )
+    )
+    db.add(enrollment)
+    await db.commit()
+    return {
+        "enrollmentId": enrollment.id,
+        "manualKey": secret,
+        "qrImageUrl": f"/api/setup/totp/enrollments/{enrollment.id}/qr",
+        "expiresAt": enrollment.expires_at,
+    }
 
 
 @router.post("/totp/verify", dependencies=[Depends(require_setup_session)])
-async def verify_totp(payload: TOTPVerifyRequest):
-    valid = pyotp.TOTP(payload.secret).verify(payload.code, valid_window=1)
-    if not valid:
+async def verify_totp(payload: TOTPVerifyRequest, request: Request, db: AsyncSession = Depends(get_session)):
+    enrollment = await _setup_totp_enrollment(db, request, payload.enrollment_id)
+    identity = f"{enrollment.setup_session_hash}:{enrollment.id}:{client_ip(request)}"
+    await enforce_rate_limit(db, "totp_enrollment", identity)
+    if not verify_enrollment_code(enrollment, payload.code):
+        await fail_rate_limit(db, "totp_enrollment", identity, limit=5, window_seconds=300)
         raise HTTPException(status_code=422, detail={"code": "invalid_totp", "message": "The authenticator code was not accepted."})
-    return {"valid": True}
+    enrollment.verified_at = time.time()
+    db.add(enrollment)
+    await db.commit()
+    await clear_rate_limit(db, "totp_enrollment", identity)
+    return {"valid": True, "enrollmentId": enrollment.id}
+
+
+@router.get("/totp/enrollments/{enrollment_id}/qr", dependencies=[Depends(require_setup_session)])
+async def setup_totp_qr(enrollment_id: str, request: Request, db: AsyncSession = Depends(get_session)):
+    enrollment = await _setup_totp_enrollment(db, request, enrollment_id)
+    return Response(
+        content=render_qr_svg(enrollment),
+        media_type="image/svg+xml",
+        headers=qr_response_headers(),
+    )
+
+
+@router.delete("/totp/enrollments/{enrollment_id}", status_code=204, dependencies=[Depends(require_setup_session)])
+async def cancel_setup_totp(enrollment_id: str, request: Request, db: AsyncSession = Depends(get_session)):
+    enrollment = await _setup_totp_enrollment(db, request, enrollment_id)
+    await db.delete(enrollment)
+    await db.commit()
+    return Response(status_code=204)
 
 
 @router.post("/rclone/drive/oauth/start", dependencies=[Depends(require_setup_session)])
@@ -792,6 +870,16 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
             raise HTTPException(status_code=422, detail={"code": "invalid_storage_engine", "message": "Choose local or cloud storage."})
         if payload.auto_update_enabled:
             raise HTTPException(status_code=422, detail={"code": "automatic_updates_unavailable", "message": "Automatic updates are unavailable in this alpha. Update only to an explicit release tag."})
+        totp_enrollment: Optional[TOTPEnrollment] = None
+        if payload.totp_enrollment_id:
+            totp_enrollment = await _setup_totp_enrollment(
+                db,
+                request,
+                payload.totp_enrollment_id,
+                require_verified=True,
+            )
+            if not hmac.compare_digest(totp_enrollment.email, email):
+                raise HTTPException(status_code=422, detail={"code": "totp_email_changed", "message": "The administrator email changed. Start TOTP enrollment again."})
         drive_job: Optional[DriveSetupJob] = None
         remote_path = settings.RCLONE_REMOTE_PATH
         if storage == "CLOUD":
@@ -811,9 +899,6 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
             remote_result = await rclone_service.run("lsjson", remote_path, "--dirs-only", "--max-depth", "1", timeout=30)
             if not remote_result.ok:
                 raise HTTPException(status_code=422, detail={"code": remote_result.error_code or "drive_test_failed", "message": "The activated Google Drive remote could not be reached."})
-        if payload.totp_secret and (not payload.totp_code or not pyotp.TOTP(payload.totp_secret).verify(payload.totp_code, valid_window=1)):
-            raise HTTPException(status_code=422, detail={"code": "invalid_totp", "message": "Verify TOTP again before completing setup."})
-
         ingestion_token = secrets.token_urlsafe(36)
         server_updates = {
             "TMDB_READ_ACCESS_TOKEN": payload.tmdb_token.strip(),
@@ -842,8 +927,8 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
             user = existing or User(email=email, password_hash="")
             user.email = email
             user.password_hash = bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode()
-            user.totp_secret = protect_secret(payload.totp_secret)
-            user.two_factor_enabled = bool(payload.totp_secret)
+            user.totp_secret = totp_enrollment.secret_encrypted if totp_enrollment else None
+            user.two_factor_enabled = bool(totp_enrollment)
             user.failed_login_attempts = 0
             user.lockout_until = None
             db.add(user)
@@ -859,6 +944,8 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
             )
             ingestion_credential.scopes = ["ingest"]
             db.add(ingestion_credential)
+            if totp_enrollment:
+                await db.delete(totp_enrollment)
 
             for target, temporary in staged_files:
                 os.replace(temporary, target)

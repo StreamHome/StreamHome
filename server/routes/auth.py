@@ -20,7 +20,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from db import get_session
-from models import AuthChallenge, AuthSession, IntegrationCredential, RecoveryCode, SecurityEvent, User
+from models import AuthChallenge, AuthSession, IntegrationCredential, RecoveryCode, SecurityEvent, TOTPEnrollment, User
 from services.logger import logger
 from services.request_security import client_ip, request_is_secure
 from services.secret_crypto import is_protected_secret, protect_secret, reveal_secret
@@ -28,6 +28,12 @@ from services.rate_limit import clear as clear_rate_limit
 from services.rate_limit import enforce as enforce_rate_limit
 from services.rate_limit import fail as fail_rate_limit
 from services.integration_auth import integration_token_hash
+from services.totp_enrollment import (
+    create_totp_enrollment,
+    qr_response_headers,
+    render_qr_svg,
+    verify_enrollment_code,
+)
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 health_router = APIRouter(tags=["System"])
@@ -57,6 +63,7 @@ class ReauthenticateRequest(BaseModel):
 
 
 class TOTPVerifySetupRequest(BaseModel):
+    enrollment_id: str
     code: str
 
 
@@ -641,6 +648,35 @@ async def replace_recovery_codes(user: User, db: AsyncSession) -> list[str]:
     return codes
 
 
+async def user_totp_enrollment(
+    db: AsyncSession,
+    enrollment_id: str,
+    user: User,
+    session: AuthSession,
+) -> TOTPEnrollment:
+    enrollment = await db.get(TOTPEnrollment, enrollment_id)
+    valid = bool(
+        enrollment
+        and enrollment.owner_type == "user"
+        and enrollment.user_id == user.id
+        and enrollment.auth_session_id == session.id
+        and enrollment.consumed_at is None
+    )
+    if not valid or not enrollment:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "totp_enrollment_not_found", "message": "Start TOTP enrollment again."},
+        )
+    if enrollment.expires_at <= now():
+        await db.delete(enrollment)
+        await db.commit()
+        raise HTTPException(
+            status_code=410,
+            detail={"code": "totp_enrollment_expired", "message": "TOTP enrollment expired. Start again."},
+        )
+    return enrollment
+
+
 @router.post("/recovery-codes/regenerate")
 async def regenerate_recovery_codes(request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
     if not user.two_factor_enabled:
@@ -653,29 +689,91 @@ async def regenerate_recovery_codes(request: Request, user: User = Depends(get_c
 
 @router.post("/2fa/setup")
 async def setup_totp(user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
-    del session
     if user.two_factor_enabled:
-        raise HTTPException(status_code=400, detail="TOTP is already enabled")
-    secret = pyotp.random_base32()
-    user.totp_secret = protect_secret(secret)
-    user.two_factor_enabled = False
-    db.add(user)
+        raise HTTPException(status_code=400, detail={"code": "totp_already_enabled", "message": "TOTP is already enabled."})
+    await db.execute(
+        delete(TOTPEnrollment).where(
+            TOTPEnrollment.owner_type == "user",
+            TOTPEnrollment.user_id == user.id,
+            TOTPEnrollment.consumed_at == None,
+        )
+    )
+    enrollment, secret = create_totp_enrollment(
+        enrollment_id=str(uuid.uuid4()),
+        owner_type="user",
+        email=user.email,
+        user_id=user.id,
+        auth_session_id=session.id,
+    )
+    db.add(enrollment)
     await db.commit()
-    return {"secret": secret, "provisioning_uri": pyotp.TOTP(secret).provisioning_uri(name=user.email, issuer_name="StreamHome")}
+    return {
+        "enrollmentId": enrollment.id,
+        "manualKey": secret,
+        "qrImageUrl": f"/api/auth/2fa/enrollments/{enrollment.id}/qr",
+        "expiresAt": enrollment.expires_at,
+    }
 
 
 @router.post("/2fa/verify-setup")
 async def verify_totp_setup(req: TOTPVerifySetupRequest, request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
-    if not user.totp_secret or not pyotp.TOTP(reveal_secret(user.totp_secret)).verify(req.code, valid_window=1):
-        raise HTTPException(status_code=400, detail="Invalid verification code")
+    enrollment = await user_totp_enrollment(db, req.enrollment_id, user, session)
+    identity = f"{user.id}:{session.id}:{enrollment.id}:{client_ip(request)}"
+    await enforce_rate_limit(db, "totp_enrollment", identity)
+    if not verify_enrollment_code(enrollment, req.code):
+        await fail_rate_limit(db, "totp_enrollment", identity, limit=5, window_seconds=300)
+        raise HTTPException(status_code=400, detail={"code": "invalid_totp", "message": "The authenticator code was not accepted."})
+    claimed_at = now()
+    claim = await db.execute(
+        update(TOTPEnrollment)
+        .where(
+            TOTPEnrollment.id == enrollment.id,
+            TOTPEnrollment.consumed_at == None,
+        )
+        .values(verified_at=claimed_at, consumed_at=claimed_at)
+    )
+    if claim.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail={"code": "totp_enrollment_consumed", "message": "This TOTP enrollment was already used. Start again."})
+    user.totp_secret = enrollment.secret_encrypted
     user.two_factor_enabled = True
     user.failed_login_attempts = 0
     user.lockout_until = None
     codes = await replace_recovery_codes(user, db)
     db.add(user)
     await add_event(db, request, "totp_enabled", "success", user.id, session.id)
+    await db.delete(enrollment)
     await db.commit()
+    await clear_rate_limit(db, "totp_enrollment", identity)
     return {"message": "TOTP successfully enabled.", "recoveryCodes": codes}
+
+
+@router.get("/2fa/enrollments/{enrollment_id}/qr")
+async def totp_enrollment_qr(
+    enrollment_id: str,
+    user: User = Depends(get_current_user),
+    session: AuthSession = Depends(require_recent_reauth),
+    db: AsyncSession = Depends(get_session),
+):
+    enrollment = await user_totp_enrollment(db, enrollment_id, user, session)
+    return Response(
+        content=render_qr_svg(enrollment),
+        media_type="image/svg+xml",
+        headers=qr_response_headers(),
+    )
+
+
+@router.delete("/2fa/enrollments/{enrollment_id}", status_code=204)
+async def cancel_totp_enrollment(
+    enrollment_id: str,
+    user: User = Depends(get_current_user),
+    session: AuthSession = Depends(require_recent_reauth),
+    db: AsyncSession = Depends(get_session),
+):
+    enrollment = await user_totp_enrollment(db, enrollment_id, user, session)
+    await db.delete(enrollment)
+    await db.commit()
+    return Response(status_code=204)
 
 
 @router.post("/2fa/disable")

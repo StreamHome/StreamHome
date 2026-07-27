@@ -7,6 +7,8 @@ StreamHome is a self-hosted application. The operator is responsible for the hos
 - Passwords and profile PINs are bcrypt hashes.
 - Profile PIN hashes are never returned by the API.
 - Two-factor authentication uses local TOTP only. SMTP and email OTP are not supported.
+- TOTP enrollment secrets are generated and encrypted by the server. Setup and Account & Security display a server-rendered QR code plus a manual setup key; verification uses a short-lived, session-bound enrollment identifier rather than accepting a browser-supplied secret.
+- Pending TOTP enrollments expire after 15 minutes, QR responses are marked `no-store`, and failed enrollment verification is rate-limited.
 - Authentication uses HttpOnly session cookies.
 - Sensitive account, update, backup, and storage mutations require recent reauthentication.
 - Ingestion uses scoped integration credentials rather than the administrator session.

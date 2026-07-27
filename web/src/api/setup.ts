@@ -22,8 +22,7 @@ export interface SetupCompleteRequest {
   tmdb_validation_token: string;
   web_port: number;
   public_url: string;
-  totp_secret?: string;
-  totp_code?: string;
+  totp_enrollment_id?: string;
   backup_enabled: boolean;
   auto_update_enabled: boolean;
   hevc_compression_mode: "auto" | "on" | "off";
@@ -77,8 +76,16 @@ export const getSetupStatus = () => apiGet<SetupStatus>("/api/setup/status", set
 export const unlockSetup = (code: string, driveJobId?: string) => apiPost<void>("/api/setup/unlock", { code, drive_job_id: driveJobId || undefined }, setupOptions);
 export const getSetupReadiness = () => apiGet<SetupReadiness>("/api/setup/readiness", setupOptions);
 export const validateSetupTMDB = (token: string) => apiPost<{ valid: true; validationToken: string }>("/api/setup/tmdb/validate", { token }, setupOptions);
-export const beginSetupTOTP = (email: string) => apiPost<{ secret: string; provisioningUri: string }>("/api/setup/totp/begin", { email }, setupOptions);
-export const verifySetupTOTP = (secret: string, code: string) => apiPost<{ valid: true }>("/api/setup/totp/verify", { secret, code }, setupOptions);
+export interface SetupTOTPEnrollment {
+  enrollmentId: string;
+  manualKey: string;
+  qrImageUrl: string;
+  expiresAt: number;
+}
+
+export const beginSetupTOTP = (email: string) => apiPost<SetupTOTPEnrollment>("/api/setup/totp/begin", { email }, setupOptions);
+export const verifySetupTOTP = (enrollmentId: string, code: string) => apiPost<{ valid: true; enrollmentId: string }>("/api/setup/totp/verify", { enrollment_id: enrollmentId, code }, setupOptions);
+export const cancelSetupTOTP = (enrollmentId: string) => apiDelete<void>(`/api/setup/totp/enrollments/${encodeURIComponent(enrollmentId)}`, setupOptions);
 
 export const startDriveOAuth = (payload: {
   clientId: string;

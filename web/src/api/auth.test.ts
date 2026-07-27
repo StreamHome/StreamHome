@@ -16,7 +16,7 @@ describe("authentication response normalization", () => {
   it("normalizes TOTP status and setup keys", async () => {
     respond({ two_factor_enabled: true, email: "admin@example.test" });
     await expect(get2FAStatus()).resolves.toEqual({ twoFactorEnabled: true, email: "admin@example.test" });
-    respond({ secret: "ABC", provisioning_uri: "otpauth://totp/example" });
-    await expect(setup2FA()).resolves.toEqual({ secret: "ABC", provisioningUri: "otpauth://totp/example" });
+    respond({ enrollmentId: "enrollment", manualKey: "ABC", qrImageUrl: "/api/auth/2fa/enrollments/enrollment/qr", expiresAt: 1_720_000_900 });
+    await expect(setup2FA()).resolves.toEqual({ enrollmentId: "enrollment", manualKey: "ABC", qrImageUrl: "/api/auth/2fa/enrollments/enrollment/qr", expiresAt: 1_720_000_900 });
   });
 });

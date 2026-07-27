@@ -86,9 +86,9 @@ export async function get2FAStatus(): Promise<TwoFAStatusResponse> {
 }
 
 export async function setup2FA(): Promise<TwoFASetupResponse> {
-  const raw = await apiPost<{ secret: string; provisioning_uri?: string; provisioningUri?: string }>("/api/auth/2fa/setup");
-  return { secret: raw.secret, provisioningUri: raw.provisioning_uri ?? raw.provisioningUri ?? "" };
+  return apiPost<TwoFASetupResponse>("/api/auth/2fa/setup");
 }
 
-export const verifySetup2FA = (code: string) => apiPost<{ message: string; recoveryCodes: string[] }>("/api/auth/2fa/verify-setup", { code });
+export const verifySetup2FA = (enrollmentId: string, code: string) => apiPost<{ message: string; recoveryCodes: string[] }>("/api/auth/2fa/verify-setup", { enrollment_id: enrollmentId, code });
+export const cancelSetup2FA = (enrollmentId: string) => apiDelete<void>(`/api/auth/2fa/enrollments/${encodeURIComponent(enrollmentId)}`);
 export const disable2FA = (code: string) => apiPost<{ message: string }>("/api/auth/2fa/disable", { code });

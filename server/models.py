@@ -483,6 +483,19 @@ class RateLimitBucket(SQLModel, table=True):
     blocked_until: Optional[float] = Field(default=None, index=True)
     updated_at: float = Field(index=True)
 
+class TOTPEnrollment(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    owner_type: str = Field(index=True)
+    setup_session_hash: Optional[str] = Field(default=None, index=True)
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
+    auth_session_id: Optional[str] = Field(default=None, index=True)
+    email: str
+    secret_encrypted: str
+    created_at: float = Field(index=True)
+    expires_at: float = Field(index=True)
+    verified_at: Optional[float] = Field(default=None, index=True)
+    consumed_at: Optional[float] = Field(default=None, index=True)
+
 class DriveSetupJob(SQLModel, table=True):
     id: str = Field(primary_key=True)
     session_hash: str = Field(index=True)

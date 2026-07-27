@@ -13,6 +13,6 @@ The web server listens on the configured public port and proxies `/api` and `/me
 
 Ingestion is queue-based. Finalization writes portable `.metadata/metadata.json` beside media so catalog recovery can reconstruct quality, language, and subtitle information.
 
-Authentication uses HttpOnly sessions and optional local TOTP. SMTP and email OTP are intentionally absent.
+Authentication uses HttpOnly sessions and optional local TOTP. TOTP enrollment state is server-owned, encrypted at rest, short-lived, and bound to the initiating setup or authenticated user session. The server renders the enrollment QR as a non-cacheable SVG and promotes the pending secret to the user only after successful verification. SMTP and email OTP are intentionally absent.
 
 Release changes must preserve the fixed database/media paths, the application-owned Rclone command path, and the movie-ingestion payload rule.

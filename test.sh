@@ -23,6 +23,7 @@ SERVER_CHECKS=(
   scratch/test_search_caching.py
   scratch/test_security_validation.py
   scratch/test_setup_scripts.py
+  scratch/test_totp_enrollment.py
   scratch/test_vibe_analysis.py
 )
 

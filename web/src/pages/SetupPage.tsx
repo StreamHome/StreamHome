@@ -3,6 +3,7 @@ import {
   activateDrive,
   beginSetupTOTP,
   cancelDriveJob,
+  cancelSetupTOTP,
   completeSetup,
   createDriveFolder,
   getDriveJob,
@@ -65,10 +66,13 @@ export function SetupPage() {
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [totpEnabled, setTotpEnabled] = useState(false);
-  const [totpSecret, setTotpSecret] = useState("");
-  const [totpUri, setTotpUri] = useState("");
+  const [totpEnrollmentId, setTotpEnrollmentId] = useState("");
+  const [totpManualKey, setTotpManualKey] = useState("");
+  const [totpQrImageUrl, setTotpQrImageUrl] = useState("");
+  const [totpExpiresAt, setTotpExpiresAt] = useState(0);
   const [totpCode, setTotpCode] = useState("");
   const [totpVerified, setTotpVerified] = useState(false);
+  const [totpCopyStatus, setTotpCopyStatus] = useState<"" | "copied" | "failed">("");
   const [tmdbToken, setTmdbToken] = useState("");
   const [tmdbValid, setTmdbValid] = useState(false);
   const [tmdbValidationToken, setTmdbValidationToken] = useState("");
@@ -281,6 +285,21 @@ export function SetupPage() {
     else setError("Resolve the required checks before continuing. Rclone is optional when local storage is selected.");
   });
 
+  const changeAdministratorEmail = (nextEmail: string) => {
+    if (nextEmail !== email && totpEnrollmentId) {
+      void cancelSetupTOTP(totpEnrollmentId).catch(() => undefined);
+      setTotpEnabled(false);
+      setTotpEnrollmentId("");
+      setTotpManualKey("");
+      setTotpQrImageUrl("");
+      setTotpExpiresAt(0);
+      setTotpCode("");
+      setTotpVerified(false);
+      setTotpCopyStatus("");
+    }
+    setEmail(nextEmail);
+  };
+
   const prepareSecurity = () => {
     if (!email.includes("@")) return setError("Enter a valid administrator email.");
     if (password.length < 6 || new TextEncoder().encode(password).length > 72) return setError("Use a password between 6 characters and 72 UTF-8 bytes.");
@@ -293,16 +312,31 @@ export function SetupPage() {
     setTotpEnabled(enabled);
     setTotpVerified(false);
     setTotpCode("");
-    if (!enabled) { setTotpSecret(""); setTotpUri(""); return; }
+    setTotpCopyStatus("");
+    if (!enabled) {
+      if (totpEnrollmentId) await cancelSetupTOTP(totpEnrollmentId);
+      setTotpEnrollmentId("");
+      setTotpManualKey("");
+      setTotpQrImageUrl("");
+      setTotpExpiresAt(0);
+      return;
+    }
     const setup = await beginSetupTOTP(email);
-    setTotpSecret(setup.secret);
-    setTotpUri(setup.provisioningUri);
+    setTotpEnrollmentId(setup.enrollmentId);
+    setTotpManualKey(setup.manualKey);
+    setTotpQrImageUrl(setup.qrImageUrl);
+    setTotpExpiresAt(setup.expiresAt);
   });
 
   const verifyTotp = () => run(async () => {
-    await verifySetupTOTP(totpSecret, totpCode);
+    await verifySetupTOTP(totpEnrollmentId, totpCode);
     setTotpVerified(true);
   });
+
+  const copyTotpKey = async () => {
+    const copied = await copySetupText(totpManualKey);
+    setTotpCopyStatus(copied ? "copied" : "failed");
+  };
 
   const validateTmdb = () => run(async () => {
     const validation = await validateSetupTMDB(tmdbToken);
@@ -405,8 +439,7 @@ export function SetupPage() {
       tmdb_validation_token: tmdbValidationToken,
       web_port: webPort,
       public_url: publicUrl,
-      totp_secret: totpEnabled ? totpSecret : undefined,
-      totp_code: totpEnabled ? totpCode : undefined,
+      totp_enrollment_id: totpEnabled ? totpEnrollmentId : undefined,
       backup_enabled: backups,
       auto_update_enabled: false,
       hevc_compression_mode: hevc,
@@ -520,9 +553,9 @@ export function SetupPage() {
 
         {step === 1 && <><h2>System readiness</h2><p>StreamHome checks its runtime without changing the established media layout.</p>{checks.length > 0 && <div className="setup-check-grid">{checks.map((check) => <article key={check.id} data-ready={check.ready}><i>{check.ready ? "✓" : "!"}</i><div><strong>{check.id.replace(/_/g, " ")}</strong><span>{check.detail}</span></div></article>)}</div>}<button className="setup-primary" disabled={busy} onClick={inspect}>{checks.length ? "Check again" : "Run system checks"}</button></>}
 
-        {step === 2 && <><h2>Create the administrator</h2><p>This account controls profiles, server settings, storage, and security.</p><div className="setup-form-grid"><label>Email address<input type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} /></label><label>Password<input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><label>Confirm password<input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} /></label></div><button className="setup-primary" onClick={prepareSecurity}>Continue</button></>}
+        {step === 2 && <><h2>Create the administrator</h2><p>This account controls profiles, server settings, storage, and security.</p><div className="setup-form-grid"><label>Email address<input type="email" autoComplete="username" value={email} onChange={(event) => changeAdministratorEmail(event.target.value)} /></label><label>Password<input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><label>Confirm password<input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} /></label></div><button className="setup-primary" onClick={prepareSecurity}>Continue</button></>}
 
-        {step === 3 && <><h2>Local account security</h2><p>TOTP is optional. When enabled, setup creates ten one-time recovery codes.</p><div className="setup-choice"><button data-selected={!totpEnabled} onClick={() => void toggleTotp(false)}><strong>Password only</strong><span>Enable TOTP later in Admin.</span></button><button data-selected={totpEnabled} onClick={() => void toggleTotp(true)}><strong>Password + TOTP</strong><span>Recommended for remotely accessible servers.</span></button></div>{totpEnabled && <div className="setup-secret"><label>Authenticator secret<input readOnly value={totpSecret} /></label><small>{totpUri}</small><label>Six-digit code<input inputMode="numeric" maxLength={6} value={totpCode} onChange={(event) => { setTotpCode(event.target.value.replace(/\D/g, "")); setTotpVerified(false); }} /></label><button onClick={verifyTotp} disabled={totpCode.length !== 6 || busy}>{totpVerified ? "Verified ✓" : "Verify code"}</button></div>}<div className="setup-footer-actions"><button onClick={() => goToStep(2)}>Back</button><button className="setup-primary" disabled={totpEnabled && !totpVerified} onClick={() => goToStep(4)}>Continue</button></div></>}
+        {step === 3 && <><h2>Local account security</h2><p>TOTP is optional. When enabled, setup creates ten one-time recovery codes.</p><div className="setup-choice"><button data-selected={!totpEnabled} onClick={() => void toggleTotp(false)}><strong>Password only</strong><span>Enable TOTP later in Admin.</span></button><button data-selected={totpEnabled} onClick={() => void toggleTotp(true)}><strong>Password + TOTP</strong><span>Recommended for remotely accessible servers.</span></button></div>{totpEnabled && <div className="setup-secret setup-totp-enrollment">{totpQrImageUrl ? <><div className="setup-totp-qr"><img src={totpQrImageUrl} alt={`Scan this QR code to add StreamHome for ${email} to an authenticator app`} /><div><strong>Scan with your authenticator</strong><span>The QR code is generated by this StreamHome server and expires at {new Date(totpExpiresAt * 1000).toLocaleTimeString()}.</span></div></div><div className="setup-totp-manual"><span>Can&apos;t scan? Enter this setup key manually.</span><code>{totpManualKey}</code><button type="button" onClick={() => void copyTotpKey()}>{totpCopyStatus === "copied" ? "Copied" : "Copy setup key"}</button>{totpCopyStatus === "failed" && <small role="status">Copy was blocked. Select the key and copy it manually.</small>}</div><label>Six-digit authenticator code<input inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={totpCode} onChange={(event) => { setTotpCode(event.target.value.replace(/\D/g, "")); setTotpVerified(false); }} /></label><button onClick={verifyTotp} disabled={!totpEnrollmentId || totpCode.length !== 6 || busy}>{totpVerified ? "Verified ✓" : "Verify code"}</button></> : <p role="status">Generating secure TOTP enrollment…</p>}</div>}<div className="setup-footer-actions"><button onClick={() => goToStep(2)}>Back</button><button className="setup-primary" disabled={totpEnabled && !totpVerified} onClick={() => goToStep(4)}>Continue</button></div></>}
 
         {step === 4 && <><h2>Connect TMDB</h2><p>A valid TMDB v4 read-access token is required for catalog metadata and artwork.</p><label>Read-access token<textarea value={tmdbToken} onChange={(event) => { setTmdbToken(event.target.value.trim()); setTmdbValid(false); setTmdbValidationToken(""); }} rows={5} /></label><button onClick={validateTmdb} disabled={!tmdbToken || busy}>{tmdbValid ? "TMDB connected ✓" : "Validate token"}</button><div className="setup-footer-actions"><button onClick={() => goToStep(3)}>Back</button><button className="setup-primary" disabled={!tmdbValid} onClick={() => goToStep(5)}>Continue</button></div></>}
 

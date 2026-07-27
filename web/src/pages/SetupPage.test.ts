@@ -60,4 +60,16 @@ describe("Google Drive setup presentation", () => {
     expect(setup).toContain("unlockSetup(bootstrapCode, driveJobIdToLoad)");
     expect(api).toContain("drive_job_id: driveJobId || undefined");
   });
+
+  it("renders a server-generated TOTP QR code and verifies by enrollment ID", () => {
+    const setup = read("src/pages/SetupPage.tsx");
+    const api = read("src/api/setup.ts");
+    expect(setup).toContain("setup.qrImageUrl");
+    expect(setup).toContain("Scan this QR code to add StreamHome");
+    expect(setup).toContain("Copy setup key");
+    expect(setup).toContain("{totpQrImageUrl ? <>");
+    expect(setup).toContain("Generating secure TOTP enrollment");
+    expect(api).toContain("enrollment_id: enrollmentId");
+    expect(api).not.toContain("{ secret, code }");
+  });
 });

@@ -42,8 +42,10 @@ export interface TwoFAStatusResponse {
 }
 
 export interface TwoFASetupResponse {
-  secret: string;
-  provisioningUri: string;
+  enrollmentId: string;
+  manualKey: string;
+  qrImageUrl: string;
+  expiresAt: number;
 }
 
 export interface Profile {

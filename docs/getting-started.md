@@ -89,13 +89,16 @@ StreamHome may offer optional TOTP-based two-factor authentication during setup.
 When enabling two-factor authentication:
 
 1. Scan the displayed QR code using a compatible authenticator application.
-2. Enter the generated verification code.
-3. Save the provided recovery codes in a secure offline location.
-4. Do not store recovery codes inside the StreamHome server directory.
+2. If scanning is unavailable, copy the displayed manual setup key into the authenticator.
+3. Enter the generated verification code before the 15-minute enrollment expires.
+4. Save the provided recovery codes in a secure offline location.
+5. Do not store recovery codes inside the StreamHome server directory.
 
 Recovery codes are intended for account recovery if access to the authenticator is lost.
 
 Each recovery code should be treated like a password.
+
+The StreamHome server generates and encrypts the enrollment secret. QR images are served only to the current setup or authenticated administrator session and are not cacheable.
 
 ## 5. Configure TMDB
 
