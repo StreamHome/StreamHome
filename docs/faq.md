@@ -90,7 +90,7 @@ StreamHome is intended for users who want:
 
 ### How do I install StreamHome?
 
-Open the [StreamHome Releases](https://github.com/WaqSea/StreamHome/releases) page and follow the installation instructions included with the exact release you want to install.
+Open the [StreamHome Releases](https://github.com/StreamHome/StreamHome/releases) page and follow the installation instructions included with the exact release you want to install.
 
 Do not use installation scripts from the mutable development branch unless the release documentation explicitly instructs you to do so.
 
@@ -1018,7 +1018,7 @@ Use the following order:
 4. [Adding Media](adding-media.md)
 5. [Playback](playback.md)
 6. [Troubleshooting](troubleshooting.md)
-7. Existing [GitHub Issues](https://github.com/WaqSea/StreamHome/issues)
+7. Existing [GitHub Issues](https://github.com/StreamHome/StreamHome/issues)
 
 When opening an issue, include:
 

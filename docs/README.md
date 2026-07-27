@@ -35,4 +35,4 @@ This documentation describes the supported `v0.1.0-alpha.1` Linux server release
 - Google Drive uses StreamHome’s encrypted application-owned Rclone configuration.
 - The browser client is responsive but is not an offline-capable PWA.
 
-Report reproducible defects through [GitHub Issues](https://github.com/WaqSea/StreamHome/issues). Report vulnerabilities privately without publishing secrets or exploit details.
+Report reproducible defects through [GitHub Issues](https://github.com/StreamHome/StreamHome/issues). Report vulnerabilities privately without publishing secrets or exploit details.

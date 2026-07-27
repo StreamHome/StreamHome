@@ -45,8 +45,8 @@ async def run_git_cmd(args: list) -> tuple:
         return -1, "", str(e)
 
 async def initialize_remote() -> bool:
-    """Ensures git remote is configured and points to https://github.com/WaqSea/StreamHome."""
-    target_url = "https://github.com/WaqSea/StreamHome"
+    """Ensures git remote is configured and points to https://github.com/StreamHome/StreamHome."""
+    target_url = "https://github.com/StreamHome/StreamHome"
     
     # Check current remotes
     ret, stdout, stderr = await run_git_cmd(["remote"])

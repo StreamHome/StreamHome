@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
-$RepositoryUrl = "https://github.com/WaqSea/StreamHome.git"
+$RepositoryUrl = "https://github.com/StreamHome/StreamHome.git"
 $InstallRef = if ($env:STREAMHOME_REF) { $env:STREAMHOME_REF } else { "v0.1.0-alpha.1" }
 $InstallDirectory = if ($env:STREAMHOME_INSTALL_DIR) {
     $env:STREAMHOME_INSTALL_DIR
@@ -14,7 +14,7 @@ function Show-Usage {
 StreamHome bootstrap installer
 
 Usage:
-  irm https://raw.githubusercontent.com/WaqSea/StreamHome/v0.1.0-alpha.1/install.ps1 | iex
+  irm https://raw.githubusercontent.com/StreamHome/StreamHome/v0.1.0-alpha.1/install.ps1 | iex
 
 Environment overrides:
   STREAMHOME_INSTALL_DIR  Installation directory (default: ~/StreamHome)
@@ -69,6 +69,9 @@ function Install-Git {
 function Test-StreamHomeRemote([string]$Remote) {
     $normalized = $Remote.Trim().TrimEnd("/")
     return $normalized -in @(
+        "https://github.com/StreamHome/StreamHome",
+        "https://github.com/StreamHome/StreamHome.git",
+        "git@github.com:StreamHome/StreamHome.git",
         "https://github.com/WaqSea/StreamHome",
         "https://github.com/WaqSea/StreamHome.git",
         "git@github.com:WaqSea/StreamHome.git"
@@ -92,6 +95,7 @@ function Prepare-Checkout {
         if ($LASTEXITCODE -ne 0 -or -not (Test-StreamHomeRemote $remote)) {
             throw "The existing directory is not a StreamHome checkout from $RepositoryUrl"
         }
+        Invoke-Git @("-C", $InstallDirectory, "remote", "set-url", "origin", $RepositoryUrl)
         $dirty = ((& git.exe -C $InstallDirectory status --porcelain --untracked-files=normal) | Out-String).Trim()
         if ($LASTEXITCODE -ne 0) {
             throw "The existing StreamHome checkout could not be inspected."

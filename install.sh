@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPOSITORY_URL="https://github.com/WaqSea/StreamHome.git"
+REPOSITORY_URL="https://github.com/StreamHome/StreamHome.git"
 INSTALL_DIR="${STREAMHOME_INSTALL_DIR:-${HOME}/StreamHome}"
 INSTALL_REF="${STREAMHOME_REF:-v0.1.0-alpha.1}"
 
@@ -62,7 +62,7 @@ install_git() {
 
 valid_remote() {
     case "${1%/}" in
-        https://github.com/WaqSea/StreamHome|https://github.com/WaqSea/StreamHome.git|git@github.com:WaqSea/StreamHome.git)
+        https://github.com/StreamHome/StreamHome|https://github.com/StreamHome/StreamHome.git|git@github.com:StreamHome/StreamHome.git|https://github.com/WaqSea/StreamHome|https://github.com/WaqSea/StreamHome.git|git@github.com:WaqSea/StreamHome.git)
             return 0
             ;;
         *)
@@ -83,6 +83,7 @@ prepare_checkout() {
     if [[ -d "$INSTALL_DIR/.git" ]]; then
         remote="$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)"
         valid_remote "$remote" || fail "The existing directory is not a StreamHome checkout from $REPOSITORY_URL"
+        git -C "$INSTALL_DIR" remote set-url origin "$REPOSITORY_URL"
         dirty="$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=normal)"
         [[ -z "$dirty" ]] || fail "The existing StreamHome checkout has local changes. Commit or move them before updating."
 

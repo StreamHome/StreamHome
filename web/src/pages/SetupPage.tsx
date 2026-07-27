@@ -60,7 +60,7 @@ export function SetupPage() {
   const [paths, setPaths] = useState({ media: "server/media", database: "server/database.db" });
   const [publicUrl, setPublicUrl] = useState(initialCheckpoint?.publicUrl || window.location.origin);
   const [driveCallbackUrl, setDriveCallbackUrl] = useState(`${window.location.origin}/api/setup/rclone/drive/callback`);
-  const [driveGuideUrl, setDriveGuideUrl] = useState("https://github.com/WaqSea/StreamHome/blob/v0.1.0-alpha.1/docs/google-drive.md");
+  const [driveGuideUrl, setDriveGuideUrl] = useState("https://github.com/StreamHome/StreamHome/blob/v0.1.0-alpha.1/docs/google-drive.md");
   const [email, setEmail] = useState(initialCheckpoint?.email ?? "");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -115,7 +115,7 @@ export function SetupPage() {
       setPaths({ media: status.mediaPath, database: status.databasePath });
       if (!initialCheckpoint?.publicUrl) setPublicUrl(status.publicUrl || window.location.origin);
       setDriveCallbackUrl(status.driveCallbackUrl || `${window.location.origin}/api/setup/rclone/drive/callback`);
-      setDriveGuideUrl(status.driveGuideUrl || "https://github.com/WaqSea/StreamHome/blob/v0.1.0-alpha.1/docs/google-drive.md");
+      setDriveGuideUrl(status.driveGuideUrl || "https://github.com/StreamHome/StreamHome/blob/v0.1.0-alpha.1/docs/google-drive.md");
       if (status.unlocked) {
         setSetupUnlocked(true);
         let nextStep = 1;

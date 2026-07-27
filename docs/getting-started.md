@@ -22,7 +22,7 @@ Google Drive is optional. StreamHome can operate using local storage only.
 
 ## 1. Install StreamHome
 
-Open the [StreamHome Releases](https://github.com/WaqSea/StreamHome/releases) page and select the release you want to install.
+Open the [StreamHome Releases](https://github.com/StreamHome/StreamHome/releases) page and select the release you want to install.
 
 Each release contains its own:
 
@@ -508,7 +508,7 @@ If the problem remains:
 
 1. Read the [FAQ](faq.md).
 2. Review [Troubleshooting](troubleshooting.md).
-3. Search existing [GitHub Issues](https://github.com/WaqSea/StreamHome/issues).
+3. Search existing [GitHub Issues](https://github.com/StreamHome/StreamHome/issues).
 4. Open a new issue with reproducible steps and sanitized logs.
 
 Include:

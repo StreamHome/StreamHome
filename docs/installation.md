@@ -5,7 +5,7 @@ The supported alpha server target is a current Linux distribution with `systemd`
 ## Install the tagged release
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/WaqSea/StreamHome/v0.1.0-alpha.1/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/v0.1.0-alpha.1/install.sh | bash
 ```
 
 The installer:
@@ -20,7 +20,7 @@ Use a different installation directory only when needed:
 
 ```bash
 STREAMHOME_INSTALL_DIR=/srv/streamhome \
-curl -fsSL https://raw.githubusercontent.com/WaqSea/StreamHome/v0.1.0-alpha.1/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/v0.1.0-alpha.1/install.sh | bash
 ```
 
 After installation:

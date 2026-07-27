@@ -77,7 +77,12 @@ class SetupScriptContracts(unittest.TestCase):
         windows_stop = (ROOT / "scripts" / "stop-windows.ps1").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
+        self.assertIn("https://github.com/StreamHome/StreamHome.git", install_sh)
+        self.assertIn("https://github.com/StreamHome/StreamHome.git", install_ps1)
+        self.assertIn("remote set-url origin", install_sh)
+        self.assertIn('"remote", "set-url", "origin"', install_ps1)
         self.assertIn("https://github.com/WaqSea/StreamHome.git", install_sh)
+        self.assertIn("https://github.com/WaqSea/StreamHome.git", install_ps1)
         self.assertIn("status --porcelain --untracked-files=normal", install_sh)
         self.assertIn("merge --ff-only", install_sh)
         self.assertIn("exec ./setup.sh", install_sh)
@@ -122,7 +127,7 @@ class SetupScriptContracts(unittest.TestCase):
             create_fixture_repository(remote)
             fixture_url = remote.resolve().as_uri()
             source = (ROOT / "install.sh").read_text(encoding="utf-8")
-            source = source.replace("https://github.com/WaqSea/StreamHome.git", fixture_url)
+            source = source.replace("https://github.com/StreamHome/StreamHome.git", fixture_url)
             installer = root / "install-fixture.sh"
             installer.write_text(source, encoding="utf-8", newline="\n")
 
@@ -252,7 +257,7 @@ class SetupScriptContracts(unittest.TestCase):
             create_fixture_repository(remote)
             fixture_url = remote.resolve().as_uri()
             source = (ROOT / "install.ps1").read_text(encoding="utf-8")
-            source = source.replace("https://github.com/WaqSea/StreamHome.git", fixture_url)
+            source = source.replace("https://github.com/StreamHome/StreamHome.git", fixture_url)
             installer = root / "install-fixture.ps1"
             installer.write_text(source, encoding="utf-8")
 

@@ -10,11 +10,11 @@
   </p>
 
   <p>
-    <a href="https://github.com/WaqSea/StreamHome/releases/tag/v0.1.0-alpha.1">
+    <a href="https://github.com/StreamHome/StreamHome/releases/tag/v0.1.0-alpha.1">
       <img src="https://img.shields.io/badge/Download-Early%20Public%20Alpha-E25822?style=for-the-badge&logo=github&logoColor=white" alt="Download Early Public Alpha">
     </a>
-    <a href="https://github.com/WaqSea/StreamHome/releases">
-      <img src="https://img.shields.io/github/v/release/WaqSea/StreamHome?include_prereleases&style=for-the-badge&label=Latest%20Release" alt="Latest Release">
+    <a href="https://github.com/StreamHome/StreamHome/releases">
+      <img src="https://img.shields.io/github/v/release/StreamHome/StreamHome?include_prereleases&style=for-the-badge&label=Latest%20Release" alt="Latest Release">
     </a>
     <a href="LICENSE">
       <img src="https://img.shields.io/badge/License-GPLv3-blue?style=for-the-badge&logo=gnu&logoColor=white" alt="GPLv3 License">
@@ -251,13 +251,13 @@ Background HEVC optimization pauses when users require server resources and ther
 The supported alpha server target is Linux. Install the tagged release with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/WaqSea/StreamHome/v0.1.0-alpha.1/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/v0.1.0-alpha.1/install.sh | bash
 ```
 
 The installer checks out the immutable `v0.1.0-alpha.1` tag by default. Set `STREAMHOME_REF` only when intentionally testing another branch or tag.
 
 <p align="center">
-  <a href="https://github.com/WaqSea/StreamHome/releases/tag/v0.1.0-alpha.1">
+  <a href="https://github.com/StreamHome/StreamHome/releases/tag/v0.1.0-alpha.1">
     <img src="https://img.shields.io/badge/View-Installation%20Instructions-E25822?style=for-the-badge&logo=github&logoColor=white" alt="View installation instructions">
   </a>
 </p>
@@ -272,7 +272,7 @@ Complete documentation covering installation, setup, reverse proxies, Google Dri
 Until then:
 
 * review the installation information included with the relevant release;
-* report reproducible problems through [GitHub Issues](https://github.com/WaqSea/StreamHome/issues);
+* report reproducible problems through [GitHub Issues](https://github.com/StreamHome/StreamHome/issues);
 * report security vulnerabilities privately rather than through a public issue.
 
 ## 🚧 Alpha Status
