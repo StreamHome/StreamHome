@@ -27,4 +27,4 @@ Follow [Google Drive Storage](google-drive.md). Rclone is controlled only by Str
 
 ## Completion
 
-Save the one-time MediaSender ingestion token and any TOTP recovery codes before leaving the completion page. Restart completion is handled by `start.sh` on the supported Linux server path.
+Save the one-time MediaSender ingestion token and any TOTP recovery codes before leaving the completion page. Restart completion is handled by the detached `restart.sh` lifecycle handoff on the supported Linux server path.

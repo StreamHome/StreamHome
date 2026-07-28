@@ -9,6 +9,8 @@ import { AccountSecurityPage } from "./AccountSecurityPage";
 vi.mock("../api/auth", () => ({
   getReauthenticationStatus: vi.fn(), beginReauthentication: vi.fn(), verifyReauthentication: vi.fn(),
   getSecuritySummary: vi.fn(), getAuthSessions: vi.fn(), getSecurityEvents: vi.fn(),
+  getIntegrationCredentials: vi.fn(), getIntegrationScopes: vi.fn(), createIntegrationCredential: vi.fn(),
+  updateIntegrationCredential: vi.fn(), revokeIntegrationCredential: vi.fn(),
   revokeAuthSession: vi.fn(), revokeOtherSessions: vi.fn(), regenerateRecoveryCodes: vi.fn(),
   setup2FA: vi.fn(), verifySetup2FA: vi.fn(), cancelSetup2FA: vi.fn(), disable2FA: vi.fn(),
   updateAccountEmail: vi.fn(), updateAccountPassword: vi.fn(), updateSessionPolicy: vi.fn(),
@@ -16,6 +18,11 @@ vi.mock("../api/auth", () => ({
 
 const summary = { email: "admin@example.test", twoFactorEnabled: true, recoveryCodesRemaining: 8, sessionLifetimeDays: 60, previousLogin: { at: 1_720_000_000, ipAddress: "10.0.0.2", deviceLabel: "Chrome on Windows" } };
 const securityEvent = { id: "event-123", type: "login_failure", outcome: "failure", createdAt: 1_720_000_000, ipAddress: "10.0.0.2", deviceLabel: "Chrome on Windows", details: { locked: true, attemptCount: 5, factors: ["password", "totp"], context: { purpose: "login" } } };
+const integrationScopes = [
+  { id: "ingest" as const, label: "Add media", description: "Submit movies and episodes to the ingestion queue." },
+  { id: "downloads:read" as const, label: "View download queue", description: "Read current and recent ingestion task status." },
+  { id: "downloads:cancel" as const, label: "Cancel downloads", description: "Cancel ingestion workers and remove download tasks." },
+];
 
 function renderPage() {
   return render(<MemoryRouter><AccountSecurityPage /></MemoryRouter>);
@@ -27,6 +34,8 @@ describe("AccountSecurityPage", () => {
     vi.mocked(auth.getSecuritySummary).mockResolvedValue(summary);
     vi.mocked(auth.getAuthSessions).mockResolvedValue([{ id: "current", current: true, createdAt: 1_720_000_000, lastSeenAt: 1_720_000_100, expiresAt: 1_725_000_000, ipAddress: "10.0.0.2", deviceLabel: "Chrome on Windows" }]);
     vi.mocked(auth.getSecurityEvents).mockResolvedValue({ events: [securityEvent], nextCursor: null });
+    vi.mocked(auth.getIntegrationCredentials).mockResolvedValue([]);
+    vi.mocked(auth.getIntegrationScopes).mockResolvedValue(integrationScopes);
   });
 
   it("requires server-side reauthentication before loading sensitive details", async () => {
@@ -100,6 +109,65 @@ describe("AccountSecurityPage", () => {
     fireEvent.change(screen.getByLabelText("Session lifetime in days"), { target: { value: "30" } });
     fireEvent.click(screen.getByRole("button", { name: "Save lifetime" }));
     await waitFor(() => expect(auth.updateSessionPolicy).toHaveBeenCalledWith(30));
+  });
+
+  it("creates a named API key with selected permissions and displays its secret once", async () => {
+    vi.mocked(auth.getReauthenticationStatus).mockResolvedValue({ reauthenticated: true, remainingSeconds: 500 });
+    vi.mocked(auth.createIntegrationCredential).mockResolvedValue({
+      credential: {
+        id: "credential-1",
+        name: "Living room sender",
+        tokenHint: "shk_abcd…123456",
+        scopes: ["ingest", "downloads:read"],
+        createdAt: 1_720_000_000,
+        expiresAt: 1_727_776_000,
+        revokedAt: null,
+        lastUsedAt: null,
+      },
+      token: "shk_complete_show_once_secret",
+    });
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("API key name"), { target: { value: "Living room sender" } });
+    fireEvent.click(screen.getByLabelText("View download queue"));
+    fireEvent.change(screen.getByLabelText("API key expiration"), { target: { value: "90" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create API key" }));
+    await waitFor(() => expect(auth.createIntegrationCredential).toHaveBeenCalledWith(
+      "Living room sender",
+      ["ingest", "downloads:read"],
+      90,
+    ));
+    expect(await screen.findByText("shk_complete_show_once_secret")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "I saved the key" })).toBeTruthy();
+  });
+
+  it("edits and individually revokes an API key without rotating the others", async () => {
+    vi.mocked(auth.getReauthenticationStatus).mockResolvedValue({ reauthenticated: true, remainingSeconds: 500 });
+    const credential = {
+      id: "credential-1",
+      name: "Bedroom sender",
+      tokenHint: "shk_abcd…123456",
+      scopes: ["ingest" as const],
+      createdAt: 1_720_000_000,
+      expiresAt: null,
+      revokedAt: null,
+      lastUsedAt: null,
+    };
+    vi.mocked(auth.getIntegrationCredentials).mockResolvedValue([credential]);
+    vi.mocked(auth.updateIntegrationCredential).mockResolvedValue({ ...credential, name: "Bedroom automation", scopes: ["ingest", "downloads:cancel"] });
+    vi.mocked(auth.revokeIntegrationCredential).mockResolvedValue({ revoked: true });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Edit name for Bedroom sender"), { target: { value: "Bedroom automation" } });
+    fireEvent.click(screen.getByLabelText("Cancel downloads for Bedroom sender"));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(auth.updateIntegrationCredential).toHaveBeenCalledWith(
+      "credential-1",
+      "Bedroom automation",
+      ["ingest", "downloads:cancel"],
+    ));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm revoke" }));
+    await waitFor(() => expect(auth.revokeIntegrationCredential).toHaveBeenCalledWith("credential-1"));
   });
 
   it("opens complete event details and restores focus when closed", async () => {

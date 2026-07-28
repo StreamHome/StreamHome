@@ -90,6 +90,10 @@ async def init_db():
                     sync_conn.exec_driver_sql("ALTER TABLE authsession ADD COLUMN selected_profile_id TEXT")
                 if "selected_profile_pin_version" not in auth_session_columns:
                     sync_conn.exec_driver_sql("ALTER TABLE authsession ADD COLUMN selected_profile_pin_version INTEGER")
+            if "integrationcredential" in inspector.get_table_names():
+                integration_columns = [col["name"] for col in inspector.get_columns("integrationcredential")]
+                if "token_hint" not in integration_columns:
+                    sync_conn.exec_driver_sql("ALTER TABLE integrationcredential ADD COLUMN token_hint TEXT")
             if "downloadtask" in inspector.get_table_names():
                 columns = [col["name"] for col in inspector.get_columns("downloadtask")]
                 if "language" not in columns:
@@ -333,6 +337,7 @@ async def init_db():
                         token_hash=digest,
                     )
                 credential.token_hash = digest
+                credential.token_hint = f"{settings.API_BEARER_TOKEN[:8]}…{settings.API_BEARER_TOKEN[-6:]}"
                 credential.revoked_at = None
                 credential.scopes = ["ingest"]
                 db.add(credential)

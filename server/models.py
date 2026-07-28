@@ -460,6 +460,7 @@ class IntegrationCredential(SQLModel, table=True):
     id: str = Field(primary_key=True)
     name: str
     token_hash: str = Field(unique=True, index=True)
+    token_hint: Optional[str] = Field(default=None)
     scopes_str: str = Field(default='["ingest"]')
     created_at: float = Field(default_factory=time.time, index=True)
     expires_at: Optional[float] = Field(default=None, index=True)

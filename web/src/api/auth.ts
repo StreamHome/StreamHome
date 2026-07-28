@@ -15,6 +15,10 @@ import type {
   AccountEmailUpdateResponse,
   AccountSecurityUpdateResponse,
   SessionPolicyUpdateResponse,
+  IntegrationCredentialCreateResponse,
+  IntegrationCredentialInfo,
+  IntegrationScope,
+  IntegrationScopeDefinition,
 } from "../types/api";
 
 type RawAuthResponse = {
@@ -79,6 +83,14 @@ export const revokeAuthSession = (id: string) => apiDelete<{ revoked: boolean; c
 export const revokeOtherSessions = () => apiPost<{ revokedCount: number }>("/api/auth/sessions/revoke-others");
 export const getSecurityEvents = (before?: number) => apiGet<SecurityEventsResponse>(`/api/auth/security/events${before ? `?before=${before}` : ""}`);
 export const regenerateRecoveryCodes = () => apiPost<{ recoveryCodes: string[]; remaining: number }>("/api/auth/recovery-codes/regenerate");
+export const getIntegrationCredentials = () => apiGet<IntegrationCredentialInfo[]>("/api/auth/integrations");
+export const getIntegrationScopes = () => apiGet<IntegrationScopeDefinition[]>("/api/auth/integrations/scopes");
+export const createIntegrationCredential = (name: string, scopes: IntegrationScope[], expiresInDays: number | null) =>
+  apiPost<IntegrationCredentialCreateResponse>("/api/auth/integrations", { name, scopes, expires_in_days: expiresInDays });
+export const updateIntegrationCredential = (id: string, name: string, scopes: IntegrationScope[]) =>
+  apiPut<IntegrationCredentialInfo>(`/api/auth/integrations/${encodeURIComponent(id)}`, { name, scopes });
+export const revokeIntegrationCredential = (id: string) =>
+  apiDelete<{ revoked: boolean }>(`/api/auth/integrations/${encodeURIComponent(id)}`);
 
 export async function get2FAStatus(): Promise<TwoFAStatusResponse> {
   const raw = await apiGet<{ two_factor_enabled?: boolean; twoFactorEnabled?: boolean; email: string }>("/api/auth/2fa/status");

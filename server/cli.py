@@ -16,6 +16,8 @@ import shutil
 import pyotp
 import httpx
 import re
+import time
+import uuid
 from typing import Optional
 from sqlmodel import SQLModel, select
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -35,7 +37,12 @@ from config import settings, config_dir
 from models import User, DownloadTask, Movie, Episode, IntegrationCredential
 from db import init_db
 from services.secret_crypto import protect_secret
-from services.integration_auth import integration_token_hash
+from services.integration_auth import (
+    INTEGRATION_SCOPE_DEFINITIONS,
+    MAX_ACTIVE_INTEGRATION_CREDENTIALS,
+    integration_token_hash,
+    validate_integration_scopes,
+)
 
 console = Console()
 
@@ -386,19 +393,20 @@ async def configure_settings():
                     console.print("   [dim]Press Enter to continue...[/dim]", end="")
                     get_text_input("", default_val="")
             
-        # ─── CASE 2: INTERACTIVE INGEST API KEY PANEL (FULLY DETACHED AS REQUESTED) ───
+        # ─── CASE 2: ADMIN API KEY MANAGER ───
         elif choice == 1:
             key_options = [
-                "✨ Generate Secure 32-Char API Key",
-                "📋 View Current Active API Key",
-                "🗑️  Revoke / Delete API Key",
+                "✨ Create API Key",
+                "📋 View API Keys",
+                "✏️  Edit API Key",
+                "🗑️  Revoke API Key",
                 "↩️  Back to Config Menu"
             ]
-            key_icons = ["⚡", "🔍", "🔥", "↩️"]
+            key_icons = ["⚡", "🔍", "✏️", "🔥", "↩️"]
             
             while True:
                 key_choice = arrow_menu(key_options, key_icons, is_sub_menu=True)
-                if key_choice == -1 or key_choice == 3:
+                if key_choice == -1 or key_choice == 4:
                     break
                     
                 clear_screen()
@@ -406,58 +414,147 @@ async def configure_settings():
                 
                 # Sub-Case 1: Generate Key
                 if key_choice == 0:
-                    console.print(Panel("[bold white]⚡ AUTONOMOUS API KEY GENERATION[/bold white]", border_style="bright_yellow", width=68))
-                    console.print("\n[dim]   Generating a new cryptographically secure 32-character API key...[/dim]\n")
-                    new_key = secrets.token_urlsafe(36)
-                    
+                    console.print(Panel("[bold white]⚡ CREATE API KEY[/bold white]", border_style="bright_yellow", width=68))
+                    name = prompt_input("API key name", "MediaSender")
+                    if name == "ESC" or not name.strip():
+                        continue
+                    console.print("\n   [dim]Available permissions:[/dim]")
+                    for scope, details in INTEGRATION_SCOPE_DEFINITIONS.items():
+                        console.print(f"   [cyan]{scope}[/cyan] - {details['label']}: {details['description']}")
+                    scope_input = prompt_input("Comma-separated permissions", "ingest")
+                    if scope_input == "ESC":
+                        continue
+                    try:
+                        selected_scopes = validate_integration_scopes(scope_input.split(","))
+                    except Exception as exc:
+                        detail = getattr(exc, "detail", None)
+                        message = detail.get("message") if isinstance(detail, dict) else str(exc)
+                        console.print(f"\n   [bold bright_red][✗][/bold bright_red] [white]{message}[/white]")
+                        console.print("\n   [dim]Press Enter to return to Key Manager...[/dim]", end="")
+                        get_text_input("", default_val="")
+                        continue
+                    expiration_input = prompt_input("Expiration in days (blank for never)", "")
+                    if expiration_input == "ESC":
+                        continue
+                    expires_at = None
+                    if expiration_input.strip():
+                        try:
+                            expiration_days = int(expiration_input)
+                            if expiration_days < 1 or expiration_days > 3650:
+                                raise ValueError
+                            expires_at = time.time() + expiration_days * 86400
+                        except ValueError:
+                            console.print("\n   [bold bright_red][✗][/bold bright_red] [white]Expiration must be between 1 and 3650 days.[/white]")
+                            console.print("\n   [dim]Press Enter to return to Key Manager...[/dim]", end="")
+                            get_text_input("", default_val="")
+                            continue
+                    new_key = f"shk_{secrets.token_urlsafe(36)}"
                     engine = create_async_engine(settings.DATABASE_URL)
-                    async with AsyncSession(engine) as session:
-                        existing = (await session.execute(select(IntegrationCredential))).scalars().all()
-                        for credential in existing:
-                            if "ingest" in credential.scopes and not credential.revoked_at:
-                                credential.revoked_at = __import__("time").time()
-                                session.add(credential)
-                        credential = IntegrationCredential(
-                            id=__import__("uuid").uuid4().hex,
-                            name="CLI MediaSender",
-                            token_hash=integration_token_hash(new_key),
-                        )
-                        credential.scopes = ["ingest"]
-                        session.add(credential)
-                        await session.commit()
-                    console.print(f"   [bold bright_green][✓][/bold bright_green] [white]New scoped ingestion key generated (shown once):[/white]")
+                    try:
+                        async with AsyncSession(engine) as session:
+                            timestamp = time.time()
+                            existing = (await session.exec(
+                                select(IntegrationCredential).where(IntegrationCredential.revoked_at == None)
+                            )).all()
+                            active_count = sum(
+                                1 for item in existing
+                                if item.expires_at is None or item.expires_at > timestamp
+                            )
+                            if active_count >= MAX_ACTIVE_INTEGRATION_CREDENTIALS:
+                                console.print(f"\n   [bold bright_red][✗][/bold bright_red] [white]The active API key limit is {MAX_ACTIVE_INTEGRATION_CREDENTIALS}. Revoke a key first.[/white]")
+                                continue
+                            credential = IntegrationCredential(
+                                id=str(uuid.uuid4()),
+                                name=" ".join(name.strip().split())[:80],
+                                token_hash=integration_token_hash(new_key),
+                                token_hint=f"{new_key[:8]}…{new_key[-6:]}",
+                                expires_at=expires_at,
+                            )
+                            credential.scopes = selected_scopes
+                            session.add(credential)
+                            await session.commit()
+                    finally:
+                        await engine.dispose()
+                    console.print(f"   [bold bright_green][✓][/bold bright_green] [white]New API key generated (shown once):[/white]")
                     console.print(f"   👉 [bold bright_yellow]{new_key}[/bold bright_yellow]\n")
                     console.print("   [bold red]⚠️  IMPORTANT: COPY THIS KEY NOW. IT CANNOT BE VIEWED AGAIN.[/bold red]")
                 
                 # Sub-Case 2: View Key
                 elif key_choice == 1:
-                    console.print(Panel("[bold white]🔍 VIEW ACTIVE INGESTION API KEY[/bold white]", border_style="bright_yellow", width=68))
+                    console.print(Panel("[bold white]🔍 VIEW API KEYS[/bold white]", border_style="bright_yellow", width=68))
                     engine = create_async_engine(settings.DATABASE_URL)
-                    async with AsyncSession(engine) as session:
-                        credentials = (await session.execute(select(IntegrationCredential))).scalars().all()
-                        active = [item for item in credentials if "ingest" in item.scopes and not item.revoked_at]
-                    if active:
-                        console.print(f"\n   [bold bright_green]{len(active)} active scoped ingestion credential(s).[/bold bright_green]")
-                        for credential in active:
-                            console.print(f"   • {credential.name} ({credential.id})")
+                    try:
+                        async with AsyncSession(engine) as session:
+                            credentials = (await session.exec(
+                                select(IntegrationCredential).order_by(IntegrationCredential.created_at.desc())
+                            )).all()
+                    finally:
+                        await engine.dispose()
+                    if credentials:
+                        for credential in credentials:
+                            key_state = "revoked" if credential.revoked_at else (
+                                "expired" if credential.expires_at and credential.expires_at <= time.time() else "active"
+                            )
+                            console.print(f"\n   [bold white]{credential.name}[/bold white] [dim]({credential.id})[/dim]")
+                            console.print(f"   Status: [cyan]{key_state}[/cyan]  Key: [yellow]{credential.token_hint or 'legacy key'}[/yellow]")
+                            console.print(f"   Permissions: {', '.join(credential.scopes)}")
                         console.print("   [dim]Raw keys are intentionally show-once and cannot be recovered.[/dim]\n")
                     else:
-                        console.print("\n   [bold bright_red][✗][/bold bright_red] [white]No active ingestion credential exists.[/white]\n")
+                        console.print("\n   [bold bright_red][✗][/bold bright_red] [white]No API keys exist.[/white]\n")
                         
-                # Sub-Case 3: Delete Key
+                # Sub-Case 3: Edit Key
                 elif key_choice == 2:
-                    console.print(Panel("[bold white]🔥 REVOKE INGEST API KEY CONTROL[/bold white]", border_style="bright_red", width=68))
-                    confirm = prompt_input("Are you absolutely sure you want to completely clear the active API key? (y/N)", "N")
+                    console.print(Panel("[bold white]✏️ EDIT API KEY[/bold white]", border_style="bright_yellow", width=68))
+                    credential_id = prompt_input("API key ID", "")
+                    if credential_id == "ESC" or not credential_id.strip():
+                        continue
+                    engine = create_async_engine(settings.DATABASE_URL)
+                    try:
+                        async with AsyncSession(engine) as session:
+                            credential = await session.get(IntegrationCredential, credential_id.strip())
+                            if not credential or credential.revoked_at:
+                                console.print("\n   [bold bright_red][✗][/bold bright_red] [white]An active API key with that ID was not found.[/white]")
+                            else:
+                                name = prompt_input("API key name", credential.name)
+                                if name != "ESC" and name.strip():
+                                    scope_input = prompt_input("Comma-separated permissions", ",".join(credential.scopes))
+                                    if scope_input != "ESC":
+                                        try:
+                                            credential.name = " ".join(name.strip().split())[:80]
+                                            credential.scopes = validate_integration_scopes(scope_input.split(","))
+                                            session.add(credential)
+                                            await session.commit()
+                                            console.print("\n   [bold bright_green][✓][/bold bright_green] [white]API key updated.[/white]")
+                                        except Exception as exc:
+                                            detail = getattr(exc, "detail", None)
+                                            message = detail.get("message") if isinstance(detail, dict) else str(exc)
+                                            console.print(f"\n   [bold bright_red][✗][/bold bright_red] [white]{message}[/white]")
+                    finally:
+                        await engine.dispose()
+
+                # Sub-Case 4: Revoke Key
+                elif key_choice == 3:
+                    console.print(Panel("[bold white]🔥 REVOKE API KEY[/bold white]", border_style="bright_red", width=68))
+                    credential_id = prompt_input("API key ID", "")
+                    if credential_id == "ESC" or not credential_id.strip():
+                        continue
+                    confirm = prompt_input("Revoke only this API key? (y/N)", "N")
                     if confirm.lower() == "y" and confirm != "ESC":
                         engine = create_async_engine(settings.DATABASE_URL)
-                        async with AsyncSession(engine) as session:
-                            existing = (await session.execute(select(IntegrationCredential))).scalars().all()
-                            for credential in existing:
-                                if "ingest" in credential.scopes and not credential.revoked_at:
-                                    credential.revoked_at = __import__("time").time()
+                        try:
+                            async with AsyncSession(engine) as session:
+                                credential = await session.get(IntegrationCredential, credential_id.strip())
+                                if not credential:
+                                    console.print("\n   [bold bright_red][✗][/bold bright_red] [white]API key not found.[/white]")
+                                elif credential.revoked_at:
+                                    console.print("\n   [bold bright_yellow][!][/bold bright_yellow] [white]That API key is already revoked.[/white]")
+                                else:
+                                    credential.revoked_at = time.time()
                                     session.add(credential)
-                            await session.commit()
-                        console.print("\n   [bold bright_green][✓][/bold bright_green] [white]API key successfully deleted. Ingestion pipeline locked.[/white]")
+                                    await session.commit()
+                                    console.print("\n   [bold bright_green][✓][/bold bright_green] [white]API key revoked. Other keys remain active.[/white]")
+                        finally:
+                            await engine.dispose()
                     else:
                         console.print("\n   [bold bright_yellow][!][/bold bright_yellow] [dim]Revocation cancelled.[/dim]")
                 

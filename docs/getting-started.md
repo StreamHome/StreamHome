@@ -119,6 +119,8 @@ During setup, StreamHome creates or requests an ingestion credential for compati
 
 This credential should only be used for media-ingestion operations.
 
+After setup, additional named keys can be created under **Admin → Account and Security → API keys**. Assign only the permissions each client needs; creating or revoking one key does not affect the others.
+
 Keep it private and do not:
 
 * publish it in screenshots;

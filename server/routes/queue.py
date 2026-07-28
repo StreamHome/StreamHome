@@ -5,28 +5,73 @@ import asyncio
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, Security, status, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import StreamingResponse
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from db import engine
-from models import AuthSession, DownloadTask, DownloadAddRequest, Movie, Episode, IntegrationCredential
+from config import settings
+from db import engine, get_session
+from models import DownloadTask, DownloadAddRequest, Movie, Episode, IntegrationCredential
 from services.queue import queue_manager
 from services.state import ACTIVE_DOWNLOAD_METRICS
 from services.tmdb import tmdb_client
 from services.vibe_analysis import compute_trope_vectors
 
 from services.logger import logger
-from routes.auth import get_current_user, require_recent_reauth
+from routes.auth import resolve_auth
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
-from services.integration_auth import require_integration_scope
+from services.integration_auth import (
+    authenticate_integration_token,
+    integration_token_hash,
+    require_integration_scope,
+)
 from services.request_security import address_is_loopback, client_ip
 
 router = APIRouter()
+queue_security = HTTPBearer(auto_error=False)
 
 def is_local_playable_url(url: Optional[str]) -> bool:
     return bool(url and url.startswith("/media/"))
+
+
+def require_browser_or_integration_scope(scope: str, *, recent_reauthentication: bool = False):
+    async def dependency(
+        request: Request,
+        credentials: HTTPAuthorizationCredentials | None = Security(queue_security),
+        db: AsyncSession = Depends(get_session),
+    ):
+        if credentials and credentials.credentials:
+            digest = integration_token_hash(credentials.credentials)
+            result = await db.exec(
+                select(IntegrationCredential).where(IntegrationCredential.token_hash == digest)
+            )
+            integration = result.first()
+            if integration or credentials.credentials.startswith("shk_"):
+                return await authenticate_integration_token(
+                    credentials.credentials,
+                    scope,
+                    request,
+                    db,
+                )
+
+        _user, auth_session = await resolve_auth(request, credentials, db)
+        if recent_reauthentication and (
+            not auth_session.reauthenticated_at
+            or time.time() - auth_session.reauthenticated_at > settings.REAUTHENTICATION_MINUTES * 60
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "reauthentication_required",
+                    "message": "Confirm your password and authenticator code to continue.",
+                },
+            )
+        return auth_session
+
+    return dependency
+
 
 # ----------------- Ingestion Endpoint -----------------
 
@@ -299,9 +344,53 @@ async def download_progress_generator():
             logger.error(f"[SSE generator] Error assembling stream data: {e}")
             await asyncio.sleep(2.0)
 
+
+async def current_download_snapshot() -> list[dict[str, Any]]:
+    async with AsyncSession(engine) as db:
+        result = await db.exec(select(DownloadTask).order_by(DownloadTask.created_at.desc()))
+        tasks = result.all()
+
+    snapshot: list[dict[str, Any]] = []
+    for task in tasks:
+        metrics = ACTIVE_DOWNLOAD_METRICS.get(
+            task.id,
+            {"progress": 0.0, "speed": "0 KB/s", "eta": "00:00:00"},
+        )
+        status_text = task.status
+        if status_text == "DOWNLOADING":
+            status_text = "Downloading"
+        elif status_text == "MERGING":
+            status_text = "Compressing with FFmpeg (H.265)"
+        elif status_text == "COMPLETED":
+            status_text = "Completed"
+        elif status_text == "FAILED":
+            status_text = "Failed"
+
+        snapshot.append({
+            "id": task.id,
+            "title": task.title or f"TMDB {task.tmdb_id}",
+            "status": status_text,
+            "progress": 100.0 if task.status == "COMPLETED" else (0.0 if task.status == "FAILED" else metrics["progress"]),
+            "speed": "Finished" if task.status == "COMPLETED" else ("Failed" if task.status == "FAILED" else metrics["speed"]),
+            "eta": "00:00:00" if task.status in ("COMPLETED", "FAILED") else metrics["eta"],
+        })
+    return snapshot
+
+
+@router.get("/api/downloads")
+async def get_downloads(
+    access=Depends(require_browser_or_integration_scope("downloads:read")),
+):
+    del access
+    return await current_download_snapshot()
+
+
 @router.get("/api/downloads/stream")
-async def get_downloads_stream(user = Depends(get_current_user)):
+async def get_downloads_stream(
+    access=Depends(require_browser_or_integration_scope("downloads:read")),
+):
     """SSE streaming channel tracking download state queues in real time."""
+    del access
     return StreamingResponse(
         download_progress_generator(),
         media_type="text/event-stream",
@@ -315,9 +404,17 @@ async def get_downloads_stream(user = Depends(get_current_user)):
 # ----------------- Task Deletion and Process Termination -----------------
 
 @router.delete("/api/downloads/{task_id}")
-async def delete_download(task_id: str, session: AuthSession = Depends(require_recent_reauth)):
+async def delete_download(
+    task_id: str,
+    access=Depends(
+        require_browser_or_integration_scope(
+            "downloads:cancel",
+            recent_reauthentication=True,
+        )
+    ),
+):
     """Cancels the worker and child process before deleting its database record."""
-    del session
+    del access
     async with AsyncSession(engine) as db:
         task = await db.get(DownloadTask, task_id)
         if not task:

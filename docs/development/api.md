@@ -12,6 +12,22 @@ Important route families:
 - `/api/system/*`: authenticated administration;
 - `/media/*`: range-capable physical media delivery.
 
+API-key management is available only to an authenticated administrator with recent reauthentication:
+
+- `GET /api/auth/integrations`: list keys without revealing their secrets;
+- `GET /api/auth/integrations/scopes`: list assignable permissions;
+- `POST /api/auth/integrations`: create a named key and return its secret once;
+- `PUT /api/auth/integrations/{credential_id}`: update its name and permissions;
+- `DELETE /api/auth/integrations/{credential_id}`: revoke one key.
+
+Supported machine permissions are:
+
+- `ingest`: submit media through `POST /api/add-movie`;
+- `downloads:read`: read `GET /api/downloads` or its `/stream` SSE variant;
+- `downloads:cancel`: cancel and remove a task through `DELETE /api/downloads/{task_id}`.
+
+API keys never authorize account security, backups, server settings, profile PIN operations, or playback.
+
 Use the generated FastAPI OpenAPI document from a development server for the exact schema. Security-sensitive mutations must use the existing authentication, same-origin, rate-limit, and recent-reauthentication dependencies.
 
 TOTP setup begins with a server-owned enrollment. The client receives an opaque enrollment identifier, a one-time manual key, and a same-origin SVG QR URL. Verification sends the enrollment identifier and current six-digit code; it never posts the TOTP secret back to the server. Setup enrollments are bound to the setup-session hash, while administrator enrollments are bound to both the user and current authenticated session.

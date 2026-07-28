@@ -35,6 +35,22 @@ export interface SessionPolicyUpdateResponse { message: string; sessionLifetimeD
 export interface AuthSessionInfo { id: string; createdAt: number; lastSeenAt: number; expiresAt: number; ipAddress: string; deviceLabel: string; current: boolean }
 export interface SecurityEventInfo { id: string; type: string; outcome: string; createdAt: number; ipAddress: string; deviceLabel: string; details?: Record<string, unknown> | null }
 export interface SecurityEventsResponse { events: SecurityEventInfo[]; nextCursor: number | null }
+export type IntegrationScope = "ingest" | "downloads:read" | "downloads:cancel";
+export interface IntegrationScopeDefinition { id: IntegrationScope; label: string; description: string }
+export interface IntegrationCredentialInfo {
+  id: string;
+  name: string;
+  tokenHint: string | null;
+  scopes: IntegrationScope[];
+  createdAt: number;
+  expiresAt: number | null;
+  revokedAt: number | null;
+  lastUsedAt: number | null;
+}
+export interface IntegrationCredentialCreateResponse {
+  credential: IntegrationCredentialInfo;
+  token: string;
+}
 
 export interface TwoFAStatusResponse {
   twoFactorEnabled: boolean;

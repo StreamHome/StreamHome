@@ -13,7 +13,7 @@ import pyotp
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, text, update
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -28,7 +28,12 @@ from services.rate_limit import clear as clear_rate_limit
 from services.rate_limit import enforce as enforce_rate_limit
 from services.rate_limit import fail as fail_rate_limit
 import services.state as service_state
-from services.integration_auth import integration_token_hash
+from services.integration_auth import (
+    INTEGRATION_SCOPE_DEFINITIONS,
+    MAX_ACTIVE_INTEGRATION_CREDENTIALS,
+    integration_token_hash,
+    validate_integration_scopes,
+)
 from services.totp_enrollment import (
     create_totp_enrollment,
     qr_response_headers,
@@ -86,8 +91,15 @@ class SessionPolicyRequest(BaseModel):
     session_lifetime_days: int
 
 
-class IntegrationCredentialRequest(BaseModel):
-    name: str = "MediaSender"
+class IntegrationCredentialCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    scopes: list[str] = Field(default_factory=lambda: ["ingest"], min_length=1, max_length=3)
+    expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)
+
+
+class IntegrationCredentialUpdateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    scopes: list[str] = Field(min_length=1, max_length=3)
 
 
 def now() -> float:
@@ -562,41 +574,162 @@ async def list_sessions(user: User = Depends(get_current_user), current: AuthSes
 @router.get("/integrations")
 async def list_integrations(user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
     del user, session
-    result = await db.execute(select(IntegrationCredential).order_by(IntegrationCredential.created_at.desc()))
+    result = await db.exec(select(IntegrationCredential).order_by(IntegrationCredential.created_at.desc()))
     return [{
         "id": item.id,
         "name": item.name,
+        "tokenHint": item.token_hint,
         "scopes": item.scopes,
         "createdAt": item.created_at,
         "expiresAt": item.expires_at,
         "revokedAt": item.revoked_at,
         "lastUsedAt": item.last_used_at,
-    } for item in result.scalars().all()]
+    } for item in result.all()]
 
 
-@router.post("/integrations/rotate")
-async def rotate_ingestion_credential(req: IntegrationCredentialRequest, request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
-    name = req.name.strip()[:80]
+@router.get("/integrations/scopes")
+async def list_integration_scopes(user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth)):
+    del user, session
+    return [
+        {"id": scope, "label": details["label"], "description": details["description"]}
+        for scope, details in INTEGRATION_SCOPE_DEFINITIONS.items()
+    ]
+
+
+def normalize_integration_name(value: str) -> str:
+    name = " ".join(value.strip().split())
     if not name:
         raise HTTPException(status_code=422, detail={"code": "invalid_integration_name", "message": "Enter a name for the integration credential."})
+    if any(ord(character) < 32 or ord(character) == 127 for character in name):
+        raise HTTPException(status_code=422, detail={"code": "invalid_integration_name", "message": "API key names cannot contain control characters."})
+    return name[:80]
+
+
+async def create_integration_credential_record(
+    req: IntegrationCredentialCreateRequest,
+    request: Request,
+    user: User,
+    session: AuthSession,
+    db: AsyncSession,
+) -> dict:
+    name = normalize_integration_name(req.name)
+    scopes = validate_integration_scopes(req.scopes)
     timestamp = now()
-    existing = (await db.execute(select(IntegrationCredential).where(IntegrationCredential.revoked_at == None))).scalars().all()
-    for item in existing:
-        if "ingest" in item.scopes:
-            item.revoked_at = timestamp
-            db.add(item)
-    raw_token = secrets.token_urlsafe(36)
+    credentials = (await db.exec(select(IntegrationCredential).where(IntegrationCredential.revoked_at == None))).all()
+    active_count = sum(
+        1
+        for item in credentials
+        if item.expires_at is None or item.expires_at > timestamp
+    )
+    if active_count >= MAX_ACTIVE_INTEGRATION_CREDENTIALS:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "integration_credential_limit",
+                "message": f"Revoke an API key before creating another. The active-key limit is {MAX_ACTIVE_INTEGRATION_CREDENTIALS}.",
+            },
+        )
+    raw_token = f"shk_{secrets.token_urlsafe(36)}"
+    expires_at = timestamp + (req.expires_in_days * 86400) if req.expires_in_days is not None else None
     credential = IntegrationCredential(
         id=str(uuid.uuid4()),
         name=name,
         token_hash=integration_token_hash(raw_token),
+        token_hint=f"{raw_token[:8]}…{raw_token[-6:]}",
         created_at=timestamp,
+        expires_at=expires_at,
     )
-    credential.scopes = ["ingest"]
+    credential.scopes = scopes
     db.add(credential)
-    await add_event(db, request, "integration_credential_rotated", "success", user.id, session.id, {"credentialId": credential.id, "name": name})
+    await add_event(
+        db,
+        request,
+        "integration_credential_created",
+        "success",
+        user.id,
+        session.id,
+        {"credentialId": credential.id, "name": name, "scopes": scopes, "expiresAt": expires_at},
+    )
     await db.commit()
-    return {"credential": {"id": credential.id, "name": credential.name, "scopes": credential.scopes, "createdAt": credential.created_at}, "token": raw_token}
+    return {
+        "credential": {
+            "id": credential.id,
+            "name": credential.name,
+            "tokenHint": credential.token_hint,
+            "scopes": credential.scopes,
+            "createdAt": credential.created_at,
+            "expiresAt": credential.expires_at,
+            "revokedAt": credential.revoked_at,
+            "lastUsedAt": credential.last_used_at,
+        },
+        "token": raw_token,
+    }
+
+
+@router.post("/integrations", status_code=status.HTTP_201_CREATED)
+async def create_integration_credential(
+    req: IntegrationCredentialCreateRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    session: AuthSession = Depends(require_recent_reauth),
+    db: AsyncSession = Depends(get_session),
+):
+    return await create_integration_credential_record(req, request, user, session, db)
+
+
+@router.post("/integrations/rotate", status_code=status.HTTP_201_CREATED, deprecated=True)
+async def create_integration_credential_legacy(
+    req: IntegrationCredentialCreateRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    session: AuthSession = Depends(require_recent_reauth),
+    db: AsyncSession = Depends(get_session),
+):
+    return await create_integration_credential_record(req, request, user, session, db)
+
+
+@router.put("/integrations/{credential_id}")
+async def update_integration_credential(
+    credential_id: str,
+    req: IntegrationCredentialUpdateRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    session: AuthSession = Depends(require_recent_reauth),
+    db: AsyncSession = Depends(get_session),
+):
+    credential = await db.get(IntegrationCredential, credential_id)
+    if not credential:
+        raise HTTPException(status_code=404, detail="Integration credential not found")
+    if credential.revoked_at:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "integration_credential_revoked", "message": "Revoked API keys cannot be edited."},
+        )
+    name = normalize_integration_name(req.name)
+    scopes = validate_integration_scopes(req.scopes)
+    credential.name = name
+    credential.scopes = scopes
+    db.add(credential)
+    await add_event(
+        db,
+        request,
+        "integration_credential_updated",
+        "success",
+        user.id,
+        session.id,
+        {"credentialId": credential.id, "name": name, "scopes": scopes},
+    )
+    await db.commit()
+    return {
+        "id": credential.id,
+        "name": credential.name,
+        "tokenHint": credential.token_hint,
+        "scopes": credential.scopes,
+        "createdAt": credential.created_at,
+        "expiresAt": credential.expires_at,
+        "revokedAt": credential.revoked_at,
+        "lastUsedAt": credential.last_used_at,
+    }
 
 
 @router.delete("/integrations/{credential_id}")

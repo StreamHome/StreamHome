@@ -46,14 +46,14 @@ Header format:
 Authorization: Bearer <API_BEARER_TOKEN>
 ```
 
-The ingestion token is generated during StreamHome's initial setup.
+The first ingestion key is generated during StreamHome's initial setup. To create additional keys, open **Admin → Account and Security → API keys**, enter a descriptive name, and select **Add media**. Keys are independent: creating a new one does not revoke existing keys.
 
-It may also be displayed or regenerated from the appropriate administrator settings when supported by the installed release.
+The complete key is shown only once. StreamHome stores a secure hash plus a non-secret hint, so a lost key must be replaced. Each key can be renamed, assigned different permissions, given an optional expiration, or revoked individually from the same page.
 
 > [!WARNING]
 > Treat the ingestion token like a password.
 >
-> Anyone possessing a valid token may be able to submit media-processing tasks to the server.
+> Anyone possessing a valid key with the **Add media** permission can submit media-processing tasks to the server.
 
 Never:
 

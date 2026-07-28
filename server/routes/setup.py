@@ -916,7 +916,7 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
             remote_result = await rclone_service.run("lsjson", remote_path, "--dirs-only", "--max-depth", "1", timeout=30)
             if not remote_result.ok:
                 raise HTTPException(status_code=422, detail={"code": remote_result.error_code or "drive_test_failed", "message": "The activated Google Drive remote could not be reached."})
-        ingestion_token = secrets.token_urlsafe(36)
+        ingestion_token = f"shk_{secrets.token_urlsafe(36)}"
         server_updates = {
             "TMDB_READ_ACCESS_TOKEN": payload.tmdb_token.strip(),
             "STORAGE_ENGINE": storage,
@@ -958,6 +958,7 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
                 id=str(uuid.uuid4()),
                 name="MediaSender",
                 token_hash=integration_token_hash(ingestion_token),
+                token_hint=f"{ingestion_token[:8]}…{ingestion_token[-6:]}",
             )
             ingestion_credential.scopes = ["ingest"]
             db.add(ingestion_credential)
