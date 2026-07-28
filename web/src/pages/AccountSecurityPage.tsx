@@ -3,22 +3,17 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   beginReauthentication,
   cancelSetup2FA,
-  createIntegrationCredential,
   disable2FA,
   getAuthSessions,
-  getIntegrationCredentials,
-  getIntegrationScopes,
   getReauthenticationStatus,
   getSecurityEvents,
   getSecuritySummary,
   regenerateRecoveryCodes,
   revokeAuthSession,
-  revokeIntegrationCredential,
   revokeOtherSessions,
   setup2FA,
   updateAccountEmail,
   updateAccountPassword,
-  updateIntegrationCredential,
   updateSessionPolicy,
   verifyReauthentication,
   verifySetup2FA,
@@ -27,9 +22,6 @@ import { MOTION_EASE, MOTION_TIMINGS, useAppMotion } from "../motion/motionSyste
 import { useAuthStore } from "../stores/authStore";
 import type {
   AuthSessionInfo,
-  IntegrationCredentialInfo,
-  IntegrationScope,
-  IntegrationScopeDefinition,
   SecurityEventInfo,
   SecuritySummary,
   TwoFASetupResponse,
@@ -116,18 +108,6 @@ export function AccountSecurityPage() {
   const [factorMethod, setFactorMethod] = useState<"totp" | "recovery">("totp");
   const [summary, setSummary] = useState<SecuritySummary | null>(null);
   const [sessions, setSessions] = useState<AuthSessionInfo[]>([]);
-  const [integrationCredentials, setIntegrationCredentials] = useState<IntegrationCredentialInfo[]>([]);
-  const [integrationScopes, setIntegrationScopes] = useState<IntegrationScopeDefinition[]>([]);
-  const [integrationName, setIntegrationName] = useState("");
-  const [selectedIntegrationScopes, setSelectedIntegrationScopes] = useState<IntegrationScope[]>(["ingest"]);
-  const [integrationExpiration, setIntegrationExpiration] = useState("never");
-  const [generatedIntegrationToken, setGeneratedIntegrationToken] = useState("");
-  const [generatedIntegrationName, setGeneratedIntegrationName] = useState("");
-  const [integrationCopyStatus, setIntegrationCopyStatus] = useState<"" | "copied" | "failed">("");
-  const [editingIntegrationId, setEditingIntegrationId] = useState<string | null>(null);
-  const [editingIntegrationName, setEditingIntegrationName] = useState("");
-  const [editingIntegrationScopes, setEditingIntegrationScopes] = useState<IntegrationScope[]>([]);
-  const [confirmRevokeIntegrationId, setConfirmRevokeIntegrationId] = useState<string | null>(null);
   const [events, setEvents] = useState<SecurityEventInfo[]>([]);
   const [nextCursor, setNextCursor] = useState<number | null>(null);
   const [setup, setSetup] = useState<TwoFASetupResponse | null>(null);
@@ -151,15 +131,12 @@ export function AccountSecurityPage() {
   const load = useCallback(async () => {
     setBusy(true); setError("");
     try {
-      const [nextSummary, nextSessions, nextEvents, nextCredentials, nextScopes] = await Promise.all([
+      const [nextSummary, nextSessions, nextEvents] = await Promise.all([
         getSecuritySummary(),
         getAuthSessions(),
         getSecurityEvents(),
-        getIntegrationCredentials(),
-        getIntegrationScopes(),
       ]);
       setSummary(nextSummary); setSessions(nextSessions); setEvents(nextEvents.events); setNextCursor(nextEvents.nextCursor);
-      setIntegrationCredentials(nextCredentials); setIntegrationScopes(nextScopes);
       setEmail(nextSummary.email); setSessionLifetimeDays(nextSummary.sessionLifetimeDays);
     } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Security information could not be loaded."); }
     finally { setBusy(false); }
@@ -219,55 +196,6 @@ export function AccountSecurityPage() {
   const regenerate = async () => { setBusy(true); setError(""); try { const result = await regenerateRecoveryCodes(); setRecoveryCodes(result.recoveryCodes); setCodesSaved(false); setMessage("New recovery codes generated. Previous codes no longer work."); await load(); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Recovery codes could not be generated."); } finally { setBusy(false); } };
   const copyCodes = async () => { await navigator.clipboard.writeText(recoveryCodes.join("\n")); setMessage("Recovery codes copied."); };
   const downloadCodes = () => { const blob = new Blob([`StreamHome recovery codes\nGenerated ${new Date().toISOString()}\n\n${recoveryCodes.join("\n")}\n`], { type: "text/plain" }); const href = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = href; anchor.download = "streamhome-recovery-codes.txt"; anchor.click(); URL.revokeObjectURL(href); };
-  const toggleIntegrationScope = (scope: IntegrationScope, editing = false) => {
-    const selected = editing ? editingIntegrationScopes : selectedIntegrationScopes;
-    const update = editing ? setEditingIntegrationScopes : setSelectedIntegrationScopes;
-    update(selected.includes(scope) ? selected.filter((item) => item !== scope) : [...selected, scope]);
-  };
-  const createApiKey = async (event: React.FormEvent) => {
-    event.preventDefault(); setBusy(true); setError(""); setMessage(""); setIntegrationCopyStatus("");
-    try {
-      const expiresInDays = integrationExpiration === "never" ? null : Number(integrationExpiration);
-      const result = await createIntegrationCredential(integrationName, selectedIntegrationScopes, expiresInDays);
-      setGeneratedIntegrationToken(result.token); setGeneratedIntegrationName(result.credential.name);
-      setIntegrationName(""); setSelectedIntegrationScopes(["ingest"]); setIntegrationExpiration("never");
-      setMessage("API key created. Save the secret now; StreamHome will not display it again.");
-      await load();
-    } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "The API key could not be created."); }
-    finally { setBusy(false); }
-  };
-  const copyIntegrationToken = async () => {
-    try { await navigator.clipboard.writeText(generatedIntegrationToken); setIntegrationCopyStatus("copied"); }
-    catch { setIntegrationCopyStatus("failed"); }
-  };
-  const downloadIntegrationToken = () => {
-    const blob = new Blob([`StreamHome API key\nName: ${generatedIntegrationName}\nGenerated: ${new Date().toISOString()}\n\n${generatedIntegrationToken}\n`], { type: "text/plain" });
-    const href = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = href;
-    anchor.download = `streamhome-api-key-${generatedIntegrationName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "credential"}.txt`;
-    anchor.click(); URL.revokeObjectURL(href);
-  };
-  const beginIntegrationEdit = (credential: IntegrationCredentialInfo) => {
-    setEditingIntegrationId(credential.id); setEditingIntegrationName(credential.name);
-    setEditingIntegrationScopes([...credential.scopes]); setConfirmRevokeIntegrationId(null);
-  };
-  const saveIntegration = async (event: React.FormEvent) => {
-    event.preventDefault(); if (!editingIntegrationId) return;
-    setBusy(true); setError(""); setMessage("");
-    try {
-      await updateIntegrationCredential(editingIntegrationId, editingIntegrationName, editingIntegrationScopes);
-      setEditingIntegrationId(null); setMessage("API key settings updated."); await load();
-    } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "The API key could not be updated."); }
-    finally { setBusy(false); }
-  };
-  const revokeIntegration = async (credential: IntegrationCredentialInfo) => {
-    if (confirmRevokeIntegrationId !== credential.id) { setConfirmRevokeIntegrationId(credential.id); setEditingIntegrationId(null); return; }
-    setBusy(true); setError(""); setMessage("");
-    try {
-      await revokeIntegrationCredential(credential.id); setConfirmRevokeIntegrationId(null);
-      setMessage(`API key “${credential.name}” revoked. Other API keys remain active.`); await load();
-    } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "The API key could not be revoked."); }
-    finally { setBusy(false); }
-  };
   const revoke = async (session: AuthSessionInfo) => { setBusy(true); setError(""); try { const result = await revokeAuthSession(session.id); if (result.currentSession) { logout(); return; } await load(); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Session could not be revoked."); } finally { setBusy(false); } };
   const revokeOthers = async () => { setBusy(true); setError(""); try { const result = await revokeOtherSessions(); setMessage(`${result.revokedCount} other session${result.revokedCount === 1 ? "" : "s"} signed out.`); await load(); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Other sessions could not be revoked."); } finally { setBusy(false); } };
   const loadMore = async () => { if (!nextCursor) return; setBusy(true); try { const result = await getSecurityEvents(nextCursor); setEvents((current) => [...current, ...result.events]); setNextCursor(result.nextCursor); } finally { setBusy(false); } };
@@ -293,28 +221,6 @@ export function AccountSecurityPage() {
         {summary?.twoFactorEnabled && <div className="security-actions"><div><h4>Recovery codes</h4><p>Generate a fresh set if the previous copy is unavailable.</p><button onClick={() => void regenerate()} disabled={busy}>Regenerate codes</button></div><div><h4>Disable TOTP</h4><p>This also invalidates recovery codes and signs out other devices.</p><input aria-label="TOTP code to disable" inputMode="numeric" maxLength={6} value={disableCode} onChange={(event) => setDisableCode(event.target.value.replace(/\D/g, ""))} placeholder="Six-digit code" /><button className="security-danger" disabled={disableCode.length !== 6 || busy} onClick={() => void disable()}>Disable TOTP</button></div></div>}
       </section>
       {recoveryCodes.length > 0 && <section className="security-card security-recovery"><header><div><p className="security-eyebrow">Show once</p><h3>Save your recovery codes now</h3></div></header><p>Each code can replace your authenticator once. They cannot be displayed again.</p><div className="security-code-grid">{recoveryCodes.map((item) => <code key={item}>{item}</code>)}</div><div className="security-inline-actions"><button onClick={() => void copyCodes()}>Copy all</button><button onClick={downloadCodes}>Download .txt</button></div><label><input type="checkbox" checked={codesSaved} onChange={(event) => setCodesSaved(event.target.checked)} /> I saved these codes somewhere secure</label><button className="security-primary" disabled={!codesSaved} onClick={() => setRecoveryCodes([])}>Finish</button></section>}
-      <section className="security-card security-integrations">
-        <header><div><p className="security-eyebrow">Machine access</p><h3>API keys</h3></div><span>{integrationCredentials.filter((item) => !item.revokedAt && (!item.expiresAt || item.expiresAt > Date.now() / 1000)).length} active</span></header>
-        <p>Create separate, named API keys for applications such as MediaSender. Each key receives only the permissions selected here.</p>
-        <form className="security-integration-create" onSubmit={createApiKey}>
-          <label>Key name<input aria-label="API key name" maxLength={80} value={integrationName} onChange={(event) => setIntegrationName(event.target.value)} placeholder="Living room MediaSender" required /></label>
-          <label>Expiration<select aria-label="API key expiration" value={integrationExpiration} onChange={(event) => setIntegrationExpiration(event.target.value)}><option value="never">Never</option><option value="30">30 days</option><option value="90">90 days</option><option value="365">1 year</option></select></label>
-          <fieldset><legend>Permissions</legend><div className="security-scope-grid">{integrationScopes.map((scope) => <label key={scope.id}><input aria-label={scope.label} type="checkbox" checked={selectedIntegrationScopes.includes(scope.id)} onChange={() => toggleIntegrationScope(scope.id)} /><span><strong>{scope.label}</strong><small>{scope.description}</small></span></label>)}</div></fieldset>
-          <button className="security-primary" disabled={busy || Boolean(generatedIntegrationToken) || !integrationName.trim() || selectedIntegrationScopes.length === 0}>Create API key</button>
-        </form>
-        {generatedIntegrationToken && <section className="security-integration-secret" aria-labelledby="generated-api-key-title"><div><p className="security-eyebrow">Shown once</p><h4 id="generated-api-key-title">Save the API key for {generatedIntegrationName}</h4><p>StreamHome stores only a secure hash. This secret cannot be displayed again after you dismiss it.</p></div><code>{generatedIntegrationToken}</code><div className="security-inline-actions"><button type="button" onClick={() => void copyIntegrationToken()}>{integrationCopyStatus === "copied" ? "Copied" : "Copy key"}</button><button type="button" onClick={downloadIntegrationToken}>Download .txt</button><button type="button" className="security-primary" onClick={() => { setGeneratedIntegrationToken(""); setGeneratedIntegrationName(""); setIntegrationCopyStatus(""); }}>I saved the key</button></div>{integrationCopyStatus === "failed" && <small role="status">Clipboard access was blocked. Select the key above and copy it manually.</small>}</section>}
-        <div className="security-integration-list">
-          {integrationCredentials.map((credential) => {
-            const expired = Boolean(credential.expiresAt && credential.expiresAt <= Date.now() / 1000);
-            const state = credential.revokedAt ? "revoked" : expired ? "expired" : "active";
-            return <article key={credential.id} data-state={state}>
-              <div className="security-integration-summary"><div><strong>{credential.name}</strong><b>{state}</b></div><code>{credential.tokenHint || "Legacy key"}</code><span>Created {formatTime(credential.createdAt)} · Last used {formatTime(credential.lastUsedAt)}</span><span>{credential.expiresAt ? `Expires ${formatTime(credential.expiresAt)}` : "Does not expire"}</span><ul>{credential.scopes.map((scope) => <li key={scope}>{integrationScopes.find((item) => item.id === scope)?.label || scope}</li>)}</ul></div>
-              {editingIntegrationId === credential.id ? <form className="security-integration-edit" onSubmit={saveIntegration}><label>Key name<input aria-label={`Edit name for ${credential.name}`} maxLength={80} value={editingIntegrationName} onChange={(event) => setEditingIntegrationName(event.target.value)} required /></label><fieldset><legend>Permissions</legend><div className="security-scope-grid">{integrationScopes.map((scope) => <label key={scope.id}><input aria-label={`${scope.label} for ${credential.name}`} type="checkbox" checked={editingIntegrationScopes.includes(scope.id)} onChange={() => toggleIntegrationScope(scope.id, true)} /><span><strong>{scope.label}</strong><small>{scope.description}</small></span></label>)}</div></fieldset><div className="security-inline-actions"><button type="button" onClick={() => setEditingIntegrationId(null)}>Cancel</button><button className="security-primary" disabled={busy || !editingIntegrationName.trim() || editingIntegrationScopes.length === 0}>Save changes</button></div></form> : <div className="security-integration-actions">{state === "active" && <button type="button" onClick={() => beginIntegrationEdit(credential)}>Edit</button>}{!credential.revokedAt && <button type="button" className="security-danger" onClick={() => void revokeIntegration(credential)}>{confirmRevokeIntegrationId === credential.id ? "Confirm revoke" : "Revoke"}</button>}{confirmRevokeIntegrationId === credential.id && <button type="button" onClick={() => setConfirmRevokeIntegrationId(null)}>Cancel</button>}</div>}
-            </article>;
-          })}
-          {integrationCredentials.length === 0 && <p className="security-integration-empty">No API keys have been created.</p>}
-        </div>
-      </section>
       <section className="security-card"><header><div><p className="security-eyebrow">Session access policy</p><h3>Active sessions</h3></div><button onClick={() => void revokeOthers()} disabled={busy || sessions.length < 2}>Sign out all other devices</button></header><form className="security-session-policy" onSubmit={saveSessionPolicy}><label>New-session lifetime<div><input aria-label="Session lifetime in days" type="number" min={1} max={365} value={sessionLifetimeDays} onChange={(event) => setSessionLifetimeDays(Number(event.target.value))} /><span>days</span></div></label><p>Applies to future sign-ins. Existing sessions retain the expiration shown below.</p><button className="security-primary" disabled={busy || !summary || sessionLifetimeDays === summary.sessionLifetimeDays || sessionLifetimeDays < 1 || sessionLifetimeDays > 365}>Save lifetime</button></form><div className="security-session-list">{sessions.map((item) => <article key={item.id}><div><strong>{item.deviceLabel}{item.current && <b>Current</b>}</strong><span>{item.ipAddress} · Last active {formatTime(item.lastSeenAt)}</span><small>Expires {formatTime(item.expiresAt)}</small></div><button className={item.current ? "security-danger" : ""} onClick={() => void revoke(item)}>{item.current ? "Sign out" : "Revoke"}</button></article>)}</div></section>
       <section className="security-card"><header><div><p className="security-eyebrow">180-day history</p><h3>Security activity</h3></div></header><div className="security-event-list">{events.map((item) => <button type="button" className="security-event-entry" key={item.id} aria-haspopup="dialog" onClick={() => setSelectedEvent(item)}><i data-outcome={item.outcome} aria-hidden="true" /><span className="security-event-entry__copy"><strong>{eventLabel(item.type)}</strong><small>{item.deviceLabel} · {item.ipAddress}</small></span><time dateTime={new Date(item.createdAt * 1000).toISOString()}>{formatTime(item.createdAt)}</time></button>)}{events.length === 0 && <p>No security activity has been recorded yet.</p>}</div>{nextCursor && <button className="security-load-more" disabled={busy} onClick={() => void loadMore()}>Load earlier activity</button>}</section>
     </div>}

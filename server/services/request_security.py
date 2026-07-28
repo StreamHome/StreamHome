@@ -111,6 +111,36 @@ def same_origin_request(request: Request) -> bool:
     )
 
 
+def integration_bearer_request(request: Request) -> bool:
+    """Identify unsafe routes that always validate an explicit integration key."""
+    authorization = request.headers.get("authorization", "").strip()
+    scheme, separator, token = authorization.partition(" ")
+    if separator != " " or scheme.lower() != "bearer" or not token.startswith("shk_"):
+        return False
+    path = request.url.path
+    return bool(
+        (request.method == "POST" and path == "/api/add-movie")
+        or (
+            request.method == "DELETE"
+            and path.startswith("/api/downloads/")
+            and bool(path.removeprefix("/api/downloads/"))
+            and "/" not in path.removeprefix("/api/downloads/")
+        )
+    )
+
+
+def unsafe_cookie_request_requires_same_origin(request: Request) -> bool:
+    cookie_authenticated = bool(
+        request.cookies.get("streamhome_session")
+        or request.cookies.get("streamhome_setup")
+    )
+    return bool(
+        request.method not in {"GET", "HEAD", "OPTIONS"}
+        and cookie_authenticated
+        and not integration_bearer_request(request)
+    )
+
+
 def allowed_origins() -> set[str]:
     allowed = {settings.PUBLIC_URL.rstrip("/"), *settings.ALLOWED_ORIGINS}
     parsed = urlsplit(settings.PUBLIC_URL)

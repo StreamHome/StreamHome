@@ -83,8 +83,8 @@ export const revokeAuthSession = (id: string) => apiDelete<{ revoked: boolean; c
 export const revokeOtherSessions = () => apiPost<{ revokedCount: number }>("/api/auth/sessions/revoke-others");
 export const getSecurityEvents = (before?: number) => apiGet<SecurityEventsResponse>(`/api/auth/security/events${before ? `?before=${before}` : ""}`);
 export const regenerateRecoveryCodes = () => apiPost<{ recoveryCodes: string[]; remaining: number }>("/api/auth/recovery-codes/regenerate");
-export const getIntegrationCredentials = () => apiGet<IntegrationCredentialInfo[]>("/api/auth/integrations");
-export const getIntegrationScopes = () => apiGet<IntegrationScopeDefinition[]>("/api/auth/integrations/scopes");
+export const getIntegrationCredentials = (signal?: AbortSignal) => apiGet<IntegrationCredentialInfo[]>("/api/auth/integrations", { signal });
+export const getIntegrationScopes = (signal?: AbortSignal) => apiGet<IntegrationScopeDefinition[]>("/api/auth/integrations/scopes", { signal });
 export const createIntegrationCredential = (name: string, scopes: IntegrationScope[], expiresInDays: number | null) =>
   apiPost<IntegrationCredentialCreateResponse>("/api/auth/integrations", { name, scopes, expires_in_days: expiresInDays });
 export const updateIntegrationCredential = (id: string, name: string, scopes: IntegrationScope[]) =>

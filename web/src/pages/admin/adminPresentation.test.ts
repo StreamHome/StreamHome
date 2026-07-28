@@ -19,6 +19,7 @@ describe("admin presentation contracts", () => {
     const storage = read("src/pages/admin/panels/StoragePanel.tsx");
     const updates = read("src/pages/admin/panels/UpdatesPanel.tsx");
     const profileData = read("src/pages/admin/panels/ProfileDataPanel.tsx");
+    const apiKeys = read("src/pages/admin/panels/ApiKeysPanel.tsx");
     const adminCenter = read("src/pages/admin/AdminCenter.tsx");
 
     for (const selector of [
@@ -32,6 +33,8 @@ describe("admin presentation contracts", () => {
       ".update-log-card",
       ".admin-subject-bar",
       ".profile-data-table-card",
+      ".admin-panel--api-keys",
+      ".api-key-readiness",
     ]) expect(application).toContain(selector);
 
     expect(gate).toContain('className="admin-auth-form"');
@@ -43,7 +46,11 @@ describe("admin presentation contracts", () => {
     expect(updates).toContain("Retry failed target");
     expect(profileData).toContain('className="admin-panel admin-panel--profile-data"');
     expect(profileData).toContain("TMDB cache is not profile-owned");
+    expect(apiKeys).toContain('className="admin-panel admin-panel--api-keys admin-security"');
+    expect(apiKeys).toContain("API keys belong to the server account, not to a viewing profile");
     expect(adminCenter).toContain('aria-label="Selected profile"');
+    expect(adminCenter).toContain('{ id: "api-keys", label: "API Keys" }');
+    expect(adminCenter).toContain('const profileAware = section === "profiles" || section === "recommendations"');
     expect(adminCenter).toContain("<ProfileDataPanel profileId={subjectProfile.id} />");
     expect(application).toContain("@media (max-width: 760px)");
   });

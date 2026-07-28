@@ -15,6 +15,8 @@ Important route families:
 
 API-key management is available only to an authenticated administrator with recent reauthentication:
 
+The web manager is a server-wide **Admin → API Keys** panel. It is not associated with the profile selected for profile-data inspection.
+
 - `GET /api/auth/integrations`: list keys without revealing their secrets;
 - `GET /api/auth/integrations/scopes`: list assignable permissions;
 - `POST /api/auth/integrations`: create a named key and return its secret once;
@@ -28,6 +30,8 @@ Supported machine permissions are:
 - `downloads:cancel`: cancel and remove a task through `DELETE /api/downloads/{task_id}`.
 
 API keys never authorize account security, backups, server settings, profile PIN operations, or playback.
+
+Unsafe extension requests to integration-capable routes may include both an explicit `shk_` Bearer key and an existing browser session cookie. The security boundary treats those requests as machine authentication only on the allowlisted ingestion/download routes; the route must validate the key and may not fall back to cookie authorization when the key is invalid. Authentication failures use stable `missing_integration_credential`, `invalid_integration_credential`, and `insufficient_scope` codes.
 
 Update lifecycle endpoints require a recently reauthenticated administrator, except for the authenticated browser-presence heartbeat and the loopback-only ephemeral controller handoff:
 

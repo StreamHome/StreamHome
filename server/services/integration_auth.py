@@ -72,7 +72,10 @@ async def authenticate_integration_token(
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or inactive integration credential.",
+            detail={
+                "code": "invalid_integration_credential",
+                "message": "The API key is invalid, expired, or revoked.",
+            },
         )
     if scope not in credential.scopes:
         raise HTTPException(
@@ -100,7 +103,13 @@ def require_integration_scope(scope: str) -> Callable:
         db: AsyncSession = Depends(get_session),
     ) -> IntegrationCredential:
         if not credentials or not credentials.credentials:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing integration credential.")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "code": "missing_integration_credential",
+                    "message": "Send the StreamHome API key as an Authorization Bearer token.",
+                },
+            )
         return await authenticate_integration_token(credentials.credentials, scope, request, db)
 
     return dependency

@@ -151,6 +151,8 @@ class IntegrationCredentialRegression(unittest.TestCase):
             self.client.get("/integration-test/downloads", headers=self.bearer(first_token)).status_code,
             403,
         )
+        insufficient = self.client.get("/integration-test/downloads", headers=self.bearer(first_token))
+        self.assertEqual(insufficient.json()["detail"]["code"], "insufficient_scope")
         self.assertEqual(
             self.client.get("/integration-test/downloads", headers=self.bearer(second_token)).status_code,
             200,
@@ -191,6 +193,8 @@ class IntegrationCredentialRegression(unittest.TestCase):
             self.client.get("/integration-test/ingest", headers=self.bearer(first_token)).status_code,
             401,
         )
+        inactive = self.client.get("/integration-test/ingest", headers=self.bearer(first_token))
+        self.assertEqual(inactive.json()["detail"]["code"], "invalid_integration_credential")
         self.assertEqual(
             self.client.get("/integration-test/downloads", headers=self.bearer(second_token)).status_code,
             200,

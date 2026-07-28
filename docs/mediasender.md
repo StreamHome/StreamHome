@@ -46,7 +46,7 @@ Header format:
 Authorization: Bearer <API_BEARER_TOKEN>
 ```
 
-The first ingestion key is generated during StreamHome's initial setup. To create additional keys, open **Admin → Account and Security → API keys**, enter a descriptive name, and select **Add media**. Keys are independent: creating a new one does not revoke existing keys.
+The first ingestion key is generated during StreamHome's initial setup. To create additional keys, open **Admin → API Keys**, enter a descriptive name, and select **Add media**. Keys are independent: creating a new one does not revoke existing keys.
 
 The complete key is shown only once. StreamHome stores a secure hash plus a non-secret hint, so a lost key must be replaced. Each key can be renamed, assigned different permissions, given an optional expiration, or revoked individually from the same page.
 
@@ -862,6 +862,18 @@ Do not use:
 ```http
 Authorization: <API_BEARER_TOKEN>
 ```
+
+StreamHome returns `missing_integration_credential` when the Bearer header is absent and `invalid_integration_credential` when the key is invalid, expired, or revoked.
+
+### Request returns `403 Forbidden`
+
+Read the JSON response body before changing the key:
+
+* `insufficient_scope` means the key does not currently have **Add media** permission;
+* `cross_site_request_blocked` means a cookie-authenticated mutation failed the browser-origin boundary;
+* a non-JSON Cloudflare or reverse-proxy response means the request was rejected before StreamHome handled it.
+
+Extension requests that provide an explicit `shk_` Bearer key are authenticated as machine requests even when the browser also has a StreamHome login cookie. The API key is still validated independently, and an invalid key cannot fall back to the cookie session.
 
 ### Request returns `422 Unprocessable Entity`
 

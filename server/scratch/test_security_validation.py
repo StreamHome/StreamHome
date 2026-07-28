@@ -9,7 +9,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from config import settings
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
-from services.request_security import client_ip, normalize_origin, same_origin_request, trusted_proxy_origin
+from services.request_security import (
+    client_ip,
+    integration_bearer_request,
+    normalize_origin,
+    same_origin_request,
+    trusted_proxy_origin,
+    unsafe_cookie_request_requires_same_origin,
+)
 from services.rate_limit import _key as rate_limit_key
 from services.rate_limit import fail as record_rate_limit_failure
 from services.secret_crypto import protect_secret, reveal_secret
@@ -36,6 +43,8 @@ def browser_request(
     forwarded_proto: str = "",
     forwarded_host: str = "",
     setup_cookie: bool = True,
+    authorization: str = "",
+    method: str = "POST",
 ) -> Request:
     headers = [(b"origin", origin.encode())]
     if forwarded_proto:
@@ -44,9 +53,11 @@ def browser_request(
         headers.append((b"x-forwarded-host", forwarded_host.encode()))
     if setup_cookie:
         headers.append((b"cookie", b"streamhome_setup=test-session"))
+    if authorization:
+        headers.append((b"authorization", authorization.encode()))
     return Request({
         "type": "http",
-        "method": "POST",
+        "method": method,
         "path": path,
         "headers": headers,
         "client": (client, 5000),
@@ -140,6 +151,37 @@ async def run() -> None:
             setup_cookie=False,
         )
         assert same_origin_request(configured_origin)
+
+        extension_ingest = browser_request(
+            origin="chrome-extension://abcdefghijklmnop",
+            client="198.51.100.20",
+            path="/api/add-movie",
+            authorization="Bearer shk_extension-test-key",
+        )
+        assert not same_origin_request(extension_ingest)
+        assert integration_bearer_request(extension_ingest)
+        assert not unsafe_cookie_request_requires_same_origin(extension_ingest)
+        assert not integration_bearer_request(browser_request(
+            origin="chrome-extension://abcdefghijklmnop",
+            client="198.51.100.20",
+            path="/api/add-movie",
+            authorization="Bearer invalid-prefix",
+        ))
+        cross_site_account_change = browser_request(
+            origin="chrome-extension://abcdefghijklmnop",
+            client="198.51.100.20",
+            path="/api/auth/security/email",
+            authorization="Bearer shk_extension-test-key",
+        )
+        assert not integration_bearer_request(cross_site_account_change)
+        assert unsafe_cookie_request_requires_same_origin(cross_site_account_change)
+        assert integration_bearer_request(browser_request(
+            origin="chrome-extension://abcdefghijklmnop",
+            client="198.51.100.20",
+            path="/api/downloads/task-1",
+            authorization="Bearer shk_extension-test-key",
+            method="DELETE",
+        ))
     finally:
         settings.PUBLIC_URL = previous_public_url
         settings.ALLOWED_ORIGINS = previous_allowed_origins

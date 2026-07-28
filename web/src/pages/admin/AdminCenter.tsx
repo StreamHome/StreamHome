@@ -8,6 +8,7 @@ import { useProfileStore } from "../../stores/profileStore";
 import { useThemeStore } from "../../stores/themeStore";
 import { getThemeDefinition } from "../../themes/application/themeRegistry";
 import { AccountPanel } from "./panels/AccountPanel";
+import { ApiKeysPanel } from "./panels/ApiKeysPanel";
 import { DownloadsPanel } from "./panels/DownloadsPanel";
 import { RecommendationsPanel } from "./panels/RecommendationsPanel";
 import { StoragePanel } from "./panels/StoragePanel";
@@ -16,6 +17,7 @@ import { ProfileDataPanel } from "./panels/ProfileDataPanel";
 
 const PANELS: Array<{ id: AdminSection; label: string }> = [
   { id: "account", label: "Account & Security" },
+  { id: "api-keys", label: "API Keys" },
   { id: "profiles", label: "Profile data" },
   { id: "recommendations", label: "Recommendations" },
   { id: "storage", label: "Storage & HEVC" },
@@ -60,6 +62,7 @@ export function AdminCenter() {
         <AnimatePresence mode="wait" initial={false}>
           <motion.div className="admin-content__transition" key={section} variants={CONTENT_REVEAL} initial="hidden" animate="shown" exit="exit">
             {section === "account" && <AccountPanel />}
+            {section === "api-keys" && <ApiKeysPanel />}
             {section === "profiles" && <ProfileDataPanel profileId={subjectProfile.id} />}
             {section === "recommendations" && <RecommendationsPanel profileId={subjectProfile.id} />}
             {section === "storage" && <StoragePanel />}

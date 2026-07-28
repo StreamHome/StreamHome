@@ -45,7 +45,7 @@ from services.recommendation import (
     reset_media_preferences,
     persist_profile_pool,
 )
-from services.request_security import allowed_origins, client_ip, same_origin_request
+from services.request_security import allowed_origins, client_ip, same_origin_request, unsafe_cookie_request_requires_same_origin
 from services.profile_security import grant_profile_access, hash_profile_pin, require_profile_access, verify_profile_pin
 from services.rate_limit import clear as clear_rate_limit
 from services.rate_limit import enforce as enforce_rate_limit
@@ -353,11 +353,7 @@ class SetupGateMiddleware(BaseHTTPMiddleware):
 
 class SecurityBoundaryMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        cookie_authenticated = bool(
-            request.cookies.get("streamhome_session")
-            or request.cookies.get("streamhome_setup")
-        )
-        if request.method not in {"GET", "HEAD", "OPTIONS"} and cookie_authenticated and not same_origin_request(request):
+        if unsafe_cookie_request_requires_same_origin(request) and not same_origin_request(request):
             return JSONResponse(
                 status_code=403,
                 content={"detail": {"code": "cross_site_request_blocked", "message": "Cross-site authenticated requests are not allowed."}},
