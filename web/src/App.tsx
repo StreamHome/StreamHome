@@ -4,6 +4,7 @@ import { useAuthStore } from './stores/authStore';
 import './themes/index';
 
 import { AuthGuard } from './components/guards/AuthGuard';
+import { AnonymousOnlyGuard } from './components/guards/AnonymousOnlyGuard';
 import { QueryProfileGuard } from './components/guards/QueryProfileGuard';
 import { ErrorBoundary } from './components/ui/ErrorBoundary';
 import { SetupStateGate } from './components/guards/SetupStateGate';
@@ -50,7 +51,7 @@ export default function App() {
       <SetupStateGate>
       <Suspense fallback={<RouteChunkFallback />}><Routes>
         <Route path="/setup" element={<SetupPage />} />
-        <Route path="/login" element={<LoginPage />} />
+        <Route path="/login" element={<AnonymousOnlyGuard><LoginPage /></AnonymousOnlyGuard>} />
         
         <Route path="/profiles" element={
           <AuthGuard>
