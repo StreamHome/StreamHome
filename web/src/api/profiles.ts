@@ -4,5 +4,6 @@ import type { Profile, CreateProfileRequest, SaveProfileRequest } from "../types
 export const getProfiles = () => apiGet<Profile[]>("/api/profiles");
 export const createProfile = (data: CreateProfileRequest) => apiPost<Profile>("/api/profiles", data);
 export const saveProfile = (data: SaveProfileRequest) => apiPost<Profile>("/api/profiles", data);
+export const selectProfileAccess = (id: string) => apiPost<{ selected: true }>(`/api/profiles/${encodeURIComponent(id)}/select`, {});
 export const unlockProfile = (id: string, pin: string) => apiPost<{ verified: true }>(`/api/profiles/${encodeURIComponent(id)}/unlock`, { pin });
 export const deleteProfile = (id: string) => apiDelete<{ status: string }>(`/api/profiles/${encodeURIComponent(id)}`);

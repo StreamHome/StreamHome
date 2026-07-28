@@ -211,16 +211,6 @@ export interface PlaybackSession {
   isFinished: boolean;
 }
 
-export interface TrackPlaybackRequest {
-  movieId: string;
-  profileId: string;
-  timestamp: number;
-  durationWatched?: number;
-  completionRate?: number;
-  episodeId?: string;
-  isFinished?: boolean;
-}
-
 export interface WatchlistToggleResponse {
   status: "added" | "removed";
   watchlist: string[];

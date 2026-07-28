@@ -214,6 +214,8 @@ StreamHome then creates the final media structure, retrieves metadata and artwor
 
 Finalized media can remain in local storage or be synchronized with Google Drive through StreamHome’s application-managed Rclone configuration.
 
+Rclone runs only on the StreamHome server; browser clients never receive its configuration or cloud credentials.
+
 Cloud uploads are verified before local media is removed when that behavior is enabled.
 
 ### 6. 🍿 Personalized Playback

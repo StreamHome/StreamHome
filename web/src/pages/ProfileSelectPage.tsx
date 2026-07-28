@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useLocation, useNavigate } from "react-router-dom";
-import { createProfile, getProfiles, unlockProfile } from "../api/profiles";
+import { createProfile, getProfiles, selectProfileAccess, unlockProfile } from "../api/profiles";
 import { profileEditUrl } from "../navigation/profileEditing";
 import { appUrl, parseAppQuery } from "../navigation/queryState";
 import { useProfileStore } from "../stores/profileStore";
@@ -68,6 +68,7 @@ export function ProfileSelectPage() {
   const [error, setError] = useState("");
   const { value: ambientTheme, schedule: previewTheme, cancel: cancelPreview, setImmediate: setAmbientTheme } = useHoverIntent<ThemeId>("ember", PROFILE_INTENT_DELAY);
   const [enteringProfile, setEnteringProfile] = useState<string | null>(null);
+  const [selectingProfile, setSelectingProfile] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [name, setName] = useState("");
   const [theme, setNewTheme] = useState<ThemeId>("ember");
@@ -107,14 +108,23 @@ export function ProfileSelectPage() {
     navigationTimer.current = window.setTimeout(() => navigate(destinationFor(profile, state?.from)), reduced ? 180 : MOTION_TIMINGS.profileEntry * 1000);
   };
 
-  const chooseProfile = (profile: Profile) => {
+  const chooseProfile = async (profile: Profile) => {
     if (profile.pinEnabled) {
       setPinProfile(profile);
       setProfilePin("");
       setPinError("");
       return;
     }
-    enterProfile(profile);
+    setSelectingProfile(profile.id);
+    setError("");
+    try {
+      await selectProfileAccess(profile.id);
+      enterProfile(profile);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "The profile could not be selected.");
+    } finally {
+      setSelectingProfile(null);
+    }
   };
 
   const submitProfilePin = async (event: React.FormEvent) => {
@@ -165,7 +175,7 @@ export function ProfileSelectPage() {
           {profiles.map((profile) => {
             const profileTheme = normalizeTheme(profile.theme);
             return <motion.article key={profile.id} className="profile-tile" data-selected={enteringProfile === profile.id} variants={{ hidden: { opacity: 0, y: 10 }, shown: { opacity: 1, y: 0, transition: { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileEntry, ease: MOTION_EASE } } }} onMouseEnter={() => previewTheme(profileTheme)} onMouseLeave={clearPreview} onFocus={() => previewTheme(profileTheme)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) clearPreview(); }}>
-              <button className="profile-tile__select" onClick={() => chooseProfile(profile)}><span className={`profile-preview profile-preview--${profileTheme}`} aria-hidden="true"><i /><i /><i /></span><strong>{profile.name}</strong><small>{THEME_LABELS[profileTheme]}{profile.id === "1" ? " / administrator" : " / profile"}</small></button>
+              <button className="profile-tile__select" disabled={selectingProfile !== null} onClick={() => void chooseProfile(profile)}><span className={`profile-preview profile-preview--${profileTheme}`} aria-hidden="true"><i /><i /><i /></span><strong>{profile.name}</strong><small>{selectingProfile === profile.id ? "Selecting..." : `${THEME_LABELS[profileTheme]}${profile.id === "1" ? " / administrator" : " / profile"}`}</small></button>
               <button className="profile-tile__edit" onClick={() => navigate(profileEditUrl(profile.id), { state: { returnTo: "/profiles" } })}>Edit profile</button>
             </motion.article>;
           })}

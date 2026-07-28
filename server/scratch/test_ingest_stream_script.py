@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -16,6 +17,23 @@ from scratch.test_ingest_stream import LocalMediaBridge, build_payload, normaliz
 
 
 class IngestionSmokeTestScriptTests(unittest.TestCase):
+    def test_ingestion_schema_rejects_ambiguous_or_invalid_media_identity(self):
+        invalid_payloads = [
+            {"tmdb_id": 0, "media_type": "movie", "video_url": "https://example.test/video.mp4"},
+            {"tmdb_id": 1, "media_type": "documentary", "video_url": "https://example.test/video.mp4"},
+            {"tmdb_id": 1, "media_type": "tv", "video_url": "https://example.test/video.mp4"},
+            {
+                "tmdb_id": 1,
+                "media_type": "movie",
+                "season": 1,
+                "episode": 1,
+                "video_url": "https://example.test/video.mp4",
+            },
+        ]
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), self.assertRaises(ValidationError):
+                DownloadAddRequest(**payload)
+
     def test_movie_payload_omits_tv_and_null_fields(self):
         payload = build_payload(
             tmdb_id=550,

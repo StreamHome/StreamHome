@@ -13,7 +13,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from db import engine
 from models import AuthSession, DownloadTask, DownloadAddRequest, Movie, Episode, IntegrationCredential
 from services.queue import queue_manager
-from services.state import ACTIVE_DOWNLOAD_METRICS, cancel_and_kill_process
+from services.state import ACTIVE_DOWNLOAD_METRICS
 from services.tmdb import tmdb_client
 from services.vibe_analysis import compute_trope_vectors
 
@@ -222,6 +222,7 @@ async def download_progress_generator():
     """
     last_db_query_time = 0.0
     cached_completed_tasks = []
+    cached_active_tasks = []
     
     while True:
         try:
@@ -240,24 +241,24 @@ async def download_progress_generator():
                         
                         # Cache the tasks
                         cached_completed_tasks = [t for t in tasks if t.status in ("COMPLETED", "FAILED")]
-                        active_tasks = [t for t in tasks if t.status not in ("COMPLETED", "FAILED")]
+                        cached_active_tasks = [t for t in tasks if t.status not in ("COMPLETED", "FAILED")]
                     else:
                         # If idle, just pull all tasks once
                         stmt = select(DownloadTask).order_by(DownloadTask.created_at.desc())
                         result = await db.exec(stmt)
                         tasks = result.all()
                         cached_completed_tasks = [t for t in tasks if t.status in ("COMPLETED", "FAILED")]
-                        active_tasks = []
+                        cached_active_tasks = [t for t in tasks if t.status not in ("COMPLETED", "FAILED")]
                         
                     last_db_query_time = now
             else:
-                # Use cached completed tasks, and active tasks list is empty
-                active_tasks = []
+                # Reuse the most recent database snapshot between refreshes.
+                pass
             
             download_list = []
             
             # Process active tasks (which we just fetched, or empty if idle)
-            for t in active_tasks:
+            for t in cached_active_tasks:
                 metrics = ACTIVE_DOWNLOAD_METRICS.get(t.id, {"progress": 0.0, "speed": "0 KB/s", "eta": "00:00:00"})
                 status_text = t.status
                 progress = metrics["progress"]
@@ -315,23 +316,27 @@ async def get_downloads_stream(user = Depends(get_current_user)):
 
 @router.delete("/api/downloads/{task_id}")
 async def delete_download(task_id: str, session: AuthSession = Depends(require_recent_reauth)):
-    """Deletes download task from DB and terminates active FFmpeg OS process (Fix 2)."""
+    """Cancels the worker and child process before deleting its database record."""
     del session
-    # 1. Kill the active OS process registered in state.py if running
-    killed = await cancel_and_kill_process(task_id)
-    if killed:
-        logger.info(f"[API] Running download process for task {task_id} was cancelled and terminated.")
-        
-    # 2. Asynchronously delete from DB
     async with AsyncSession(engine) as db:
         task = await db.get(DownloadTask, task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
+
+    worker_cancelled, process_killed = await queue_manager.cancel_task(task_id)
+    if worker_cancelled or process_killed:
+        logger.info(f"[API] Active ingestion for task {task_id} was cancelled.")
+
+    async with AsyncSession(engine) as db:
+        task = await db.get(DownloadTask, task_id)
+        if not task:
+            return {"status": "success", "message": f"Task {task_id} was already removed.", "processKilled": process_killed}
         await db.delete(task)
         await db.commit()
         
     return {
         "status": "success",
         "message": f"Task {task_id} deleted successfully.",
-        "processKilled": killed
+        "processKilled": process_killed,
+        "workerCancelled": worker_cancelled,
     }

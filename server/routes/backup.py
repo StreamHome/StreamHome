@@ -65,7 +65,8 @@ async def restore_backup_endpoint(filename: str, session: AuthSession = Depends(
         if success:
             return {
                 "status": "success",
-                "message": f"Database successfully restored from: {filename}"
+                "message": f"Database successfully restored from: {filename}. Restart StreamHome before continuing.",
+                "restart_required": True,
             }
         else:
             raise HTTPException(
