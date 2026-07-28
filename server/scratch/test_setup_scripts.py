@@ -179,6 +179,7 @@ class SetupScriptContracts(unittest.TestCase):
                 )
             installer = root / "install-fixture.sh"
             installer.write_text(source, encoding="utf-8", newline="\n")
+            installer.chmod(0o755)
 
             environment = os.environ.copy()
             environment["STREAMHOME_INSTALL_DIR"] = bash_path(install_directory)
