@@ -15,7 +15,7 @@ from config import settings
 from routes.playback import parse_byte_range, rewrite_hls_playlist
 from services.media_probe import probe_completed_media
 from services.media_source import MediaSourceError, ResolvedMediaSource, canonicalize_catalog_path, is_safe_presentation_asset, resolve_media_source
-from services.playback_prep import PlaybackPrepService, playback_prep_service
+from services.playback_prep import PlaybackMediaSnapshot, PlaybackPrepService, playback_prep_service
 from services.rclone import rclone_service
 from services.queue import srt_to_vtt
 
@@ -86,6 +86,46 @@ class PlaybackPipelineRegression(unittest.TestCase):
         for protected in (self.catalog_path, f"/media/Movies/{self.media_directory.name}/subtitle_eng.vtt", f"/media/Movies/{self.media_directory.name}/.metadata/metadata.json"):
             with self.subTest(protected=protected):
                 self.assertFalse(is_safe_presentation_asset(protected))
+
+    def test_background_preparation_uses_a_session_independent_snapshot(self) -> None:
+        service = PlaybackPrepService()
+        source = ResolvedMediaSource(
+            catalog_path=self.catalog_path,
+            relative_path=self.catalog_path.removeprefix("/media/"),
+            local_path=self.media_file,
+            cloud_path=None,
+            local_exists=True,
+            cloud_exists=False,
+        )
+        media = SimpleNamespace(
+            id="m_snapshot_contract",
+            source_fingerprint=source.fingerprint,
+            probed_duration=5.0,
+            container="mov,mp4",
+            codec="h264",
+            width=640,
+            height=360,
+            frame_rate=24.0,
+            audio_metadata=[{"index": 0, "language": "eng", "label": "English", "default": True}],
+            languages=["eng"],
+        )
+        scheduled: list[PlaybackMediaSnapshot] = []
+
+        async def run() -> None:
+            with (
+                patch.object(service, "_schedule_video", side_effect=lambda _id, _fingerprint, _source, _rendition, snapshot: scheduled.append(snapshot)),
+                patch.object(service, "_schedule_audio", side_effect=lambda _id, _fingerprint, _source, _rendition, snapshot: scheduled.append(snapshot)),
+                patch.object(service, "_schedule_remaining"),
+                patch.object(service, "rebuild_master", new=AsyncMock(return_value=None)),
+                patch.object(service, "preparation_state", return_value="preparing"),
+            ):
+                await service.prepare(media.id, media, source, include_remaining=True, retry_errors=True)
+
+        asyncio.run(run())
+        self.assertTrue(scheduled)
+        self.assertTrue(all(isinstance(item, PlaybackMediaSnapshot) for item in scheduled))
+        media.width = 1
+        self.assertTrue(all(item.width == 640 for item in scheduled))
 
     def test_cloud_fingerprint_changes_when_remote_identity_changes(self) -> None:
         old_engine = settings.STORAGE_ENGINE

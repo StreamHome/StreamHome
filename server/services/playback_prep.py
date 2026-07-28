@@ -41,6 +41,22 @@ class AudioRendition:
     default: bool
 
 
+@dataclass(frozen=True, slots=True)
+class PlaybackMediaSnapshot:
+    """Session-independent media fields safe to retain in background tasks."""
+
+    id: str
+    source_fingerprint: Optional[str]
+    probed_duration: float
+    container: str
+    codec: str
+    width: int
+    height: int
+    frame_rate: float
+    audio_metadata: tuple[dict[str, Any], ...]
+    languages: tuple[str, ...]
+
+
 class PlaybackPreparationError(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -70,6 +86,23 @@ class PlaybackPrepService:
 
     def cache_path(self, media_id: str, fingerprint: str) -> Path:
         return Path(self.get_cache_path(media_id, fingerprint)).resolve()
+
+    @staticmethod
+    def snapshot_media(media_obj: Any) -> PlaybackMediaSnapshot:
+        if isinstance(media_obj, PlaybackMediaSnapshot):
+            return media_obj
+        return PlaybackMediaSnapshot(
+            id=str(media_obj.id),
+            source_fingerprint=str(media_obj.source_fingerprint) if media_obj.source_fingerprint else None,
+            probed_duration=max(0.0, float(media_obj.probed_duration or 0)),
+            container=str(media_obj.container or ""),
+            codec=str(media_obj.codec or ""),
+            width=max(0, int(media_obj.width or 0)),
+            height=max(0, int(media_obj.height or 0)),
+            frame_rate=max(0.0, float(media_obj.frame_rate or 0)),
+            audio_metadata=tuple(dict(item) for item in (media_obj.audio_metadata or [])),
+            languages=tuple(str(item) for item in (media_obj.languages or [])),
+        )
 
     @staticmethod
     def _width_for_height(source_width: int, source_height: int, height: int) -> int:
@@ -167,11 +200,15 @@ class PlaybackPrepService:
         source: ResolvedMediaSource,
         *,
         include_remaining: bool,
+        retry_errors: bool = False,
     ) -> str:
+        media_obj = self.snapshot_media(media_obj)
         fingerprint = getattr(media_obj, "source_fingerprint", None) or source.fingerprint
         cache_path = self.cache_path(media_id, fingerprint)
         cache_path.mkdir(parents=True, exist_ok=True)
         self.touch(media_id, fingerprint)
+        if retry_errors:
+            self.clear_preparation_error(media_id, fingerprint)
 
         baseline = self.baseline_video(media_obj)
         audios = self.audio_renditions(media_obj)
@@ -385,9 +422,14 @@ class PlaybackPrepService:
                 self._write_preparation_error(media_id, fingerprint, exc.code, str(exc))
                 logger.error(f"[Playback Prep] {media_id}/{rendition_name} failed ({exc.code}): {self.sanitize_diagnostics(str(exc), 800)}")
             except Exception as exc:
-                message = self.sanitize_diagnostics(str(exc), 800)
-                self._write_preparation_error(media_id, fingerprint, "PREPARATION_FAILED", message)
-                logger.error(f"[Playback Prep] {media_id}/{rendition_name} failed: {message}")
+                diagnostics = self.sanitize_diagnostics(str(exc), 800)
+                self._write_preparation_error(
+                    media_id,
+                    fingerprint,
+                    "INTERNAL_PREPARATION_ERROR",
+                    "Playback preparation encountered an internal server error. Retry this title.",
+                )
+                logger.error(f"[Playback Prep] {media_id}/{rendition_name} internal failure: {type(exc).__name__}: {diagnostics}")
             finally:
                 if pump_task and not pump_task.done():
                     pump_task.cancel()
@@ -519,6 +561,9 @@ class PlaybackPrepService:
     def _clear_preparation_error(self, media_id: str, fingerprint: str) -> None:
         (self.cache_path(media_id, fingerprint) / "preparation-error.json").unlink(missing_ok=True)
 
+    def clear_preparation_error(self, media_id: str, fingerprint: str) -> None:
+        self._clear_preparation_error(media_id, fingerprint)
+
     def touch(self, media_id: str, fingerprint: str) -> None:
         path = self.cache_path(media_id, fingerprint)
         path.mkdir(parents=True, exist_ok=True)
@@ -549,7 +594,7 @@ class PlaybackPrepService:
         from sqlmodel.ext.asyncio.session import AsyncSession
 
         self.recover_interrupted_outputs()
-        async with AsyncSession(engine) as db:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
             movies = (await db.exec(select(Movie).where(Movie.video_url != ""))).all()
             episodes = (await db.exec(select(Episode).where(Episode.video_url != ""))).all()
             for media_obj in [*movies, *episodes]:

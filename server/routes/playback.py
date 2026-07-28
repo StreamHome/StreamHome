@@ -28,6 +28,7 @@ from services.media_source import MediaSourceError, ResolvedMediaSource, resolve
 from services.media_probe import probe_completed_media
 from services.playback_prep import AudioRendition, PlaybackPrepService, VideoRendition, playback_prep_service
 from services.ingest_preview import IngestPreviewError, ingest_preview_service
+from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
 from services.profile_security import require_profile_access
 from services.rclone import rclone_service
 from services.recommendation import record_playback_progress
@@ -37,6 +38,8 @@ router = APIRouter(prefix="/api/playback", tags=["Playback"])
 PLAYBACK_TICKET_MINUTES = 15
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 SAFE_SUBTITLE_LANGUAGE_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
+ACTIVE_REPAIR_STATUSES = {"PENDING", "DOWNLOADING", "MERGING", "MOVING_CLOUD"}
+REPAIRABLE_PREPARATION_ERRORS = {"MEDIA_SOURCE_MISSING", "CLOUD_STREAM_FAILED", "EMPTY_RENDITION"}
 
 
 class PlaybackRunRequest(APIModel):
@@ -219,6 +222,96 @@ async def active_preview_task(db: AsyncSession, movie: Movie, media_obj: Any) ->
     if task.media_type == "movie" or task.season != media_obj.season_number or task.episode != media_obj.episode_number:
         return None
     return task
+
+
+async def queue_media_repair(
+    db: AsyncSession,
+    movie: Movie,
+    media_obj: Any,
+    reason_code: str,
+) -> Optional[DownloadTask]:
+    """Queue one verified replacement from retained ingestion intent, without deleting the catalog row."""
+
+    filters = [DownloadTask.tmdb_id == int(movie.tmdb_id or 0)]
+    if media_obj is movie:
+        filters.extend([DownloadTask.media_type == "movie", DownloadTask.season.is_(None), DownloadTask.episode.is_(None)])
+    else:
+        filters.extend(
+            [
+                DownloadTask.media_type != "movie",
+                DownloadTask.season == media_obj.season_number,
+                DownloadTask.episode == media_obj.episode_number,
+            ]
+        )
+
+    existing = (
+        await db.exec(
+            select(DownloadTask)
+            .where(*filters, DownloadTask.status.in_(ACTIVE_REPAIR_STATUSES))
+            .order_by(DownloadTask.created_at.desc())
+        )
+    ).first()
+    if existing:
+        media_obj.preview_task_id = existing.id
+        if media_obj is movie:
+            movie.availability = "processing"
+        db.add(media_obj)
+        db.add(movie)
+        await db.commit()
+        return existing
+
+    previous = (
+        await db.exec(
+            select(DownloadTask)
+            .where(*filters, DownloadTask.status == "COMPLETED")
+            .order_by(DownloadTask.created_at.desc())
+        )
+    ).first()
+    if not previous or not previous.video_url.startswith(("http://", "https://")):
+        return None
+
+    try:
+        client_address = "127.0.0.1" if previous.private_source_allowed else ""
+        await validate_url(previous.video_url, client_address=client_address)
+        await validate_url(previous.audio_url, client_address=client_address)
+        normalized_headers = validate_headers(previous.headers)
+        for subtitle in previous.subtitles:
+            await validate_url(subtitle.get("url"), client_address=client_address)
+    except UnsafeIngestionSource as exc:
+        logger.warning(f"[Playback Repair] Retained source for {media_obj.id} is no longer safe: {type(exc).__name__}")
+        return None
+
+    repair = DownloadTask(
+        id=str(uuid.uuid4()),
+        tmdb_id=previous.tmdb_id,
+        title=previous.title,
+        media_type=previous.media_type,
+        season=previous.season,
+        episode=previous.episode,
+        video_url=previous.video_url,
+        audio_url=previous.audio_url,
+        video_source_type=previous.video_source_type,
+        audio_source_type=previous.audio_source_type,
+        headers_str=json.dumps(normalized_headers),
+        private_source_allowed=previous.private_source_allowed,
+        status="PENDING",
+        subtitles_str=previous.subtitles_str,
+        quality=previous.quality,
+        language=previous.language,
+        skip_markers_str=previous.skip_markers_str,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    db.add(repair)
+    media_obj.preview_task_id = repair.id
+    if media_obj is movie:
+        movie.availability = "processing"
+    elif movie.availability != "available":
+        movie.availability = "processing"
+    db.add(media_obj)
+    db.add(movie)
+    await db.commit()
+    logger.warning(f"[Playback Repair] Queued replacement task {repair.id} for {media_obj.id} after {reason_code}.")
+    return repair
 
 
 async def synchronize_source_fingerprint(db: AsyncSession, media_obj: Any, source: ResolvedMediaSource) -> None:
@@ -453,11 +546,25 @@ async def create_playback_run(
         source_kind = "ingest_preview"
         source_fingerprint = ingest_preview_service.fingerprint(preview_task.id)
     else:
-        source = await require_available_source(media_obj)
-        await ensure_source_metadata(db, media_obj, source)
-        await synchronize_source_fingerprint(db, media_obj, source)
-        source_kind = "catalog"
-        source_fingerprint = str(media_obj.source_fingerprint or source.fingerprint)
+        try:
+            source = await require_available_source(media_obj)
+            await ensure_source_metadata(db, media_obj, source)
+            await synchronize_source_fingerprint(db, media_obj, source)
+        except HTTPException as source_error:
+            detail = source_error.detail if isinstance(source_error.detail, dict) else {}
+            error_code = str(detail.get("code") or "")
+            if error_code not in {"MEDIA_SOURCE_MISSING", "MEDIA_PROBE_FAILED", "INVALID_MEDIA_PATH"}:
+                raise
+            preview_task = await queue_media_repair(db, movie, media_obj, error_code)
+            if not preview_task:
+                raise
+            source = None
+        if preview_task:
+            source_kind = "ingest_preview"
+            source_fingerprint = ingest_preview_service.fingerprint(preview_task.id)
+        else:
+            source_kind = "catalog"
+            source_fingerprint = str(media_obj.source_fingerprint or source.fingerprint)
 
     filters = [PlaybackSession.profile_id == req.profile_id, PlaybackSession.movie_id == req.movie_id]
     filters.append(PlaybackSession.episode_id == req.episode_id if req.episode_id else PlaybackSession.episode_id.is_(None))
@@ -484,7 +591,13 @@ async def create_playback_run(
     db.add(run)
     await db.commit()
     if source is not None:
-        await playback_prep_service.prepare(media_obj.id, media_obj, source, include_remaining=True)
+        await playback_prep_service.prepare(
+            media_obj.id,
+            media_obj,
+            source,
+            include_remaining=True,
+            retry_errors=True,
+        )
     return await build_run_response(db, request, user, run, media_obj, initial_resume_position=position)
 
 
@@ -497,15 +610,46 @@ async def get_playback_run(
     user: User = Depends(get_current_user),
 ) -> PlaybackRunResponse:
     run = await authorized_run(db, request, run_id)
-    _, media_obj = await resolve_run_media(db, run.movie_id, run.episode_id)
+    movie, media_obj = await resolve_run_media(db, run.movie_id, run.episode_id)
     if run.source_kind != "ingest_preview":
-        source = await require_available_source(media_obj)
-        await ensure_source_metadata(db, media_obj, source)
-        await synchronize_source_fingerprint(db, media_obj, source)
-        if retry:
-            error_path = playback_prep_service.cache_path(media_obj.id, str(media_obj.source_fingerprint)) / "preparation-error.json"
-            error_path.unlink(missing_ok=True)
-        await playback_prep_service.prepare(media_obj.id, media_obj, source, include_remaining=True)
+        fingerprint = str(media_obj.source_fingerprint or "")
+        cached_failure = playback_prep_service.preparation_error(media_obj.id, fingerprint) if fingerprint else None
+        if cached_failure and cached_failure["code"] in REPAIRABLE_PREPARATION_ERRORS and not retry:
+            repair_task = await queue_media_repair(db, movie, media_obj, cached_failure["code"])
+            if repair_task:
+                run.source_kind = "ingest_preview"
+                run.source_task_id = repair_task.id
+                run.source_fingerprint = ingest_preview_service.fingerprint(repair_task.id)
+                run.updated_at = time.time()
+                db.add(run)
+                await db.commit()
+        if run.source_kind != "ingest_preview":
+            try:
+                source = await require_available_source(media_obj)
+                await ensure_source_metadata(db, media_obj, source)
+                await synchronize_source_fingerprint(db, media_obj, source)
+            except HTTPException as source_error:
+                detail = source_error.detail if isinstance(source_error.detail, dict) else {}
+                error_code = str(detail.get("code") or "")
+                if error_code not in {"MEDIA_SOURCE_MISSING", "MEDIA_PROBE_FAILED", "INVALID_MEDIA_PATH"}:
+                    raise
+                repair_task = await queue_media_repair(db, movie, media_obj, error_code)
+                if not repair_task:
+                    raise
+                run.source_kind = "ingest_preview"
+                run.source_task_id = repair_task.id
+                run.source_fingerprint = ingest_preview_service.fingerprint(repair_task.id)
+                run.updated_at = time.time()
+                db.add(run)
+                await db.commit()
+            if run.source_kind != "ingest_preview":
+                await playback_prep_service.prepare(
+                    media_obj.id,
+                    media_obj,
+                    source,
+                    include_remaining=True,
+                    retry_errors=retry,
+                )
     run.last_seen_at = time.time()
     run.updated_at = time.time()
     db.add(run)

@@ -273,6 +273,83 @@ class PlaybackContractRegression(unittest.TestCase):
             asyncio.run(restore())
             ingest_preview_service.remove(task_id)
 
+    def test_missing_media_queues_one_repair_without_discarding_catalog_identity(self) -> None:
+        source_task_id = f"repair-source-{uuid.uuid4().hex}"
+        missing_path = self.media_file.with_suffix(".missing")
+
+        async def seed_repair_source() -> None:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                movie = await db.get(Movie, "m_playback_contract")
+                movie.tmdb_id = 445566
+                movie.video_url = self.catalog_path
+                movie.availability = "available"
+                movie.preview_task_id = None
+                db.add(movie)
+                db.add(
+                    DownloadTask(
+                        id=source_task_id,
+                        tmdb_id=445566,
+                        title="Playback Contract",
+                        media_type="movie",
+                        video_url="https://media.example.test/contract.mp4",
+                        status="COMPLETED",
+                        language="en",
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                )
+                await db.commit()
+
+        async def inspect_repair() -> tuple[list[DownloadTask], Movie]:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                tasks = list(
+                    (
+                        await db.exec(
+                            select(DownloadTask).where(
+                                DownloadTask.tmdb_id == 445566,
+                                DownloadTask.status == "PENDING",
+                            )
+                        )
+                    ).all()
+                )
+                return tasks, await db.get(Movie, "m_playback_contract")
+
+        async def cleanup() -> None:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                movie = await db.get(Movie, "m_playback_contract")
+                movie.tmdb_id = None
+                movie.video_url = self.catalog_path
+                movie.availability = "available"
+                movie.preview_task_id = None
+                db.add(movie)
+                tasks = list((await db.exec(select(DownloadTask).where(DownloadTask.tmdb_id == 445566))).all())
+                for task in tasks:
+                    await db.delete(task)
+                await db.commit()
+
+        asyncio.run(seed_repair_source())
+        self.media_file.replace(missing_path)
+        try:
+            with patch("routes.playback.validate_url", new=AsyncMock(return_value=None)):
+                first = self.client.post(
+                    "/api/playback/runs",
+                    json={"movieId": "m_playback_contract", "profileId": "contract-profile"},
+                )
+                second = self.client.post(
+                    "/api/playback/runs",
+                    json={"movieId": "m_playback_contract", "profileId": "contract-profile"},
+                )
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(first.json()["preparationState"], "preparing")
+            self.assertEqual(second.status_code, 200, second.text)
+            tasks, movie = asyncio.run(inspect_repair())
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(movie.video_url, self.catalog_path)
+            self.assertEqual(movie.availability, "processing")
+            self.assertEqual(movie.preview_task_id, tasks[0].id)
+        finally:
+            missing_path.replace(self.media_file)
+            asyncio.run(cleanup())
+
     def test_progress_is_sequenced_completion_is_sticky_and_start_over_is_explicit(self) -> None:
         run = self.create_run()
         heartbeat = self.client.post(
