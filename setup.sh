@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+RUN_DIR="$ROOT_DIR/.run"
 NO_START=false
 SKIP_SYSTEM_PACKAGES=false
 CURRENT_STEP="initialization"
 MIN_RCLONE_VERSION="1.68"
+RCLONE_INSTALL_VERSION="1.74.4"
+SETUP_LOCK=""
+RCLONE_TEMP=""
+RCLONE_STAGED=""
 
 usage() {
     cat <<'EOF'
-StreamHome Unix setup
+StreamHome Linux setup
 
 Usage:
   ./setup.sh [--no-start] [--skip-system-packages] [--help]
@@ -30,6 +35,24 @@ fail() {
     exit 1
 }
 
+cleanup() {
+    if [[ -n "$RCLONE_STAGED" && -f "$RCLONE_STAGED" ]]; then
+        rm -f -- "$RCLONE_STAGED"
+    fi
+    if [[ -n "$RCLONE_TEMP" && -d "$RCLONE_TEMP" ]]; then
+        case "$RCLONE_TEMP" in
+            "${TMPDIR:-/tmp}"/tmp.*|"${TMPDIR:-/tmp}"/streamhome-rclone.*)
+                rm -rf -- "$RCLONE_TEMP"
+                ;;
+        esac
+    fi
+    if [[ -n "$SETUP_LOCK" && -d "$SETUP_LOCK" ]]; then
+        rm -f -- "$SETUP_LOCK/owner.pid"
+        rmdir -- "$SETUP_LOCK" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
 on_error() {
     local exit_code=$?
     printf '\n[StreamHome Setup] ERROR: %s failed near line %s (exit %s).\n' "$CURRENT_STEP" "$1" "$exit_code" >&2
@@ -41,6 +64,25 @@ on_error() {
     exit "$exit_code"
 }
 trap 'on_error $LINENO' ERR
+
+acquire_setup_lock() {
+    local owner=""
+    [[ -d "$RUN_DIR" ]] || mkdir -p "$RUN_DIR"
+    chmod 700 "$RUN_DIR" 2>/dev/null || true
+    SETUP_LOCK="$RUN_DIR/setup.lock"
+    if mkdir "$SETUP_LOCK" 2>/dev/null; then
+        printf '%s\n' "$$" > "$SETUP_LOCK/owner.pid"
+        return 0
+    fi
+    owner="$(cat "$SETUP_LOCK/owner.pid" 2>/dev/null || true)"
+    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+        fail "Another StreamHome setup is already running."
+    fi
+    rm -f -- "$SETUP_LOCK/owner.pid"
+    rmdir -- "$SETUP_LOCK" 2>/dev/null || fail "The stale setup lock could not be removed: $SETUP_LOCK"
+    mkdir "$SETUP_LOCK" || fail "Could not acquire the setup lock."
+    printf '%s\n' "$$" > "$SETUP_LOCK/owner.pid"
+}
 
 run_privileged() {
     if [[ "${EUID}" -eq 0 ]]; then
@@ -74,44 +116,71 @@ raise SystemExit(0 if current >= minimum else 1)
 PY
 }
 
+rclone_archive_details() {
+    local machine
+    machine="$(uname -m)"
+    case "$machine" in
+        x86_64|amd64)
+            printf '%s %s\n' "amd64" "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d"
+            ;;
+        aarch64|arm64)
+            printf '%s %s\n' "arm64" "97685285c9ad6a0cf17d5844115d2a67245af6444db672187074bd9c358de419"
+            ;;
+        armv7l)
+            printf '%s %s\n' "arm-v7" "75844809d25d2534da96220727e7746a300e30ec8c676ca98c47affe5a752e7b"
+            ;;
+        armv6l)
+            printf '%s %s\n' "arm-v6" "c9e1048feb597938884c0fff314d5d9a002599933cb94ce17fee19599cbfa3f1"
+            ;;
+        i386|i686)
+            printf '%s %s\n' "386" "7feee086d7ff72652c5a91ef4b4a576941ccd33b2929772a2d70471904e516f0"
+            ;;
+        *)
+            fail "Unsupported Rclone architecture: $machine."
+            ;;
+    esac
+}
+
 install_app_rclone() {
     CURRENT_STEP="Rclone compatibility installation"
-    local os_name arch archive_name archive_url temporary checksum_file extracted binary
-    case "$(uname -s)" in
-        Linux) os_name="linux" ;;
-        Darwin) os_name="osx" ;;
-        *) fail "Rclone $MIN_RCLONE_VERSION or newer must be installed manually on this operating system." ;;
-    esac
-    case "$(uname -m)" in
-        x86_64|amd64) arch="amd64" ;;
-        aarch64|arm64) arch="arm64" ;;
-        armv7l) arch="arm-v7" ;;
-        armv6l) arch="arm-v6" ;;
-        i386|i686) arch="386" ;;
-        *) fail "Unsupported Rclone architecture: $(uname -m)." ;;
-    esac
-    archive_name="rclone-current-${os_name}-${arch}.zip"
-    archive_url="https://downloads.rclone.org/${archive_name}"
-    temporary="$(mktemp -d)"
-    checksum_file="$temporary/${archive_name}.sha256"
-    log "Installing a current application-owned Rclone"
-    curl -fsSL "$archive_url" -o "$temporary/$archive_name"
-    curl -fsSL "${archive_url}.sha256" -o "$checksum_file"
-    (
-        cd "$temporary"
-        if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum -c "$(basename "$checksum_file")"
-        else
-            shasum -a 256 -c "$(basename "$checksum_file")"
-        fi
-    )
-    python3 -m zipfile -e "$temporary/$archive_name" "$temporary/unpacked"
-    extracted="$(find "$temporary/unpacked" -type f -name rclone -print -quit)"
+    local arch expected_hash archive_name archive_url extracted actual_hash binary
+    read -r arch expected_hash < <(rclone_archive_details)
+    archive_name="rclone-v${RCLONE_INSTALL_VERSION}-linux-${arch}.zip"
+    archive_url="https://downloads.rclone.org/v${RCLONE_INSTALL_VERSION}/${archive_name}"
+    RCLONE_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/streamhome-rclone.XXXXXX")"
+
+    log "Installing application-owned Rclone v$RCLONE_INSTALL_VERSION"
+    curl --fail --silent --show-error --location \
+        --retry 3 --retry-delay 1 --connect-timeout 15 \
+        "$archive_url" \
+        -o "$RCLONE_TEMP/$archive_name"
+    actual_hash="$(python3 - "$RCLONE_TEMP/$archive_name" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as archive:
+    for block in iter(lambda: archive.read(1024 * 1024), b""):
+        digest.update(block)
+print(digest.hexdigest())
+PY
+)"
+    [[ "$actual_hash" == "$expected_hash" ]] || fail "The Rclone archive checksum did not match the pinned official release."
+
+    python3 -m zipfile -e "$RCLONE_TEMP/$archive_name" "$RCLONE_TEMP/unpacked"
+    extracted="$(find "$RCLONE_TEMP/unpacked" -type f -name rclone -print -quit)"
     [[ -n "$extracted" ]] || fail "The official Rclone archive did not contain the expected executable."
+
     mkdir -p "$ROOT_DIR/bin"
     binary="$ROOT_DIR/bin/rclone"
-    install -m 0755 "$extracted" "$binary"
-    rm -rf "$temporary"
+    RCLONE_STAGED="$(mktemp "$ROOT_DIR/bin/.rclone.XXXXXX")"
+    install -m 0755 "$extracted" "$RCLONE_STAGED"
+    "$RCLONE_STAGED" version >/dev/null
+    mv -f -- "$RCLONE_STAGED" "$binary"
+    RCLONE_STAGED=""
+
+    rm -rf -- "$RCLONE_TEMP"
+    RCLONE_TEMP=""
 }
 
 missing_commands() {
@@ -121,7 +190,6 @@ missing_commands() {
     command -v npm >/dev/null 2>&1 || missing+=(npm)
     command -v ffmpeg >/dev/null 2>&1 || missing+=(ffmpeg)
     command -v ffprobe >/dev/null 2>&1 || missing+=(ffprobe)
-    [[ -n "$(rclone_binary)" ]] || missing+=(rclone)
     command -v git >/dev/null 2>&1 || missing+=(git)
     command -v curl >/dev/null 2>&1 || missing+=(curl)
     if ! command -v lsof >/dev/null 2>&1 \
@@ -141,23 +209,20 @@ install_system_packages() {
 
     log "Installing missing system dependencies: ${missing[*]}"
     if command -v apt-get >/dev/null 2>&1; then
-        packages=(ca-certificates curl git python3 python3-pip python3-venv nodejs npm ffmpeg rclone lsof)
+        packages=(ca-certificates curl git python3 python3-pip python3-venv nodejs npm ffmpeg lsof)
         run_privileged apt-get update
         run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
-        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg rclone lsof)
+        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg lsof)
         run_privileged dnf install -y "${packages[@]}"
     elif command -v yum >/dev/null 2>&1; then
-        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg rclone lsof)
+        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg lsof)
         run_privileged yum install -y "${packages[@]}"
     elif command -v pacman >/dev/null 2>&1; then
-        packages=(ca-certificates curl git python python-pip nodejs npm ffmpeg rclone lsof)
+        packages=(ca-certificates curl git python python-pip nodejs npm ffmpeg lsof)
         run_privileged pacman -Sy --needed --noconfirm "${packages[@]}"
-    elif command -v brew >/dev/null 2>&1; then
-        packages=(git python node ffmpeg rclone lsof)
-        brew install "${packages[@]}"
     else
-        fail "No supported package manager was found. Install Python 3.11+, Node.js 18+, FFmpeg, FFprobe, and rclone manually."
+        fail "No supported Linux package manager was found. Install Python 3.11+, Node.js 18+, FFmpeg, FFprobe, curl, Git, and a listener inspector manually."
     fi
 }
 
@@ -168,7 +233,8 @@ validate_versions() {
     command -v npm >/dev/null 2>&1 || fail "npm is unavailable after dependency installation."
     command -v ffmpeg >/dev/null 2>&1 || fail "ffmpeg is unavailable after dependency installation."
     command -v ffprobe >/dev/null 2>&1 || fail "ffprobe is unavailable after dependency installation."
-    [[ -n "$(rclone_binary)" ]] || fail "rclone is unavailable after dependency installation."
+    command -v git >/dev/null 2>&1 || fail "git is unavailable after dependency installation."
+    command -v curl >/dev/null 2>&1 || fail "curl is unavailable after dependency installation."
     if ! command -v lsof >/dev/null 2>&1 \
         && ! command -v ss >/dev/null 2>&1 \
         && ! command -v fuser >/dev/null 2>&1; then
@@ -185,6 +251,13 @@ validate_versions() {
         install_app_rclone
     fi
     rclone_version_supported || fail "Rclone $MIN_RCLONE_VERSION or newer is required."
+}
+
+stop_existing_runtime() {
+    CURRENT_STEP="existing StreamHome shutdown"
+    if [[ -x "$ROOT_DIR/stop.sh" ]]; then
+        "$ROOT_DIR/stop.sh" --quiet
+    fi
 }
 
 prepare_virtual_environment() {
@@ -206,10 +279,12 @@ prepare_virtual_environment() {
     fi
 
     CURRENT_STEP="server dependency installation"
-    "$ROOT_DIR/venv/bin/python" -m pip install --upgrade pip
+    "$ROOT_DIR/venv/bin/python" -m pip --version >/dev/null \
+        || "$ROOT_DIR/venv/bin/python" -m ensurepip --upgrade
     "$ROOT_DIR/venv/bin/python" -m pip install \
         -c "$ROOT_DIR/server/requirements.lock" \
         -r "$ROOT_DIR/server/requirements.txt"
+    "$ROOT_DIR/venv/bin/python" -m pip check
 }
 
 prepare_web() {
@@ -217,6 +292,7 @@ prepare_web() {
     (cd "$ROOT_DIR/web" && npm ci)
     CURRENT_STEP="production web build"
     (cd "$ROOT_DIR/web" && npm run build)
+    [[ -s "$ROOT_DIR/web/dist/index.html" ]] || fail "The production web build did not create web/dist/index.html."
 }
 
 prepare_environment() {
@@ -227,11 +303,11 @@ prepare_environment() {
         else
             printf 'SETUP=false\nWEB_PORT=3000\n' > "$ROOT_DIR/.env"
         fi
-        chmod 600 "$ROOT_DIR/.env" 2>/dev/null || true
         log "Created .env with first-run setup enabled"
     else
         log "Preserving the existing .env configuration"
     fi
+    chmod 600 "$ROOT_DIR/.env" 2>/dev/null || true
 
     chmod +x \
         "$ROOT_DIR/install.sh" \
@@ -244,23 +320,36 @@ prepare_environment() {
 main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --no-start) NO_START=true ;;
-            --skip-system-packages) SKIP_SYSTEM_PACKAGES=true ;;
-            --help|-h) usage; return 0 ;;
-            *) fail "Unknown argument: $1 (use --help for usage)" ;;
+            --no-start)
+                NO_START=true
+                ;;
+            --skip-system-packages)
+                SKIP_SYSTEM_PACKAGES=true
+                ;;
+            --help|-h)
+                usage
+                return 0
+                ;;
+            *)
+                fail "Unknown argument: $1 (use --help for usage)"
+                ;;
         esac
         shift
     done
 
+    [[ "$(uname -s)" == "Linux" ]] || fail "The alpha server setup supports Linux only."
     cd "$ROOT_DIR"
+    acquire_setup_lock
     log "Preparing StreamHome in $ROOT_DIR"
+
     CURRENT_STEP="system dependency detection"
-    missing=()
+    local -a missing=()
     while IFS= read -r command_name; do
         [[ -n "$command_name" ]] && missing+=("$command_name")
     done < <(missing_commands)
     install_system_packages "${missing[@]}"
     validate_versions
+    stop_existing_runtime
     prepare_virtual_environment
     prepare_web
     prepare_environment
@@ -272,7 +361,7 @@ main() {
     fi
 
     CURRENT_STEP="StreamHome startup"
-    exec "$ROOT_DIR/start.sh"
+    "$ROOT_DIR/start.sh"
 }
 
 main "$@"

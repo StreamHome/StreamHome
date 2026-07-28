@@ -12,9 +12,16 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+REPOSITORY_URL = "https://github.com/StreamHome/StreamHome.git"
 
 
-def run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+def run(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    timeout: int = 60,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
         cwd=cwd,
@@ -38,8 +45,13 @@ def create_fixture_repository(directory: Path) -> None:
     git(["config", "user.email", "setup-test@streamhome.invalid"], cwd=directory)
     git(["config", "user.name", "StreamHome Setup Test"], cwd=directory)
     files = {
-        "setup.sh": "#!/usr/bin/env bash\nset -e\nprintf 'ready' > .setup-ran\n",
-        "setup.bat": "@echo off\r\n> .setup-ran-windows echo ready\r\n",
+        ".gitignore": ".setup-ran\n.setup-args\n",
+        "setup.sh": (
+            "#!/usr/bin/env bash\n"
+            "set -e\n"
+            "printf 'ready' > .setup-ran\n"
+            "printf '%s\\n' \"$@\" > .setup-args\n"
+        ),
         "install.sh": "#!/usr/bin/env bash\nexit 0\n",
         "start.sh": "#!/usr/bin/env bash\nexit 0\n",
         "stop.sh": "#!/usr/bin/env bash\nexit 0\n",
@@ -48,7 +60,18 @@ def create_fixture_repository(directory: Path) -> None:
     for name, content in files.items():
         (directory / name).write_text(content, encoding="utf-8", newline="")
     git(["add", "."], cwd=directory)
-    git(["update-index", "--chmod=+x", "setup.sh", "install.sh", "start.sh", "stop.sh", "test.sh"], cwd=directory)
+    git(
+        [
+            "update-index",
+            "--chmod=+x",
+            "setup.sh",
+            "install.sh",
+            "start.sh",
+            "stop.sh",
+            "test.sh",
+        ],
+        cwd=directory,
+    )
     git(["commit", "-m", "fixture"], cwd=directory)
 
 
@@ -60,6 +83,14 @@ def bash_path(path: Path) -> str:
     return f"/{drive[0].lower()}{tail.replace(os.sep, '/')}"
 
 
+def bash_command() -> str | None:
+    bash = shutil.which("bash")
+    if os.name == "nt":
+        candidate = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "bin" / "bash.exe"
+        bash = str(candidate) if candidate.is_file() else bash
+    return bash
+
+
 def unused_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -67,67 +98,77 @@ def unused_port() -> int:
 
 
 class SetupScriptContracts(unittest.TestCase):
-    def test_documented_bootstrap_contracts_and_safe_runtime_rules(self) -> None:
+    def test_linux_bootstrap_setup_and_lifecycle_contracts(self) -> None:
         install_sh = (ROOT / "install.sh").read_text(encoding="utf-8")
-        install_ps1 = (ROOT / "install.ps1").read_text(encoding="utf-8")
         setup_sh = (ROOT / "setup.sh").read_text(encoding="utf-8")
         start_sh = (ROOT / "start.sh").read_text(encoding="utf-8")
         stop_sh = (ROOT / "stop.sh").read_text(encoding="utf-8")
-        windows_setup = (ROOT / "scripts" / "setup-windows.ps1").read_text(encoding="utf-8")
-        windows_stop = (ROOT / "scripts" / "stop-windows.ps1").read_text(encoding="utf-8")
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        test_sh = (ROOT / "test.sh").read_text(encoding="utf-8")
 
-        self.assertIn("https://github.com/StreamHome/StreamHome.git", install_sh)
-        self.assertIn("https://github.com/StreamHome/StreamHome.git", install_ps1)
+        self.assertIn(REPOSITORY_URL, install_sh)
         self.assertIn("remote set-url origin", install_sh)
-        self.assertIn('"remote", "set-url", "origin"', install_ps1)
         self.assertIn("https://github.com/WaqSea/StreamHome.git", install_sh)
-        self.assertIn("https://github.com/WaqSea/StreamHome.git", install_ps1)
         self.assertIn("status --porcelain --untracked-files=normal", install_sh)
         self.assertIn("merge --ff-only", install_sh)
-        self.assertIn("exec ./setup.sh", install_sh)
-        self.assertIn("cmd.exe /d /c setup.bat", install_ps1)
+        self.assertIn(".streamhome-install.", install_sh)
+        self.assertIn("install.lock", install_sh)
+        self.assertIn("setup_args+=(--no-start)", install_sh)
+        self.assertIn("./setup.sh", install_sh)
+        self.assertIn('[[ "$(uname -s)" == "Linux" ]]', install_sh)
+        self.assertNotIn("brew install", install_sh)
+
         self.assertIn("npm ci", setup_sh)
         self.assertIn("npm run build", setup_sh)
+        self.assertIn("-m pip check", setup_sh)
         self.assertIn("listener-inspector", setup_sh)
-        self.assertIn("lsof", setup_sh)
         self.assertIn('MIN_RCLONE_VERSION="1.68"', setup_sh)
-        self.assertIn("rclone-current-${os_name}-${arch}.zip", setup_sh)
-        self.assertIn("sha256sum -c", setup_sh)
-        self.assertIn("exec \"$ROOT_DIR/start.sh\"", setup_sh)
+        self.assertIn('RCLONE_INSTALL_VERSION="1.74.4"', setup_sh)
+        self.assertIn("downloads.rclone.org/v${RCLONE_INSTALL_VERSION}", setup_sh)
+        self.assertNotIn("rclone-current-${os_name}-${arch}.zip", setup_sh)
+        self.assertNotIn("${archive_url}.sha256", setup_sh)
+        self.assertIn("hashlib.sha256", setup_sh)
         self.assertIn("do not repeat setup", setup_sh)
-        self.assertIn('"$ROOT_DIR/stop.sh" --startup', start_sh)
-        self.assertIn("setup and dependencies do not need to be repeated", start_sh)
+        self.assertIn('"$ROOT_DIR/stop.sh" --quiet', setup_sh)
+
+        self.assertIn('"$ROOT_DIR/stop.sh" --startup --lock-held', start_sh)
         self.assertIn("detect_server_ip", start_sh)
         self.assertIn("STREAMHOME_PUBLIC_URL_EXPLICIT", start_sh)
-        self.assertIn('echo "Setup URL: ${PUBLIC_URL}/setup"', start_sh)
-        self.assertNotIn('echo "Setup URL: http://localhost:${WEB_PORT}/setup"', start_sh)
+        self.assertIn("-m uvicorn main:app --host 127.0.0.1 --port 8000", start_sh)
+        self.assertNotIn('"$BACKEND_PYTHON" main.py', start_sh)
+        self.assertIn("wait_for_services", start_sh)
+        self.assertIn("lifecycle.lock", start_sh)
+        self.assertIn("Setup URL: %s/setup", start_sh)
+
         self.assertIn("is_streamhome_process", stop_sh)
         self.assertIn("stop_process_tree", stop_sh)
         self.assertIn("It was not stopped.", stop_sh)
-        self.assertIn('Invoke-Checked $npm @("ci")', windows_setup)
-        self.assertNotIn("server\\cli.py --setup", windows_setup)
-        self.assertIn("taskkill.exe /PID", windows_stop)
-        self.assertNotIn("/im python.exe", windows_stop.lower())
-        self.assertNotIn("/im node.exe", windows_stop.lower())
-        self.assertIn("releases/tag/v0.1.0-alpha.1", readme)
+        self.assertIn("its PID record was preserved", stop_sh)
+        self.assertIn("Shutdown did not complete cleanly", stop_sh)
 
-    def test_unix_bootstrap_clones_runs_setup_and_refuses_dirty_update(self) -> None:
-        bash = shutil.which("bash")
-        if os.name == "nt":
-            candidate = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "bin" / "bash.exe"
-            bash = str(candidate) if candidate.is_file() else bash
+        self.assertIn("--server-only", test_sh)
+        self.assertIn("--web-only", test_sh)
+        self.assertIn("--syntax-only", test_sh)
+        self.assertIn("Port 8000 is active", test_sh)
+        self.assertIn("shellcheck -x", test_sh)
+
+    def test_linux_bootstrap_is_atomic_forwards_options_and_refuses_dirty_update(self) -> None:
+        bash = bash_command()
         if not bash:
             self.skipTest("Bash is not installed")
 
         with tempfile.TemporaryDirectory(dir=ROOT / "temp") as temporary:
             root = Path(temporary)
             remote = root / "remote"
-            install_directory = root / "unix-install"
+            install_directory = root / "linux-install"
             create_fixture_repository(remote)
             fixture_url = remote.resolve().as_uri()
             source = (ROOT / "install.sh").read_text(encoding="utf-8")
-            source = source.replace("https://github.com/StreamHome/StreamHome.git", fixture_url)
+            source = source.replace(REPOSITORY_URL, fixture_url)
+            if os.name == "nt":
+                source = source.replace(
+                    '[[ "$(uname -s)" == "Linux" ]] || fail "The alpha server installer supports Linux only."',
+                    "true",
+                )
             installer = root / "install-fixture.sh"
             installer.write_text(source, encoding="utf-8", newline="\n")
 
@@ -139,18 +180,37 @@ class SetupScriptContracts(unittest.TestCase):
             self.assertEqual((install_directory / ".setup-ran").read_text(encoding="utf-8"), "ready")
 
             (install_directory / ".setup-ran").unlink()
+            forwarded = run(
+                [bash, "-lc", f"'{bash_path(installer)}' --no-start --skip-system-packages"],
+                cwd=root,
+                env=environment,
+            )
+            self.assertEqual(forwarded.returncode, 0, forwarded.stdout + forwarded.stderr)
+            self.assertEqual(
+                (install_directory / ".setup-args").read_text(encoding="utf-8").splitlines(),
+                ["--no-start", "--skip-system-packages"],
+            )
+
+            (install_directory / ".setup-ran").unlink()
             local_change = install_directory / "local-change.txt"
             local_change.write_text("preserve me", encoding="utf-8")
-            second = run([bash, "-lc", f"'{bash_path(installer)}'"], cwd=root, env=environment)
-            self.assertNotEqual(second.returncode, 0)
-            self.assertIn("local changes", (second.stdout + second.stderr).lower())
+            dirty = run([bash, "-lc", f"'{bash_path(installer)}'"], cwd=root, env=environment)
+            self.assertNotEqual(dirty.returncode, 0)
+            self.assertIn("local changes", (dirty.stdout + dirty.stderr).lower())
             self.assertEqual(local_change.read_text(encoding="utf-8"), "preserve me")
 
-    def test_unix_stop_executes_without_pid_records_under_nounset(self) -> None:
-        bash = shutil.which("bash")
-        if os.name == "nt":
-            candidate = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "bin" / "bash.exe"
-            bash = str(candidate) if candidate.is_file() else bash
+            failed_install = root / "failed-install"
+            failed_environment = environment.copy()
+            failed_environment["STREAMHOME_INSTALL_DIR"] = bash_path(failed_install)
+            failed_environment["STREAMHOME_REF"] = "missing-ref"
+            failed = run([bash, "-lc", f"'{bash_path(installer)}'"], cwd=root, env=failed_environment)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertFalse(failed_install.exists())
+            self.assertFalse(Path(f"{failed_install}.install.lock").exists())
+            self.assertEqual(list(root.glob(".streamhome-install.*")), [])
+
+    def test_linux_stop_executes_without_pid_records_under_nounset(self) -> None:
+        bash = bash_command()
         if not bash:
             self.skipTest("Bash is not installed")
 
@@ -159,16 +219,18 @@ class SetupScriptContracts(unittest.TestCase):
             script = fixture / "stop.sh"
             shutil.copy2(ROOT / "stop.sh", script)
             (fixture / ".env").write_text("WEB_PORT=3000\n", encoding="utf-8")
+            (fixture / ".run").mkdir()
             result = run(
                 [bash, "-lc", f"'{bash_path(script)}' --quiet --recover-port {unused_port()}"],
                 cwd=fixture,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("unbound variable", (result.stdout + result.stderr).lower())
+            self.assertFalse((fixture / ".run" / "lifecycle.lock").exists())
 
-    @unittest.skipIf(os.name == "nt", "Unix listener ownership uses /proc or lsof")
-    def test_unix_stop_recovers_owned_orphan_and_preserves_unrelated_listener(self) -> None:
-        bash = shutil.which("bash")
+    @unittest.skipIf(os.name == "nt", "Linux listener ownership uses /proc or lsof")
+    def test_linux_stop_recovers_owned_orphan_and_preserves_unrelated_listener(self) -> None:
+        bash = bash_command()
         if not bash:
             self.skipTest("Bash is not installed")
         if not any(shutil.which(command) for command in ("lsof", "ss", "fuser")):
@@ -247,42 +309,6 @@ class SetupScriptContracts(unittest.TestCase):
             finally:
                 unrelated.kill()
                 unrelated.wait(timeout=5)
-
-    @unittest.skipUnless(os.name == "nt", "PowerShell bootstrap test is Windows-specific")
-    def test_windows_bootstrap_clones_runs_setup_and_refuses_dirty_update(self) -> None:
-        with tempfile.TemporaryDirectory(dir=ROOT / "temp") as temporary:
-            root = Path(temporary)
-            remote = root / "remote"
-            install_directory = root / "windows-install"
-            create_fixture_repository(remote)
-            fixture_url = remote.resolve().as_uri()
-            source = (ROOT / "install.ps1").read_text(encoding="utf-8")
-            source = source.replace("https://github.com/StreamHome/StreamHome.git", fixture_url)
-            installer = root / "install-fixture.ps1"
-            installer.write_text(source, encoding="utf-8")
-
-            environment = os.environ.copy()
-            environment["STREAMHOME_INSTALL_DIR"] = str(install_directory)
-            environment["STREAMHOME_REF"] = "main"
-            first = run(
-                ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(installer)],
-                cwd=root,
-                env=environment,
-            )
-            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-            self.assertEqual((install_directory / ".setup-ran-windows").read_text(encoding="utf-8").strip(), "ready")
-
-            (install_directory / ".setup-ran-windows").unlink()
-            local_change = install_directory / "local-change.txt"
-            local_change.write_text("preserve me", encoding="utf-8")
-            second = run(
-                ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(installer)],
-                cwd=root,
-                env=environment,
-            )
-            self.assertNotEqual(second.returncode, 0)
-            self.assertIn("local changes", (second.stdout + second.stderr).lower())
-            self.assertEqual(local_change.read_text(encoding="utf-8"), "preserve me")
 
 
 if __name__ == "__main__":

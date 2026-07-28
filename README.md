@@ -32,10 +32,8 @@ Powered by a high-performance ASGI Python backend and a modern React 19 frontend
 
 Your media remains under your control. StreamHome can store it locally, synchronize it with Google Drive, preserve portable recovery metadata alongside your media files, and maintain automatic local and cloud database backups.
 
-> [!IMPORTANT]
-> StreamHome is currently available as an **early public alpha pre-release**.
->
-> The platform is still under active development. Features, APIs, installation procedures, database migrations, and system requirements may change before the full public alpha release.
+> [!IMPORTANT]>
+> The platform is still under active development.
 >
 > Back up your StreamHome data before installing an update.
 
@@ -182,9 +180,17 @@ The database can also be backed up automatically to:
 
 The recovery architecture is designed to preserve media availability, catalog metadata, accounts, profiles, settings, and playback state.
 
-### 📱 Responsive Web Client
+### 📱 Installable Progressive Web App
 
-StreamHome includes a responsive browser client for desktop and mobile screens. The `v0.1.0-alpha.1` release does not register a service worker and does not promise PWA installation, offline playback, or offline downloads.
+StreamHome can be installed as a Progressive Web App on supported desktop and mobile browsers.
+
+The PWA provides:
+
+* an application-like standalone experience;
+* home-screen installation;
+* automatic synchronization with the server-delivered client;
+* supported offline functionality;
+* access without maintaining separate native mobile applications.
 
 ## ⚙️ How It Works
 
@@ -248,22 +254,8 @@ Background HEVC optimization pauses when users require server resources and ther
 
 ## 📦 Installation
 
-The supported alpha server target is Linux. Install the tagged release with:
+An Alpha version will be released soon. The download URL will be available when it's released.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/v0.1.0-alpha.1/install.sh | bash
-```
-
-The installer checks out the immutable `v0.1.0-alpha.1` tag by default. Set `STREAMHOME_REF` only when intentionally testing another branch or tag.
-
-<p align="center">
-  <a href="https://github.com/StreamHome/StreamHome/releases/tag/v0.1.0-alpha.1">
-    <img src="https://img.shields.io/badge/View-Installation%20Instructions-E25822?style=for-the-badge&logo=github&logoColor=white" alt="View installation instructions">
-  </a>
-</p>
-
-> [!NOTE]
-> Use installation instructions from the release you are installing. Alpha installation and update procedures may change between versions.
 
 ## 📚 Documentation and Support
 

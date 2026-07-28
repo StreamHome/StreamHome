@@ -2,19 +2,29 @@
 set -Eeuo pipefail
 
 REPOSITORY_URL="https://github.com/StreamHome/StreamHome.git"
-INSTALL_DIR="${STREAMHOME_INSTALL_DIR:-${HOME}/StreamHome}"
+INSTALL_DIR="${STREAMHOME_INSTALL_DIR:-${HOME:-}/StreamHome}"
 INSTALL_REF="${STREAMHOME_REF:-v0.1.0-alpha.1}"
+NO_START=false
+SKIP_SYSTEM_PACKAGES=false
+INSTALL_PARENT=""
+INSTALL_LOCK=""
+STAGING_DIR=""
 
 usage() {
     cat <<'EOF'
 StreamHome bootstrap installer
 
 Usage:
-  install.sh [--help]
+  install.sh [--no-start] [--skip-system-packages] [--help]
+
+Options:
+  --no-start             Install and build without starting StreamHome.
+  --skip-system-packages Do not install missing operating-system packages.
+  --help                 Show this help text.
 
 Environment overrides:
-  STREAMHOME_INSTALL_DIR  Installation directory (default: ~/StreamHome)
-  STREAMHOME_REF          Git branch or tag (default: v0.1.0-alpha.1)
+  STREAMHOME_INSTALL_DIR Installation directory (default: ~/StreamHome)
+  STREAMHOME_REF         Git branch or tag (default: v0.1.0-alpha.1)
 
 The installer clones or safely fast-forwards StreamHome, grants executable
 permissions to its shell entry points, and runs setup.sh.
@@ -29,6 +39,21 @@ fail() {
     printf '\n[StreamHome] ERROR: %s\n' "$1" >&2
     exit 1
 }
+
+cleanup() {
+    if [[ -n "$STAGING_DIR" && -d "$STAGING_DIR" ]]; then
+        case "$STAGING_DIR" in
+            "$INSTALL_PARENT"/.streamhome-install.*)
+                rm -rf -- "$STAGING_DIR"
+                ;;
+        esac
+    fi
+    if [[ -n "$INSTALL_LOCK" && -d "$INSTALL_LOCK" ]]; then
+        rm -f -- "$INSTALL_LOCK/owner.pid"
+        rmdir -- "$INSTALL_LOCK" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
 
 run_privileged() {
     if [[ "${EUID}" -eq 0 ]]; then
@@ -52,10 +77,8 @@ install_git() {
         run_privileged yum install -y git ca-certificates
     elif command -v pacman >/dev/null 2>&1; then
         run_privileged pacman -Sy --needed --noconfirm git ca-certificates
-    elif command -v brew >/dev/null 2>&1; then
-        brew install git
     else
-        fail "Git is required. Install Git with your operating system package manager and retry."
+        fail "Git is required. Install Git with your Linux distribution package manager and retry."
     fi
     command -v git >/dev/null 2>&1 || fail "Git installation completed but the git command is still unavailable. Open a new terminal and retry."
 }
@@ -71,50 +94,116 @@ valid_remote() {
     esac
 }
 
-prepare_checkout() {
-    local parent remote dirty
-    parent="$(dirname "$INSTALL_DIR")"
+normalize_install_path() {
+    local requested parent name
+    requested="$INSTALL_DIR"
+    [[ -n "$requested" ]] || fail "STREAMHOME_INSTALL_DIR may not be empty."
+    name="$(basename "$requested")"
+    [[ "$name" != "." && "$name" != ".." && "$name" != "/" ]] || fail "Choose a dedicated StreamHome installation directory."
+    parent="$(dirname "$requested")"
     [[ -d "$parent" ]] || mkdir -p "$parent"
+    INSTALL_PARENT="$(cd "$parent" && pwd -P)"
+    INSTALL_DIR="$INSTALL_PARENT/$name"
+}
 
-    if [[ -e "$INSTALL_DIR" && ! -d "$INSTALL_DIR" ]]; then
-        fail "The installation path exists and is not a directory: $INSTALL_DIR"
+acquire_install_lock() {
+    local owner=""
+    INSTALL_LOCK="${INSTALL_DIR}.install.lock"
+    if mkdir "$INSTALL_LOCK" 2>/dev/null; then
+        printf '%s\n' "$$" > "$INSTALL_LOCK/owner.pid"
+        return 0
     fi
-
-    if [[ -d "$INSTALL_DIR/.git" ]]; then
-        remote="$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)"
-        valid_remote "$remote" || fail "The existing directory is not a StreamHome checkout from $REPOSITORY_URL"
-        git -C "$INSTALL_DIR" remote set-url origin "$REPOSITORY_URL"
-        dirty="$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=normal)"
-        [[ -z "$dirty" ]] || fail "The existing StreamHome checkout has local changes. Commit or move them before updating."
-
-        log "Updating the existing StreamHome checkout"
-        git -C "$INSTALL_DIR" fetch --depth 1 origin "$INSTALL_REF"
-        if git -C "$INSTALL_DIR" show-ref --verify --quiet "refs/heads/$INSTALL_REF"; then
-            git -C "$INSTALL_DIR" checkout "$INSTALL_REF"
-            git -C "$INSTALL_DIR" merge --ff-only FETCH_HEAD
-        else
-            git -C "$INSTALL_DIR" checkout --detach FETCH_HEAD
-        fi
-        return
+    owner="$(cat "$INSTALL_LOCK/owner.pid" 2>/dev/null || true)"
+    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+        fail "Another StreamHome installation or update is already running for $INSTALL_DIR."
     fi
+    rm -f -- "$INSTALL_LOCK/owner.pid"
+    rmdir -- "$INSTALL_LOCK" 2>/dev/null || fail "The installation lock is stale but could not be removed: $INSTALL_LOCK"
+    mkdir "$INSTALL_LOCK" || fail "Could not acquire the installation lock: $INSTALL_LOCK"
+    printf '%s\n' "$$" > "$INSTALL_LOCK/owner.pid"
+}
 
+prepare_existing_checkout() {
+    local remote dirty fetched_commit head_commit
+    remote="$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)"
+    valid_remote "$remote" || fail "The existing directory is not a StreamHome checkout from $REPOSITORY_URL"
+    git -C "$INSTALL_DIR" remote set-url origin "$REPOSITORY_URL"
+    dirty="$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=normal)"
+    [[ -z "$dirty" ]] || fail "The existing StreamHome checkout has local changes. Commit or move them before updating."
+
+    log "Updating the existing StreamHome checkout"
+    git -C "$INSTALL_DIR" fetch --depth 1 origin "$INSTALL_REF"
+    fetched_commit="$(git -C "$INSTALL_DIR" rev-parse 'FETCH_HEAD^{commit}')"
+    if git -C "$INSTALL_DIR" show-ref --verify --quiet "refs/heads/$INSTALL_REF"; then
+        git -C "$INSTALL_DIR" checkout "$INSTALL_REF"
+        git -C "$INSTALL_DIR" merge --ff-only "$fetched_commit"
+    else
+        git -C "$INSTALL_DIR" -c advice.detachedHead=false checkout --detach "$fetched_commit"
+    fi
+    head_commit="$(git -C "$INSTALL_DIR" rev-parse HEAD)"
+    [[ "$head_commit" == "$fetched_commit" ]] || fail "The checkout did not resolve exactly to the requested ref $INSTALL_REF."
+}
+
+prepare_new_checkout() {
+    local checkout
     if [[ -d "$INSTALL_DIR" && -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]]; then
         fail "The installation directory is not empty and is not a StreamHome checkout: $INSTALL_DIR"
     fi
 
-    log "Cloning StreamHome into $INSTALL_DIR"
-    git clone --depth 1 --branch "$INSTALL_REF" "$REPOSITORY_URL" "$INSTALL_DIR"
+    STAGING_DIR="$(mktemp -d "$INSTALL_PARENT/.streamhome-install.XXXXXX")"
+    checkout="$STAGING_DIR/checkout"
+    log "Cloning StreamHome into a temporary checkout"
+    git clone --depth 1 --branch "$INSTALL_REF" "$REPOSITORY_URL" "$checkout"
+    [[ -d "$checkout/.git" ]] || fail "The temporary StreamHome checkout is incomplete."
+
+    if [[ -d "$INSTALL_DIR" ]]; then
+        rmdir -- "$INSTALL_DIR" || fail "The installation directory must remain empty during bootstrap: $INSTALL_DIR"
+    fi
+    mv -- "$checkout" "$INSTALL_DIR"
+    rmdir -- "$STAGING_DIR"
+    STAGING_DIR=""
+    log "Installed StreamHome into $INSTALL_DIR"
+}
+
+prepare_checkout() {
+    if [[ -e "$INSTALL_DIR" && ! -d "$INSTALL_DIR" ]]; then
+        fail "The installation path exists and is not a directory: $INSTALL_DIR"
+    fi
+    if [[ -d "$INSTALL_DIR/.git" ]]; then
+        prepare_existing_checkout
+    else
+        prepare_new_checkout
+    fi
 }
 
 main() {
-    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-        usage
-        return 0
-    fi
-    [[ $# -eq 0 ]] || fail "Unknown argument: $1 (use --help for usage)"
+    local -a setup_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-start)
+                NO_START=true
+                ;;
+            --skip-system-packages)
+                SKIP_SYSTEM_PACKAGES=true
+                ;;
+            --help|-h)
+                usage
+                return 0
+                ;;
+            *)
+                fail "Unknown argument: $1 (use --help for usage)"
+                ;;
+        esac
+        shift
+    done
+
+    [[ -n "${HOME:-}" || -n "${STREAMHOME_INSTALL_DIR:-}" ]] || fail "HOME is unavailable; set STREAMHOME_INSTALL_DIR explicitly."
+    [[ "$(uname -s)" == "Linux" ]] || fail "The alpha server installer supports Linux only."
     [[ "$INSTALL_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || fail "STREAMHOME_REF contains unsupported characters."
     [[ "$INSTALL_REF" != *".."* ]] || fail "STREAMHOME_REF may not contain '..'."
 
+    normalize_install_path
+    acquire_install_lock
     install_git
     prepare_checkout
 
@@ -126,9 +215,14 @@ main() {
         "$INSTALL_DIR/stop.sh" \
         "$INSTALL_DIR/test.sh"
 
+    [[ "$NO_START" == true ]] && setup_args+=(--no-start)
+    [[ "$SKIP_SYSTEM_PACKAGES" == true ]] && setup_args+=(--skip-system-packages)
+
     log "Starting StreamHome setup"
-    cd "$INSTALL_DIR"
-    exec ./setup.sh
+    (
+        cd "$INSTALL_DIR"
+        ./setup.sh "${setup_args[@]}"
+    )
 }
 
 main "$@"

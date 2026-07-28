@@ -12,6 +12,10 @@ cd ~/StreamHome
 
 Inspect `backend.log` and `frontend.log`. Confirm ports 3000 and 8000 are not owned by unrelated services.
 
+`start.sh` waits up to 30 seconds for the database-backed API health endpoint and production web response. If either service fails, it prints both log tails, stops the partial process tree, and returns a nonzero status instead of reporting a false success.
+
+If a lifecycle-lock error appears, first confirm that no other `start.sh` or `stop.sh` command is running. Dead-owner locks are recovered automatically; do not remove a lock owned by a live process.
+
 ## Setup returns to the unlock screen
 
 The signed setup session expired. Enter the current bootstrap code again. A still-active Google Drive setup job will be rebound from the saved browser checkpoint.
@@ -24,6 +28,8 @@ Return to the TMDB step and validate the token again. The validation receipt is 
 
 Run `./setup.sh` again to verify Rclone 1.68 or newer, then consult [Google Drive Storage](google-drive.md). Do not run `rclone config`; StreamHome uses its own encrypted configuration.
 
+When the system Rclone is missing or too old, setup installs the pinned application-owned build from a versioned official archive and verifies its embedded release checksum before atomic activation.
+
 ## Database errors
 
 Run from `server/`:
@@ -33,6 +39,10 @@ PYTHONPATH=. python scratch/check_db.py
 ```
 
 The only supported catalog database is `server/database.db`.
+
+## Release checks refuse to start
+
+`test.sh` deliberately refuses to run while the API or web port is active. Run `./stop.sh` first. Use `./test.sh --server-only`, `./test.sh --web-only`, or `./test.sh --syntax-only` when a narrower diagnostic is appropriate.
 
 ## Browser shows old assets
 

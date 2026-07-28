@@ -9,7 +9,9 @@ StreamHome consists of:
 - a React, TypeScript, and Vite web client in `web/`;
 - Linux lifecycle scripts at the repository root.
 
-The web server listens on the configured public port and proxies `/api` and `/media` to FastAPI on loopback port 8000. Physical media lives under `server/media`.
+The web server listens on the configured public port and proxies `/api` and `/media` to FastAPI bound explicitly to `127.0.0.1:8000`. Physical media lives under `server/media`.
+
+Linux lifecycle operations are serialized by installation, setup, and start/stop locks. Bootstrap promotes only a complete temporary checkout, setup stops an owned runtime before replacing dependencies or assets, PID records are written atomically, startup reports success only after API and web health checks pass, and shutdown preserves evidence when an owned process cannot be terminated.
 
 Ingestion is queue-based. Finalization writes portable `.metadata/metadata.json` beside media so catalog recovery can reconstruct quality, language, and subtitle information.
 
