@@ -1,6 +1,6 @@
 import json
 import time
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, Literal
 from pydantic import BaseModel, ConfigDict, Field as PydanticField, model_validator
 from sqlmodel import SQLModel, Field, Relationship
 from sqlalchemy import UniqueConstraint
@@ -557,6 +557,8 @@ class DownloadTask(SQLModel, table=True):
     episode: Optional[int] = None
     video_url: str
     audio_url: Optional[str] = None
+    video_source_type: str = Field(default="auto")
+    audio_source_type: str = Field(default="auto")
     headers_str: Optional[str] = Field(default="{}")  # Serialized JSON headers
     private_source_allowed: bool = Field(default=False)
     status: str = "PENDING"  # PENDING, DOWNLOADING, MERGING, COMPLETED, FAILED
@@ -831,6 +833,8 @@ class DownloadAddRequest(BaseModel):
     episode: Optional[int] = PydanticField(default=None, gt=0)
     video_url: str = PydanticField(min_length=1, max_length=4096)
     audio_url: Optional[str] = PydanticField(default=None, max_length=4096)
+    video_source_type: Literal["auto", "hls"] = "auto"
+    audio_source_type: Literal["auto", "hls"] = "auto"
     headers: Optional[Dict[str, str]] = None
     subtitles: Optional[List[SubtitleInput]] = PydanticField(default=None, max_length=32)
     quality: Optional[str] = PydanticField(default=None, max_length=32)

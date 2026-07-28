@@ -44,6 +44,8 @@ Update lifecycle endpoints require a recently reauthenticated administrator, exc
 
 Machine API keys cannot use update endpoints.
 
+`POST /api/add-movie` accepts optional `video_source_type` and `audio_source_type` values of `"auto"` or `"hls"`. MediaSender clients should send `"hls"` when they identify a manifest behind a misleading filename such as `master.txt`. The server persists the resolved source type with the queued task and applies the supplied allowlisted headers to both probing and FFmpeg ingestion.
+
 Administrative profile-data endpoints require recent reauthentication and do not require selecting or unlocking the inspected profile:
 
 - `GET /api/admin/profiles`: summary counts for every profile and the storage-location map;

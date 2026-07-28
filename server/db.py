@@ -117,6 +117,12 @@ async def init_db():
                 if "private_source_allowed" not in columns:
                     logger.info("[Database] Migrating: Adding private-source trust marker to download tasks...")
                     sync_conn.exec_driver_sql("ALTER TABLE downloadtask ADD COLUMN private_source_allowed BOOLEAN NOT NULL DEFAULT 0")
+                if "video_source_type" not in columns:
+                    logger.info("[Database] Migrating: Adding video source-type hint to download tasks...")
+                    sync_conn.exec_driver_sql("ALTER TABLE downloadtask ADD COLUMN video_source_type TEXT NOT NULL DEFAULT 'auto'")
+                if "audio_source_type" not in columns:
+                    logger.info("[Database] Migrating: Adding audio source-type hint to download tasks...")
+                    sync_conn.exec_driver_sql("ALTER TABLE downloadtask ADD COLUMN audio_source_type TEXT NOT NULL DEFAULT 'auto'")
             
             if "user" in inspector.get_table_names():
                 user_cols = [col["name"] for col in inspector.get_columns("user")]

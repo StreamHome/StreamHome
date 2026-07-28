@@ -29,10 +29,27 @@ class IngestionSmokeTestScriptTests(unittest.TestCase):
                 "episode": 1,
                 "video_url": "https://example.test/video.mp4",
             },
+            {
+                "tmdb_id": 1,
+                "media_type": "movie",
+                "video_url": "https://example.test/master.txt",
+                "video_source_type": "dash",
+            },
         ]
         for payload in invalid_payloads:
             with self.subTest(payload=payload), self.assertRaises(ValidationError):
                 DownloadAddRequest(**payload)
+
+    def test_ingestion_schema_accepts_explicit_disguised_hls_sources(self):
+        request = DownloadAddRequest(
+            tmdb_id=290250,
+            media_type="movie",
+            video_url="https://example.test/hls/movie.mp4/txt/master.txt",
+            video_source_type="hls",
+        )
+
+        self.assertEqual(request.video_source_type, "hls")
+        self.assertEqual(request.audio_source_type, "auto")
 
     def test_movie_payload_omits_tv_and_null_fields(self):
         payload = build_payload(
@@ -153,6 +170,8 @@ class IngestionSmokeTestScriptTests(unittest.TestCase):
                     self.assertIsNone(task.season)
                     self.assertIsNone(task.episode)
                     self.assertEqual(task.video_url, video_url)
+                    self.assertEqual(task.video_source_type, "auto")
+                    self.assertEqual(task.audio_source_type, "auto")
                     self.assertIsNotNone(movie)
                     self.assertEqual(movie.title, "Catalogued Test Movie")
                     self.assertEqual(movie.description, "TMDB description")

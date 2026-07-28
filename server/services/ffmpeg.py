@@ -188,6 +188,8 @@ async def download_and_merge(
     headers: Dict[str, str],
     output_path: str,
     duration_secs: float,
+    video_source_type: str = "auto",
+    audio_source_type: str = "auto",
 ) -> tuple[bool, Optional[IngestionFailure]]:
     """Download video/audio streams, merge losslessly, inject headers, track progress."""
     
@@ -204,14 +206,14 @@ async def download_and_merge(
     is_video_http = is_http_media_source(video_url)
     if headers_str.strip() and is_video_http:
         cmd.extend(["-headers", headers_str])
-    cmd.extend(ffmpeg_network_input_options(video_url))
+    cmd.extend(ffmpeg_network_input_options(video_url, video_source_type))
     cmd.extend(["-i", video_url])
     
     if audio_url:
         is_audio_http = is_http_media_source(audio_url)
         if headers_str.strip() and is_audio_http:
             cmd.extend(["-headers", headers_str])
-        cmd.extend(ffmpeg_network_input_options(audio_url))
+        cmd.extend(ffmpeg_network_input_options(audio_url, audio_source_type))
         # faststart eklendi
         cmd.extend(["-i", audio_url, "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", "-map", "0:v:0", "-map", "1:a:0", "-shortest"])
     else:

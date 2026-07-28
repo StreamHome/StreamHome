@@ -229,6 +229,17 @@ HLS example:
 https://media.example.com/movies/master.m3u8
 ```
 
+Some providers disguise an HLS manifest behind a nonstandard name such as `master.txt`. A MediaSender client that has positively identified that response as HLS should declare it explicitly:
+
+```json
+{
+  "video_url": "https://media.example.com/hls/movie.mp4/txt/master.txt",
+  "video_source_type": "hls"
+}
+```
+
+`video_source_type` and `audio_source_type` accept `"auto"` (the default) or `"hls"`. In automatic mode StreamHome first probes normally, then safely retries an ambiguous HTTP source with the HLS demuxer and persists the detected type for the download. The explicit hint avoids relying on a misleading filename.
+
 Do not submit local filesystem paths directly:
 
 ```text
@@ -254,7 +265,9 @@ A MediaSender client can submit an additional `audio_url`:
 ```json
 {
   "video_url": "https://media.example.com/video/episode.m3u8",
-  "audio_url": "https://media.example.com/audio/episode-en.m3u8"
+  "audio_url": "https://media.example.com/audio/episode-en.m3u8",
+  "video_source_type": "hls",
+  "audio_source_type": "hls"
 }
 ```
 

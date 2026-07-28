@@ -129,6 +129,8 @@ async def add_movie(
             episode=payload.episode,
             video_url=payload.video_url,
             audio_url=payload.audio_url,
+            video_source_type=payload.video_source_type,
+            audio_source_type=payload.audio_source_type,
             headers_str=json.dumps(headers_dict),
             private_source_allowed=address_is_loopback(source_client),
             status="PENDING",

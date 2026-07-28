@@ -9,13 +9,23 @@ from typing import Dict, Any, Optional
 from config import settings
 from services.logger import logger
 from services.ingestion_errors import IngestionFailure, classify_failure, compact_diagnostics, sanitize_url, write_task_diagnostics
-from services.ffmpeg_input import ffmpeg_network_input_options, is_http_media_source
+from services.ffmpeg_input import (
+    ffmpeg_network_input_options,
+    is_hls_media_source,
+    is_http_media_source,
+    normalize_source_type,
+)
+
+
+HLS_FALLBACK_FAILURES = {"INVALID_MEDIA_SOURCE", "MEDIA_PROBE_FAILED", "FFMPEG_OPTION_UNSUPPORTED"}
 
 async def probe_media_stream(
     video_url: str,
     audio_url: Optional[str] = None,
     headers: Optional[Dict[str, str]] = None,
     task_id: Optional[str] = None,
+    video_source_type: str = "auto",
+    audio_source_type: str = "auto",
 ) -> Dict[str, Any]:
     """
     Probes remote or local video and audio streams using ffprobe to detect
@@ -27,16 +37,32 @@ async def probe_media_stream(
     if headers and isinstance(headers, dict) and len(headers) > 0:
         headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
 
-    async def run_ffprobe(url: str) -> Dict[str, Any]:
+    async def run_ffprobe(url: str, source_type: str) -> Dict[str, Any]:
+        normalized_source_type = normalize_source_type(source_type)
         if not url:
-            return {"has_video": False, "has_audio": False, "height": 0, "failure": IngestionFailure("MISSING_SOURCE", "No media source URL was supplied.")}
+            return {
+                "has_video": False,
+                "has_audio": False,
+                "height": 0,
+                "source_type": normalized_source_type,
+                "diagnostics": "No media source URL was supplied.",
+                "failure": IngestionFailure("MISSING_SOURCE", "No media source URL was supplied."),
+            }
             
-        cmd = [ffprobe_path, "-v", "error", "-show_entries", "stream=codec_type,height,width", "-of", "json"]
+        cmd = [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,height,width:format=format_name",
+            "-of",
+            "json",
+        ]
         
         is_http = is_http_media_source(url)
         if headers_str.strip() and is_http:
             cmd.extend(["-headers", headers_str])
-        cmd.extend(ffmpeg_network_input_options(url))
+        cmd.extend(ffmpeg_network_input_options(url, normalized_source_type))
         cmd.append(url)
         
         logger.info(f"[Media Probe] Probing source: {sanitize_url(url)[:120]}")
@@ -53,32 +79,84 @@ async def probe_media_stream(
             
             if process.returncode != 0:
                 err_msg = stderr.decode("utf-8", errors="ignore").strip()
-                diagnostics_path = write_task_diagnostics(task_id, "ffprobe", err_msg) if task_id else None
                 failure = classify_failure(err_msg, "MEDIA_PROBE_FAILED")
-                failure = IngestionFailure(failure.code, failure.message, failure.retryable, diagnostics_path)
-                return {"has_video": False, "has_audio": False, "height": 0, "failure": failure}
+                return {
+                    "has_video": False,
+                    "has_audio": False,
+                    "height": 0,
+                    "source_type": normalized_source_type,
+                    "diagnostics": err_msg,
+                    "failure": failure,
+                }
                 
             data = json.loads(stdout.decode("utf-8", errors="ignore"))
             streams = data.get("streams", [])
             
             has_video = any(s.get("codec_type") == "video" for s in streams)
             has_audio = any(s.get("codec_type") == "audio" for s in streams)
+            format_name = str((data.get("format") or {}).get("format_name") or "").lower()
+            detected_source_type = (
+                "hls"
+                if normalized_source_type == "hls"
+                or is_hls_media_source(url)
+                or "hls" in {part.strip() for part in format_name.split(",")}
+                else "auto"
+            )
             
             # Find the max height among video streams
             heights = [int(s.get("height", 0)) for s in streams if s.get("codec_type") == "video" and s.get("height")]
             max_height = max(heights) if heights else 0
             
-            return {"has_video": has_video, "has_audio": has_audio, "height": max_height, "failure": None}
+            return {
+                "has_video": has_video,
+                "has_audio": has_audio,
+                "height": max_height,
+                "source_type": detected_source_type,
+                "diagnostics": "",
+                "failure": None,
+            }
             
         except Exception as e:
-            diagnostics_path = write_task_diagnostics(task_id, "ffprobe exception", repr(e)) if task_id else None
             failure = classify_failure(str(e), "MEDIA_PROBE_FAILED")
-            failure = IngestionFailure(failure.code, failure.message, failure.retryable, diagnostics_path)
-            return {"has_video": False, "has_audio": False, "height": 0, "failure": failure}
+            return {
+                "has_video": False,
+                "has_audio": False,
+                "height": 0,
+                "source_type": normalized_source_type,
+                "diagnostics": repr(e),
+                "failure": failure,
+            }
+
+    async def probe_source(url: str, source_type: str, expected_stream: str) -> Dict[str, Any]:
+        normalized_source_type = normalize_source_type(source_type)
+        result = await run_ffprobe(url, normalized_source_type)
+        expected_found = bool(result.get(f"has_{expected_stream}"))
+        failure = result.get("failure")
+        should_force_hls = (
+            normalized_source_type == "auto"
+            and is_http_media_source(url)
+            and not expected_found
+            and (not failure or failure.code in HLS_FALLBACK_FAILURES)
+        )
+        if not should_force_hls:
+            return result
+
+        logger.info(f"[Media Probe] Retrying ambiguous HTTP source as an HLS manifest: {sanitize_url(url)[:120]}")
+        forced_result = await run_ffprobe(url, "hls")
+        if forced_result.get(f"has_{expected_stream}") and not forced_result.get("failure"):
+            return forced_result
+        forced_failure = forced_result.get("failure")
+        if forced_failure and forced_failure.code not in HLS_FALLBACK_FAILURES:
+            return forced_result
+        return result
 
     # Run probes
-    video_res = await run_ffprobe(video_url)
-    audio_res = await run_ffprobe(audio_url) if audio_url else {"has_video": False, "has_audio": False, "height": 0, "failure": None}
+    video_res = await probe_source(video_url, video_source_type, "video")
+    audio_res = (
+        await probe_source(audio_url, audio_source_type, "audio")
+        if audio_url
+        else {"has_video": False, "has_audio": False, "height": 0, "source_type": "auto", "diagnostics": "", "failure": None}
+    )
     
     has_video = video_res["has_video"]
     has_audio = video_res["has_audio"] or audio_res["has_audio"]
@@ -88,6 +166,12 @@ async def probe_media_stream(
         failure = IngestionFailure("INVALID_MEDIA_SOURCE", "The media sender source contains no video stream.")
     if audio_url and not audio_res["has_audio"] and not failure:
         failure = audio_res.get("failure") or IngestionFailure("INVALID_AUDIO_SOURCE", "The separate audio source contains no audio stream.")
+    if failure and task_id:
+        failure_result = video_res if video_res.get("failure") else audio_res
+        diagnostics = str(failure_result.get("diagnostics") or "").strip()
+        if diagnostics:
+            diagnostics_path = write_task_diagnostics(task_id, "ffprobe", diagnostics)
+            failure = IngestionFailure(failure.code, failure.message, failure.retryable, diagnostics_path)
     
     # Map height to quality string
     quality = "Source"
@@ -111,6 +195,8 @@ async def probe_media_stream(
         "has_video": has_video,
         "has_audio": has_audio,
         "scan_quality": quality,
+        "video_source_type": video_res.get("source_type", normalize_source_type(video_source_type)),
+        "audio_source_type": audio_res.get("source_type", normalize_source_type(audio_source_type)),
         "failure": failure,
     }
 

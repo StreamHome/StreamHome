@@ -107,19 +107,21 @@ http://localhost:8000/api/add-movie
 
 ## Request Schema
 
-| Field          | Type             | Required | Description                                                                        |
-| -------------- | ---------------- | :------: | ---------------------------------------------------------------------------------- |
-| `tmdb_id`      | Integer          |    Yes   | TMDB identifier for the movie or television series.                                |
-| `media_type`   | String           |    Yes   | Media type. Use `"movie"` for movies or `"tv"` for television series.              |
-| `video_url`    | String           |    Yes   | Direct HTTP or HTTPS video file or stream-manifest URL, such as MP4, WebM, or HLS. |
-| `audio_url`    | String or `null` |    No    | Separate audio source when the video and audio are provided independently.         |
-| `season`       | Integer          |  TV only | Season number for a television episode.                                            |
-| `episode`      | Integer          |  TV only | Episode number for a television episode.                                           |
-| `headers`      | Object           |    No    | Request headers required to access the submitted source.                           |
-| `subtitles`    | Array            |    No    | External subtitle sources with language and URL information.                       |
-| `quality`      | String           |    No    | Source-quality label such as `"1080p"` or `"720p"`.                                |
-| `language`     | String           |    No    | Primary audio-language code such as `"en"` or `"tr"`.                              |
-| `skip_markers` | Object           |    No    | Intro, recap, credits, and preview playback markers.                               |
+| Field                | Type             | Required | Description                                                                        |
+| -------------------- | ---------------- | :------: | ---------------------------------------------------------------------------------- |
+| `tmdb_id`            | Integer          |    Yes   | TMDB identifier for the movie or television series.                                |
+| `media_type`         | String           |    Yes   | Media type. Use `"movie"` for movies or `"tv"` for television series.              |
+| `video_url`          | String           |    Yes   | Direct HTTP or HTTPS video file or stream-manifest URL, such as MP4, WebM, or HLS. |
+| `audio_url`          | String or `null` |    No    | Separate audio source when the video and audio are provided independently.         |
+| `video_source_type`  | String           |    No    | `"auto"` (default) or `"hls"` when the client positively identifies a manifest.    |
+| `audio_source_type`  | String           |    No    | `"auto"` (default) or `"hls"` for a separately supplied audio manifest.            |
+| `season`             | Integer          |  TV only | Season number for a television episode.                                            |
+| `episode`            | Integer          |  TV only | Episode number for a television episode.                                           |
+| `headers`            | Object           |    No    | Request headers required to access the submitted source.                           |
+| `subtitles`          | Array            |    No    | External subtitle sources with language and URL information.                       |
+| `quality`            | String           |    No    | Source-quality label such as `"1080p"` or `"720p"`.                                |
+| `language`           | String           |    No    | Primary audio-language code such as `"en"` or `"tr"`.                              |
+| `skip_markers`       | Object           |    No    | Intro, recap, credits, and preview playback markers.                               |
 
 ## Field Requirements
 
@@ -761,6 +763,21 @@ https://media.example.com/movie/master.m3u8
 ```
 
 StreamHome applies HLS-specific FFmpeg options only when the source is identified as an HLS manifest.
+
+Identification does not depend only on a `.m3u8` suffix. If a provider returns an HLS playlist from a disguised URL such as `master.txt`, submit the extension's positive classification:
+
+```json
+{
+  "video_url": "https://media.example.com/hls/movie.mp4/txt/master.txt",
+  "video_source_type": "hls",
+  "headers": {
+    "Referer": "https://media.example.com/",
+    "User-Agent": "Mozilla/5.0"
+  }
+}
+```
+
+For older clients that leave the default `"auto"`, StreamHome inspects FFprobe's detected container and performs one forced-HLS retry when an HTTP source is ambiguous. Once identified, the queue persists the HLS type so the same header and demuxer contract is used during download and for nested segment requests.
 
 A MediaSender client should not attempt to provide FFmpeg command-line options directly.
 

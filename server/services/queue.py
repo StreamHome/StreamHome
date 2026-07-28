@@ -206,6 +206,8 @@ class DownloadQueueManager:
                 video_url = task.video_url
                 submitted_video_url = video_url
                 audio_url = task.audio_url
+                video_source_type = task.video_source_type
+                audio_source_type = task.audio_source_type
                 season = task.season
                 episode = task.episode
                 subtitles_list = task.subtitles
@@ -241,7 +243,14 @@ class DownloadQueueManager:
             logger.info(f"[Queue Manager] Validating media sender source for task {task_id}...")
             probe_res = None
             for probe_attempt in range(1, 4):
-                probe_res = await probe_media_stream(video_url, audio_url, headers, task_id=task_id)
+                probe_res = await probe_media_stream(
+                    video_url,
+                    audio_url,
+                    headers,
+                    task_id=task_id,
+                    video_source_type=video_source_type,
+                    audio_source_type=audio_source_type,
+                )
                 probe_failure = probe_res.get("failure")
                 if not probe_failure or not probe_failure.retryable or probe_attempt == 3:
                     break
@@ -253,6 +262,8 @@ class DownloadQueueManager:
             has_video = probe_res["has_video"]
             has_audio = probe_res["has_audio"]
             scan_quality = probe_res["scan_quality"]
+            video_source_type = probe_res["video_source_type"]
+            audio_source_type = probe_res["audio_source_type"]
 
             # Save probe details to DB
             async with AsyncSession(engine) as db:
@@ -261,6 +272,8 @@ class DownloadQueueManager:
                     task_db.has_video = has_video
                     task_db.has_audio = has_audio
                     task_db.scan_quality = scan_quality
+                    task_db.video_source_type = video_source_type
+                    task_db.audio_source_type = audio_source_type
                     db.add(task_db)
                     await db.commit()
 
@@ -384,7 +397,8 @@ class DownloadQueueManager:
                 
                 success, failure = await download_and_merge(
                     task_id=task_id, video_url=video_url, audio_url=audio_url,
-                    headers=headers, output_path=output_abs_path, duration_secs=duration_secs
+                    headers=headers, output_path=output_abs_path, duration_secs=duration_secs,
+                    video_source_type=video_source_type, audio_source_type=audio_source_type,
                 )
                 
                 if success:

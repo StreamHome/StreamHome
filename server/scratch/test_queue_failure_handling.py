@@ -57,6 +57,15 @@ def test_ffmpeg_input_options_are_source_specific() -> None:
     query_manifest_options = ffmpeg_network_input_options("https://sender.example/play?format=m3u8")
     assert "-allowed_extensions" in query_manifest_options
 
+    disguised_manifest_options = ffmpeg_network_input_options(
+        "https://sender.example/hls/movie.mp4/txt/master.txt",
+        "hls",
+    )
+    assert is_hls_media_source("https://sender.example/hls/movie.mp4/txt/master.txt", "hls")
+    assert "-allowed_extensions" in disguised_manifest_options
+    assert "-extension_picky" in disguised_manifest_options
+    assert disguised_manifest_options[-2:] == ["-f", "hls"]
+
     assert ffmpeg_network_input_options("C:/media/video.mp4") == []
 
 
