@@ -27,6 +27,7 @@ from services.secret_crypto import is_protected_secret, protect_secret, reveal_s
 from services.rate_limit import clear as clear_rate_limit
 from services.rate_limit import enforce as enforce_rate_limit
 from services.rate_limit import fail as fail_rate_limit
+import services.state as service_state
 from services.integration_auth import integration_token_hash
 from services.totp_enrollment import (
     create_totp_enrollment,
@@ -315,7 +316,19 @@ async def require_recent_reauth(session: AuthSession = Depends(get_current_sessi
 @health_router.get("/api/health")
 async def health(db: AsyncSession = Depends(get_session)):
     try:
+        if service_state.MAINTENANCE_MODE:
+            raise RuntimeError("Server restart required after database restore")
         await db.execute(text("SELECT 1"))
+        required_tables = {"user", "profile", "authsession", "movie", "downloadtask"}
+        table_result = await db.execute(
+            text(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name IN ('user', 'profile', 'authsession', 'movie', 'downloadtask')"
+            )
+        )
+        available_tables = {str(name) for name in table_result.scalars().all()}
+        if not required_tables.issubset(available_tables):
+            raise RuntimeError("Required database schema is incomplete")
         return {"status": "ready", "version": settings.APP_VERSION, "serverTime": now()}
     except Exception:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail={"code": "server_unavailable", "message": "The server database is not ready."})

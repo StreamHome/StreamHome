@@ -127,7 +127,7 @@ class Settings:
     BACKUP_ENABLED: bool = os.getenv("BACKUP_ENABLED", "False").lower() in ("true", "1", "yes")
 
     # Automated Update System
-    AUTO_UPDATE_ENABLED: bool = os.getenv("AUTO_UPDATE_ENABLED", "False").lower() in ("true", "1", "yes")
+    AUTO_UPDATE_ENABLED: bool = False
     UPDATE_BRANCH: str = os.getenv("UPDATE_BRANCH", "main").strip() or "main"
     UPDATE_REQUIRE_SIGNED_COMMITS: bool = os.getenv("UPDATE_REQUIRE_SIGNED_COMMITS", "true").lower() in ("true", "1", "yes")
 
@@ -149,7 +149,7 @@ class Settings:
                     self.GOOGLE_DRIVE_AUDIENCE = data.get("google_drive_audience", getattr(self, "GOOGLE_DRIVE_AUDIENCE", "external"))
                     self.GOOGLE_DRIVE_PUBLISHING_STATUS = data.get("google_drive_publishing_status", getattr(self, "GOOGLE_DRIVE_PUBLISHING_STATUS", "production"))
                     self.BACKUP_ENABLED = data.get("backup_enabled", self.BACKUP_ENABLED)
-                    self.AUTO_UPDATE_ENABLED = data.get("auto_update_enabled", self.AUTO_UPDATE_ENABLED)
+                    self.AUTO_UPDATE_ENABLED = False
                     self.HEVC_COMPRESSION_MODE = data.get("hevc_compression_mode", self.HEVC_COMPRESSION_MODE)
                     self.SESSION_LIFETIME_DAYS = max(1, min(365, int(data.get("session_lifetime_days", self.SESSION_LIFETIME_DAYS))))
                     self.JWT_EXPIRATION_MINUTES = 60 * 24 * self.SESSION_LIFETIME_DAYS
@@ -167,7 +167,7 @@ class Settings:
                 "google_drive_audience": getattr(self, "GOOGLE_DRIVE_AUDIENCE", "external"),
                 "google_drive_publishing_status": getattr(self, "GOOGLE_DRIVE_PUBLISHING_STATUS", "production"),
                 "backup_enabled": self.BACKUP_ENABLED,
-                "auto_update_enabled": self.AUTO_UPDATE_ENABLED,
+                "auto_update_enabled": False,
                 "hevc_compression_mode": self.HEVC_COMPRESSION_MODE,
                 "session_lifetime_days": self.SESSION_LIFETIME_DAYS
             }, f, indent=2, ensure_ascii=False)

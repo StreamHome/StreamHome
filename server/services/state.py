@@ -13,6 +13,7 @@ ACTIVE_PROCESSES: Dict[str, Union[asyncio.subprocess.Process, subprocess.Popen]]
 # Active HTTP traffic metrics for update idle detection
 ACTIVE_HTTP_REQUESTS: int = 0
 LAST_HTTP_ACTIVITY_TIMESTAMP: float = 0.0
+MAINTENANCE_MODE: bool = False
 
 import json
 import os

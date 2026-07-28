@@ -1112,6 +1112,14 @@ async def refresh_profile_cache(profile_id: str, force: bool = False) -> bool:
 async def recommendation_worker(stop_event) -> None:
     """Refresh profiles hourly while draining bounded catalog-enrichment batches."""
     while not stop_event.is_set():
+        from services import state as service_state
+
+        if service_state.MAINTENANCE_MODE:
+            try:
+                await __import__("asyncio").wait_for(stop_event.wait(), timeout=5)
+            except __import__("asyncio").TimeoutError:
+                pass
+            continue
         backfilled = 0
         try:
             from services.vibe_analysis import backfill_catalog_vibes

@@ -1,7 +1,7 @@
 import json
 import time
 from typing import Optional, List, Any, Dict
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field as PydanticField, model_validator
 from sqlmodel import SQLModel, Field, Relationship
 from sqlalchemy import UniqueConstraint
 
@@ -25,6 +25,7 @@ class Profile(SQLModel, table=True):
     theme: Optional[str] = "netflix"
     pin_enabled: Optional[bool] = Field(default=False)
     pin_hash: Optional[str] = None
+    pin_version: int = Field(default=0)
 
 class Movie(SQLModel, table=True):
     id: str = Field(primary_key=True)
@@ -423,6 +424,8 @@ class AuthSession(SQLModel, table=True):
     reauthenticated_at: Optional[float] = Field(default=None)
     ip_address: str = Field(default="Unknown")
     device_label: str = Field(default="Unknown device")
+    selected_profile_id: Optional[str] = Field(default=None, index=True)
+    selected_profile_pin_version: Optional[int] = Field(default=None)
 
 class AuthChallenge(SQLModel, table=True):
     id: str = Field(primary_key=True)
@@ -787,8 +790,8 @@ class PlaybackSessionResponse(APIModel):
     is_finished: Optional[bool]
 
 class SubtitleInput(BaseModel):
-    language: str
-    url: str
+    language: str = PydanticField(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_-]+$")
+    url: str = PydanticField(min_length=1, max_length=4096)
 
 class TelemetryRequest(BaseModel):
     event_type: str
@@ -815,14 +818,27 @@ class RecommendationOnboardingRequest(BaseModel):
     title_ids: List[str] = []
 
 class DownloadAddRequest(BaseModel):
-    tmdb_id: int
+    tmdb_id: int = PydanticField(gt=0)
     media_type: str  # "movie" or "tv" / "series"
-    season: Optional[int] = None
-    episode: Optional[int] = None
-    video_url: str
-    audio_url: Optional[str] = None
+    season: Optional[int] = PydanticField(default=None, gt=0)
+    episode: Optional[int] = PydanticField(default=None, gt=0)
+    video_url: str = PydanticField(min_length=1, max_length=4096)
+    audio_url: Optional[str] = PydanticField(default=None, max_length=4096)
     headers: Optional[Dict[str, str]] = None
-    subtitles: Optional[List[SubtitleInput]] = None
-    quality: Optional[str] = None
-    language: Optional[str] = None
+    subtitles: Optional[List[SubtitleInput]] = PydanticField(default=None, max_length=32)
+    quality: Optional[str] = PydanticField(default=None, max_length=32)
+    language: Optional[str] = PydanticField(default=None, min_length=1, max_length=32)
     skip_markers: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def validate_media_identity(self) -> "DownloadAddRequest":
+        normalized_type = self.media_type.strip().lower()
+        if normalized_type not in {"movie", "tv", "series"}:
+            raise ValueError("media_type must be 'movie', 'tv', or 'series'")
+        self.media_type = normalized_type
+        if normalized_type == "movie":
+            if self.season is not None or self.episode is not None:
+                raise ValueError("Movie ingestion must omit season and episode")
+        elif self.season is None or self.episode is None:
+            raise ValueError("TV ingestion requires both season and episode")
+        return self

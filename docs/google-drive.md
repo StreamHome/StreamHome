@@ -4,6 +4,8 @@ This guide explains how to create a Google Cloud project, enable the Google Driv
 
 No manual Rclone terminal configuration is required. StreamHome manages its own Rclone configuration after Google OAuth has been configured successfully.
 
+Rclone runs only on the StreamHome server. Browser clients never receive the Rclone configuration or cloud credentials.
+
 > [!IMPORTANT]
 > Google Cloud Console changes occasionally. Labels or button positions may differ slightly, but the required configuration remains the same.
 >

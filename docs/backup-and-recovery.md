@@ -12,13 +12,14 @@ The primary catalog database is `server/database.db`. Media portability metadata
 
 ## Restoration
 
-Stop StreamHome before restoring a database:
+The authenticated Admin restore workflow first refuses active playback/downloads, quiesces other requests, validates the backup, creates a rollback backup, and atomically installs the selected database. A successful restore deliberately leaves the API in maintenance mode. Restart StreamHome immediately before making any other request:
 
 ```bash
 ./stop.sh
+./start.sh
 ```
 
-Use the authenticated Admin restore workflow when the application is operational. Manual file replacement should be reserved for disaster recovery and must preserve ownership and permissions.
+For a manual disaster-recovery replacement, stop StreamHome before touching `server/database.db` and preserve file ownership and permissions.
 
 After restoration:
 
@@ -29,4 +30,4 @@ cd ..
 ./start.sh
 ```
 
-If the database cannot be recovered, the catalog recovery scanner can rebuild supported media records from `.metadata/metadata.json`. Account credentials, sessions, and playback history still require a database backup.
+If the database cannot be recovered, the catalog recovery scanner can rebuild supported local or configured-cloud media records from `.metadata/metadata.json`. Account credentials, sessions, and playback history still require a database backup.

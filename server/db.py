@@ -71,6 +71,8 @@ async def init_db():
                 profile_columns = [col["name"] for col in inspector.get_columns("profile")]
                 if "pin_hash" not in profile_columns:
                     sync_conn.exec_driver_sql("ALTER TABLE profile ADD COLUMN pin_hash TEXT")
+                if "pin_version" not in profile_columns:
+                    sync_conn.exec_driver_sql("ALTER TABLE profile ADD COLUMN pin_version INTEGER NOT NULL DEFAULT 0")
                 if "pin" in profile_columns:
                     legacy_pins = sync_conn.exec_driver_sql(
                         "SELECT id, pin FROM profile WHERE pin IS NOT NULL AND TRIM(pin) != ''"
@@ -82,6 +84,12 @@ async def init_db():
                             (pin_hash, profile_id),
                         )
                     sync_conn.exec_driver_sql("UPDATE profile SET pin = NULL WHERE pin IS NOT NULL")
+            if "authsession" in inspector.get_table_names():
+                auth_session_columns = [col["name"] for col in inspector.get_columns("authsession")]
+                if "selected_profile_id" not in auth_session_columns:
+                    sync_conn.exec_driver_sql("ALTER TABLE authsession ADD COLUMN selected_profile_id TEXT")
+                if "selected_profile_pin_version" not in auth_session_columns:
+                    sync_conn.exec_driver_sql("ALTER TABLE authsession ADD COLUMN selected_profile_pin_version INTEGER")
             if "downloadtask" in inspector.get_table_names():
                 columns = [col["name"] for col in inspector.get_columns("downloadtask")]
                 if "language" not in columns:

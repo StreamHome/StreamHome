@@ -23,12 +23,11 @@ from models import (
     PlaybackSessionResponse, DiscoverMovieResponse, EpisodeResponse, 
     Profile, ProfileResponse, APIModel, DownloadTask, TelemetryRequest,
     RecommendationFeedResponse, MediaPreferenceRequest, RecommendationExposureBatch,
-    RecommendationOnboardingRequest, User, DriveSetupJob, PlaybackRun
+    RecommendationOnboardingRequest, User, DriveSetupJob, PlaybackRun, AuthSession
 )
 from services.recommendation import (
     process_telemetry_event,
     record_authoritative_signal,
-    record_playback_progress,
     rank_movies_for_profile,
     build_recommendation_payload,
     recommendation_worker,
@@ -42,7 +41,7 @@ from services.recommendation import (
     persist_profile_pool,
 )
 from services.request_security import allowed_origins, client_ip, same_origin_request
-from services.profile_security import hash_profile_pin, verify_profile_pin
+from services.profile_security import grant_profile_access, hash_profile_pin, require_profile_access, verify_profile_pin
 from services.rate_limit import clear as clear_rate_limit
 from services.rate_limit import enforce as enforce_rate_limit
 from services.rate_limit import fail as fail_rate_limit
@@ -54,7 +53,7 @@ from services.playback_prep import playback_prep_service
 from services.vibe_analysis import vibe_analysis_manager
 import services.state as state
 from routes.queue import router as queue_router
-from routes.auth import router as auth_router, health_router, get_current_user, require_recent_reauth
+from routes.auth import router as auth_router, health_router, get_current_session, get_current_user, require_recent_reauth
 from routes.stream import router as stream_router
 from routes.backup import router as backup_router
 from routes.update import router as update_router
@@ -92,10 +91,8 @@ async def playback_run_reaper():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Sunucu başlarken (Startup) yapılacaklar:
-    try:
-        await init_db()
-    except Exception as db_err:
-        logger.error(f"[Lifespan Startup] Database initialization failed (server continuing): {db_err}")
+    await init_db()
+    background_tasks: list[asyncio.Task] = []
 
     try:
         async with AsyncSession(engine) as db:
@@ -201,7 +198,9 @@ async def lifespan(app: FastAPI):
             logger.error(f"[Lifespan Startup] Catalog/playback recovery failed: {type(exc).__name__}: {exc}")
 
     try:
-        asyncio.create_task(recover_catalog_and_playback())
+        background_tasks.append(
+            asyncio.create_task(recover_catalog_and_playback(), name="catalog-playback-recovery")
+        )
     except Exception as sync_err:
         logger.error(f"[Lifespan Startup] Error scheduling media sync from disk: {sync_err}")
 
@@ -252,30 +251,7 @@ async def lifespan(app: FastAPI):
                 logger.error(f"[Backup Worker] Error in daily backup scheduler: {e}")
             await asyncio.sleep(3600)
 
-    asyncio.create_task(daily_backup_worker())
-
-    async def auto_update_worker():
-        await asyncio.sleep(45)
-        while True:
-            try:
-                if settings.AUTO_UPDATE_ENABLED:
-                    from services.update import check_for_github_updates, is_system_idle, pull_and_install_updates, self_restart_server
-                    if await check_for_github_updates():
-                        while not await is_system_idle():
-                            logger.info("[Update Worker] Update is available, but system is currently in use. Retrying idle check in 5 minutes...")
-                            await asyncio.sleep(300)
-                            
-                        logger.info("[Update Worker] System is idle. Executing pull and update...")
-                        success = await pull_and_install_updates()
-                        if success:
-                            logger.info("[Update Worker] Update successfully applied. Restarting server...")
-                            self_restart_server()
-                            break
-            except Exception as e:
-                logger.error(f"[Update Worker] Error in automatic update scheduler: {e}")
-            await asyncio.sleep(3600)
-
-    asyncio.create_task(auto_update_worker())
+    background_tasks.append(asyncio.create_task(daily_backup_worker(), name="daily-backup"))
 
     recommendation_stop = asyncio.Event()
     recommendation_task = asyncio.create_task(recommendation_worker(recommendation_stop))
@@ -288,6 +264,11 @@ async def lifespan(app: FastAPI):
     yield
     
     reaper_task.cancel()
+    await asyncio.gather(reaper_task, return_exceptions=True)
+    for background_task in background_tasks:
+        background_task.cancel()
+    if background_tasks:
+        await asyncio.gather(*background_tasks, return_exceptions=True)
     for playback_task in list(playback_prep_service.active_jobs.values()):
         playback_task.cancel()
     
@@ -302,7 +283,7 @@ async def lifespan(app: FastAPI):
         logger.error(f"[Lifespan Shutdown] Error stopping vibe analyzer: {vibe_stop_err}")
         
     try:
-        hevc_compressor.stop()
+        await hevc_compressor.stop()
     except Exception as h_stop_err:
         logger.error(f"[Lifespan Shutdown] Error stopping hevc compressor: {h_stop_err}")
     recommendation_stop.set()
@@ -320,6 +301,21 @@ async def lifespan(app: FastAPI):
 
 class ActivityTrackingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        if (
+            state.MAINTENANCE_MODE
+            and request.url.path != "/api/health"
+            and not request.url.path.startswith("/api/backup/restore/")
+        ):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": {
+                        "code": "maintenance_restart_required",
+                        "message": "The database was restored. Restart StreamHome before continuing.",
+                    }
+                },
+                headers={"Retry-After": "30"},
+            )
         if "/api/update" in request.url.path:
             return await call_next(request)
             
@@ -434,9 +430,15 @@ async def serve_media_file(file_path: str, request: Request):
 # ----------------- Movies Catalog API -----------------
 
 @app.get("/api/movies", response_model=List[MovieResponse])
-async def get_movies(profile_id: Optional[str] = Query(None), user = Depends(get_current_user)):
+async def get_movies(
+    profile_id: Optional[str] = Query(None),
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
     """Fetches all cataloged media assets with linked episode detail mappings, optionally personalized."""
     async with AsyncSession(engine) as db:
+        if profile_id:
+            await require_profile_access(db, auth_session, profile_id)
         stmt = select(Movie)
         result = await db.exec(stmt)
         movies = result.all()
@@ -490,10 +492,20 @@ async def get_movie(media_id: str, user = Depends(get_current_user)):
 
 # ----------------- Playback Tracking & Pulse -----------------
 
+async def authorize_profile(profile_id: str, auth_session: AuthSession) -> None:
+    async with AsyncSession(engine) as db:
+        await require_profile_access(db, auth_session, profile_id)
+
+
 @app.get("/api/track/{profile_id}", response_model=List[PlaybackSessionResponse])
-async def get_playback_tracking(profile_id: str, user = Depends(get_current_user)):
+async def get_playback_tracking(
+    profile_id: str,
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
     """Retrieves continue-watching tracking playback states for a profile."""
     async with AsyncSession(engine) as db:
+        await require_profile_access(db, auth_session, profile_id)
         stmt = select(PlaybackSession).where(PlaybackSession.profile_id == profile_id)
         result = await db.exec(stmt)
         sessions = result.all()
@@ -512,81 +524,16 @@ async def get_playback_tracking(profile_id: str, user = Depends(get_current_user
         ]
 
 @app.post("/api/telemetry")
-async def handle_telemetry(request: TelemetryRequest, profile_id: str = Query(...), user = Depends(get_current_user)):
+async def handle_telemetry(
+    request: TelemetryRequest,
+    profile_id: str = Query(...),
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
     """Receives generic tracking telemetry from the web UI."""
+    await authorize_profile(profile_id, auth_session)
     accepted = await process_telemetry_event(profile_id, request)
     return {"status": "accepted" if accepted else "ignored", "accepted": accepted}
-
-@app.post("/api/track")
-async def update_playback_tracking(request: Request, user = Depends(get_current_user)):
-    """Receives 10-second playback tracker pulses from the VideoPlayer."""
-    from starlette.requests import ClientDisconnect
-    try:
-        body = await request.json()
-    except ClientDisconnect:
-        print("[Tracking] Client disconnected while sending tracking update.")
-        return {"status": "disconnected"}
-    
-    movie_id = body.get("movieId")
-    profile_id = body.get("profileId")
-    timestamp = body.get("timestamp")
-    duration_watched = body.get("duration_watched", 0)
-    completion_rate = body.get("completion_rate", 0.0)
-    episode_id = body.get("episodeId")
-    is_finished = body.get("is_finished", False)
-    
-    if not movie_id or not profile_id or timestamp is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing required parameters: movieId, profileId"
-        )
-        
-    async with AsyncSession(engine) as db:
-        filters = [
-            PlaybackSession.movie_id == movie_id,
-            PlaybackSession.profile_id == profile_id,
-        ]
-        if episode_id:
-            filters.append(PlaybackSession.episode_id == episode_id)
-        else:
-            filters.append(PlaybackSession.episode_id.is_(None))
-        stmt = select(PlaybackSession).where(*filters)
-        result = await db.exec(stmt)
-        session = result.first()
-        
-        now_str = datetime.utcnow().isoformat()
-        if session:
-            session.timestamp = int(timestamp)
-            session.duration_watched = int(duration_watched)
-            session.completion_rate = float(completion_rate)
-            session.updated_at = now_str
-            session.is_finished = is_finished
-            db.add(session)
-        else:
-            session = PlaybackSession(
-                profile_id=profile_id,
-                movie_id=movie_id,
-                episode_id=episode_id,
-                timestamp=int(timestamp),
-                duration_watched=int(duration_watched),
-                completion_rate=float(completion_rate),
-                updated_at=now_str,
-                is_finished=is_finished
-            )
-            db.add(session)
-            
-        await db.commit()
-        
-    viewing_attempt_id = await record_playback_progress(
-        profile_id=profile_id,
-        movie_id=movie_id,
-        episode_id=episode_id,
-        position=int(timestamp),
-        duration_watched=int(duration_watched or 0),
-        completion_rate=float(completion_rate or 0.0),
-        is_finished=bool(is_finished),
-    )
-    return {"status": "ok", "viewingSessionId": viewing_attempt_id}
 
 # ----------------- Watchlist Management API -----------------
 
@@ -604,22 +551,34 @@ async def get_recommendations(
     limit: int = Query(48, ge=1, le=100),
     offset: int = Query(0, ge=0),
     user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
 ):
     """Return a personalized mixed cached/server catalog for the future web client."""
     if scope not in {"home", "movies", "series"}:
         raise HTTPException(status_code=400, detail="Invalid recommendation scope")
     async with AsyncSession(engine) as db:
-        if not await db.get(Profile, profile_id):
-            raise HTTPException(status_code=404, detail="Profile not found")
+        await require_profile_access(db, auth_session, profile_id)
         payload = await build_recommendation_payload(db, profile_id, scope, category, limit, offset)
         return RecommendationFeedResponse(**payload)
 
 @app.get("/api/recommendations/{profile_id}/preferences")
-async def list_recommendation_preferences(profile_id: str, user = Depends(get_current_user)):
+async def list_recommendation_preferences(
+    profile_id: str,
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
+    await authorize_profile(profile_id, auth_session)
     return {"preferences": await get_media_preferences(profile_id)}
 
 @app.put("/api/recommendations/{profile_id}/preferences/{movie_id}")
-async def update_recommendation_preference(profile_id: str, movie_id: str, request: MediaPreferenceRequest, user = Depends(get_current_user)):
+async def update_recommendation_preference(
+    profile_id: str,
+    movie_id: str,
+    request: MediaPreferenceRequest,
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
+    await authorize_profile(profile_id, auth_session)
     try:
         return await set_media_preference(profile_id, movie_id, request.preference)
     except ValueError as error:
@@ -628,41 +587,76 @@ async def update_recommendation_preference(profile_id: str, movie_id: str, reque
         raise HTTPException(status_code=404, detail=str(error))
 
 @app.post("/api/recommendations/{profile_id}/exposures")
-async def add_recommendation_exposures(profile_id: str, request: RecommendationExposureBatch, user = Depends(get_current_user)):
+async def add_recommendation_exposures(
+    profile_id: str,
+    request: RecommendationExposureBatch,
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
+    await authorize_profile(profile_id, auth_session)
     return {"accepted": await record_recommendation_exposures(profile_id, request.exposures)}
 
 @app.get("/api/recommendations/{profile_id}/onboarding")
-async def read_recommendation_onboarding(profile_id: str, user = Depends(get_current_user)):
+async def read_recommendation_onboarding(
+    profile_id: str,
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
+    await authorize_profile(profile_id, auth_session)
     return await get_onboarding_preferences(profile_id)
 
 @app.put("/api/recommendations/{profile_id}/onboarding")
-async def update_recommendation_onboarding(profile_id: str, request: RecommendationOnboardingRequest, user = Depends(get_current_user)):
+async def update_recommendation_onboarding(
+    profile_id: str,
+    request: RecommendationOnboardingRequest,
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
+    await authorize_profile(profile_id, auth_session)
     try:
         return await set_onboarding_preferences(profile_id, request.genres, request.title_ids)
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error))
 
 @app.get("/api/recommendations/{profile_id}/diagnostics")
-async def recommendation_diagnostics(profile_id: str, user = Depends(get_current_user)):
+async def recommendation_diagnostics(
+    profile_id: str,
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
+    await authorize_profile(profile_id, auth_session)
     return await get_recommendation_diagnostics(profile_id)
 
 @app.post("/api/recommendations/{profile_id}/rebuild")
-async def rebuild_recommendations(profile_id: str, user = Depends(get_current_user)):
+async def rebuild_recommendations(
+    profile_id: str,
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
     async with AsyncSession(engine) as db:
-        if not await db.get(Profile, profile_id):
-            raise HTTPException(status_code=404, detail="Profile not found")
+        await require_profile_access(db, auth_session, profile_id)
         await persist_profile_pool(db, profile_id)
         await db.commit()
     return {"status": "rebuilt"}
 
 @app.delete("/api/recommendations/{profile_id}/preferences")
-async def clear_recommendation_preferences(profile_id: str, user = Depends(get_current_user)):
+async def clear_recommendation_preferences(
+    profile_id: str,
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
+    await authorize_profile(profile_id, auth_session)
     return {"cleared": await reset_media_preferences(profile_id)}
 
 @app.get("/api/watchlist/{profile_id}", response_model=List[str])
-async def get_watchlist(profile_id: str, user = Depends(get_current_user)):
+async def get_watchlist(
+    profile_id: str,
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
     """Retrieves watchlist items for a profile."""
     async with AsyncSession(engine) as db:
+        await require_profile_access(db, auth_session, profile_id)
         stmt = select(WatchlistItem).where(WatchlistItem.profile_id == profile_id)
         result = await db.exec(stmt)
         items = result.all()
@@ -670,9 +664,14 @@ async def get_watchlist(profile_id: str, user = Depends(get_current_user)):
         return [item.movie_id for item in items]
 
 @app.post("/api/watchlist/toggle")
-async def toggle_watchlist(req: WatchlistToggleRequest, user = Depends(get_current_user)):
+async def toggle_watchlist(
+    req: WatchlistToggleRequest,
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
     """Toggles movie presence in the profile's server watchlist."""
     async with AsyncSession(engine) as db:
+        await require_profile_access(db, auth_session, req.profile_id)
         stmt = select(WatchlistItem).where(
             WatchlistItem.profile_id == req.profile_id,
             WatchlistItem.movie_id == req.movie_id
@@ -709,9 +708,17 @@ async def toggle_watchlist(req: WatchlistToggleRequest, user = Depends(get_curre
 
 
 @app.get("/api/discover", response_model=List[DiscoverMovieResponse])
-async def get_discover_movies(category: str = "action", type: str = "movie", profile_id: Optional[str] = Query(None), user = Depends(get_current_user)):
+async def get_discover_movies(
+    category: str = "action",
+    type: str = "movie",
+    profile_id: Optional[str] = Query(None),
+    user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
+):
     """Fetches trending movies or series from TMDB for the discover rows."""
     from services.tmdb import tmdb_client
+    if profile_id:
+        await authorize_profile(profile_id, auth_session)
     return await tmdb_client.discover_media(category, type, profile_id)
 
 @app.get("/api/search", response_model=List[DiscoverMovieResponse])
@@ -894,16 +901,20 @@ async def save_profile(req: ProfileSaveRequest, user = Depends(get_current_user)
         clean_name = req.name.strip()
         if not clean_name or len(clean_name) > 40:
             raise HTTPException(status_code=422, detail={"code": "invalid_profile_name", "message": "Profile names must contain between 1 and 40 characters."})
+        previous_pin_enabled = bool(profile and profile.pin_enabled and profile.pin_hash)
         pin_hash: Optional[str] = profile.pin_hash if profile else None
+        pin_changed = False
         if req.pin_enabled:
             if req.pin:
                 try:
                     pin_hash = hash_profile_pin(req.pin)
+                    pin_changed = True
                 except ValueError as exc:
                     raise HTTPException(status_code=422, detail={"code": "invalid_profile_pin", "message": str(exc)}) from exc
             elif not pin_hash:
                 raise HTTPException(status_code=422, detail={"code": "profile_pin_required", "message": "Enter a 4 to 8 digit PIN before enabling profile protection."})
         else:
+            pin_changed = previous_pin_enabled
             pin_hash = None
 
         if not profile:
@@ -914,6 +925,7 @@ async def save_profile(req: ProfileSaveRequest, user = Depends(get_current_user)
                 theme=req.theme,
                 pin_enabled=req.pin_enabled,
                 pin_hash=pin_hash,
+                pin_version=1 if req.pin_enabled and pin_hash else 0,
             )
             db.add(profile)
         else:
@@ -922,6 +934,9 @@ async def save_profile(req: ProfileSaveRequest, user = Depends(get_current_user)
             profile.theme = req.theme
             profile.pin_enabled = req.pin_enabled
             profile.pin_hash = pin_hash
+            next_pin_enabled = bool(req.pin_enabled and pin_hash)
+            if pin_changed or next_pin_enabled != previous_pin_enabled:
+                profile.pin_version = int(profile.pin_version or 0) + 1
             db.add(profile)
 
         await db.commit()
@@ -935,12 +950,26 @@ async def save_profile(req: ProfileSaveRequest, user = Depends(get_current_user)
         )
 
 
+@app.post("/api/profiles/{profile_id}/select")
+async def select_profile(
+    profile_id: str,
+    auth_session: AuthSession = Depends(get_current_session),
+    user = Depends(get_current_user),
+):
+    """Selects an unprotected profile or reuses this session's current protected-profile grant."""
+    async with AsyncSession(engine) as db:
+        profile = await require_profile_access(db, auth_session, profile_id)
+        await grant_profile_access(db, auth_session, profile)
+        return {"selected": True}
+
+
 @app.post("/api/profiles/{profile_id}/unlock")
 async def unlock_profile(
     profile_id: str,
     req: ProfileUnlockRequest,
     request: Request,
     user = Depends(get_current_user),
+    auth_session: AuthSession = Depends(get_current_session),
 ):
     """Verifies a protected profile PIN without returning or exposing the stored hash."""
     identity = f"{user.id}:{profile_id}:{client_ip(request)}"
@@ -951,11 +980,13 @@ async def unlock_profile(
             raise HTTPException(status_code=404, detail={"code": "profile_not_found", "message": "That profile does not exist."})
         if not profile.pin_enabled or not profile.pin_hash:
             await clear_rate_limit(db, "profile_pin", identity)
+            await grant_profile_access(db, auth_session, profile)
             return {"verified": True}
         if not verify_profile_pin(req.pin, profile.pin_hash):
             await fail_rate_limit(db, "profile_pin", identity, limit=5, window_seconds=300)
             raise HTTPException(status_code=401, detail={"code": "invalid_profile_pin", "message": "The profile PIN was not accepted."})
         await clear_rate_limit(db, "profile_pin", identity)
+        await grant_profile_access(db, auth_session, profile)
         return {"verified": True}
 
 @app.delete("/api/profiles/{profile_id}")
@@ -967,6 +998,13 @@ async def delete_profile(profile_id: str, user = Depends(get_current_user)):
         profile = result.first()
         if not profile:
             raise HTTPException(status_code=404, detail="Profile not found")
+        sessions = (
+            await db.exec(select(AuthSession).where(AuthSession.selected_profile_id == profile_id))
+        ).all()
+        for auth_session in sessions:
+            auth_session.selected_profile_id = None
+            auth_session.selected_profile_pin_version = None
+            db.add(auth_session)
         await db.delete(profile)
         await db.commit()
         return {"status": "deleted"}

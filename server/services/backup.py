@@ -16,8 +16,10 @@ from models import PlaybackSession
 from services.logger import logger
 from services.queue import queue_manager
 from services.rclone import rclone_service
+import services.state as state
 
 BACKUP_FILENAME_RE = re.compile(r"^backup_\d{8}_\d{6}\.db$")
+BACKUP_LOCK = asyncio.Lock()
 
 def get_backup_dir() -> str:
     """Resolve absolute path to server/backup folder."""
@@ -95,29 +97,33 @@ async def create_backup() -> str:
     Perform a secure online backup of database.db using SQLite Backup API.
     Creates backup in server/backup/backup_YYYYMMDD_HHMMSS.db.
     """
-    backup_dir = get_backup_dir()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_filename = f"backup_{timestamp}.db"
-    dest_path = os.path.join(backup_dir, backup_filename)
+    async with BACKUP_LOCK:
+        backup_dir = get_backup_dir()
+        candidate_time = datetime.now()
+        while True:
+            backup_filename = f"backup_{candidate_time.strftime('%Y%m%d_%H%M%S')}.db"
+            dest_path = os.path.join(backup_dir, backup_filename)
+            if not os.path.exists(dest_path):
+                break
+            candidate_time += timedelta(seconds=1)
 
-    active_db_path = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "database.db"))
+        active_db_path = str(Path(settings.db_path).resolve())
+        logger.info(f"[Backup Service] Starting secure online backup: {active_db_path} -> {dest_path}")
 
-    logger.info(f"[Backup Service] Starting secure online backup: {active_db_path} -> {dest_path}")
+        def run_backup():
+            src_conn = sqlite3.connect(active_db_path)
+            dest_conn = sqlite3.connect(dest_path)
+            try:
+                with dest_conn:
+                    src_conn.backup(dest_conn)
+            finally:
+                dest_conn.close()
+                src_conn.close()
 
-    # Use run_in_executor to avoid blocking the asyncio event loop during backup I/O
-    def run_backup():
-        src_conn = sqlite3.connect(active_db_path)
-        dest_conn = sqlite3.connect(dest_path)
-        try:
-            with dest_conn:
-                src_conn.backup(dest_conn)
-        finally:
-            dest_conn.close()
-            src_conn.close()
-
-    await asyncio.get_running_loop().run_in_executor(None, run_backup)
-    logger.info(f"[Backup Service] Backup successfully created: {backup_filename}")
-    return dest_path
+        await asyncio.get_running_loop().run_in_executor(None, run_backup)
+        validate_backup_database(Path(dest_path))
+        logger.info(f"[Backup Service] Backup successfully created: {backup_filename}")
+        return dest_path
 
 def prune_old_backups(keep_count: int = 7):
     """Keep only the last keep_count backup files locally."""
@@ -126,7 +132,7 @@ def prune_old_backups(keep_count: int = 7):
         files = [
             os.path.join(backup_dir, f)
             for f in os.listdir(backup_dir)
-            if f.startswith("backup_") and f.endswith(".db")
+            if BACKUP_FILENAME_RE.fullmatch(f)
         ]
         # Sort files by creation time
         files.sort(key=os.path.getmtime)
@@ -147,7 +153,7 @@ def get_local_backups() -> list:
         if not os.path.exists(backup_dir):
             return []
         
-        files = [f for f in os.listdir(backup_dir) if f.startswith("backup_") and f.endswith(".db")]
+        files = [f for f in os.listdir(backup_dir) if BACKUP_FILENAME_RE.fullmatch(f)]
         for f in files:
             file_path = os.path.join(backup_dir, f)
             mtime = os.path.getmtime(file_path)
@@ -188,49 +194,72 @@ async def restore_backup(filename: str) -> bool:
     Safely restore a database backup file to database.db.
     Disposes active sessions/connections to prevent locking.
     """
-    backup_file_path = resolve_backup_file(filename, must_exist=True)
-    active_db_path = Path(settings.db_path).resolve()
+    async with BACKUP_LOCK:
+        backup_file_path = resolve_backup_file(filename, must_exist=True)
+        active_db_path = Path(settings.db_path).resolve()
 
-    if not backup_file_path:
-        logger.error(f"[Backup Service] Restore failed: Backup file '{filename}' does not exist.")
-        return False
+        if not backup_file_path:
+            logger.error(f"[Backup Service] Restore failed: Backup file '{filename}' does not exist.")
+            return False
+        if not await is_database_idle():
+            logger.warning("[Backup Service] Restore refused while downloads or playback are active.")
+            return False
 
-    temporary_path: Path | None = None
-    try:
-        validate_backup_database(backup_file_path)
-        logger.warning(f"[Backup Service] Restoring database to: {filename}")
+        state.MAINTENANCE_MODE = True
+        deadline = time.monotonic() + 5
+        while state.ACTIVE_HTTP_REQUESTS > 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        if state.ACTIVE_HTTP_REQUESTS > 1:
+            state.MAINTENANCE_MODE = False
+            logger.warning("[Backup Service] Restore refused because other requests did not quiesce.")
+            return False
 
-        # Build and validate the replacement before touching the live database.
-        with tempfile.NamedTemporaryFile(
-            dir=active_db_path.parent,
-            prefix=".database-restore-",
-            suffix=".db",
-            delete=False,
-        ) as handle:
-            temporary_path = Path(handle.name)
-        shutil.copy2(backup_file_path, temporary_path)
-        validate_backup_database(temporary_path)
-
-        # Preserve a rollback point using SQLite's online backup API.
-        rollback_path = Path(get_backup_dir()) / f"pre-restore-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
-        source = sqlite3.connect(active_db_path)
-        rollback = sqlite3.connect(rollback_path)
+        temporary_path: Path | None = None
+        queue_stopped = False
         try:
-            source.backup(rollback)
-        finally:
-            rollback.close()
-            source.close()
+            validate_backup_database(backup_file_path)
+            logger.warning(f"[Backup Service] Restoring database to: {filename}")
 
-        await engine.dispose()
-        for suffix in ("-wal", "-shm"):
-            Path(f"{active_db_path}{suffix}").unlink(missing_ok=True)
-        os.replace(temporary_path, active_db_path)
-        temporary_path = None
-        logger.info("[Backup Service] Database successfully restored.")
-        return True
-    except Exception as e:
-        logger.error(f"[Backup Service] Restore error: {e}")
-        return False
-    finally:
-        if temporary_path:
-            temporary_path.unlink(missing_ok=True)
+            with tempfile.NamedTemporaryFile(
+                dir=active_db_path.parent,
+                prefix=".database-restore-",
+                suffix=".db",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+            shutil.copy2(backup_file_path, temporary_path)
+            validate_backup_database(temporary_path)
+
+            rollback_time = datetime.now()
+            while True:
+                rollback_path = Path(get_backup_dir()) / f"backup_{rollback_time.strftime('%Y%m%d_%H%M%S')}.db"
+                if not rollback_path.exists() and rollback_path != backup_file_path:
+                    break
+                rollback_time += timedelta(seconds=1)
+            source = sqlite3.connect(active_db_path)
+            rollback = sqlite3.connect(rollback_path)
+            try:
+                source.backup(rollback)
+            finally:
+                rollback.close()
+                source.close()
+            validate_backup_database(rollback_path)
+
+            await queue_manager.stop()
+            queue_stopped = True
+            await engine.dispose()
+            for suffix in ("-wal", "-shm"):
+                Path(f"{active_db_path}{suffix}").unlink(missing_ok=True)
+            os.replace(temporary_path, active_db_path)
+            temporary_path = None
+            logger.info("[Backup Service] Database restored; server remains in maintenance mode until restart.")
+            return True
+        except Exception as e:
+            state.MAINTENANCE_MODE = False
+            if queue_stopped:
+                queue_manager.start()
+            logger.error(f"[Backup Service] Restore error: {e}")
+            return False
+        finally:
+            if temporary_path:
+                temporary_path.unlink(missing_ok=True)

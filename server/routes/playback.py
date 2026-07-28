@@ -21,12 +21,13 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from db import get_session
-from models import APIModel, AuthSession, Episode, Movie, PlaybackRun, PlaybackSession, Profile, User
+from models import APIModel, AuthSession, Episode, Movie, PlaybackRun, PlaybackSession, User
 from routes.auth import get_current_user
 from services.logger import logger
 from services.media_source import MediaSourceError, ResolvedMediaSource, resolve_media_source
 from services.media_probe import probe_completed_media
 from services.playback_prep import AudioRendition, PlaybackPrepService, VideoRendition, playback_prep_service
+from services.profile_security import require_profile_access
 from services.rclone import rclone_service
 from services.recommendation import record_playback_progress
 
@@ -367,9 +368,8 @@ async def create_playback_run(
     db: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> PlaybackRunResponse:
-    profile = await db.get(Profile, req.profile_id)
-    if not profile:
-        raise playback_error(status.HTTP_404_NOT_FOUND, "PROFILE_NOT_FOUND", "The selected profile does not exist.")
+    auth_session = current_auth_session(request)
+    await require_profile_access(db, auth_session, req.profile_id)
     movie, media_obj = await resolve_run_media(db, req.movie_id, req.episode_id)
     source = await require_available_source(media_obj)
     await ensure_source_metadata(db, media_obj, source)
@@ -379,7 +379,6 @@ async def create_playback_run(
     filters.append(PlaybackSession.episode_id == req.episode_id if req.episode_id else PlaybackSession.episode_id.is_(None))
     session_rec = (await db.exec(select(PlaybackSession).where(*filters))).first()
     position = resume_position(session_rec, float(media_obj.probed_duration or 0))
-    auth_session = current_auth_session(request)
     now = time.time()
     run = PlaybackRun(
         id=str(uuid.uuid4()),
