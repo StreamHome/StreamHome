@@ -17,6 +17,11 @@ describe("series playback sequence", () => {
     expect(nextPlayableEpisode([episode("ep1", 1, 1)], "ep1")).toBeNull();
     expect(nextPlayableEpisode([episode("ep1", 1, 1)], "missing")).toBeNull();
   });
+
+  it("treats an application-owned ingestion preview as playable", () => {
+    const preview = { ...episode("ep2", 1, 2, ""), previewTaskId: "preview-task" };
+    expect(nextPlayableEpisode([episode("ep1", 1, 1), preview], "ep1")?.id).toBe("ep2");
+  });
 });
 
 describe("actual watched-time accounting", () => {

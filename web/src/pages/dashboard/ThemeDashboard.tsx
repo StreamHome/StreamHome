@@ -47,7 +47,7 @@ function MediaCollection({ title, label, items, sessions, theme, kind = "standar
 function FeatureActions({ movie, onDetails, onPlay }: { movie: Movie; onDetails: () => void; onPlay: () => void }) {
   const playable = isAvailableMedia(movie) && isPlayableMovie(movie);
   if (!playable) return <div className="feature-actions"><button className="feature-action feature-action--primary" onClick={onDetails}>View details</button><button className="feature-action" disabled>{mediaAvailability(movie) === "processing" ? "Processing" : "Cached suggestion"}</button></div>;
-  return <div className="feature-actions"><button className="feature-action feature-action--primary" onClick={movie.type === "series" ? onDetails : onPlay}>{movie.type === "series" ? "Select episode" : "Play now"}</button><button className="feature-action" onClick={onDetails}>View details</button></div>;
+  return <div className="feature-actions"><button className="feature-action feature-action--primary" onClick={movie.type === "series" ? onDetails : onPlay}>{movie.type === "series" ? "Select episode" : mediaAvailability(movie) === "processing" ? "Play while downloading" : "Play now"}</button><button className="feature-action" onClick={onDetails}>View details</button></div>;
 }
 
 function FeaturedStage({ movie, variant, context, onDetails, onPlay }: { movie: Movie; variant: string; context: "home" | "movies" | "series"; onDetails: () => void; onPlay: () => void }) {

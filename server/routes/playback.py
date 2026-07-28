@@ -21,12 +21,13 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from db import get_session
-from models import APIModel, AuthSession, Episode, Movie, PlaybackRun, PlaybackSession, User
+from models import APIModel, AuthSession, DownloadTask, Episode, Movie, PlaybackRun, PlaybackSession, User
 from routes.auth import get_current_user
 from services.logger import logger
 from services.media_source import MediaSourceError, ResolvedMediaSource, resolve_media_source
 from services.media_probe import probe_completed_media
 from services.playback_prep import AudioRendition, PlaybackPrepService, VideoRendition, playback_prep_service
+from services.ingest_preview import IngestPreviewError, ingest_preview_service
 from services.profile_security import require_profile_access
 from services.rclone import rclone_service
 from services.recommendation import record_playback_progress
@@ -170,7 +171,12 @@ async def validate_playback_ticket(ticket: str, media_id: str, db: AsyncSession)
         raise playback_error(status.HTTP_403_FORBIDDEN, "PLAYBACK_TICKET_SCOPE_MISMATCH", "The playback ticket scope is invalid.")
 
     media_obj = await db.get(Episode, run.episode_id) if run.episode_id else await db.get(Movie, run.movie_id)
-    if not media_obj or media_obj.source_fingerprint != payload["fingerprint"]:
+    if not media_obj:
+        raise playback_error(status.HTTP_409_CONFLICT, "PLAYBACK_SOURCE_CHANGED", "The media source changed. Start playback again.")
+    if run.source_kind == "ingest_preview":
+        if not run.source_task_id or run.source_fingerprint != payload["fingerprint"]:
+            raise playback_error(status.HTTP_409_CONFLICT, "PLAYBACK_SOURCE_CHANGED", "The ingestion preview changed. Start playback again.")
+    elif media_obj.source_fingerprint != payload["fingerprint"]:
         raise playback_error(status.HTTP_409_CONFLICT, "PLAYBACK_SOURCE_CHANGED", "The media source changed. Start playback again.")
     return payload, run, media_obj
 
@@ -199,6 +205,20 @@ async def require_available_source(media_obj: Any) -> ResolvedMediaSource:
     if not source.available:
         raise playback_error(status.HTTP_409_CONFLICT, "MEDIA_SOURCE_MISSING", "The media file is not currently available on this server.")
     return source
+
+
+async def active_preview_task(db: AsyncSession, movie: Movie, media_obj: Any) -> Optional[DownloadTask]:
+    task_id = str(getattr(media_obj, "preview_task_id", None) or "")
+    if not task_id:
+        return None
+    task = await db.get(DownloadTask, task_id)
+    if not task or task.status == "FAILED" or task.tmdb_id != movie.tmdb_id:
+        return None
+    if media_obj is movie:
+        return task if task.media_type == "movie" else None
+    if task.media_type == "movie" or task.season != media_obj.season_number or task.episode != media_obj.episode_number:
+        return None
+    return task
 
 
 async def synchronize_source_fingerprint(db: AsyncSession, media_obj: Any, source: ResolvedMediaSource) -> None:
@@ -321,6 +341,62 @@ async def build_run_response(
     initial_resume_position: float,
 ) -> PlaybackRunResponse:
     auth_session = current_auth_session(request)
+    if run.source_kind == "ingest_preview":
+        if not run.source_task_id or not run.source_fingerprint:
+            raise playback_error(status.HTTP_409_CONFLICT, "PREVIEW_SOURCE_MISSING", "The play-while-downloading source is unavailable.")
+        preview_status = ingest_preview_service.status(run.source_task_id)
+        fingerprint = run.source_fingerprint
+        failure = (
+            PlaybackPreparationFailure(
+                code=preview_status["error_code"] or "PREVIEW_FAILED",
+                message=preview_status["error_message"] or "The play-while-downloading stream could not be prepared.",
+            )
+            if preview_status["phase"] == "error"
+            else None
+        )
+        ticket, expires_at = issue_playback_ticket(user, auth_session, run.profile_id, run.id, media_obj.id, fingerprint)
+        encoded_ticket = quote(ticket, safe="")
+        duration = max(float(getattr(media_obj, "probed_duration", 0) or 0), float(preview_status["duration_seconds"] or 0))
+        return PlaybackRunResponse(
+            run_id=run.id,
+            media_id=media_obj.id,
+            movie_id=run.movie_id,
+            episode_id=run.episode_id,
+            resume_position=0,
+            source_metadata=PlaybackSourceMetadata(
+                duration=duration,
+                container="hls",
+                codec="h264",
+                width=max(0, int(getattr(media_obj, "width", 0) or 0)),
+                height=min(720, max(0, int(getattr(media_obj, "height", 0) or 720))),
+                frame_rate=max(0.0, float(getattr(media_obj, "frame_rate", 0) or 0)),
+            ),
+            tracks=[],
+            renditions=[
+                PlaybackRendition(
+                    id="ingest_preview",
+                    label="Downloading preview",
+                    height=min(720, max(1, int(getattr(media_obj, "height", 0) or 720))),
+                    width=max(0, int(getattr(media_obj, "width", 0) or 0)),
+                    original=False,
+                    ready=preview_status["phase"] == "ready",
+                )
+            ],
+            subtitles=[],
+            ticket=ticket,
+            ticket_expires_at=expires_at,
+            manifest_url=(
+                f"/api/playback/preview/{quote(media_obj.id, safe='')}/playlist.m3u8?ticket={encoded_ticket}"
+                if preview_status["phase"] == "ready"
+                else None
+            ),
+            progressive_url="",
+            next_episode_id=None,
+            preparation_state=preview_status["phase"],
+            preparation_error=failure,
+            next_sequence_number=run.sequence_number,
+        )
+
     fingerprint = str(media_obj.source_fingerprint or "")
     state = playback_prep_service.preparation_state(media_obj.id, fingerprint, media_obj)
     failure_payload = playback_prep_service.preparation_error(media_obj.id, fingerprint)
@@ -371,9 +447,17 @@ async def create_playback_run(
     auth_session = current_auth_session(request)
     await require_profile_access(db, auth_session, req.profile_id)
     movie, media_obj = await resolve_run_media(db, req.movie_id, req.episode_id)
-    source = await require_available_source(media_obj)
-    await ensure_source_metadata(db, media_obj, source)
-    await synchronize_source_fingerprint(db, media_obj, source)
+    preview_task = await active_preview_task(db, movie, media_obj)
+    source: Optional[ResolvedMediaSource] = None
+    if preview_task:
+        source_kind = "ingest_preview"
+        source_fingerprint = ingest_preview_service.fingerprint(preview_task.id)
+    else:
+        source = await require_available_source(media_obj)
+        await ensure_source_metadata(db, media_obj, source)
+        await synchronize_source_fingerprint(db, media_obj, source)
+        source_kind = "catalog"
+        source_fingerprint = str(media_obj.source_fingerprint or source.fingerprint)
 
     filters = [PlaybackSession.profile_id == req.profile_id, PlaybackSession.movie_id == req.movie_id]
     filters.append(PlaybackSession.episode_id == req.episode_id if req.episode_id else PlaybackSession.episode_id.is_(None))
@@ -386,6 +470,9 @@ async def create_playback_run(
         movie_id=movie.id,
         episode_id=req.episode_id,
         auth_session_id=auth_session.id,
+        source_kind=source_kind,
+        source_fingerprint=source_fingerprint,
+        source_task_id=preview_task.id if preview_task else None,
         sequence_number=1,
         lifecycle_state="active",
         created_at=now,
@@ -396,7 +483,8 @@ async def create_playback_run(
     )
     db.add(run)
     await db.commit()
-    await playback_prep_service.prepare(media_obj.id, media_obj, source, include_remaining=True)
+    if source is not None:
+        await playback_prep_service.prepare(media_obj.id, media_obj, source, include_remaining=True)
     return await build_run_response(db, request, user, run, media_obj, initial_resume_position=position)
 
 
@@ -410,18 +498,19 @@ async def get_playback_run(
 ) -> PlaybackRunResponse:
     run = await authorized_run(db, request, run_id)
     _, media_obj = await resolve_run_media(db, run.movie_id, run.episode_id)
-    source = await require_available_source(media_obj)
-    await ensure_source_metadata(db, media_obj, source)
-    await synchronize_source_fingerprint(db, media_obj, source)
-    if retry:
-        error_path = playback_prep_service.cache_path(media_obj.id, str(media_obj.source_fingerprint)) / "preparation-error.json"
-        error_path.unlink(missing_ok=True)
-    await playback_prep_service.prepare(media_obj.id, media_obj, source, include_remaining=True)
+    if run.source_kind != "ingest_preview":
+        source = await require_available_source(media_obj)
+        await ensure_source_metadata(db, media_obj, source)
+        await synchronize_source_fingerprint(db, media_obj, source)
+        if retry:
+            error_path = playback_prep_service.cache_path(media_obj.id, str(media_obj.source_fingerprint)) / "preparation-error.json"
+            error_path.unlink(missing_ok=True)
+        await playback_prep_service.prepare(media_obj.id, media_obj, source, include_remaining=True)
     run.last_seen_at = time.time()
     run.updated_at = time.time()
     db.add(run)
     await db.commit()
-    position = await run_resume_position(db, run, media_obj)
+    position = 0 if run.source_kind == "ingest_preview" else await run_resume_position(db, run, media_obj)
     return await build_run_response(db, request, user, run, media_obj, initial_resume_position=position)
 
 
@@ -536,7 +625,17 @@ def protected_hls_url(media_id: str, relative_path: str, ticket: str) -> str:
     return f"/api/playback/hls/{quote(media_id, safe='')}/{quote(relative_path, safe='/')}?ticket={quote(ticket, safe='')}"
 
 
-def rewrite_hls_playlist(content: str, media_id: str, ticket: str, base_path: PurePosixPath) -> str:
+def protected_preview_url(media_id: str, relative_path: str, ticket: str) -> str:
+    return f"/api/playback/preview/{quote(media_id, safe='')}/{quote(relative_path, safe='/')}?ticket={quote(ticket, safe='')}"
+
+
+def rewrite_playlist(
+    content: str,
+    media_id: str,
+    ticket: str,
+    base_path: PurePosixPath,
+    url_builder,
+) -> str:
     def resolve_reference(reference: str) -> str:
         reference_path = PurePosixPath(reference)
         joined = base_path / reference_path
@@ -550,7 +649,7 @@ def rewrite_hls_playlist(content: str, media_id: str, ticket: str, base_path: Pu
                 normalized_parts.pop()
             else:
                 normalized_parts.append(part)
-        return protected_hls_url(media_id, "/".join(normalized_parts), ticket)
+        return url_builder(media_id, "/".join(normalized_parts), ticket)
 
     rewritten: list[str] = []
     for line in content.splitlines():
@@ -564,6 +663,14 @@ def rewrite_hls_playlist(content: str, media_id: str, ticket: str, base_path: Pu
     return "\n".join(rewritten) + "\n"
 
 
+def rewrite_hls_playlist(content: str, media_id: str, ticket: str, base_path: PurePosixPath) -> str:
+    return rewrite_playlist(content, media_id, ticket, base_path, protected_hls_url)
+
+
+def rewrite_ingest_preview_playlist(content: str, media_id: str, ticket: str, base_path: PurePosixPath) -> str:
+    return rewrite_playlist(content, media_id, ticket, base_path, protected_preview_url)
+
+
 def safe_hls_file(cache_root: Path, relative_path: str) -> Path:
     candidate = (cache_root / Path(*PurePosixPath(relative_path).parts)).resolve()
     try:
@@ -571,6 +678,76 @@ def safe_hls_file(cache_root: Path, relative_path: str) -> Path:
     except ValueError as exc:
         raise playback_error(status.HTTP_403_FORBIDDEN, "HLS_PATH_INVALID", "The HLS path is outside the playback cache.") from exc
     return candidate
+
+
+async def preview_run_from_ticket(
+    media_id: str,
+    ticket: str,
+    db: AsyncSession,
+) -> tuple[PlaybackRun, str]:
+    _, run, _ = await validate_playback_ticket(ticket, media_id, db)
+    if run.source_kind != "ingest_preview" or not run.source_task_id:
+        raise playback_error(status.HTTP_403_FORBIDDEN, "PREVIEW_TICKET_REQUIRED", "This playback ticket does not permit an ingestion preview.")
+    try:
+        ingest_preview_service.task_path(run.source_task_id)
+    except IngestPreviewError as exc:
+        raise playback_error(status.HTTP_403_FORBIDDEN, "PREVIEW_SOURCE_INVALID", "The ingestion preview source is invalid.") from exc
+    return run, run.source_task_id
+
+
+@router.get("/preview/{media_id}/playlist.m3u8")
+async def serve_ingest_preview_manifest(
+    media_id: str,
+    ticket: str = Query(...),
+    db: AsyncSession = Depends(get_session),
+) -> PlainTextResponse:
+    _, task_id = await preview_run_from_ticket(media_id, ticket, db)
+    preview_status = ingest_preview_service.status(task_id)
+    if preview_status["phase"] == "error":
+        raise playback_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            preview_status["error_code"] or "PREVIEW_FAILED",
+            preview_status["error_message"] or "The play-while-downloading stream failed.",
+        )
+    playlist = ingest_preview_service.playlist_path(task_id)
+    if preview_status["phase"] != "ready" or not playlist.is_file():
+        raise playback_error(status.HTTP_425_TOO_EARLY, "PREVIEW_PREPARING", "The play-while-downloading buffer is still preparing.")
+    ingest_preview_service.touch(task_id)
+    content = rewrite_ingest_preview_playlist(
+        playlist.read_text(encoding="utf-8"),
+        media_id,
+        ticket,
+        PurePosixPath(),
+    )
+    return PlainTextResponse(content, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
+
+
+@router.get("/preview/{media_id}/{path:path}")
+async def serve_ingest_preview_asset(
+    media_id: str,
+    path: str,
+    ticket: str = Query(...),
+    db: AsyncSession = Depends(get_session),
+):
+    _, task_id = await preview_run_from_ticket(media_id, ticket, db)
+    if PurePosixPath(path).suffix.lower() not in {".m4s", ".mp4"}:
+        raise playback_error(status.HTTP_403_FORBIDDEN, "PREVIEW_ASSET_TYPE_FORBIDDEN", "Only ingestion preview media fragments may be requested.")
+    try:
+        target = ingest_preview_service.safe_asset(task_id, path)
+    except IngestPreviewError as exc:
+        raise playback_error(status.HTTP_403_FORBIDDEN, "PREVIEW_PATH_INVALID", "The ingestion preview path is invalid.") from exc
+    if not target.is_file():
+        preview_status = ingest_preview_service.status(task_id)
+        if preview_status["phase"] == "error":
+            raise playback_error(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                preview_status["error_code"] or "PREVIEW_FAILED",
+                preview_status["error_message"] or "The play-while-downloading stream failed.",
+            )
+        raise playback_error(status.HTTP_404_NOT_FOUND, "PREVIEW_ASSET_NOT_READY", "The requested ingestion preview segment is not ready.")
+    ingest_preview_service.touch(task_id)
+    media_type = "video/iso.segment" if target.suffix.lower() == ".m4s" else mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    return FileResponse(target, media_type=media_type, headers={"Cache-Control": "private, max-age=900"})
 
 
 @router.get("/manifest/{media_id}")

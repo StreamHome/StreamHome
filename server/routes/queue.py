@@ -22,6 +22,7 @@ from services.vibe_analysis import compute_trope_vectors
 from services.logger import logger
 from routes.auth import resolve_auth
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
+from services.ingest_preview import ingest_preview_service
 from services.integration_auth import (
     authenticate_integration_token,
     integration_token_hash,
@@ -165,7 +166,8 @@ async def add_movie(
                     vote_average=meta.get("vote_average", 7.5),
                     vote_count=meta.get("vote_count", 100),
                     catalog_source="server",
-                    availability="processing"
+                    availability="processing",
+                    preview_task_id=task_id,
                 )
                 movie.genres = meta.get("genres", [])
                 movie.cast = meta.get("cast", [])
@@ -180,6 +182,7 @@ async def add_movie(
                 if not preserve_local_media:
                     movie.video_url = payload.video_url
                     movie.availability = "processing"
+                    movie.preview_task_id = task_id
                 movie.tmdb_id = payload.tmdb_id
                 movie.catalog_source = "server"
                 if payload.skip_markers:
@@ -234,13 +237,15 @@ async def add_movie(
                         thumbnail_url=ep_meta.get("thumbnailUrl", ""),
                         video_url=payload.video_url, # External proxy
                         duration=ep_meta.get("duration", "45m"),
-                        quality=payload.quality or "Source"
+                        quality=payload.quality or "Source",
+                        preview_task_id=task_id,
                     )
                     ep_entry.skip_markers = payload.skip_markers or {}
                     db.add(ep_entry)
                 else:
                     if not preserve_local_episode:
                         ep_entry.video_url = payload.video_url
+                        ep_entry.preview_task_id = task_id
                     if payload.skip_markers:
                         ep_entry.skip_markers = payload.skip_markers
                     db.add(ep_entry)
@@ -430,6 +435,28 @@ async def delete_download(
         task = await db.get(DownloadTask, task_id)
         if not task:
             return {"status": "success", "message": f"Task {task_id} was already removed.", "processKilled": process_killed}
+        ingest_preview_service.mark_error(task_id, "PREVIEW_CANCELLED", "The download and its play-while-downloading preview were cancelled.")
+        if task.media_type == "movie":
+            movie = await db.get(Movie, f"m_{task.tmdb_id}")
+            if movie and movie.preview_task_id == task_id:
+                movie.preview_task_id = None
+                if not is_local_playable_url(movie.video_url):
+                    movie.video_url = ""
+                    movie.availability = "cached"
+                db.add(movie)
+        elif task.season is not None and task.episode is not None:
+            episode = await db.get(Episode, f"ep_{task.tmdb_id}_s{task.season}_e{task.episode}")
+            if episode and episode.preview_task_id == task_id:
+                episode.preview_task_id = None
+                if not is_local_playable_url(episode.video_url):
+                    episode.video_url = ""
+                db.add(episode)
+            show = await db.get(Movie, f"tv_{task.tmdb_id}")
+            if show:
+                episode_result = await db.exec(select(Episode).where(Episode.movie_id == show.id))
+                has_local_episode = any(is_local_playable_url(item.video_url) for item in episode_result.all())
+                show.availability = "available" if has_local_episode else "cached"
+                db.add(show)
         await db.delete(task)
         await db.commit()
         

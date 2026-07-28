@@ -85,6 +85,7 @@ class Movie(SQLModel, table=True):
     frame_rate: Optional[float] = Field(default=None)
     source_fingerprint: Optional[str] = Field(default=None, index=True)
     audio_metadata_str: Optional[str] = Field(default="[]")
+    preview_task_id: Optional[str] = Field(default=None, index=True)
 
     @property
     def genres(self) -> List[str]:
@@ -215,6 +216,7 @@ class Episode(SQLModel, table=True):
     frame_rate: Optional[float] = Field(default=None)
     source_fingerprint: Optional[str] = Field(default=None, index=True)
     audio_metadata_str: Optional[str] = Field(default="[]")
+    preview_task_id: Optional[str] = Field(default=None, index=True)
     dialogue_wpm: Optional[float] = Field(default=None)
     dialogue_word_count: int = Field(default=0)
     dialogue_language: Optional[str] = Field(default=None)
@@ -540,6 +542,9 @@ class PlaybackRun(SQLModel, table=True):
     movie_id: str = Field(index=True)
     episode_id: Optional[str] = Field(default=None, index=True)
     auth_session_id: Optional[str] = Field(default=None)
+    source_kind: str = Field(default="catalog")
+    source_fingerprint: Optional[str] = Field(default=None)
+    source_task_id: Optional[str] = Field(default=None, index=True)
     sequence_number: int = Field(default=1)
     lifecycle_state: str = Field(default="active")  # "active", "finished", "expired", "abandoned"
     created_at: float = Field(default_factory=time.time)
@@ -636,6 +641,7 @@ class EpisodeResponse(APIModel):
     skip_markers: Dict[str, Any] = {}
     dialogue_wpm: Optional[float] = None
     dialogue_confidence: float = 0.0
+    preview_task_id: Optional[str] = None
 
 class MovieResponse(APIModel):
     id: str
@@ -669,6 +675,7 @@ class MovieResponse(APIModel):
     trope_vectors: List[Dict[str, Any]] = []
     dialogue_wpm: Optional[float] = None
     dialogue_confidence: float = 0.0
+    preview_task_id: Optional[str] = None
 
     @classmethod
     def from_db(cls, movie: Movie, episodes: Optional[List[Episode]] = None) -> "MovieResponse":
@@ -678,7 +685,7 @@ class MovieResponse(APIModel):
             description=movie.description,
             thumbnail_url=movie.thumbnail_url,
             banner_url=movie.banner_url,
-            video_url=movie.video_url,
+            video_url="" if movie.preview_task_id else movie.video_url,
             genres=movie.genres,
             duration=movie.duration,
             release_year=movie.release_year,
@@ -700,7 +707,7 @@ class MovieResponse(APIModel):
                     title=e.title,
                     description=e.description,
                     thumbnail_url=e.thumbnail_url,
-                    video_url=e.video_url,
+                    video_url="" if e.preview_task_id else e.video_url,
                     duration=e.duration,
                     quality=e.quality or "Source",
                     languages=e.languages,
@@ -708,6 +715,7 @@ class MovieResponse(APIModel):
                     skip_markers=e.skip_markers,
                     dialogue_wpm=e.dialogue_wpm,
                     dialogue_confidence=e.dialogue_confidence,
+                    preview_task_id=e.preview_task_id,
                 )
                 for e in episodes
             ] if episodes else None,
@@ -722,6 +730,7 @@ class MovieResponse(APIModel):
             trope_vectors=movie.trope_vectors,
             dialogue_wpm=movie.dialogue_wpm,
             dialogue_confidence=movie.dialogue_confidence,
+            preview_task_id=movie.preview_task_id,
         )
 
 class DiscoverMovieResponse(APIModel):

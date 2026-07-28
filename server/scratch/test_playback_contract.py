@@ -23,10 +23,11 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from db import get_session
-from models import AuthSession, Movie, PlaybackSession, Profile, User
+from models import AuthSession, DownloadTask, Movie, PlaybackSession, Profile, User
 from routes.auth import get_current_user
 from routes.playback import router
 from services.media_source import resolve_media_source
+from services.ingest_preview import ingest_preview_service
 from services.playback_prep import playback_prep_service
 
 
@@ -183,6 +184,94 @@ class PlaybackContractRegression(unittest.TestCase):
         self.assertEqual(segment.content, b"video-segment")
         denied = self.client.get("/api/playback/hls/m_playback_contract/video_original/segment_00000.m4s")
         self.assertEqual(denied.status_code, 422)
+
+    def test_ingest_preview_is_protected_and_survives_local_catalog_handoff(self) -> None:
+        task_id = f"preview-{uuid.uuid4().hex}"
+        preview_root = ingest_preview_service.prepare(task_id, 20)
+        (preview_root / "playlist.m3u8").write_text(
+            "#EXTM3U\n"
+            "#EXT-X-VERSION:7\n"
+            "#EXT-X-MAP:URI=\"init.mp4\"\n"
+            "#EXTINF:16,\n"
+            "segment_00000.m4s\n"
+            "#EXT-X-ENDLIST\n",
+            encoding="utf-8",
+        )
+        (preview_root / "init.mp4").write_bytes(b"preview-init")
+        (preview_root / "segment_00000.m4s").write_bytes(b"preview-segment")
+        ingest_preview_service.mark_complete(task_id)
+
+        async def enable_preview() -> None:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                movie = await db.get(Movie, "m_playback_contract")
+                movie.tmdb_id = 918273
+                movie.video_url = "https://hidden-source.invalid/master.txt"
+                movie.availability = "processing"
+                movie.preview_task_id = task_id
+                db.add(movie)
+                db.add(
+                    DownloadTask(
+                        id=task_id,
+                        tmdb_id=918273,
+                        title="Playback Contract",
+                        media_type="movie",
+                        video_url=movie.video_url,
+                        status="DOWNLOADING",
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                )
+                await db.commit()
+
+        async def finish_handoff() -> None:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                movie = await db.get(Movie, "m_playback_contract")
+                movie.video_url = self.catalog_path
+                movie.availability = "available"
+                movie.preview_task_id = None
+                movie.source_fingerprint = self.fingerprint
+                db.add(movie)
+                await db.commit()
+
+        async def restore() -> None:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                movie = await db.get(Movie, "m_playback_contract")
+                movie.tmdb_id = None
+                movie.video_url = self.catalog_path
+                movie.availability = "available"
+                movie.preview_task_id = None
+                movie.source_fingerprint = self.fingerprint
+                db.add(movie)
+                task = await db.get(DownloadTask, task_id)
+                if task:
+                    await db.delete(task)
+                await db.commit()
+
+        asyncio.run(enable_preview())
+        try:
+            run = self.create_run()
+            self.assertIn(f"/api/playback/preview/m_playback_contract/playlist.m3u8", run["manifestUrl"])
+            manifest = self.client.get(run["manifestUrl"])
+            self.assertEqual(manifest.status_code, 200, manifest.text)
+            self.assertNotIn("hidden-source.invalid", manifest.text)
+            self.assertIn("/api/playback/preview/m_playback_contract/init.mp4?ticket=", manifest.text)
+            segment_url = next(line for line in manifest.text.splitlines() if "segment_00000.m4s" in line)
+            segment = self.client.get(segment_url)
+            self.assertEqual(segment.status_code, 200)
+            self.assertEqual(segment.content, b"preview-segment")
+            state_url = segment_url.replace("segment_00000.m4s", "state.json")
+            state_response = self.client.get(state_url)
+            self.assertEqual(state_response.status_code, 403)
+            self.assertEqual(state_response.json()["detail"]["code"], "PREVIEW_ASSET_TYPE_FORBIDDEN")
+
+            asyncio.run(finish_handoff())
+            refreshed = self.client.get(f"/api/playback/runs/{run['runId']}")
+            self.assertEqual(refreshed.status_code, 200, refreshed.text)
+            self.assertIn("/api/playback/preview/", refreshed.json()["manifestUrl"])
+            continued = self.client.get(run["manifestUrl"])
+            self.assertEqual(continued.status_code, 200, continued.text)
+        finally:
+            asyncio.run(restore())
+            ingest_preview_service.remove(task_id)
 
     def test_progress_is_sequenced_completion_is_sticky_and_start_over_is_explicit(self) -> None:
         run = self.create_run()

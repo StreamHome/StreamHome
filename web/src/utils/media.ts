@@ -60,8 +60,8 @@ export function serverArtworkCandidates(
 }
 
 export function isPlayableMovie(movie: Movie): boolean {
-  if (movie.type === "series") return Boolean(movie.episodes?.some((episode) => episode.videoUrl));
-  return Boolean(movie.videoUrl);
+  if (movie.type === "series") return Boolean(movie.episodes?.some((episode) => episode.videoUrl || episode.previewTaskId));
+  return Boolean(movie.videoUrl || movie.previewTaskId);
 }
 
 export function mediaAvailability(movie: Movie): "available" | "processing" | "cached" {
@@ -70,7 +70,13 @@ export function mediaAvailability(movie: Movie): "available" | "processing" | "c
 }
 
 export function isAvailableMedia(movie: Movie): boolean {
-  return mediaAvailability(movie) === "available";
+  const availability = mediaAvailability(movie);
+  if (availability === "available") return true;
+  if (availability !== "processing") return false;
+  if (movie.type === "series") {
+    return Boolean(movie.episodes?.some((episode) => episode.previewTaskId));
+  }
+  return Boolean(movie.previewTaskId);
 }
 
 export function tmdbIdFromMovie(movie: Movie): number | null {

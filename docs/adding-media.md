@@ -33,7 +33,7 @@ The standard media-ingestion process is:
 10. TMDB metadata and artwork are retrieved.
 11. The completed title becomes available in the StreamHome catalog.
 
-When supported by the submitted source and installed StreamHome release, playback may begin from the incoming source while background processing continues.
+When FFmpeg can decode the submitted source, the catalog shows **Play while downloading** after StreamHome has built a safe application-owned buffer. The server produces that protected preview and the final media file from one source read; it does not send the original URL or headers to the browser. If preview preparation fails, normal background ingestion continues when possible.
 
 ## Before You Begin
 
@@ -473,7 +473,7 @@ After a request is accepted, StreamHome may perform the following operations:
 2. Validate the request structure.
 3. Create a background task.
 4. Inspect the submitted source.
-5. Begin supported immediate-source playback.
+5. Build a protected, adaptively buffered play-while-downloading preview when supported.
 6. Download the video and audio.
 7. Process compatible tracks with FFmpeg.
 8. Download and prepare subtitles.

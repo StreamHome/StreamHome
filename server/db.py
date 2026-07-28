@@ -212,6 +212,7 @@ async def init_db():
                     "frame_rate": "FLOAT",
                     "source_fingerprint": "TEXT",
                     "audio_metadata_str": "TEXT DEFAULT '[]'",
+                    "preview_task_id": "TEXT",
                 }
                 for column, sql_type in probe_columns.items():
                     if column not in movie_cols:
@@ -250,6 +251,7 @@ async def init_db():
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_catalog_enrichment_version ON movie (catalog_enrichment_version)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_collection_name ON movie (collection_name)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_source_fingerprint ON movie (source_fingerprint)")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_preview_task_id ON movie (preview_task_id)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_movie_vibe_analysis_status ON movie (vibe_analysis_status)")
                 sync_conn.exec_driver_sql(
                     "UPDATE movie SET cache_state = CASE "
@@ -275,12 +277,14 @@ async def init_db():
                     "vibe_analysis_status": "TEXT",
                     "vibe_analysis_version": "INTEGER DEFAULT 0",
                     "vibe_analyzed_at": "FLOAT",
+                    "preview_task_id": "TEXT",
                 }
                 for column, sql_type in probe_columns.items():
                     if column not in ep_cols:
                         logger.info(f"[Database] Migrating: Adding '{column}' column to 'episode' table...")
                         sync_conn.exec_driver_sql(f"ALTER TABLE episode ADD COLUMN {column} {sql_type}")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_episode_source_fingerprint ON episode (source_fingerprint)")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_episode_preview_task_id ON episode (preview_task_id)")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_episode_vibe_analysis_status ON episode (vibe_analysis_status)")
 
             if "playbackrun" in inspector.get_table_names():
@@ -289,6 +293,13 @@ async def init_db():
                     logger.info("[Database] Migrating: Adding 'last_progress_at' column to 'playbackrun' table...")
                     sync_conn.exec_driver_sql("ALTER TABLE playbackrun ADD COLUMN last_progress_at FLOAT NOT NULL DEFAULT 0")
                     sync_conn.exec_driver_sql("UPDATE playbackrun SET last_progress_at = COALESCE(last_seen_at, created_at, 0)")
+                if "source_kind" not in playback_run_cols:
+                    sync_conn.exec_driver_sql("ALTER TABLE playbackrun ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'catalog'")
+                if "source_fingerprint" not in playback_run_cols:
+                    sync_conn.exec_driver_sql("ALTER TABLE playbackrun ADD COLUMN source_fingerprint TEXT")
+                if "source_task_id" not in playback_run_cols:
+                    sync_conn.exec_driver_sql("ALTER TABLE playbackrun ADD COLUMN source_task_id TEXT")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_playbackrun_source_task_id ON playbackrun (source_task_id)")
 
             if "profilerecommendation" in inspector.get_table_names():
                 recommendation_cols = [col["name"] for col in inspector.get_columns("profilerecommendation")]

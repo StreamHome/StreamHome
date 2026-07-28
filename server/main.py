@@ -55,6 +55,7 @@ from services.logger import logger
 from services.queue import queue_manager
 from services.hevc_compressor import hevc_compressor
 from services.playback_prep import playback_prep_service
+from services.ingest_preview import ingest_preview_service
 from services.vibe_analysis import vibe_analysis_manager
 from services.update import automatic_update_worker
 import services.state as state
@@ -99,6 +100,7 @@ async def playback_run_reaper():
 async def lifespan(app: FastAPI):
     # Sunucu başlarken (Startup) yapılacaklar:
     await init_db()
+    ingest_preview_service.cleanup_expired()
     background_tasks: list[asyncio.Task] = []
 
     try:
@@ -171,6 +173,32 @@ async def lifespan(app: FastAPI):
                     task.status = "FAILED"
                     task.error_message = "Interrupted by server shutdown/restart."
                     db.add(task)
+                    ingest_preview_service.mark_error(
+                        task.id,
+                        "INGESTION_INTERRUPTED",
+                        "The download and play-while-downloading preview were interrupted by a server restart.",
+                    )
+                    if task.media_type == "movie":
+                        movie = await db.get(Movie, f"m_{task.tmdb_id}")
+                        if movie and movie.preview_task_id == task.id:
+                            movie.preview_task_id = None
+                            if not movie.video_url.startswith("/media/"):
+                                movie.video_url = ""
+                                movie.availability = "cached"
+                            db.add(movie)
+                    elif task.season is not None and task.episode is not None:
+                        episode = await db.get(Episode, f"ep_{task.tmdb_id}_s{task.season}_e{task.episode}")
+                        if episode and episode.preview_task_id == task.id:
+                            episode.preview_task_id = None
+                            if not episode.video_url.startswith("/media/"):
+                                episode.video_url = ""
+                            db.add(episode)
+                        show = await db.get(Movie, f"tv_{task.tmdb_id}")
+                        if show:
+                            episode_result = await db.exec(select(Episode).where(Episode.movie_id == show.id))
+                            has_local_episode = any(item.video_url.startswith("/media/") for item in episode_result.all() if item.video_url)
+                            show.availability = "available" if has_local_episode else "cached"
+                            db.add(show)
                 await db.commit()
     except Exception as dangling_err:
         logger.error(f"[Lifespan Startup] Error cleaning up dangling tasks: {dangling_err}")
@@ -822,8 +850,9 @@ async def get_series_episodes(tmdb_id: int, user = Depends(get_current_user)):
                             title=local_ep.title,
                             description=local_ep.description,
                             thumbnail_url=local_ep.thumbnail_url or thumbnail_url,
-                            video_url=local_ep.video_url,
-                            duration=local_ep.duration
+                            video_url="" if local_ep.preview_task_id else local_ep.video_url,
+                            duration=local_ep.duration,
+                            preview_task_id=local_ep.preview_task_id,
                         )
                     )
                 else:
@@ -860,8 +889,9 @@ async def get_series_episodes(tmdb_id: int, user = Depends(get_current_user)):
                 title=e.title,
                 description=e.description,
                 thumbnail_url=e.thumbnail_url,
-                video_url=e.video_url,
-                duration=e.duration
+                video_url="" if e.preview_task_id else e.video_url,
+                duration=e.duration,
+                preview_task_id=e.preview_task_id,
             )
             for e in local_episodes
         ]

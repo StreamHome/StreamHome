@@ -50,7 +50,7 @@ function EmberGrid({ title, label, items, total, sessions, showReasons, onOpen }
 function EmberActions({ movie, onDetails, onPlay }: { movie: Movie; onDetails: () => void; onPlay: () => void }) {
   const playable = isAvailableMedia(movie) && isPlayableMovie(movie);
   if (!playable) return <div className="ember-actions"><button className="ember-action ember-action--primary" onClick={onDetails}>View details</button><button className="ember-action" disabled>{mediaAvailability(movie) === "processing" ? "Processing" : "Cached suggestion"}</button></div>;
-  return <div className="ember-actions"><button className="ember-action ember-action--primary" onClick={movie.type === "series" ? onDetails : onPlay}>{movie.type === "series" ? "Select episode" : "Initialize playback"}</button><button className="ember-action" onClick={onDetails}>View details</button></div>;
+  return <div className="ember-actions"><button className="ember-action ember-action--primary" onClick={movie.type === "series" ? onDetails : onPlay}>{movie.type === "series" ? "Select episode" : mediaAvailability(movie) === "processing" ? "Play while downloading" : "Initialize playback"}</button><button className="ember-action" onClick={onDetails}>View details</button></div>;
 }
 
 function EmberBillboard({ items, context, onDetails, onPlay }: { items: Movie[]; context: "home" | "movies" | "series"; onDetails: (movie: Movie) => void; onPlay: (movie: Movie) => void }) {

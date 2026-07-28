@@ -13,6 +13,7 @@ from services.state import update_task_metrics, remove_task_metrics, register_pr
 from services.logger import logger
 from services.ingestion_errors import IngestionFailure, classify_failure, sanitize_url, write_task_diagnostics
 from services.ffmpeg_input import ffmpeg_network_input_options, is_http_media_source
+from services.ingest_preview import ingest_preview_service
 
 # Regular expressions for parsing FFmpeg stderr progress
 time_regex = re.compile(r"time=\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)")
@@ -67,7 +68,7 @@ async def download_and_cache_metadata_image(image_url: str, dest_path: str) -> O
         
     return image_url
 
-def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[bool, str]:
+def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float, preview_enabled: bool = False) -> tuple[bool, str]:
     """Runs FFmpeg synchronously in a dedicated background thread, immune to asyncio loop resets."""
     stderr_lines = []
     process: subprocess.Popen[bytes] | None = None
@@ -132,6 +133,17 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[boo
                                 eta = f"{h:02d}:{m:02d}:{s:02d}"
                     except Exception:
                         pass
+
+                    if preview_enabled:
+                        try:
+                            ingest_preview_service.update_progress(
+                                task_id,
+                                processed_seconds=current_time,
+                                speed_multiplier=speed_val_mult,
+                                duration_seconds=duration_secs,
+                            )
+                        except OSError:
+                            pass
                     
                     # Calculate real download speed from file size changes
                     now = time.time()
@@ -190,6 +202,7 @@ async def download_and_merge(
     duration_secs: float,
     video_source_type: str = "auto",
     audio_source_type: str = "auto",
+    preview_enabled: bool = True,
 ) -> tuple[bool, Optional[IngestionFailure]]:
     """Download video/audio streams, merge losslessly, inject headers, track progress."""
     
@@ -201,24 +214,20 @@ async def download_and_merge(
         headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
 
     ffmpeg_path = shutil.which("ffmpeg") or r"C:\ffmpeg\bin\ffmpeg.exe"
-    cmd = [ffmpeg_path, "-y"]
+    input_cmd = [ffmpeg_path, "-y"]
     
     is_video_http = is_http_media_source(video_url)
     if headers_str.strip() and is_video_http:
-        cmd.extend(["-headers", headers_str])
-    cmd.extend(ffmpeg_network_input_options(video_url, video_source_type))
-    cmd.extend(["-i", video_url])
+        input_cmd.extend(["-headers", headers_str])
+    input_cmd.extend(ffmpeg_network_input_options(video_url, video_source_type))
+    input_cmd.extend(["-i", video_url])
     
     if audio_url:
         is_audio_http = is_http_media_source(audio_url)
         if headers_str.strip() and is_audio_http:
-            cmd.extend(["-headers", headers_str])
-        cmd.extend(ffmpeg_network_input_options(audio_url, audio_source_type))
-        # faststart eklendi
-        cmd.extend(["-i", audio_url, "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", "-map", "0:v:0", "-map", "1:a:0", "-shortest"])
-    else:
-        # faststart eklendi
-        cmd.extend(["-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy", "-movflags", "+faststart"])
+            input_cmd.extend(["-headers", headers_str])
+        input_cmd.extend(ffmpeg_network_input_options(audio_url, audio_source_type))
+        input_cmd.extend(["-i", audio_url])
         
     output_root, output_ext = os.path.splitext(abs_output_path)
     temp_output_path = f"{output_root}.{task_id}.part{output_ext or '.mp4'}"
@@ -227,7 +236,40 @@ async def download_and_merge(
             os.remove(temp_output_path)
     except OSError:
         pass
-    cmd.append(temp_output_path)
+    preview_dir = ingest_preview_service.prepare(task_id, duration_secs) if preview_enabled else None
+
+    def build_command(include_preview: bool) -> list[str]:
+        command = list(input_cmd)
+        if include_preview and preview_dir is not None:
+            command.extend(["-map", "0:v:0"])
+            command.extend(["-map", "1:a:0"] if audio_url else ["-map", "0:a:0?"])
+            command.extend([
+                "-vf", "scale=-2:min(720\\,ih)",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-profile:v", "high",
+                "-pix_fmt", "yuv420p",
+                "-crf", "22",
+                "-sc_threshold", "0",
+                "-force_key_frames", "expr:gte(t,n_forced*4)",
+                "-c:a", "aac",
+                "-b:a", "160k",
+                "-ac", "2",
+                "-f", "hls",
+                "-hls_time", "4",
+                "-hls_playlist_type", "event",
+                "-hls_flags", "independent_segments+temp_file",
+                "-hls_segment_type", "fmp4",
+                "-hls_fmp4_init_filename", "init.mp4",
+                "-hls_segment_filename", str(preview_dir / "segment_%05d.m4s"),
+                str(preview_dir / "playlist.m3u8"),
+            ])
+        if audio_url:
+            command.extend(["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", "-shortest"])
+        else:
+            command.extend(["-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy", "-movflags", "+faststart"])
+        command.append(temp_output_path)
+        return command
 
     # Initialize metrics immediately to show 0.0% progress in CLI TUI
     update_task_metrics(task_id, 0.0, speed="Connecting...", eta="00:00:00", size="0 MB", force_write=True)
@@ -237,10 +279,35 @@ async def download_and_merge(
     
     try:
         # Senkron FFmpeg fonksiyonunu sunucuyu bloke etmemesi için ayrı bir iş parçacığına yolluyoruz
-        success, diagnostics = await loop.run_in_executor(None, _run_ffmpeg_sync, task_id, cmd, duration_secs)
+        success, diagnostics = await loop.run_in_executor(
+            None,
+            _run_ffmpeg_sync,
+            task_id,
+            build_command(preview_enabled),
+            duration_secs,
+            preview_enabled,
+        )
+        preview_succeeded = bool(preview_enabled and success)
+
+        if not success and preview_enabled:
+            preview_failure = classify_failure(diagnostics, "PREVIEW_FAILED")
+            ingest_preview_service.mark_error(task_id, preview_failure.code, preview_failure.message)
+            if os.path.exists(temp_output_path):
+                os.remove(temp_output_path)
+            logger.warning(f"[FFmpeg Service] Preview branch failed for {task_id}; retrying ingestion without play-while-downloading output.")
+            success, diagnostics = await loop.run_in_executor(
+                None,
+                _run_ffmpeg_sync,
+                task_id,
+                build_command(False),
+                duration_secs,
+                False,
+            )
         
         if success:
             os.replace(temp_output_path, abs_output_path)
+            if preview_succeeded and ingest_preview_service.playlist_path(task_id).is_file():
+                ingest_preview_service.mark_complete(task_id)
             logger.info(f"[FFmpeg Service] Task completed successfully: {task_id}")
             update_task_metrics(task_id, 100.0, speed="Finished", eta="00:00:00")
             return True, None

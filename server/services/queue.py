@@ -18,6 +18,7 @@ from config import settings
 from services.logger import logger
 from services.media_probe import probe_media_stream, notify_video_sender, probe_completed_media
 from services.ingestion_errors import IngestionFailure, IngestionTaskError, prune_task_diagnostics, write_task_diagnostics
+from services.ingest_preview import ingest_preview_service
 from services.rclone import rclone_service
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
 from services.media_source import MediaSourceError, catalog_path_from_storage, resolve_media_source
@@ -311,6 +312,10 @@ class DownloadQueueManager:
                 logger.error(f"[Queue Manager] Error fetching TMDB metadata: {e}")
                 meta = {}
 
+            probed_duration = float(probe_res.get("probed_duration") or 0)
+            if probed_duration > 0:
+                duration_secs = probed_duration
+
             raw_title = meta.get("title", f"Media_{tmdb_id}")
             clean_title = "".join(c for c in raw_title if c.isalnum() or c in " .-_")
 
@@ -534,6 +539,7 @@ class DownloadQueueManager:
             remove_task_metrics(task_id)
 
     async def _record_task_failure(self, task_id: str, failure: IngestionFailure, submitted_video_url: str) -> None:
+        ingest_preview_service.mark_error(task_id, failure.code, failure.message)
         try:
             async with AsyncSession(engine) as db:
                 task = await db.get(DownloadTask, task_id)
@@ -545,14 +551,18 @@ class DownloadQueueManager:
 
                 if task.media_type == "movie":
                     movie = await db.get(Movie, f"m_{task.tmdb_id}")
-                    if movie and movie.video_url == submitted_video_url:
+                    if movie and movie.video_url == submitted_video_url and movie.preview_task_id in {None, task_id}:
                         movie.video_url = ""
                         movie.availability = "cached"
+                        if movie.preview_task_id == task_id:
+                            movie.preview_task_id = None
                         db.add(movie)
                 elif task.season is not None and task.episode is not None:
                     episode = await db.get(Episode, f"ep_{task.tmdb_id}_s{task.season}_e{task.episode}")
-                    if episode and episode.video_url == submitted_video_url:
+                    if episode and episode.video_url == submitted_video_url and episode.preview_task_id in {None, task_id}:
                         episode.video_url = ""
+                        if episode.preview_task_id == task_id:
+                            episode.preview_task_id = None
                         db.add(episode)
                     show = await db.get(Movie, f"tv_{task.tmdb_id}")
                     if show:
@@ -778,6 +788,7 @@ class DownloadQueueManager:
                 movie.height = height
                 movie.frame_rate = frame_rate
                 movie.source_fingerprint = source_fingerprint
+                movie.preview_task_id = None
                 movie.hevc_compressed = str(codec or "").lower() in {"hevc", "h265"}
                 movie.audio_metadata = audio_meta_list
                 movie.vibe_analysis_status = "queued" if subs_on_disk else "unavailable"
@@ -962,6 +973,7 @@ class DownloadQueueManager:
                 ep_entry.height = height
                 ep_entry.frame_rate = frame_rate
                 ep_entry.source_fingerprint = source_fingerprint
+                ep_entry.preview_task_id = None
                 ep_entry.hevc_compressed = str(codec or "").lower() in {"hevc", "h265"}
                 ep_entry.audio_metadata = audio_meta_list
                 ep_entry.vibe_analysis_status = "queued" if subs_on_disk else "unavailable"

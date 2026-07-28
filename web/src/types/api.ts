@@ -106,6 +106,7 @@ export interface Episode {
   skipMarkers: Record<string, unknown>;
   dialogueWpm?: number | null;
   dialogueConfidence?: number;
+  previewTaskId?: string | null;
 }
 
 export interface MediaCrewMember { name: string; roles: string[] }
@@ -148,6 +149,7 @@ export interface Movie {
   dialogueWpm?: number | null;
   dialogueConfidence?: number;
   recommendationReasonDetails?: RecommendationReasonDetail[];
+  previewTaskId?: string | null;
 }
 
 export type MediaSource = "server" | "tmdb_cache" | string;

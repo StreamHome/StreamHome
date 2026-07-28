@@ -36,6 +36,18 @@ MediaSender does not need direct access to StreamHome's database or media direct
 
 All ingestion must occur through the authenticated API.
 
+## Early Playback Contract
+
+MediaSender does not need a second streaming endpoint or a special playback payload. After `/api/add-movie` accepts a source, StreamHome owns early playback:
+
+1. the queued catalog record carries an opaque preview-task identity;
+2. FFmpeg generates a growing 720p H.264/AAC preview while writing the final file from the same input;
+3. the web player waits for the server's adaptive buffer threshold;
+4. protected playback routes serve only StreamHome-owned manifests and fragments; and
+5. completed media becomes the source for new playback runs while existing preview runs finish without a player reload.
+
+The submitted `video_url`, `audio_url`, cookies, referer, and other source headers remain backend-only. Catalog responses omit the temporary source URL while a preview task is active. A MediaSender client should continue supplying accurate source-type hints and required allowlisted headers, but must never attempt to forward those values to the web player.
+
 ## Authentication
 
 Every MediaSender request must include the StreamHome ingestion token in the HTTP `Authorization` header.

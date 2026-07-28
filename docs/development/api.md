@@ -46,6 +46,8 @@ Machine API keys cannot use update endpoints.
 
 `POST /api/add-movie` accepts optional `video_source_type` and `audio_source_type` values of `"auto"` or `"hls"`. MediaSender clients should send `"hls"` when they identify a manifest behind a misleading filename such as `master.txt`. The server persists the resolved source type with the queued task and applies the supplied allowlisted headers to both probing and FFmpeg ingestion.
 
+Processing catalog responses may include an opaque `previewTaskId`; they never serialize the submitted source URL while that preview is active. Playback-run creation automatically selects the preview source for the matching task. Ready previews use ticket-protected `GET /api/playback/preview/{media_id}/playlist.m3u8` and `/api/playback/preview/{media_id}/{path}` routes. These routes accept only a ticket for the exact authenticated session, profile, playback run, media ID, and immutable preview fingerprint. They rewrite every playlist URI back through StreamHome and never expose ingestion headers.
+
 Administrative profile-data endpoints require recent reauthentication and do not require selecting or unlocking the inspected profile:
 
 - `GET /api/admin/profiles`: summary counts for every profile and the storage-location map;

@@ -121,7 +121,7 @@ export function nextPlayableEpisode(episodes: Episode[], currentId: string): Epi
   const ordered = [...episodes].sort((left, right) => left.seasonNumber - right.seasonNumber || left.episodeNumber - right.episodeNumber);
   const currentIndex = ordered.findIndex((episode) => episode.id === currentId);
   if (currentIndex < 0) return null;
-  return ordered.slice(currentIndex + 1).find((episode) => Boolean(episode.videoUrl)) ?? null;
+  return ordered.slice(currentIndex + 1).find((episode) => Boolean(episode.videoUrl || episode.previewTaskId)) ?? null;
 }
 
 function assetFromMovie(movie: Movie): PlayableAsset {
@@ -471,8 +471,14 @@ export function PlayerPage() {
   const applyResume = useCallback((video: HTMLVideoElement) => {
     if (resumeAppliedRef.current) return;
     const position = resumePositionRef.current;
-    if (position > 0 && Number.isFinite(video.duration)) {
+    if (position >= 0 && Number.isFinite(video.duration)) {
       video.currentTime = Math.min(position, Math.max(0, video.duration - 1));
+      currentTimeRef.current = video.currentTime;
+      setCurrentTime(video.currentTime);
+    } else if (position >= 0 && video.seekable.length > 0) {
+      const seekableStart = video.seekable.start(0);
+      const seekableEnd = video.seekable.end(video.seekable.length - 1);
+      video.currentTime = Math.min(Math.max(position, seekableStart), seekableEnd);
       currentTimeRef.current = video.currentTime;
       setCurrentTime(video.currentTime);
     }
@@ -513,6 +519,7 @@ export function PlayerPage() {
         enableWorker: true,
         capLevelToPlayerSize: true,
         startLevel: -1,
+        startPosition: Math.max(0, resumePositionRef.current),
         maxBufferLength: 30,
         maxMaxBufferLength: 90,
         backBufferLength: 30,

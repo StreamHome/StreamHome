@@ -448,6 +448,12 @@ StreamHome uses an adaptive fMP4 HLS playback pipeline.
 
 Media may be prepared in short segments and served through a source-resolution-aware quality ladder.
 
+### Can I watch media before its download finishes?
+
+Yes, when FFmpeg can decode the submitted source. A processing title displays **Play while downloading** once StreamHome has accumulated a safe buffer. StreamHome creates a protected 720p H.264/AAC preview and the final media file from the same source read.
+
+The browser never receives the original source URL, cookies, or request headers. When the final media is ready, new playback sessions use it automatically; an already-playing preview continues without reloading. If the preview branch is unavailable, the normal download may still finish and the title becomes playable afterward.
+
 ### Does StreamHome support seeking?
 
 Yes.
