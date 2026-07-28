@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 from sqlalchemy import delete
+from sqlalchemy.exc import OperationalError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -225,6 +226,8 @@ async def lifespan(app: FastAPI):
     async def recover_catalog_and_playback() -> None:
         try:
             await queue_manager.sync_media_from_disk()
+            from services.audio_extractor import repair_completed_ingestion_languages
+            await repair_completed_ingestion_languages()
             await playback_prep_service.schedule_catalog_baselines()
             await vibe_analysis_manager.start()
         except asyncio.CancelledError:
@@ -395,6 +398,25 @@ class SecurityBoundaryMiddleware(BaseHTTPMiddleware):
         return response
 
 app = FastAPI(title="StreamHome Media Server", version=settings.APP_VERSION, lifespan=lifespan)
+
+
+@app.exception_handler(OperationalError)
+async def database_operational_error_handler(request: Request, exc: OperationalError):
+    del request
+    message = str(exc).lower()
+    if "database is locked" in message or "database table is locked" in message:
+        logger.warning("[Database] Request rejected because SQLite is temporarily busy.")
+        return JSONResponse(
+            status_code=503,
+            content={"detail": {"code": "database_busy", "message": "The server database is temporarily busy. Try again."}},
+            headers={"Retry-After": "1"},
+        )
+    logger.error(f"[Database] Operational request failure: {type(exc).__name__}")
+    return JSONResponse(
+        status_code=503,
+        content={"detail": {"code": "database_unavailable", "message": "The server database is unavailable."}},
+        headers={"Retry-After": "5"},
+    )
 
 app.add_middleware(ActivityTrackingMiddleware)
 app.add_middleware(SetupGateMiddleware)

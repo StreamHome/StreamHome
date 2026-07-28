@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import delete
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -265,23 +266,42 @@ async def get_media_preferences(profile_id: str) -> Dict[str, str]:
 
 async def record_recommendation_exposures(profile_id: str, exposures: Sequence[Any]) -> int:
     now = time.time()
-    accepted = 0
     async with AsyncSession(engine) as db:
         if not await db.get(Profile, profile_id):
             return 0
         cutoff = now - 90 * 86400
-        old = await db.exec(select(RecommendationExposure).where(RecommendationExposure.shown_at < cutoff))
-        for item in old.all():
-            await db.delete(item)
-        for exposure in list(exposures)[:100]:
-            if not await db.get(Movie, exposure.movie_id):
+        await db.execute(delete(RecommendationExposure).where(RecommendationExposure.shown_at < cutoff))
+        batch = list(exposures)[:100]
+        movie_ids = {exposure.movie_id for exposure in batch}
+        valid_movie_ids = set()
+        if movie_ids:
+            valid_movies = await db.exec(select(Movie.id).where(Movie.id.in_(movie_ids)))
+            valid_movie_ids = {str(movie_id) for movie_id in valid_movies.all()}
+
+        pending: list[tuple[Any, str]] = []
+        for exposure in batch:
+            if exposure.movie_id not in valid_movie_ids:
                 continue
             raw = f"{profile_id}:{exposure.feed_generation}:{exposure.surface}:{exposure.movie_id}"
             dedupe = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-            found = await db.exec(select(RecommendationExposure).where(RecommendationExposure.dedupe_key == dedupe))
-            if found.first():
+            pending.append((exposure, dedupe))
+
+        existing_keys = set()
+        if pending:
+            existing = await db.exec(
+                select(RecommendationExposure.dedupe_key).where(
+                    RecommendationExposure.dedupe_key.in_([dedupe for _, dedupe in pending])
+                )
+            )
+            existing_keys = {str(key) for key in existing.all()}
+
+        accepted = 0
+        seen_keys = set(existing_keys)
+        for exposure, dedupe in pending:
+            if dedupe in seen_keys:
                 continue
             db.add(RecommendationExposure(id=str(uuid.uuid4()), profile_id=profile_id, movie_id=exposure.movie_id, feed_generation=exposure.feed_generation[:80], surface=exposure.surface[:80], scope=exposure.scope[:20], category=exposure.category[:80], position=max(0, int(exposure.position)), shown_at=now, dedupe_key=dedupe))
+            seen_keys.add(dedupe)
             accepted += 1
         await db.commit()
     return accepted

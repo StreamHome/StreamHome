@@ -1,6 +1,7 @@
 """End-to-end regression checks for session-backed local authentication."""
 import asyncio
 import os
+import sqlite3
 import sys
 import time
 
@@ -88,6 +89,16 @@ def run() -> None:
     try:
         health = client.get("/api/health")
         assert health.status_code == 200 and health.json()["status"] == "ready"
+
+        lock_connection = sqlite3.connect(settings.db_path, timeout=0)
+        try:
+            lock_connection.execute("BEGIN IMMEDIATE")
+            busy_health = client.get("/api/health")
+            assert busy_health.status_code == 503
+            assert busy_health.json()["detail"]["code"] == "server_busy"
+        finally:
+            lock_connection.rollback()
+            lock_connection.close()
 
         for attempt in range(LOCKOUT_TEST_ATTEMPTS := 5):
             response = client.post("/api/auth/login", json={"email": EMAIL, "password": "wrong"}, headers=headers)

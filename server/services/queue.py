@@ -23,6 +23,7 @@ from services.rclone import rclone_service
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
 from services.media_source import MediaSourceError, catalog_path_from_storage, resolve_media_source
 from services.vibe_analysis import VIBE_ANALYSIS_VERSION, compute_trope_vectors, vibe_analysis_manager
+from services.audio_extractor import apply_primary_audio_language, extract_audio_and_strip_video, normalize_language_code
 
 def srt_to_vtt(srt_path: str, vtt_path: str) -> bool:
     """
@@ -424,8 +425,11 @@ class DownloadQueueManager:
                 raise IngestionTaskError(last_failure)
 
             if success:
-                from services.audio_extractor import extract_audio_and_strip_video
-                extracted_languages = await extract_audio_and_strip_video(output_abs_path, default_lang=language or "en")
+                extracted_languages = await extract_audio_and_strip_video(
+                    output_abs_path,
+                    default_lang=language or "en",
+                    override_primary=bool(language),
+                )
                 
                 if settings.STORAGE_ENGINE == "CLOUD":
                     async with AsyncSession(engine) as db:
@@ -437,6 +441,7 @@ class DownloadQueueManager:
                 
             local_dir = os.path.dirname(output_abs_path)
             uploaded_to_cloud = False
+            cloud_ingestion = settings.STORAGE_ENGINE == "CLOUD"
             async with AsyncSession(engine) as db:
                 task = await db.get(DownloadTask, task_id)
                 if not task:
@@ -446,8 +451,25 @@ class DownloadQueueManager:
                     return
                     
                 try:
-                    await self._catalog_media(db, tmdb_id, media_type, season, episode, meta, output_rel_path, extracted_languages, language, subtitles_list, quality, task.skip_markers)
+                    await self._catalog_media(
+                        db,
+                        tmdb_id,
+                        media_type,
+                        season,
+                        episode,
+                        meta,
+                        output_rel_path,
+                        extracted_languages,
+                        language,
+                        subtitles_list,
+                        quality,
+                        task.skip_markers,
+                        finalize=not cloud_ingestion,
+                        preview_task_id=task_id,
+                    )
+                    await db.commit()
                 except Exception as cat_err:
+                    await db.rollback()
                     diagnostics_path = write_task_diagnostics(task_id, "catalog", traceback.format_exc())
                     raise IngestionTaskError(
                         IngestionFailure(
@@ -458,49 +480,61 @@ class DownloadQueueManager:
                         )
                     ) from cat_err
 
-                if settings.STORAGE_ENGINE == "CLOUD":
-                    from services.state import update_task_metrics
+            if cloud_ingestion:
+                # Rclone can take minutes or hours. It must never run while an SQLite
+                # write transaction is open, otherwise login and telemetry writes are
+                # blocked for the entire upload.
+                from services.state import update_task_metrics
 
-                    update_task_metrics(task_id, 99.9, speed="Uploading", eta="00:00:00", force_write=True)
-                    if media_type == "movie":
-                        remote_subpath = os.path.join("Movies", folder_name)
-                    else:
-                        remote_subpath = os.path.join("Series", folder_name, f"Season_{season}", f"Episode_{episode}")
-                    uploaded_to_cloud = await self.run_rclone_move_dir(local_dir, remote_subpath)
-                    if uploaded_to_cloud:
-                        catalog_entry = await db.get(
-                            Movie if media_type == "movie" else Episode,
-                            f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season}_e{episode}",
-                        )
-                        if catalog_entry:
-                            catalog_entry.source_fingerprint = None
-                            db.add(catalog_entry)
-                    else:
-                        logger.warning(f"[Queue Manager] Cloud upload failed for task {task_id}; falling back to local storage.")
-                        temp_abs = os.path.normpath(os.path.abspath(settings.TEMP_DIR))
-                        media_abs = os.path.normpath(os.path.abspath(settings.MEDIA_DIR))
-                        local_dir_norm = os.path.normpath(local_dir)
-                        try:
-                            relative_dir = os.path.relpath(local_dir_norm, temp_abs)
-                            if relative_dir.startswith(".."):
-                                raise ValueError("Cloud staging folder is outside the temporary storage root")
-                            dest_dir = os.path.join(media_abs, relative_dir)
-                            os.makedirs(os.path.dirname(dest_dir), exist_ok=True)
-                            if os.path.exists(dest_dir):
-                                shutil.rmtree(dest_dir)
-                            shutil.move(local_dir, dest_dir)
-                            logger.info(f"[Queue Manager] Local fallback completed for task {task_id}: {dest_dir}")
-                        except Exception as fallback_err:
-                            diagnostics_path = write_task_diagnostics(task_id, "cloud fallback", traceback.format_exc())
-                            raise IngestionTaskError(
-                                IngestionFailure(
-                                    "CLOUD_MOVE_FAILED",
-                                    f"Cloud upload and local fallback failed ({type(fallback_err).__name__}).",
-                                    False,
-                                    diagnostics_path,
-                                )
-                            ) from fallback_err
+                update_task_metrics(task_id, 99.9, speed="Uploading", eta="00:00:00", force_write=True)
+                if media_type == "movie":
+                    remote_subpath = os.path.join("Movies", folder_name)
+                else:
+                    remote_subpath = os.path.join("Series", folder_name, f"Season_{season}", f"Episode_{episode}")
+                uploaded_to_cloud = await self.run_rclone_move_dir(local_dir, remote_subpath)
+                if not uploaded_to_cloud:
+                    logger.warning(f"[Queue Manager] Cloud upload failed for task {task_id}; falling back to local storage.")
+                    temp_abs = os.path.normpath(os.path.abspath(settings.TEMP_DIR))
+                    media_abs = os.path.normpath(os.path.abspath(settings.MEDIA_DIR))
+                    local_dir_norm = os.path.normpath(local_dir)
+                    try:
+                        relative_dir = os.path.relpath(local_dir_norm, temp_abs)
+                        if relative_dir.startswith(".."):
+                            raise ValueError("Cloud staging folder is outside the temporary storage root")
+                        dest_dir = os.path.join(media_abs, relative_dir)
+                        os.makedirs(os.path.dirname(dest_dir), exist_ok=True)
+                        if os.path.exists(dest_dir):
+                            shutil.rmtree(dest_dir)
+                        shutil.move(local_dir, dest_dir)
+                        logger.info(f"[Queue Manager] Local fallback completed for task {task_id}: {dest_dir}")
+                    except Exception as fallback_err:
+                        diagnostics_path = write_task_diagnostics(task_id, "cloud fallback", traceback.format_exc())
+                        raise IngestionTaskError(
+                            IngestionFailure(
+                                "CLOUD_MOVE_FAILED",
+                                f"Cloud upload and local fallback failed ({type(fallback_err).__name__}).",
+                                False,
+                                diagnostics_path,
+                            )
+                        ) from fallback_err
 
+            async with AsyncSession(engine) as db:
+                task = await db.get(DownloadTask, task_id)
+                if not task:
+                    self.active_tasks.discard(task_id)
+                    from services.state import remove_task_metrics
+                    remove_task_metrics(task_id)
+                    return
+                if cloud_ingestion:
+                    await self._finalize_catalog_media(
+                        db,
+                        tmdb_id,
+                        media_type,
+                        season,
+                        episode,
+                        task_id,
+                        uploaded_to_cloud=uploaded_to_cloud,
+                    )
                 task.status = "COMPLETED"
                 task.error_message = None
                 db.add(task)
@@ -551,18 +585,16 @@ class DownloadQueueManager:
 
                 if task.media_type == "movie":
                     movie = await db.get(Movie, f"m_{task.tmdb_id}")
-                    if movie and movie.video_url == submitted_video_url and movie.preview_task_id in {None, task_id}:
+                    if movie and movie.preview_task_id == task_id:
                         movie.video_url = ""
                         movie.availability = "cached"
-                        if movie.preview_task_id == task_id:
-                            movie.preview_task_id = None
+                        movie.preview_task_id = None
                         db.add(movie)
                 elif task.season is not None and task.episode is not None:
                     episode = await db.get(Episode, f"ep_{task.tmdb_id}_s{task.season}_e{task.episode}")
-                    if episode and episode.video_url == submitted_video_url and episode.preview_task_id in {None, task_id}:
+                    if episode and episode.preview_task_id == task_id:
                         episode.video_url = ""
-                        if episode.preview_task_id == task_id:
-                            episode.preview_task_id = None
+                        episode.preview_task_id = None
                         db.add(episode)
                     show = await db.get(Movie, f"tv_{task.tmdb_id}")
                     if show:
@@ -616,7 +648,10 @@ class DownloadQueueManager:
         episode: Optional[int], meta: Dict[str, Any], file_path: str, 
         extracted_languages: Optional[List[str]] = None, language: Optional[str] = None, 
         subtitles_list: Optional[List[Dict[str, str]]] = None, quality: Optional[str] = None,
-        skip_markers: Optional[Dict[str, Any]] = None
+        skip_markers: Optional[Dict[str, Any]] = None,
+        *,
+        finalize: bool = True,
+        preview_task_id: Optional[str] = None,
     ):
         server_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         
@@ -700,13 +735,14 @@ class DownloadQueueManager:
         height = probe_meta.get("height")
         frame_rate = probe_meta.get("frame_rate")
         source_fingerprint = probe_meta.get("source_fingerprint")
-        audio_meta_list = probe_meta.get("audio_metadata", [])
+        selected_language = normalize_language_code(language, "en") if language else None
+        audio_meta_list = apply_primary_audio_language(probe_meta.get("audio_metadata", []), selected_language)
         
         if media_type == "movie":
             movie_id = f"m_{tmdb_id}"
             movie_folder_abs = os.path.dirname(abs_file_path)
             movie_quality = quality or "Source"
-            movie_languages = extracted_languages if extracted_languages else ([language] if language else ["en"])
+            movie_languages = extracted_languages if extracted_languages else ([selected_language] if selected_language else ["en"])
             
             subs_on_disk = []
             if subtitles_list:
@@ -732,9 +768,9 @@ class DownloadQueueManager:
                     thumbnail_url=local_thumbnail or "", banner_url=local_banner or "", video_url=served_url,
                     duration=duration_str, release_year=meta.get("releaseYear", 2026),
                     rating=meta.get("rating", "PG-13"), director=meta.get("director", "Unknown"),
-                    original_language=language or meta.get("originalLanguage", "en"), type="movie",
+                    original_language=selected_language or meta.get("originalLanguage", "en"), type="movie",
                     vote_average=meta.get("vote_average", 7.5), vote_count=meta.get("vote_count", 100),
-                    tmdb_id=int(tmdb_id), catalog_source="server", availability="available",
+                    tmdb_id=int(tmdb_id), catalog_source="server", availability="available" if finalize else "processing",
                     probed_duration=probed_duration, container=container, codec=codec,
                     width=width, height=height, frame_rate=frame_rate,
                     source_fingerprint=source_fingerprint,
@@ -751,6 +787,7 @@ class DownloadQueueManager:
                 movie.subtitles = subs_on_disk
                 movie.skip_markers = skip_data
                 movie.audio_metadata = audio_meta_list
+                movie.preview_task_id = None if finalize else preview_task_id
                 db.add(movie)
                 await db.flush()
                 logger.info(f"[Queue Manager] Cataloged new movie: {meta.get('title', 'Unknown Movie')}")
@@ -762,7 +799,7 @@ class DownloadQueueManager:
                 movie.video_url = served_url
                 movie.tmdb_id = int(tmdb_id)
                 movie.catalog_source = "server"
-                movie.availability = "available"
+                movie.availability = "available" if finalize else "processing"
                 movie.duration = duration_str
                 movie.release_year = meta.get("releaseYear", movie.release_year)
                 movie.rating = meta.get("rating", movie.rating)
@@ -773,7 +810,7 @@ class DownloadQueueManager:
                 movie.keywords = meta.get("keywords", movie.keywords)
                 movie.collection_name = meta.get("collectionName") or meta.get("collection_name") or movie.collection_name
                 movie.trope_vectors = meta.get("tropeVectors") or meta.get("trope_vectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
-                movie.original_language = language or meta.get("originalLanguage", movie.original_language)
+                movie.original_language = selected_language or meta.get("originalLanguage", movie.original_language)
                 movie.quality = movie_quality
                 movie.languages = movie_languages
                 movie.subtitles = subs_on_disk
@@ -788,7 +825,7 @@ class DownloadQueueManager:
                 movie.height = height
                 movie.frame_rate = frame_rate
                 movie.source_fingerprint = source_fingerprint
-                movie.preview_task_id = None
+                movie.preview_task_id = None if finalize else preview_task_id
                 movie.hevc_compressed = str(codec or "").lower() in {"hevc", "h265"}
                 movie.audio_metadata = audio_meta_list
                 movie.vibe_analysis_status = "queued" if subs_on_disk else "unavailable"
@@ -815,11 +852,11 @@ class DownloadQueueManager:
                 "video_url": served_url,
                 "catalog_source": "server",
                 "availability": "available",
-                "language": language or "en",
+                "language": selected_language or "en",
                 "languages": movie_languages,
                 "quality": movie_quality,
                 "subtitles": subs_on_disk,
-                "original_language": language or "en",
+                "original_language": selected_language or "en",
                 "skip_markers": skip_data,
                 "probed_duration": probed_duration,
                 "container": container,
@@ -841,7 +878,8 @@ class DownloadQueueManager:
             }
             with open(movie_metadata_file, "w", encoding="utf-8") as f:
                 json.dump(movie_metadata_content, f, indent=2, ensure_ascii=False)
-            await self._schedule_playback_baseline(db, movie)
+            if finalize:
+                await self._schedule_playback_baseline(db, movie)
         else:
             show_id = f"tv_{tmdb_id}"
             show = await db.get(Movie, show_id)
@@ -851,9 +889,9 @@ class DownloadQueueManager:
                     thumbnail_url=local_thumbnail or "", banner_url=local_banner or "", video_url="",
                     duration=meta.get("duration", "45m"), release_year=meta.get("releaseYear", 2026),
                     rating=meta.get("rating", "TV-14"), director=meta.get("director", "Various"),
-                    original_language=language or meta.get("originalLanguage", "en"), type="series",
+                    original_language=selected_language or meta.get("originalLanguage", "en"), type="series",
                     vote_average=meta.get("vote_average", 7.5), vote_count=meta.get("vote_count", 100),
-                    tmdb_id=int(tmdb_id), catalog_source="server", availability="available"
+                    tmdb_id=int(tmdb_id), catalog_source="server", availability="available" if finalize else "processing"
                 )
                 show.genres = meta.get("genres", [])
                 show.cast = meta.get("cast", [])
@@ -862,7 +900,6 @@ class DownloadQueueManager:
                 show.collection_name = meta.get("collectionName") or meta.get("collection_name")
                 show.trope_vectors = meta.get("tropeVectors") or meta.get("trope_vectors") or compute_trope_vectors(show.genres, show.keywords, show.description)
                 db.add(show)
-                await db.flush()
                 logger.info(f"[Queue Manager] Cataloged new TV show: {meta.get('title', 'Unknown Show')}")
             else:
                 show.title = meta.get("title", show.title)
@@ -879,18 +916,17 @@ class DownloadQueueManager:
                 show.keywords = meta.get("keywords", show.keywords)
                 show.collection_name = meta.get("collectionName") or meta.get("collection_name") or show.collection_name
                 show.trope_vectors = meta.get("tropeVectors") or meta.get("trope_vectors") or compute_trope_vectors(show.genres, show.keywords, show.description)
-                show.original_language = language or meta.get("originalLanguage", show.original_language)
+                show.original_language = selected_language or meta.get("originalLanguage", show.original_language)
                 show.vote_average = meta.get("vote_average", show.vote_average)
                 show.vote_count = meta.get("vote_count", show.vote_count)
                 db.add(show)
-                await db.flush()
                 logger.info(f"[Queue Manager] Updated TV show: {show.title}")
                 
             season_num = season or 1
             episode_num = episode or 1
 
             ep_quality = quality or "Source"
-            ep_languages = extracted_languages if extracted_languages else ([language] if language else ["en"])
+            ep_languages = extracted_languages if extracted_languages else ([selected_language] if selected_language else ["en"])
 
             ep_folder_abs = os.path.dirname(abs_file_path)
             subs_on_disk = []
@@ -951,6 +987,7 @@ class DownloadQueueManager:
                 ep_entry.subtitles = subs_on_disk
                 ep_entry.skip_markers = ep_skip_data
                 ep_entry.audio_metadata = audio_meta_list
+                ep_entry.preview_task_id = None if finalize else preview_task_id
                 ep_entry.vibe_analysis_status = "queued" if subs_on_disk else "unavailable"
                 ep_entry.vibe_analysis_version = 0 if subs_on_disk else VIBE_ANALYSIS_VERSION
                 db.add(ep_entry)
@@ -973,7 +1010,7 @@ class DownloadQueueManager:
                 ep_entry.height = height
                 ep_entry.frame_rate = frame_rate
                 ep_entry.source_fingerprint = source_fingerprint
-                ep_entry.preview_task_id = None
+                ep_entry.preview_task_id = None if finalize else preview_task_id
                 ep_entry.hevc_compressed = str(codec or "").lower() in {"hevc", "h265"}
                 ep_entry.audio_metadata = audio_meta_list
                 ep_entry.vibe_analysis_status = "queued" if subs_on_disk else "unavailable"
@@ -983,7 +1020,7 @@ class DownloadQueueManager:
 
             show.tmdb_id = int(tmdb_id)
             show.catalog_source = "server"
-            show.availability = "available"
+            show.availability = "available" if finalize or show.availability == "available" else "processing"
             db.add(show)
             await db.flush()
 
@@ -1002,11 +1039,11 @@ class DownloadQueueManager:
                 "video_url": served_url,
                 "catalog_source": "server",
                 "availability": "available",
-                "language": language or "en",
+                "language": selected_language or "en",
                 "languages": ep_languages,
                 "quality": ep_quality,
                 "subtitles": subs_on_disk,
-                "original_language": language or "en",
+                "original_language": selected_language or "en",
                 "skip_markers": ep_skip_data,
                 "probed_duration": probed_duration,
                 "container": container,
@@ -1032,7 +1069,40 @@ class DownloadQueueManager:
             sync_compatible_metadata_file = os.path.join(ep_metadata_dir, f"metadata_s{season_num}_e{episode_num}.json")
             with open(sync_compatible_metadata_file, "w", encoding="utf-8") as f:
                 json.dump(ep_metadata_content, f, indent=2, ensure_ascii=False)
-            await self._schedule_playback_baseline(db, ep_entry)
+            if finalize:
+                await self._schedule_playback_baseline(db, ep_entry)
+
+    async def _finalize_catalog_media(
+        self,
+        db: AsyncSession,
+        tmdb_id: int,
+        media_type: str,
+        season: Optional[int],
+        episode: Optional[int],
+        preview_task_id: str,
+        *,
+        uploaded_to_cloud: bool,
+    ) -> None:
+        """Publish a prepared cloud catalog row in one short SQLite transaction."""
+
+        if media_type == "movie":
+            media_obj = await db.get(Movie, f"m_{tmdb_id}")
+            if not media_obj:
+                raise RuntimeError("Prepared movie catalog row disappeared before finalization")
+            media_obj.availability = "available"
+        else:
+            media_obj = await db.get(Episode, f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}")
+            if not media_obj:
+                raise RuntimeError("Prepared episode catalog row disappeared before finalization")
+            show = await db.get(Movie, f"tv_{tmdb_id}")
+            if show:
+                show.availability = "available"
+                db.add(show)
+        if media_obj.preview_task_id == preview_task_id:
+            media_obj.preview_task_id = None
+        if uploaded_to_cloud:
+            media_obj.source_fingerprint = None
+        db.add(media_obj)
 
     def _parse_duration_to_seconds(self, duration_str: str) -> float:
         total_seconds = 0.0

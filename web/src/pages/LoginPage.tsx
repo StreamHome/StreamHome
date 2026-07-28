@@ -14,7 +14,7 @@ const WEB_VERSION = import.meta.env.VITE_APP_VERSION || "0.0.0";
 const BUILD_ID = import.meta.env.VITE_BUILD_ID || "dev";
 type AuthStage = "credentials" | "factor" | "success";
 type FactorMethod = "totp" | "recovery";
-type ServerState = "checking" | "ready" | "offline" | "unreachable";
+type ServerState = "checking" | "ready" | "busy" | "offline" | "unreachable";
 
 function FieldIcon({ type }: { type: "email" | "lock" }) {
   return type === "email"
@@ -66,16 +66,20 @@ export function LoginPage() {
       setServerState("ready");
       setServerVersion(health.version);
       setServerClockOffset(health.serverTime * 1000 - Date.now());
-    } catch { setServerState(navigator.onLine ? "unreachable" : "offline"); }
+    } catch (requestError) {
+      const apiError = requestError instanceof ApiError ? requestError : null;
+      setServerState(!navigator.onLine ? "offline" : apiError?.code === "server_busy" || apiError?.code === "database_busy" ? "busy" : "unreachable");
+    }
     finally { window.clearTimeout(timeout); }
   }, []);
 
   useEffect(() => {
     void checkServer();
-    const interval = window.setInterval(() => void checkServer(), 30_000);
+    const interval = window.setInterval(() => void checkServer(), 5_000);
     const refresh = () => void checkServer();
     window.addEventListener("online", refresh); window.addEventListener("offline", refresh);
-    return () => { window.clearInterval(interval); window.removeEventListener("online", refresh); window.removeEventListener("offline", refresh); if (navigationTimer.current !== null) window.clearTimeout(navigationTimer.current); };
+    window.addEventListener("focus", refresh); document.addEventListener("visibilitychange", refresh);
+    return () => { window.clearInterval(interval); window.removeEventListener("online", refresh); window.removeEventListener("offline", refresh); window.removeEventListener("focus", refresh); document.removeEventListener("visibilitychange", refresh); if (navigationTimer.current !== null) window.clearTimeout(navigationTimer.current); };
   }, [checkServer]);
 
   useEffect(() => {
@@ -121,7 +125,10 @@ export function LoginPage() {
         setEmail(response.email); setChallengeToken(response.challengeToken); setStage("factor"); setFactorMethod("totp"); setCode(""); setProgressLabel("");
         window.setTimeout(() => codeInput.current?.focus(), reduced ? 0 : 220);
       } else completeLogin(response.email);
-    } catch (requestError) { setProgressLabel(""); showRequestError(requestError, "Login failed."); }
+    } catch (requestError) {
+      setProgressLabel(""); showRequestError(requestError, "Login failed.");
+      if (requestError instanceof ApiError && (requestError.status >= 500 || requestError.status === 0)) void checkServer();
+    }
     finally { controller.stop(); setIsLoading(false); }
   };
 
@@ -144,7 +151,7 @@ export function LoginPage() {
   const factorReady = factorMethod === "totp" ? code.length === 6 : code.replace(/[-\s]/g, "").length >= 12;
   const circumference = 2 * Math.PI * 18;
   const stageTransition = { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.dialogEnter, ease: MOTION_EASE };
-  const statusLabel = serverState === "ready" ? "Server ready" : serverState === "checking" ? "Checking server" : serverState === "offline" ? "Device offline" : "Server unreachable";
+  const statusLabel = serverState === "ready" ? "Server ready" : serverState === "checking" ? "Checking server" : serverState === "busy" ? "Server busy" : serverState === "offline" ? "Device offline" : "Server unreachable";
 
   return <motion.main className="login-page linear-ember-login" data-theme="ember" data-interaction="terminal" data-focus={focusedField} aria-busy={isLoading}>
     <div className="login-ambient" aria-hidden="true"><i /><i /><span /></div>

@@ -13,7 +13,7 @@ from services.ingestion_errors import (
 )
 from services.ffmpeg_input import ffmpeg_network_input_options, is_hls_media_source
 from services.media_source import MediaSourceError, catalog_path_from_storage
-from services.audio_extractor import audio_track_labels
+from services.audio_extractor import apply_primary_audio_language, audio_track_labels
 from config import settings
 
 
@@ -101,6 +101,13 @@ def test_audio_track_labels_are_stable_across_reingestion() -> None:
     ]
     assert audio_track_labels(streams, "en") == ["eng", "eng_1", "track_2"]
     assert audio_track_labels([{"tags": {}}], "en") == ["en"]
+    assert audio_track_labels(streams, "tr", override_primary=True) == ["tr", "eng", "track_2"]
+    corrected = apply_primary_audio_language(
+        [{"index": 0, "language": "eng", "label": "English", "default": True}],
+        "tr",
+    )
+    assert corrected[0]["language"] == "tr"
+    assert corrected[0]["label"] == "Turkish"
 
 
 def test_compact_and_redacted_diagnostics() -> None:
@@ -143,8 +150,17 @@ def test_queue_contracts() -> None:
     assert ".part{output_ext" in ffmpeg_source
     assert "preserve_local_media" in route_source
     assert "preserve_local_episode" in route_source
-    assert queue_source.index("await self._catalog_media") < queue_source.index('task.status = "COMPLETED"')
+    process_source = queue_source[queue_source.index("    async def _process_task"):queue_source.index("    async def _record_task_failure")]
+    catalog_position = process_source.index("await self._catalog_media")
+    preparation_commit_position = process_source.index("await db.commit()", catalog_position)
+    cloud_upload_position = process_source.index("await self.run_rclone_move_dir", preparation_commit_position)
+    completion_position = process_source.index('task.status = "COMPLETED"', cloud_upload_position)
+    assert catalog_position < preparation_commit_position < cloud_upload_position < completion_position
+    assert "Rclone can take minutes or hours" in process_source
     assert "CATALOG_UPDATE_FAILED" in queue_source
+    vibe_source = Path(__file__).parents[1].joinpath("services", "vibe_analysis.py").read_text(encoding="utf-8")
+    analyze_source = vibe_source[vibe_source.index("    async def analyze_entity"):]
+    assert "AsyncSession(engine, expire_on_commit=False)" in analyze_source
 
 
 if __name__ == "__main__":

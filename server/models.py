@@ -861,4 +861,14 @@ class DownloadAddRequest(BaseModel):
                 raise ValueError("Movie ingestion must omit season and episode")
         elif self.season is None or self.episode is None:
             raise ValueError("TV ingestion requires both season and episode")
+        if self.language is not None:
+            normalized_language = "".join(
+                character
+                for character in self.language.strip().lower()
+                if character.isalnum() or character == "-"
+            )
+            language_aliases = {"tur": "tr", "turkish": "tr", "eng": "en", "english": "en"}
+            self.language = language_aliases.get(normalized_language, normalized_language)
+            if not self.language:
+                raise ValueError("language must contain a language code")
         return self

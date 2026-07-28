@@ -28,6 +28,7 @@
 
 .login-server-status { position: absolute; z-index: 2; top: 25px; right: 28px; display: inline-flex; align-items: center; gap: 8px; border: 1px solid rgba(255,181,156,.13); border-radius: 999px; padding: 8px 12px; background: rgba(22,11,8,.58); color: rgba(255,215,201,.68); font: 600 9px/1 var(--font-mono); letter-spacing: .11em; text-transform: uppercase; backdrop-filter: blur(16px); }
 .login-server-status[data-state="offline"] i,.login-server-status[data-state="unreachable"] i { background: #ff8276; box-shadow: 0 0 10px rgba(255,70,55,.55); }
+.login-server-status[data-state="busy"] i { background: #ffc857; box-shadow: 0 0 10px rgba(255,190,60,.6); }
 .login-server-status[data-state="checking"] i { animation: login-pulse 1.2s ease-in-out infinite; }
 .login-server-status i,.login-auth-footer i { width: 6px; height: 6px; border-radius: 50%; background: var(--login-ember-bright); box-shadow: 0 0 10px rgba(255,107,53,.72); }
 

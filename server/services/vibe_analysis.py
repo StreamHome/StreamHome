@@ -281,7 +281,7 @@ class VibeAnalysisManager:
 
     async def analyze_entity(self, entity_type: str, entity_id: str) -> Optional[DialogueMetrics]:
         model = Movie if entity_type == "movie" else Episode
-        async with AsyncSession(engine) as db:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
             entity = await db.get(model, entity_id)
             if not entity:
                 return None

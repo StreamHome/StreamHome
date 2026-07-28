@@ -42,6 +42,14 @@ describe("LoginPage", () => {
     expect(localStorage.getItem("streamhome_token")).toBeNull();
   });
 
+  it("does not claim readiness while the backend database is busy", async () => {
+    vi.mocked(getHealth).mockRejectedValue(new ApiError("The server database is busy.", 503, "server_busy"));
+    renderLogin();
+
+    expect(await screen.findByRole("button", { name: "Server busy. Check again." })).toBeTruthy();
+    expect(screen.queryByText("Server ready")).toBeNull();
+  });
+
   it("moves into TOTP verification and distributes a pasted six-digit code", async () => {
     vi.mocked(login).mockResolvedValue({ requires2fa: true, email: "admin@example.test", challengeToken: "challenge", expiresInSeconds: 300, message: "TOTP required" });
     vi.mocked(verify2FA).mockResolvedValue({ email: "admin@example.test" });

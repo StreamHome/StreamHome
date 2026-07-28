@@ -19,7 +19,7 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
-from db import get_session
+from db import engine, get_session
 from models import AuthChallenge, AuthSession, IntegrationCredential, RecoveryCode, SecurityEvent, TOTPEnrollment, User
 from services.logger import logger
 from services.request_security import client_ip, request_is_secure
@@ -326,13 +326,18 @@ async def require_recent_reauth(session: AuthSession = Depends(get_current_sessi
 
 
 @health_router.get("/api/health")
-async def health(db: AsyncSession = Depends(get_session)):
+async def health():
+    connection = None
+    write_probe_started = False
     try:
         if service_state.MAINTENANCE_MODE:
             raise RuntimeError("Server restart required after database restore")
-        await db.execute(text("SELECT 1"))
+        connection = await engine.connect()
+        await connection.exec_driver_sql("PRAGMA busy_timeout=500")
+        await connection.exec_driver_sql("BEGIN IMMEDIATE")
+        write_probe_started = True
         required_tables = {"user", "profile", "authsession", "movie", "downloadtask"}
-        table_result = await db.execute(
+        table_result = await connection.execute(
             text(
                 "SELECT name FROM sqlite_master "
                 "WHERE type = 'table' AND name IN ('user', 'profile', 'authsession', 'movie', 'downloadtask')"
@@ -342,8 +347,23 @@ async def health(db: AsyncSession = Depends(get_session)):
         if not required_tables.issubset(available_tables):
             raise RuntimeError("Required database schema is incomplete")
         return {"status": "ready", "version": settings.APP_VERSION, "serverTime": now()}
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail={"code": "server_unavailable", "message": "The server database is not ready."})
+    except Exception as exc:
+        message = str(exc).lower()
+        code = "server_busy" if "database is locked" in message or "database table is locked" in message else "server_unavailable"
+        detail_message = "The server database is busy." if code == "server_busy" else "The server database is not ready."
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail={"code": code, "message": detail_message}) from exc
+    finally:
+        if connection is not None:
+            if write_probe_started:
+                try:
+                    await connection.rollback()
+                except Exception:
+                    pass
+            try:
+                await connection.exec_driver_sql("PRAGMA busy_timeout=5000")
+            except Exception:
+                pass
+            await connection.close()
 
 
 @router.post("/login")

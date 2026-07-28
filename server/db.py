@@ -15,7 +15,7 @@ from services.logger import logger
 
 engine = create_async_engine(
     settings.DATABASE_URL,
-    connect_args={"check_same_thread": False}
+    connect_args={"check_same_thread": False, "timeout": 5.0}
 )
 
 @event.listens_for(engine.sync_engine, "connect")
@@ -23,6 +23,7 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA busy_timeout=5000")
     cursor.close()
 
 async def init_db():
