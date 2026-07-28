@@ -10,9 +10,9 @@
   </p>
 
   <p>
-    <a href="https://github.com/StreamHome/StreamHome/releases/tag/v0.1.0-alpha.1">
+    <!-- <a href="https://github.com/StreamHome/StreamHome/releases/tag/v0.1.0-alpha.1">
       <img src="https://img.shields.io/badge/Download-Early%20Public%20Alpha-E25822?style=for-the-badge&logo=github&logoColor=white" alt="Download Early Public Alpha">
-    </a>
+    </a> -->
     <a href="https://github.com/StreamHome/StreamHome/releases">
       <img src="https://img.shields.io/github/v/release/StreamHome/StreamHome?include_prereleases&style=for-the-badge&label=Latest%20Release" alt="Latest Release">
     </a>
