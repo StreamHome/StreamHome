@@ -242,7 +242,7 @@ StreamHome is designed to operate efficiently, but FFmpeg processing, adaptive p
 
 | Resource             | Minimum                                                          | Recommended                                                               |
 | :------------------- | :--------------------------------------------------------------- | :------------------------------------------------------------------------ |
-| **Operating System** | Ubuntu 22.04 or Windows 10                                       | Ubuntu 24.04, Debian 12, or Windows 11                                    |
+| **Operating System** | Ubuntu 22.04 or an equivalent current Linux distribution         | Ubuntu 24.04 or Debian 12                                                  |
 | **CPU**              | 2 vCPUs                                                          | 4+ vCPUs                                                                  |
 | **RAM**              | 2 GB                                                             | 4–6+ GB                                                                   |
 | **Network**          | 20 Mbps (lower is no problem)                                    | Faster upload for multiple high-bitrate streams and cloud synchronization |
@@ -254,8 +254,36 @@ Background HEVC optimization pauses when users require server resources and ther
 
 ## 📦 Installation
 
-An Alpha version will be released soon. The download URL will be available when it's released.
+StreamHome currently supports Linux servers. Install it with the general installer:
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
+```
+
+The installer prepares the application in `~/StreamHome`, installs or verifies the required server dependencies, builds the production web client, and starts StreamHome. When both services are healthy, it prints the browser URL and the one-time bootstrap code used to unlock first-run setup.
+
+Use a custom installation directory when needed:
+
+```bash
+STREAMHOME_INSTALL_DIR=/srv/streamhome \
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
+```
+
+To install and build without starting StreamHome:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh \
+  | bash -s -- --no-start
+```
+
+After a no-start installation, run:
+
+```bash
+cd ~/StreamHome
+./start.sh
+```
+
+See the [installation guide](docs/installation.md) for supported package managers, ports, lifecycle commands, and deployment notes.
 
 ## 📚 Documentation and Support
 
