@@ -70,11 +70,12 @@ async def download_and_cache_metadata_image(image_url: str, dest_path: str) -> O
 def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[bool, str]:
     """Runs FFmpeg synchronously in a dedicated background thread, immune to asyncio loop resets."""
     stderr_lines = []
+    process: subprocess.Popen[bytes] | None = None
     try:
         # Popen kullanarak süreci başlatıyoruz. Windows'ta ekstra CMD penceresi açılmasını engelliyoruz.
         process = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             bufsize=0, # Unbuffered binary stream (Fix for Linux stdout/stderr buffering)
@@ -168,15 +169,17 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float) -> tuple[boo
                 buffer_bytes.extend(char_bytes)
                 
         process.wait()
-        unregister_process(task_id)
         
         success = process.returncode == 0
         error_msg = "" if success else "\n".join(stderr_lines)
         return success, error_msg
         
     except Exception as e:
-        unregister_process(task_id)
         return False, f"Exception occurred during execution: {repr(e)}\n{traceback.format_exc()}"
+    finally:
+        if process is not None and process.stderr is not None:
+            process.stderr.close()
+        unregister_process(task_id)
 
 async def download_and_merge(
     task_id: str,
