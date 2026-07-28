@@ -312,6 +312,7 @@ prepare_environment() {
     chmod +x \
         "$ROOT_DIR/install.sh" \
         "$ROOT_DIR/restart.sh" \
+        "$ROOT_DIR/update.sh" \
         "$ROOT_DIR/setup.sh" \
         "$ROOT_DIR/start.sh" \
         "$ROOT_DIR/stop.sh" \

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+import sqlite3
 import shutil
 import socket
 import subprocess
@@ -54,6 +56,7 @@ def create_fixture_repository(directory: Path) -> None:
         ),
         "install.sh": "#!/usr/bin/env bash\nexit 0\n",
         "restart.sh": "#!/usr/bin/env bash\nexit 0\n",
+        "update.sh": "#!/usr/bin/env bash\nexit 0\n",
         "start.sh": "#!/usr/bin/env bash\nexit 0\n",
         "stop.sh": "#!/usr/bin/env bash\nexit 0\n",
         "test.sh": "#!/usr/bin/env bash\nexit 0\n",
@@ -68,6 +71,7 @@ def create_fixture_repository(directory: Path) -> None:
             "setup.sh",
             "install.sh",
             "restart.sh",
+            "update.sh",
             "start.sh",
             "stop.sh",
             "test.sh",
@@ -104,6 +108,7 @@ class SetupScriptContracts(unittest.TestCase):
         install_sh = (ROOT / "install.sh").read_text(encoding="utf-8")
         setup_sh = (ROOT / "setup.sh").read_text(encoding="utf-8")
         restart_sh = (ROOT / "restart.sh").read_text(encoding="utf-8")
+        update_sh = (ROOT / "update.sh").read_text(encoding="utf-8")
         start_sh = (ROOT / "start.sh").read_text(encoding="utf-8")
         stop_sh = (ROOT / "stop.sh").read_text(encoding="utf-8")
         test_sh = (ROOT / "test.sh").read_text(encoding="utf-8")
@@ -143,6 +148,19 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn('"restart.sh"', setup_py)
         self.assertIn("handoff.wait", setup_py)
 
+        self.assertIn('nohup bash "$controller" --execute', update_sh)
+        self.assertIn("preflight_target", update_sh)
+        self.assertIn("./setup.sh --no-start --skip-system-packages", update_sh)
+        self.assertIn("/api/update/handoff", update_sh)
+        self.assertIn("X-StreamHome-Update-Handoff", update_sh)
+        self.assertIn("create_database_checkpoint", update_sh)
+        self.assertIn("start_maintenance", update_sh)
+        self.assertIn("rollback_release", update_sh)
+        self.assertIn("recover_interrupted_release", update_sh)
+        self.assertIn('git -C "$ROOT_DIR" reset --hard "$OLD_COMMIT"', update_sh)
+        self.assertIn('"$ROOT_DIR/start.sh"', update_sh)
+        self.assertIn("rollback_failed", update_sh)
+
         self.assertIn('"$ROOT_DIR/stop.sh" --startup --lock-held', start_sh)
         self.assertIn("detect_server_ip", start_sh)
         self.assertIn("STREAMHOME_PUBLIC_URL_EXPLICIT", start_sh)
@@ -151,6 +169,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("wait_for_services", start_sh)
         self.assertIn("wait_for_port_release", start_sh)
         self.assertIn("lifecycle.lock", start_sh)
+        self.assertIn("--recover-interrupted", start_sh)
         self.assertIn("Setup URL: %s/setup", start_sh)
 
         self.assertIn("is_streamhome_process", stop_sh)
@@ -167,6 +186,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("Generated runtime or build metadata must not be tracked", test_sh)
         self.assertIn("server/system_profile.json", test_sh)
         self.assertIn('"$ROOT_DIR/restart.sh"', test_sh)
+        self.assertIn('"$ROOT_DIR/update.sh"', test_sh)
 
         self.assertIn("./venv/bin/python server/cli.py", cli_py)
         self.assertNotIn("start.bat", cli_py)
@@ -297,6 +317,117 @@ class SetupScriptContracts(unittest.TestCase):
                 "restart reached start.sh",
                 (fixture / "restart.log").read_text(encoding="utf-8"),
             )
+
+    @unittest.skipIf(os.name == "nt", "Update cutover and rollback require native Linux lifecycle semantics")
+    def test_linux_update_rolls_back_database_and_release_when_new_web_start_fails(self) -> None:
+        bash = bash_command()
+        if not bash:
+            self.skipTest("Bash is not installed")
+
+        with tempfile.TemporaryDirectory(dir=ROOT / "temp") as temporary:
+            fixture = Path(temporary)
+            remote = fixture / "remote"
+            installed = fixture / "installed"
+            fake_bin = fixture / "fake-bin"
+            fake_bin.mkdir()
+            remote.mkdir()
+            git(["init", "-b", "main"], cwd=remote)
+            git(["config", "user.email", "update-test@streamhome.invalid"], cwd=remote)
+            git(["config", "user.name", "StreamHome Update Test"], cwd=remote)
+
+            helper = (ROOT / "server" / "scratch" / "maintenance_server.py").read_text(encoding="utf-8")
+            old_files = {
+                ".gitignore": ".run/\n*.log\nserver/database.db\n",
+                "setup.sh": "#!/usr/bin/env bash\nexit 0\n",
+                "test.sh": "#!/usr/bin/env bash\nexit 0\n",
+                "stop.sh": "#!/usr/bin/env bash\nexit 0\n",
+                "start.sh": "#!/usr/bin/env bash\ncd \"$(dirname \"$0\")\"\nprintf 'healthy-old\\n' > healthy.marker\nexit 0\n",
+                ".env": f"WEB_PORT={unused_port()}\n",
+                "server/scratch/maintenance_server.py": helper,
+            }
+            for relative, content in old_files.items():
+                target = remote / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8", newline="\n")
+            git(["add", "."], cwd=remote)
+            git(["update-index", "--chmod=+x", "setup.sh", "test.sh", "stop.sh", "start.sh"], cwd=remote)
+            git(["commit", "-m", "known working release"], cwd=remote)
+            old_commit = run(["git", "rev-parse", "HEAD"], cwd=remote).stdout.strip()
+
+            target_start = (
+                "#!/usr/bin/env bash\n"
+                "cd \"$(dirname \"$0\")\"\n"
+                "python3 - <<'PY'\n"
+                "import sqlite3\n"
+                "connection = sqlite3.connect('server/database.db')\n"
+                "connection.execute(\"UPDATE update_probe SET value='mutated'\")\n"
+                "connection.commit()\n"
+                "connection.close()\n"
+                "PY\n"
+                "exit 1\n"
+            )
+            (remote / "start.sh").write_text(target_start, encoding="utf-8", newline="\n")
+            git(["add", "start.sh"], cwd=remote)
+            git(["commit", "-m", "broken candidate startup"], cwd=remote)
+            target_commit = run(["git", "rev-parse", "HEAD"], cwd=remote).stdout.strip()
+
+            clone = run(["git", "clone", remote.as_uri(), str(installed)], cwd=fixture)
+            self.assertEqual(clone.returncode, 0, clone.stdout + clone.stderr)
+            git(["reset", "--hard", old_commit], cwd=installed)
+            (installed / ".run").mkdir()
+            token_file = installed / ".run" / "update-handoff.test.token"
+            token_file.write_text("test-token", encoding="utf-8")
+            database = installed / "server" / "database.db"
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE update_probe (value TEXT NOT NULL)")
+            connection.execute("INSERT INTO update_probe (value) VALUES ('original')")
+            connection.commit()
+            connection.close()
+
+            fake_curl = fake_bin / "curl"
+            fake_curl.write_text("#!/usr/bin/env bash\nprintf '200'\n", encoding="utf-8", newline="\n")
+            fake_curl.chmod(0o755)
+            controller = fixture / "controller.sh"
+            controller_source = (ROOT / "update.sh").read_text(encoding="utf-8").replace(
+                "https://github.com/StreamHome/StreamHome.git",
+                remote.as_uri(),
+            )
+            controller_source = controller_source.replace(
+                "        ./venv/bin/python -m compileall -q server\n"
+                "        PYTHONPATH=server ./venv/bin/python server/scratch/test_update_system.py\n",
+                "        true\n",
+            )
+            controller.write_text(controller_source, encoding="utf-8", newline="\n")
+            controller.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+            result = run(
+                [
+                    bash,
+                    str(controller),
+                    "--execute",
+                    target_commit,
+                    old_commit,
+                    "false",
+                    str(token_file),
+                    str(installed),
+                ],
+                cwd=fixture,
+                env=environment,
+                timeout=90,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(run(["git", "rev-parse", "HEAD"], cwd=installed).stdout.strip(), old_commit)
+            self.assertEqual((installed / "healthy.marker").read_text(encoding="utf-8"), "healthy-old\n")
+            connection = sqlite3.connect(database)
+            try:
+                value = connection.execute("SELECT value FROM update_probe").fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(value, "original")
+            status_payload = json.loads((installed / ".run" / "update-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(status_payload["phase"], "rolled_back")
+            self.assertEqual(status_payload["failed_target"], target_commit)
 
     @unittest.skipIf(os.name == "nt", "Linux listener ownership uses /proc or lsof")
     def test_linux_stop_recovers_owned_orphan_and_preserves_unrelated_listener(self) -> None:

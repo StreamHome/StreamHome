@@ -13,6 +13,8 @@ The web server listens on the configured public port and proxies `/api` and `/me
 
 Linux lifecycle operations are serialized by installation, setup, and start/stop locks. Bootstrap promotes only a complete temporary checkout, setup stops an owned runtime before replacing dependencies or assets, PID records are written atomically, startup reports success only after API and web health checks pass, and shutdown preserves evidence when an owned process cannot be terminated.
 
+Web-managed updates add a separate owner-recorded update lock and detached controller. Candidate code is dependency-installed and production-built in an isolated sibling checkout while the current release remains online. The running backend grants cutover only after a second fail-closed idle check. During stopped-runtime work, a minimal maintenance responder occupies the public web port. The controller checkpoints SQLite, applies only the exact validated fast-forward, uses the normal setup/start lifecycle, and records success only after both API and web health gates pass. Failed cutovers restore the old commit and database checkpoint before rebuilding and health-checking the previous release.
+
 Ingestion is queue-based. Finalization writes portable `.metadata/metadata.json` beside media so catalog recovery can reconstruct quality, language, and subtitle information.
 
 Authentication uses HttpOnly sessions and optional local TOTP. TOTP enrollment state is server-owned, encrypted at rest, short-lived, and bound to the initiating setup or authenticated user session. The server renders the enrollment QR as a non-cacheable SVG and promotes the pending secret to the user only after successful verification. SMTP and email OTP are intentionally absent.

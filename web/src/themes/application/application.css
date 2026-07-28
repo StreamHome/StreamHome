@@ -547,6 +547,33 @@
 .admin-settings-actions { display: flex; min-height: 70px; align-items: center; justify-content: space-between; gap: 24px; margin-top: 32px; border-top: 1px solid var(--glass-border); padding-top: 22px; }
 .admin-settings-actions > span { color: var(--text-muted); font: 500 9px/1 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
 .admin-settings-actions .admin-form-message { flex: 1; }
+.update-overview-grid { display: grid; grid-template-columns: minmax(0,1.05fr) minmax(0,.95fr); gap: 22px; align-items: start; }
+.update-release-card,.update-policy-card,.update-log-card { min-width: 0; }
+.update-release-card { padding: clamp(24px,4vw,40px); }
+.update-status-line { display: flex; align-items: center; justify-content: space-between; gap: 16px; color: var(--text-muted); font: 500 9px/1.3 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
+.update-phase { display: inline-flex; border: 1px solid var(--glass-border-hover); border-radius: 999px; padding: 8px 11px; color: var(--text-accent); }
+.update-phase[data-phase="succeeded"],.update-phase[data-phase="up_to_date"] { color: #56df9a; border-color: color-mix(in srgb,#56df9a 38%,transparent); }
+.update-phase[data-phase="failed"],.update-phase[data-phase="rollback_failed"] { color: #ff8870; border-color: color-mix(in srgb,#ff8870 42%,transparent); }
+.update-release-card > h2,.update-card-heading h2 { margin-top: 14px; color: var(--text-primary); font: 650 clamp(22px,3vw,31px)/1.12 var(--font-headline); letter-spacing: -.02em; }
+.update-commit-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 1px; margin-top: 26px; overflow: hidden; border: 1px solid var(--glass-border); border-radius: var(--radius); background: var(--glass-border); }
+.update-commit-grid > div { min-width: 0; padding: 15px; background: color-mix(in srgb,var(--bg-surface-container-lowest) 94%,transparent); }
+.update-commit-grid dt { color: var(--text-muted); font: 600 8px/1 var(--font-mono); letter-spacing: .13em; text-transform: uppercase; }
+.update-commit-grid dd { margin: 8px 0 0; overflow: hidden; color: var(--text-primary); font: 600 12px/1.2 var(--font-mono); text-overflow: ellipsis; }
+.update-blockers { margin-top: 20px; border-left: 2px solid var(--accent-primary); padding: 4px 0 4px 16px; }
+.update-blockers strong { color: var(--text-primary); font-size: 12px; }
+.update-blockers ul { display: grid; gap: 5px; margin: 8px 0 0; padding-left: 17px; color: var(--text-muted); font-size: 11px; line-height: 1.45; }
+.update-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+.update-policy-card { margin-top: 30px; }
+.update-card-heading > p { color: var(--text-accent); font: 600 9px/1 var(--font-mono); letter-spacing: .16em; }
+.update-toggle { display: flex; align-items: flex-start; gap: 12px; margin: 24px 0; border: 1px solid var(--glass-border); border-radius: var(--radius); padding: 16px; cursor: pointer; }
+.update-toggle > input { width: 18px; height: 18px; margin-top: 2px; accent-color: var(--accent-primary); }
+.update-toggle > span { display: grid; gap: 5px; }
+.update-toggle strong { color: var(--text-primary); font-size: 13px; }
+.update-toggle small { color: var(--text-muted); font-size: 10px; line-height: 1.5; }
+.update-policy-card .admin-control--input { grid-column: auto; }
+.update-log-card { margin-top: 22px; padding: clamp(22px,3vw,32px); }
+.update-log-card pre { max-height: 320px; margin: 20px 0 0; overflow: auto; border: 1px solid var(--glass-border); border-radius: var(--radius); background: color-mix(in srgb,var(--bg-surface-container-lowest) 96%,transparent); color: var(--text-secondary); padding: 16px; font: 10px/1.65 var(--font-mono); white-space: pre-wrap; word-break: break-word; }
+.update-panel-message { margin-top: 18px; }
 .admin-state-card { padding: clamp(32px,5vw,56px); text-align: center; }
 .admin-state-card h2 { margin-top: 13px; font: 650 clamp(27px,4vw,40px)/1.05 var(--font-headline); }
 .admin-state-card > div:last-child > span { display: block; max-width: 540px; margin: 13px auto 0; color: var(--text-error); font-size: 12px; line-height: 1.5; }
@@ -1009,6 +1036,9 @@
   .admin-card__icon { width: 54px; height: 54px; }
   .admin-card__action { grid-column: auto; justify-self: stretch; }
   .admin-settings-grid { grid-template-columns: 1fr; }
+  .update-overview-grid { grid-template-columns: 1fr; }
+  .update-commit-grid { grid-template-columns: 1fr; }
+  .update-status-line { align-items: flex-start; flex-direction: column; }
   .admin-control--input { grid-column: auto; }
   .admin-settings-actions { align-items: stretch; flex-direction: column; gap: 16px; }
   .admin-settings-actions .admin-primary-action { width: 100%; }

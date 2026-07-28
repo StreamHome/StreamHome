@@ -1,5 +1,6 @@
 import asyncio
 import subprocess
+import time
 from typing import Dict, Any, Union
 
 # In-memory dictionary storing active download transient metrics:
@@ -14,15 +15,35 @@ ACTIVE_PROCESSES: Dict[str, Union[asyncio.subprocess.Process, subprocess.Popen]]
 ACTIVE_HTTP_REQUESTS: int = 0
 LAST_HTTP_ACTIVITY_TIMESTAMP: float = 0.0
 MAINTENANCE_MODE: bool = False
+MAINTENANCE_REASON: str = ""
+BROWSER_PRESENCE: Dict[str, float] = {}
+PRESENCE_TTL_SECONDS: int = 90
+UPDATE_HANDOFF_TOKEN: str = ""
 
 import json
 import os
-import time
 
 from config import config_dir
 from services.logger import logger
 
 _last_metrics_file_write = 0.0
+
+
+def record_browser_presence(session_id: str, visible: bool) -> None:
+    """Track only recently visible authenticated browser sessions."""
+    if visible:
+        BROWSER_PRESENCE[session_id] = time.time()
+    else:
+        BROWSER_PRESENCE.pop(session_id, None)
+
+
+def active_browser_sessions(current_time: float | None = None) -> int:
+    """Prune expired presence records and return the visible-browser count."""
+    cutoff = (current_time if current_time is not None else time.time()) - PRESENCE_TTL_SECONDS
+    expired = [session_id for session_id, seen_at in BROWSER_PRESENCE.items() if seen_at < cutoff]
+    for session_id in expired:
+        BROWSER_PRESENCE.pop(session_id, None)
+    return len(BROWSER_PRESENCE)
 
 def update_task_metrics(task_id: str, progress: float, speed: str = "0 KB/s", eta: str = "00:00:00", size: str = "0 MB", force_write: bool = False):
     global _last_metrics_file_write

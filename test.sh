@@ -100,6 +100,7 @@ run_shell_checks() {
     local -a scripts=(
         "$ROOT_DIR/install.sh"
         "$ROOT_DIR/restart.sh"
+        "$ROOT_DIR/update.sh"
         "$ROOT_DIR/setup.sh"
         "$ROOT_DIR/start.sh"
         "$ROOT_DIR/stop.sh"
@@ -142,6 +143,7 @@ run_server_checks() {
         scratch/test_security_validation.py
         scratch/test_setup_scripts.py
         scratch/test_totp_enrollment.py
+        scratch/test_update_system.py
         scratch/test_vibe_analysis.py
     )
     command -v "$PYTHON" >/dev/null 2>&1 || [[ -x "$PYTHON" ]] || fail "Python is unavailable. Run ./setup.sh first."

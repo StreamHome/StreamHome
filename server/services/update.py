@@ -1,288 +1,505 @@
-import os
-import sys
-import subprocess
+from __future__ import annotations
+
 import asyncio
+import json
+import os
+import re
+import secrets
+import shutil
 import time
-from services.logger import logger
-from services.backup import is_database_idle
-import services.state as state
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
 from config import settings
+from services.backup import BACKUP_LOCK, is_database_idle
+from services.logger import logger
+import services.state as state
+
+
+REPOSITORY_URL = "https://github.com/StreamHome/StreamHome.git"
+LEGACY_REPOSITORY_URL = "https://github.com/WaqSea/StreamHome.git"
+TERMINAL_PHASES = {"idle", "up_to_date", "update_available", "succeeded", "failed", "rolled_back", "rollback_failed"}
+BUSY_PHASES = {"preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back"}
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+UPDATE_CHECK_LOCK = asyncio.Lock()
+UPDATE_QUEUE_LOCK = asyncio.Lock()
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+RUN_DIR = WORKSPACE_ROOT / ".run"
+STATUS_PATH = RUN_DIR / "update-state.json"
+LOG_PATH = WORKSPACE_ROOT / "update.log"
+UPDATE_SCRIPT = WORKSPACE_ROOT / "update.sh"
+
+
+def _default_status() -> dict[str, Any]:
+    return {
+        "phase": "idle",
+        "message": "No update check has run yet.",
+        "current_commit": "",
+        "target_commit": "",
+        "update_available": False,
+        "automatic": False,
+        "queued_at": None,
+        "started_at": None,
+        "finished_at": None,
+        "last_checked_at": None,
+        "last_success_at": None,
+        "failed_target": "",
+        "error": "",
+    }
+
+
+def read_update_state() -> dict[str, Any]:
+    result = _default_status()
+    try:
+        if STATUS_PATH.is_file():
+            payload = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                result.update(payload)
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning(f"[Update Service] Could not read persisted update state: {exc}")
+    return result
+
+
+def write_update_state(**changes: Any) -> dict[str, Any]:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    result = read_update_state()
+    result.update(changes)
+    result["updated_at"] = time.time()
+    temporary = STATUS_PATH.with_name(f"{STATUS_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, STATUS_PATH)
+    return result
+
+
+def read_update_log(lines: int = 80) -> list[str]:
+    try:
+        content = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+        return content[-max(1, min(lines, 200)) :]
+    except OSError:
+        return []
+
 
 def get_git_path() -> str:
-    """Find local system git binary."""
-    # First check system PATH
-    import shutil
-    git_path = shutil.which("git")
-    if git_path:
-        return git_path
-    # Windows fallback common paths
-    common_paths = [
-        r"C:\Program Files\Git\bin\git.exe",
-        r"C:\Program Files (x86)\Git\bin\git.exe"
-    ]
-    for p in common_paths:
-        if os.path.exists(p):
-            return p
-    return "git"
+    return shutil.which("git") or "git"
 
-async def run_git_cmd(args: list) -> tuple:
-    """Executes a git command asynchronously and returns (exit_code, stdout, stderr)."""
-    git_bin = get_git_path()
-    # Resolve absolute path to workspace root
-    workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    
+
+async def run_git_cmd(args: list[str], cwd: Path = WORKSPACE_ROOT) -> tuple[int, str, str]:
     try:
         process = await asyncio.create_subprocess_exec(
-            git_bin, *args,
-            cwd=workspace_root,
+            get_git_path(),
+            *args,
+            cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await process.communicate()
-        return process.returncode, stdout.decode(errors="ignore").strip(), stderr.decode(errors="ignore").strip()
-    except Exception as e:
-        logger.error(f"[Update Service] Failed to execute git command {args}: {e}")
-        return -1, "", str(e)
+        return (
+            process.returncode,
+            stdout.decode(errors="ignore").strip(),
+            stderr.decode(errors="ignore").strip(),
+        )
+    except Exception as exc:
+        logger.error(f"[Update Service] Git command failed: {type(exc).__name__}: {exc}")
+        return -1, "", str(exc)
+
+
+def _normalized_remote(value: str) -> str:
+    return value.strip().removesuffix("/").removesuffix(".git").lower()
+
 
 async def initialize_remote() -> bool:
-    """Ensures git remote is configured and points to https://github.com/StreamHome/StreamHome."""
-    target_url = "https://github.com/StreamHome/StreamHome"
-    
-    # Check current remotes
-    ret, stdout, stderr = await run_git_cmd(["remote"])
-    if ret != 0:
-        logger.error(f"[Update Service] Failed to list git remotes: {stderr}")
+    code, remote, error = await run_git_cmd(["remote", "get-url", "origin"])
+    if code != 0:
+        logger.error(f"[Update Service] Cannot read origin: {error}")
         return False
-        
-    remotes = stdout.splitlines()
-    if "origin" not in remotes:
-        logger.info(f"[Update Service] Adding remote origin pointing to: {target_url}")
-        ret, stdout, stderr = await run_git_cmd(["remote", "add", "origin", target_url])
-        if ret != 0:
-            logger.error(f"[Update Service] Failed to add origin: {stderr}")
+    allowed = {_normalized_remote(REPOSITORY_URL), _normalized_remote(LEGACY_REPOSITORY_URL)}
+    if _normalized_remote(remote) not in allowed:
+        logger.error(f"[Update Service] Refusing unexpected Git origin: {remote}")
+        return False
+    if _normalized_remote(remote) == _normalized_remote(LEGACY_REPOSITORY_URL):
+        code, _, error = await run_git_cmd(["remote", "set-url", "origin", REPOSITORY_URL])
+        if code != 0:
+            logger.error(f"[Update Service] Could not migrate the legacy origin: {error}")
             return False
-    else:
-        logger.info(f"[Update Service] Setting remote origin URL to: {target_url}")
-        ret, stdout, stderr = await run_git_cmd(["remote", "set-url", "origin", target_url])
-        if ret != 0:
-            logger.error(f"[Update Service] Failed to set origin URL: {stderr}")
-            return False
-            
     return True
+
 
 async def is_git_clean() -> bool:
-    """Verifies if the workspace has no uncommitted local code changes."""
-    ret, stdout, stderr = await run_git_cmd(["status", "--porcelain"])
-    if ret != 0:
-        logger.error(f"[Update Service] Failed to run git status: {stderr}")
+    code, output, error = await run_git_cmd(["status", "--porcelain", "--untracked-files=normal"])
+    if code != 0:
+        logger.error(f"[Update Service] Git status failed: {error}")
         return False
-    # If stdout has content, the working tree is dirty
-    return len(stdout.strip()) == 0
+    return not output
+
 
 async def get_active_branch() -> str:
-    """Resolves active branch name dynamically."""
-    ret, stdout, stderr = await run_git_cmd(["branch", "--show-current"])
-    if ret == 0 and stdout.strip():
-        return stdout.strip()
-    
-    # Fallback for older git versions
-    ret, stdout, stderr = await run_git_cmd(["symbolic-ref", "--short", "HEAD"])
-    if ret == 0 and stdout.strip():
-        return stdout.strip()
-        
-    return "master"
+    code, output, _ = await run_git_cmd(["branch", "--show-current"])
+    return output if code == 0 and output else "detached"
+
+
+async def current_commit() -> str:
+    code, output, _ = await run_git_cmd(["rev-parse", "HEAD"])
+    return output if code == 0 and COMMIT_RE.fullmatch(output) else ""
+
+
+async def check_for_update_details() -> dict[str, Any]:
+    async with UPDATE_CHECK_LOCK:
+        checked_at = time.time()
+        current = await current_commit()
+        write_update_state(
+            phase="checking",
+            message="Checking the official StreamHome repository.",
+            current_commit=current,
+            error="",
+        )
+        if not current:
+            return write_update_state(
+                phase="failed",
+                message="The installed StreamHome commit could not be identified.",
+                current_commit="",
+                update_available=False,
+                error="local_commit_unavailable",
+                last_checked_at=checked_at,
+            )
+        if not await initialize_remote():
+            return write_update_state(
+                phase="failed",
+                message="The Git origin is not the official StreamHome repository.",
+                current_commit=current,
+                update_available=False,
+                error="untrusted_origin",
+                last_checked_at=checked_at,
+            )
+        if not await is_git_clean():
+            return write_update_state(
+                phase="failed",
+                message="Local source changes must be committed or moved before updating.",
+                current_commit=current,
+                update_available=False,
+                error="dirty_worktree",
+                last_checked_at=checked_at,
+            )
+        branch = settings.UPDATE_BRANCH
+        shallow_code, shallow_value, shallow_error = await run_git_cmd(["rev-parse", "--is-shallow-repository"])
+        if shallow_code != 0:
+            logger.error(f"[Update Service] Shallow-check failed: {shallow_error}")
+            return write_update_state(
+                phase="failed",
+                message="The installation's Git history could not be inspected.",
+                current_commit=current,
+                update_available=False,
+                error="git_history_unavailable",
+                last_checked_at=checked_at,
+            )
+        fetch_args = (
+            ["fetch", "--unshallow", "origin", branch]
+            if shallow_value == "true"
+            else ["fetch", "--prune", "origin", branch]
+        )
+        code, _, error = await run_git_cmd(fetch_args)
+        if code != 0:
+            logger.error(f"[Update Service] Fetch failed: {error}")
+            return write_update_state(
+                phase="failed",
+                message="The official update source could not be reached.",
+                current_commit=current,
+                update_available=False,
+                error="update_fetch_failed",
+                last_checked_at=checked_at,
+            )
+        code, target, error = await run_git_cmd(["rev-parse", f"origin/{branch}"])
+        if code != 0 or not COMMIT_RE.fullmatch(target):
+            logger.error(f"[Update Service] Target resolution failed: {error}")
+            return write_update_state(
+                phase="failed",
+                message=f"The configured update branch '{branch}' could not be resolved.",
+                current_commit=current,
+                update_available=False,
+                error="target_unavailable",
+                last_checked_at=checked_at,
+            )
+        if settings.UPDATE_REQUIRE_SIGNED_COMMITS:
+            code, _, error = await run_git_cmd(["verify-commit", target])
+            if code != 0:
+                logger.error(f"[Update Service] Signature verification failed: {error}")
+                return write_update_state(
+                    phase="failed",
+                    message="The available commit does not satisfy signed-update policy.",
+                    current_commit=current,
+                    target_commit=target,
+                    update_available=False,
+                    error="signature_verification_failed",
+                    last_checked_at=checked_at,
+                )
+        if current == target:
+            return write_update_state(
+                phase="up_to_date",
+                message="StreamHome is up to date.",
+                current_commit=current,
+                target_commit=target,
+                update_available=False,
+                error="",
+                last_checked_at=checked_at,
+            )
+        code, _, _ = await run_git_cmd(["merge-base", "--is-ancestor", current, target])
+        if code != 0:
+            return write_update_state(
+                phase="failed",
+                message="The available commit is not a fast-forward from this installation.",
+                current_commit=current,
+                target_commit=target,
+                update_available=False,
+                error="update_not_fast_forward",
+                last_checked_at=checked_at,
+            )
+        previous = read_update_state()
+        failed_target = str(previous.get("failed_target") or "")
+        blocked = failed_target == target
+        return write_update_state(
+            phase="failed" if blocked else "update_available",
+            message=(
+                "This update previously failed and will not be retried automatically."
+                if blocked
+                else "A newer StreamHome commit is available."
+            ),
+            current_commit=current,
+            target_commit=target,
+            update_available=not blocked,
+            error="failed_target_suppressed" if blocked else "",
+            last_checked_at=checked_at,
+        )
+
 
 async def check_for_github_updates() -> bool:
-    """Fetches updates and returns True if local branch is behind remote branch on origin."""
-    # Ensure remote URL is set
-    if not await initialize_remote():
-        return False
-        
-    logger.info("[Update Service] Fetching latest remote branches from GitHub...")
-    ret, stdout, stderr = await run_git_cmd(["fetch", "origin"])
-    if ret != 0:
-        logger.error(f"[Update Service] Git fetch origin failed: {stderr}")
-        return False
-        
-    active_branch = settings.UPDATE_BRANCH
-    
-    # Get local and remote commit hashes
-    ret_local, local_hash, _ = await run_git_cmd(["rev-parse", "HEAD"])
-    ret_remote, remote_hash, _ = await run_git_cmd(["rev-parse", f"origin/{active_branch}"])
-    
-    if ret_local != 0 or ret_remote != 0:
-        logger.error(f"[Update Service] Failed to resolve commit hashes for branch {active_branch}.")
-        return False
+    """Compatibility wrapper used by the terminal control panel."""
+    return bool((await check_for_update_details()).get("update_available"))
 
-    if settings.UPDATE_REQUIRE_SIGNED_COMMITS:
-        verified, _, signature_error = await run_git_cmd(["verify-commit", remote_hash])
-        if verified != 0:
-            logger.error(f"[Update Service] Refusing unsigned or unverifiable update commit: {signature_error}")
-            return False
-        
-    if local_hash != remote_hash:
-        # Check if local is behind remote (i.e. is ancestor)
-        ret, stdout, stderr = await run_git_cmd(["merge-base", "--is-ancestor", local_hash, remote_hash])
-        if ret == 0:
-            logger.info(f"[Update Service] Update available! Local HEAD ({local_hash[:8]}) is behind remote origin/{active_branch} ({remote_hash[:8]})")
-            return True
-        else:
-            logger.warning(f"[Update Service] Local HEAD ({local_hash[:8]}) is different from remote ({remote_hash[:8]}), but not behind. Skipping auto-update to prevent conflict.")
-            return False
-            
-    logger.info("[Update Service] StreamHome is already up-to-date.")
-    return False
+
+def _minutes_since_http_activity() -> float:
+    if state.LAST_HTTP_ACTIVITY_TIMESTAMP <= 0:
+        return float("inf")
+    return max(0.0, (time.time() - state.LAST_HTTP_ACTIVITY_TIMESTAMP) / 60)
+
+
+async def idle_blockers() -> list[str]:
+    blockers: list[str] = []
+    browsers = state.active_browser_sessions()
+    if browsers:
+        blockers.append(f"{browsers} active browser session{'s' if browsers != 1 else ''}")
+    if state.ACTIVE_HTTP_REQUESTS:
+        blockers.append(f"{state.ACTIVE_HTTP_REQUESTS} active API request{'s' if state.ACTIVE_HTTP_REQUESTS != 1 else ''}")
+    idle_minutes = _minutes_since_http_activity()
+    if idle_minutes < settings.UPDATE_IDLE_MINUTES:
+        blockers.append(
+            f"only {int(idle_minutes)} of {settings.UPDATE_IDLE_MINUTES} required idle minutes elapsed"
+        )
+    if state.ACTIVE_PROCESSES:
+        blockers.append(f"{len(state.ACTIVE_PROCESSES)} active media process{'es' if len(state.ACTIVE_PROCESSES) != 1 else ''}")
+    if BACKUP_LOCK.locked():
+        blockers.append("a backup or restore operation is active")
+    if not await is_database_idle():
+        blockers.append("playback, ingestion, or download activity is present")
+    if BACKUP_LOCK.locked() and "a backup or restore operation is active" not in blockers:
+        blockers.append("a backup or restore operation is active")
+    if state.ACTIVE_PROCESSES and not any("active media process" in blocker for blocker in blockers):
+        blockers.append(f"{len(state.ACTIVE_PROCESSES)} active media process{'es' if len(state.ACTIVE_PROCESSES) != 1 else ''}")
+    return blockers
+
 
 async def is_system_idle() -> bool:
-    """
-    Checks connection tracking, active downloads, and database playback sessions
-    to confirm if the system is completely idle.
-    """
-    # 1. Check active HTTP requests
-    if state.ACTIVE_HTTP_REQUESTS > 0:
-        logger.info(f"[Update Service] System busy: {state.ACTIVE_HTTP_REQUESTS} active HTTP requests.")
+    return not await idle_blockers()
+
+
+def maintenance_window_open(current: datetime | None = None) -> bool:
+    start = settings.UPDATE_MAINTENANCE_START
+    end = settings.UPDATE_MAINTENANCE_END
+    if not start and not end:
+        return True
+    if not start or not end:
         return False
-        
-    # 2. Check time since last HTTP request activity (5 minutes = 300 seconds)
-    elapsed = time.time() - state.LAST_HTTP_ACTIVITY_TIMESTAMP
-    if elapsed < 300:
-        logger.info(f"[Update Service] System busy: Inactive for only {int(elapsed)} seconds (requires 300).")
+    try:
+        start_minutes = int(start[:2]) * 60 + int(start[3:])
+        end_minutes = int(end[:2]) * 60 + int(end[3:])
+    except (TypeError, ValueError):
         return False
-        
-    # 3. Check database queue manager active downloads & active streaming playback sessions
-    if not await is_database_idle():
-        # backup's is_database_idle already logs specific reasons
+    now = current or datetime.now()
+    current_minutes = now.hour * 60 + now.minute
+    if start_minutes == end_minutes:
+        return True
+    if start_minutes < end_minutes:
+        return start_minutes <= current_minutes < end_minutes
+    return current_minutes >= start_minutes or current_minutes < end_minutes
+
+
+def update_lock_active() -> bool:
+    owner_path = RUN_DIR / "update.lock" / "owner.pid"
+    try:
+        owner = int(owner_path.read_text(encoding="utf-8").strip())
+        os.kill(owner, 0)
+        return True
+    except (OSError, ValueError):
         return False
-        
-    return True
+
+
+async def queue_update(*, automatic: bool, allow_failed_target: bool = False) -> dict[str, Any]:
+    async with UPDATE_QUEUE_LOCK:
+        status = read_update_state()
+        if status.get("phase") == "queued" or status.get("phase") in BUSY_PHASES or update_lock_active():
+            raise RuntimeError("update_in_progress")
+        target = str(status.get("target_commit") or "")
+        if target and target == status.get("failed_target") and not allow_failed_target:
+            raise RuntimeError("failed_target_suppressed")
+        retrying_failed_target = (
+            allow_failed_target
+            and target == status.get("failed_target")
+            and COMMIT_RE.fullmatch(target)
+        )
+        if (not status.get("update_available") and not retrying_failed_target) or not COMMIT_RE.fullmatch(target):
+            status = await check_for_update_details()
+            target = str(status.get("target_commit") or "")
+            retrying_failed_target = (
+                allow_failed_target
+                and target == status.get("failed_target")
+                and COMMIT_RE.fullmatch(target)
+            )
+        if (not status.get("update_available") and not retrying_failed_target) or not COMMIT_RE.fullmatch(target):
+            raise RuntimeError(str(status.get("error") or "no_update_available"))
+        if target == status.get("failed_target") and not allow_failed_target:
+            raise RuntimeError("failed_target_suppressed")
+        return write_update_state(
+            phase="queued",
+            message="Update queued until StreamHome is idle.",
+            automatic=automatic,
+            queued_at=time.time(),
+            started_at=None,
+            finished_at=None,
+            error="",
+        )
+
+
+async def cancel_queued_update() -> dict[str, Any]:
+    async with UPDATE_QUEUE_LOCK:
+        status = read_update_state()
+        if status.get("phase") != "queued":
+            raise RuntimeError("update_not_queued")
+        return write_update_state(
+            phase="update_available",
+            message="The pending update was cancelled.",
+            automatic=False,
+            queued_at=None,
+            error="",
+        )
+
+
+async def launch_queued_update_if_ready() -> bool:
+    async with UPDATE_QUEUE_LOCK:
+        status = read_update_state()
+        if status.get("phase") != "queued":
+            return False
+        if status.get("automatic") and not maintenance_window_open():
+            return False
+        blockers = await idle_blockers()
+        if blockers:
+            write_update_state(message=f"Waiting for idle: {blockers[0]}.")
+            return False
+        target = str(status.get("target_commit") or "")
+        current = await current_commit()
+        if not COMMIT_RE.fullmatch(target) or not COMMIT_RE.fullmatch(current):
+            write_update_state(
+                phase="failed",
+                message="The queued update lost its validated commit information.",
+                error="invalid_update_state",
+                finished_at=time.time(),
+            )
+            return False
+        if not UPDATE_SCRIPT.is_file() or os.name == "nt":
+            write_update_state(
+                phase="failed",
+                message="Automatic lifecycle updates require the supported Linux installation.",
+                error="unsupported_update_platform",
+                finished_at=time.time(),
+            )
+            return False
+        token = secrets.token_urlsafe(32)
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        token_path = RUN_DIR / f"update-handoff.{secrets.token_hex(8)}.token"
+        token_path.write_text(token, encoding="utf-8")
+        if os.name != "nt":
+            os.chmod(token_path, 0o600)
+        state.UPDATE_HANDOFF_TOKEN = token
+        process = await asyncio.create_subprocess_exec(
+            "bash",
+            str(UPDATE_SCRIPT),
+            "--queue",
+            target,
+            current,
+            "true" if status.get("automatic") else "false",
+            str(token_path),
+            cwd=str(WORKSPACE_ROOT),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        return_code = await process.wait()
+        if return_code != 0:
+            state.UPDATE_HANDOFF_TOKEN = ""
+            token_path.unlink(missing_ok=True)
+            write_update_state(
+                phase="failed",
+                message="The detached update controller could not be queued.",
+                error="update_handoff_failed",
+                finished_at=time.time(),
+            )
+            return False
+        write_update_state(
+            phase="preflight",
+            message="The detached updater is validating the target release.",
+            started_at=time.time(),
+            error="",
+        )
+        return True
+
 
 async def pull_and_install_updates() -> bool:
-    """
-    Safely pulls remote update. Re-installs dependencies if requirements.txt
-    or package.json changed.
-    """
-    # 1. Be Careful: Validate working directory has no uncommitted changes
-    if not await is_git_clean():
-        logger.error("[Update Service] Aborting update: Local uncommitted changes detected in working directory.")
-        return False
-        
-    active_branch = settings.UPDATE_BRANCH
-    logger.info(f"[Update Service] Pulling remote updates for branch: {active_branch}...")
-
-    ret_old, old_hash, old_error = await run_git_cmd(["rev-parse", "HEAD"])
-    if ret_old != 0:
-        logger.error(f"[Update Service] Cannot identify the current release: {old_error}")
-        return False
-    ret_fetch, _, fetch_error = await run_git_cmd(["fetch", "origin", active_branch])
-    if ret_fetch != 0:
-        logger.error(f"[Update Service] Git fetch failed: {fetch_error}")
-        return False
-    ret_remote, remote_hash, remote_error = await run_git_cmd(["rev-parse", f"origin/{active_branch}"])
-    if ret_remote != 0:
-        logger.error(f"[Update Service] Cannot identify the target release: {remote_error}")
-        return False
-    if settings.UPDATE_REQUIRE_SIGNED_COMMITS:
-        verified, _, signature_error = await run_git_cmd(["verify-commit", remote_hash])
-        if verified != 0:
-            logger.error(f"[Update Service] Refusing unsigned or unverifiable update commit: {signature_error}")
-            return False
-    ret, stdout, stderr = await run_git_cmd(["merge", "--ff-only", f"origin/{active_branch}"])
-    if ret != 0:
-        logger.error(f"[Update Service] Fast-forward update failed: {stderr}")
-        return False
-
-    logger.info(f"[Update Service] Verified fast-forward update complete: {stdout}")
-    _, changed_files, _ = await run_git_cmd(["diff", "--name-only", old_hash, remote_hash])
-    
-    # 2. Install dependencies if config files changed
-    workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    
-    # Check the pinned server dependency inputs.
-    if "server/requirements.txt" in changed_files or "server/requirements.lock" in changed_files:
-        logger.info("[Update Service] Server dependency lock modified. Installing pinned requirements...")
-        pip_bin = sys.executable
-        server_dir = os.path.join(workspace_root, "server")
-        try:
-            process = await asyncio.create_subprocess_exec(
-                pip_bin,
-                "-m",
-                "pip",
-                "install",
-                "-c",
-                "requirements.lock",
-                "-r",
-                "requirements.txt",
-                cwd=server_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            _, dependency_error = await process.communicate()
-            if process.returncode != 0:
-                logger.error(f"[Update Service] Python dependency installation failed: {dependency_error.decode(errors='ignore')}")
-                return False
-            logger.info("[Update Service] Python dependencies updated.")
-        except Exception as e:
-            logger.error(f"[Update Service] Failed to install requirements: {e}")
-            return False
-            
-    # Check web package.json
-    if "web/package.json" in changed_files or "web/package-lock.json" in changed_files:
-        logger.info("[Update Service] web/package.json modified. Running npm install & rebuild...")
-        web_dir = os.path.join(workspace_root, "web")
-        import shutil
-        npm_bin = shutil.which("npm")
-        if npm_bin:
-            try:
-                # Run npm install
-                process_install = await asyncio.create_subprocess_exec(
-                    npm_bin, "ci",
-                    cwd=web_dir,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                await process_install.communicate()
-                
-                # Run npm run build
-                process_build = await asyncio.create_subprocess_exec(
-                    npm_bin, "run", "build",
-                    cwd=web_dir,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                await process_build.communicate()
-                logger.info("[Update Service] Web dependencies and build asset bundle updated.")
-            except Exception as e:
-                logger.error(f"[Update Service] Failed to rebuild web frontend: {e}")
-        else:
-            logger.error("[Update Service] npm not found in path. Cannot rebuild frontend.")
-            
-    return True
-
-def self_restart_server():
-    """Spawns a fresh Python process of main.py and exits the parent process cleanly."""
-    logger.info("[Update Service] Initiating server process self-restart...")
-    args = sys.argv
-    executable = sys.executable
-    server_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
+    """Compatibility wrapper: queue a validated update for the safe external controller."""
     try:
-        if sys.platform == 'win32':
-            # Detached process group on Windows
-            subprocess.Popen(
-                [executable] + args,
-                cwd=server_dir,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
-                close_fds=True
-            )
-        else:
-            # POSIX process group daemon reload
-            subprocess.Popen(
-                [executable] + args,
-                cwd=server_dir,
-                preexec_fn=os.setpgrp,
-                close_fds=True
-            )
-        logger.info("[Update Service] New process spawned successfully. Exiting parent process...")
-        os._exit(0)
-    except Exception as e:
-        logger.error(f"[Update Service] Failed to auto-restart server: {e}")
+        await queue_update(automatic=False)
+        await launch_queued_update_if_ready()
+        return True
+    except RuntimeError as exc:
+        logger.error(f"[Update Service] Could not queue update: {exc}")
+        return False
+
+
+async def automatic_update_worker(stop_event: asyncio.Event, initial_delay_seconds: float = 60) -> None:
+    """Check for updates periodically and execute queued work only after fail-closed idle checks."""
+    if initial_delay_seconds > 0:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=initial_delay_seconds)
+        except asyncio.TimeoutError:
+            pass
+    while not stop_event.is_set():
+        try:
+            status = read_update_state()
+            if state.MAINTENANCE_MODE and status.get("phase") in TERMINAL_PHASES:
+                state.MAINTENANCE_MODE = False
+                state.MAINTENANCE_REASON = ""
+                state.UPDATE_HANDOFF_TOKEN = ""
+            if status.get("phase") == "queued":
+                await launch_queued_update_if_ready()
+            elif settings.SETUP_COMPLETE and settings.AUTO_UPDATE_ENABLED and status.get("phase") not in BUSY_PHASES:
+                last_checked = float(status.get("last_checked_at") or 0)
+                interval = settings.UPDATE_CHECK_INTERVAL_HOURS * 60 * 60
+                if time.time() - last_checked >= interval:
+                    checked = await check_for_update_details()
+                    if checked.get("update_available"):
+                        await queue_update(automatic=True)
+                        await launch_queued_update_if_ready()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"[Update Worker] {type(exc).__name__}: {exc}")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass

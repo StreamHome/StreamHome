@@ -17,6 +17,7 @@ describe("admin presentation contracts", () => {
     const account = read("src/pages/admin/panels/AccountPanel.tsx");
     const security = read("src/pages/AccountSecurityPage.tsx");
     const storage = read("src/pages/admin/panels/StoragePanel.tsx");
+    const updates = read("src/pages/admin/panels/UpdatesPanel.tsx");
 
     for (const selector of [
       ".admin-auth-stage",
@@ -25,12 +26,17 @@ describe("admin presentation contracts", () => {
       ".security-credential-grid",
       ".admin-settings-grid",
       ".admin-settings-actions",
+      ".update-overview-grid",
+      ".update-log-card",
     ]) expect(application).toContain(selector);
 
     expect(gate).toContain('className="admin-auth-form"');
     expect(account).toContain("<AccountSecurityPage />");
     expect(security).toContain('className="admin-panel admin-panel--account admin-security"');
     expect(storage).toContain('className="admin-panel admin-panel--storage"');
+    expect(updates).toContain('className="admin-panel admin-panel--updates"');
+    expect(updates).toContain("Install when idle");
+    expect(updates).toContain("Retry failed target");
     expect(application).toContain("@media (max-width: 760px)");
   });
 

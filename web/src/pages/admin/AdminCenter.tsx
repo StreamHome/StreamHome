@@ -11,12 +11,14 @@ import { AccountPanel } from "./panels/AccountPanel";
 import { DownloadsPanel } from "./panels/DownloadsPanel";
 import { RecommendationsPanel } from "./panels/RecommendationsPanel";
 import { StoragePanel } from "./panels/StoragePanel";
+import { UpdatesPanel } from "./panels/UpdatesPanel";
 
 const PANELS: Array<{ id: AdminSection; label: string }> = [
   { id: "account", label: "Account & Security" },
   { id: "recommendations", label: "Recommendations" },
   { id: "storage", label: "Storage & HEVC" },
   { id: "downloads", label: "Downloads" },
+  { id: "updates", label: "Updates" },
 ];
 
 export function AdminCenter() {
@@ -51,6 +53,7 @@ export function AdminCenter() {
             {section === "recommendations" && <RecommendationsPanel />}
             {section === "storage" && <StoragePanel />}
             {section === "downloads" && <DownloadsPanel />}
+            {section === "updates" && <UpdatesPanel />}
           </motion.div>
         </AnimatePresence>
       </main>

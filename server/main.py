@@ -51,6 +51,7 @@ from services.queue import queue_manager
 from services.hevc_compressor import hevc_compressor
 from services.playback_prep import playback_prep_service
 from services.vibe_analysis import vibe_analysis_manager
+from services.update import automatic_update_worker
 import services.state as state
 from routes.queue import router as queue_router
 from routes.auth import router as auth_router, health_router, get_current_session, get_current_user, require_recent_reauth
@@ -252,6 +253,8 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(3600)
 
     background_tasks.append(asyncio.create_task(daily_backup_worker(), name="daily-backup"))
+    update_stop = asyncio.Event()
+    background_tasks.append(asyncio.create_task(automatic_update_worker(update_stop), name="automatic-update"))
 
     recommendation_stop = asyncio.Event()
     recommendation_task = asyncio.create_task(recommendation_worker(recommendation_stop))
@@ -263,6 +266,7 @@ async def lifespan(app: FastAPI):
     
     yield
     
+    update_stop.set()
     reaper_task.cancel()
     await asyncio.gather(reaper_task, return_exceptions=True)
     for background_task in background_tasks:
@@ -310,8 +314,8 @@ class ActivityTrackingMiddleware(BaseHTTPMiddleware):
                 status_code=503,
                 content={
                     "detail": {
-                        "code": "maintenance_restart_required",
-                        "message": "The database was restored. Restart StreamHome before continuing.",
+                        "code": "maintenance_mode",
+                        "message": state.MAINTENANCE_REASON or "StreamHome is temporarily unavailable for maintenance.",
                     }
                 },
                 headers={"Retry-After": "30"},

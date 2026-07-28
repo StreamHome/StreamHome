@@ -8,6 +8,7 @@ import { QueryProfileGuard } from './components/guards/QueryProfileGuard';
 import { ErrorBoundary } from './components/ui/ErrorBoundary';
 import { SetupStateGate } from './components/guards/SetupStateGate';
 import { AppFallbackRedirect, LegacyAccountSecurityRedirect, LegacyAdminRedirect, LegacyWatchRedirect } from './navigation/LegacyRedirects';
+import { reportBrowserPresence } from './api/updates';
 
 const LoginPage = lazy(() => import('./pages/LoginPage').then((module) => ({ default: module.LoginPage })));
 const ProfileSelectPage = lazy(() => import('./pages/ProfileSelectPage').then((module) => ({ default: module.ProfileSelectPage })));
@@ -21,10 +22,27 @@ function RouteChunkFallback() {
 
 export default function App() {
   const hydrate = useAuthStore((state) => state.hydrate);
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
 
   useEffect(() => {
     hydrate();
   }, [hydrate]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const report = () => { void reportBrowserPresence(document.visibilityState === "visible").catch(() => undefined); };
+    const leave = () => { void reportBrowserPresence(false).catch(() => undefined); };
+    report();
+    const interval = window.setInterval(report, 30_000);
+    document.addEventListener("visibilitychange", report);
+    window.addEventListener("pagehide", leave);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", report);
+      window.removeEventListener("pagehide", leave);
+      leave();
+    };
+  }, [isAuthenticated]);
 
   return (
     <ErrorBoundary>

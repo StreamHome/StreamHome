@@ -1715,7 +1715,6 @@ async def manage_system_updates():
         is_git_clean,
         get_active_branch,
         pull_and_install_updates,
-        self_restart_server,
         is_system_idle
     )
     
@@ -1806,15 +1805,13 @@ async def manage_system_updates():
                 print_centered("[dim]Press ENTER to pull and restart, or ESC to cancel...[/dim]")
                 key = get_key()
                 if key == "ENTER":
-                    print_centered("Pulling updates...")
+                    print_centered("Queuing the validated update controller...")
                     success = await pull_and_install_updates()
                     if success:
-                        print_centered("[bold green][✓] Updates successfully applied! Restarting server...[/bold green]")
-                        await asyncio.sleep(1.5)
-                        self_restart_server()
+                        print_centered("[bold green][✓] Update queued. The detached controller will preflight, restart, health-check, and roll back automatically if required.[/bold green]")
                         return
                     else:
-                        print_centered("[bold bright_red][✗] Failed to apply updates.[/bold bright_red]")
+                        print_centered("[bold bright_red][✗] The update could not be queued. Review the admin status and update.log.[/bold bright_red]")
                 else:
                     print_centered("[dim]Update pull cancelled.[/dim]")
             except Exception as e:

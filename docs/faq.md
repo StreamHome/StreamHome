@@ -744,7 +744,7 @@ StreamHome does not currently ship native mobile applications. Use the responsiv
 
 ### Does the browser client update automatically?
 
-The interface is delivered by the StreamHome server, so users normally receive the client version associated with their installed server release.
+The browser client is rebuilt as part of the server update. Administrators can enable automatic updates under **Admin center → Updates**. StreamHome preflights the candidate while the current release is online and installs it only after the configured maintenance window and verified-idle conditions are satisfied.
 
 Browser caching behavior may temporarily retain an older interface until the application refreshes.
 
@@ -764,9 +764,7 @@ See [Browser Client](pwa.md).
 
 ### How do I update StreamHome?
 
-Follow the update instructions included with the release you are installing.
-
-Do not replace files manually unless the release documentation explicitly instructs you to do so.
+Use **Admin center → Updates** to check and queue an update, or follow the command-line fallback in `docs/updating.md`.
 
 ### Should I back up before updating?
 

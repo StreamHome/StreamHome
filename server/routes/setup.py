@@ -885,8 +885,6 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
         storage = payload.storage_engine.upper()
         if storage not in {"LOCAL", "CLOUD"}:
             raise HTTPException(status_code=422, detail={"code": "invalid_storage_engine", "message": "Choose local or cloud storage."})
-        if payload.auto_update_enabled:
-            raise HTTPException(status_code=422, detail={"code": "automatic_updates_unavailable", "message": "Automatic updates are unavailable in this alpha. Update only to an explicit release tag."})
         totp_enrollment: Optional[TOTPEnrollment] = None
         if payload.totp_enrollment_id:
             totp_enrollment = await _setup_totp_enrollment(

@@ -243,6 +243,54 @@ export interface SystemSettings {
   googleDrivePublishingStatus?: "testing" | "production";
 }
 
+export interface UpdatePolicy {
+  automaticUpdates: boolean;
+  idleMinutes: number;
+  checkIntervalHours: number;
+  maintenanceStart: string | null;
+  maintenanceEnd: string | null;
+  branch: string;
+  requireSignedCommits: boolean;
+}
+
+export type UpdatePhase =
+  | "idle"
+  | "checking"
+  | "up_to_date"
+  | "update_available"
+  | "queued"
+  | "preflight"
+  | "waiting_for_idle"
+  | "stopping"
+  | "installing"
+  | "starting"
+  | "rolling_back"
+  | "succeeded"
+  | "failed"
+  | "rolled_back"
+  | "rollback_failed";
+
+export interface UpdateStatus {
+  phase: UpdatePhase;
+  message: string;
+  currentCommit: string;
+  targetCommit: string;
+  updateAvailable: boolean;
+  automatic: boolean;
+  queuedAt: number | null;
+  startedAt: number | null;
+  finishedAt: number | null;
+  lastCheckedAt: number | null;
+  lastSuccessAt: number | null;
+  failedTarget: string;
+  error: string;
+  blockers: string[];
+  maintenanceWindowOpen: boolean;
+  updateInProgress: boolean;
+  logTail: string[];
+  policy: UpdatePolicy;
+}
+
 export interface DownloadEvent {
   id: string;
   title: string;

@@ -1,27 +1,52 @@
 # Updating StreamHome
 
-`v0.1.0-alpha.1` installations are pinned to their release tag. Do not silently convert a release installation to the moving `main` branch.
+Administrators can manage updates from **Admin center → Updates**. The page reports the installed and available commits, the last check, current idle blockers, lifecycle progress, rollback state, and the latest update log.
 
-Before updating:
+## Manual updates
 
-1. create and verify a database backup;
-2. stop ingestion and media-processing work;
-3. run `./stop.sh` and confirm it reports a clean shutdown;
-4. read the target release notes;
-5. confirm the checkout has no local changes.
+1. Open the Updates panel and select **Check now**.
+2. Review the available commit and current activity blockers.
+3. Select **Install when idle** and reauthenticate.
+4. Leave StreamHome when convenient. The update begins only after the configured idle grace period and after playback, ingestion, downloads, media processing, backup/restore work, browser presence, and conflicting lifecycle work have stopped.
 
-To install a later tagged release:
+The updater first builds and validates the candidate in an isolated temporary checkout. A failed preflight does not stop or modify the running installation.
+
+## Automatic updates
+
+The Updates panel can enable automatic updates and configure:
+
+- an idle grace period from 5 to 120 minutes;
+- an update-check interval from 1 to 24 hours;
+- an optional maintenance window in the server's local timezone.
+
+Both maintenance times must be set or both must be empty. Overnight windows are supported. Leaving them empty permits installation at any verified-idle time.
+
+The update channel is the official `StreamHome/StreamHome` `main` branch. Updates must be clean, exact fast-forwards from the installed commit. If signed-commit enforcement is enabled through server configuration, the candidate commit must also pass Git verification.
+
+## Cutover and recovery
+
+After preflight, the detached Linux update controller asks the running backend to re-confirm that StreamHome is idle. Only then does it:
+
+1. stop the owned StreamHome processes;
+2. create and integrity-check a recovery copy of `server/database.db`;
+3. serve a temporary HTTP 503 maintenance page on the configured web port;
+4. install the exact preflighted commit;
+5. reinstall locked dependencies and rebuild production assets;
+6. start StreamHome through `start.sh`;
+7. require both the database-backed API health check and production web response to pass.
+
+An update is successful only after both services are healthy. If installation, build, API startup, or web startup fails, the controller restores the previous commit and database checkpoint, rebuilds that known-working release, restarts it, and verifies it again. The failed target is suppressed from automatic retry until an administrator explicitly selects **Retry failed target**.
+
+Lifecycle output is stored in `update.log`. While cutover is active, Cloudflare or another reverse proxy receives a maintenance response rather than an unresponsive origin whenever the temporary responder can bind the configured port.
+
+## Command-line fallback
+
+If the admin panel is unavailable, inspect `update.log` and `.run/update-state.json`. A reviewed manual update remains available:
 
 ```bash
 cd ~/StreamHome
 ./stop.sh
-git fetch --tags origin
-git checkout --detach vNEXT
-./setup.sh --no-start
-./test.sh
-./start.sh
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
 ```
 
-Replace `vNEXT` with the exact published tag. Setup also stops an owned runtime defensively before replacing dependencies or production assets. Release checks require the runtime to remain stopped because they use the canonical database and rebuild `web/dist`. Perform login, ingestion, and playback smoke tests after startup.
-
-Automatic updates are experimental during the alpha and should remain disabled on installations that require controlled maintenance windows.
+The installer verifies the official origin, refuses a dirty checkout, and permits only an exact fetched fast-forward. Do not delete `server/database.db`, `server/media`, `.env`, `server/.env`, `server/backup`, or `server/rclone`.

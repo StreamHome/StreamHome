@@ -8,6 +8,7 @@ LIFECYCLE_LOCK="$RUN_DIR/lifecycle.lock"
 LOCK_ACQUIRED=false
 STARTED_ANY=false
 START_SUCCEEDED=false
+UPDATE_RECOVERY_CHECKED=false
 
 usage() {
     cat <<'EOF'
@@ -290,11 +291,35 @@ show_startup_logs() {
 }
 
 main() {
+    if [[ "${1:-}" == "--update-recovery-complete" ]]; then
+        UPDATE_RECOVERY_CHECKED=true
+        shift
+    fi
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         usage
         return 0
     fi
     [[ $# -eq 0 ]] || fail "Unknown argument: $1 (use --help for usage)"
+
+    if [[ "$UPDATE_RECOVERY_CHECKED" == false && -x "$ROOT_DIR/update.sh" ]]; then
+        set +e
+        "$ROOT_DIR/update.sh" --recover-interrupted "$ROOT_DIR"
+        recovery_result=$?
+        set -e
+        case "$recovery_result" in
+            0)
+                exec bash "$ROOT_DIR/start.sh" --update-recovery-complete
+                ;;
+            10)
+                ;;
+            11)
+                fail "An update controller is still active. Wait for it to finish before starting StreamHome."
+                ;;
+            *)
+                fail "Interrupted update recovery failed. Review update.log before starting StreamHome."
+                ;;
+        esac
+    fi
 
     select_python
     command -v npm >/dev/null 2>&1 || fail "npm is unavailable. Run ./setup.sh first."
