@@ -12,7 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from config import settings
-from routes.playback import parse_byte_range, rewrite_hls_playlist
+from routes.playback import parse_byte_range, rewrite_hls_playlist, subtitle_contract
+from services.languages import normalize_language_tag
 from services.media_probe import probe_completed_media
 from services.media_source import MediaSourceError, ResolvedMediaSource, canonicalize_catalog_path, is_safe_presentation_asset, resolve_media_source
 from services.playback_prep import PlaybackMediaSnapshot, PlaybackPrepService, playback_prep_service
@@ -127,6 +128,31 @@ class PlaybackPipelineRegression(unittest.TestCase):
         media.width = 1
         self.assertTrue(all(item.width == 640 for item in scheduled))
 
+    def test_quality_ladder_reaches_144p_without_upscaling(self) -> None:
+        source_720p = SimpleNamespace(width=1280, height=720)
+        renditions = playback_prep_service.video_renditions(source_720p)
+        self.assertEqual([item.height for item in renditions], [720, 480, 360, 240, 144])
+        self.assertTrue(all(item.height <= 720 for item in renditions))
+
+    def test_audio_and_subtitle_contracts_accept_standard_language_tags(self) -> None:
+        self.assertEqual(normalize_language_tag("eng"), "en")
+        self.assertEqual(normalize_language_tag("SPA"), "es")
+        self.assertEqual(normalize_language_tag("fre"), "fr")
+        self.assertEqual(normalize_language_tag("tur"), "tr")
+        self.assertEqual(normalize_language_tag("pt_BR"), "pt-br")
+        media = SimpleNamespace(
+            subtitles=[
+                {"language": "eng", "ext": ".vtt"},
+                {"language": "spa", "ext": ".vtt"},
+                {"language": "fr", "ext": ".vtt"},
+                {"language": "tr", "ext": ".vtt"},
+                {"language": "zh-Hant-TW", "ext": ".vtt"},
+            ]
+        )
+        tracks = subtitle_contract(media)
+        self.assertEqual([item["id"] for item in tracks], ["eng", "spa", "fr", "tr", "zh-hant-tw"])
+        self.assertEqual([item["language"] for item in tracks], ["en", "es", "fr", "tr", "zh-hant-tw"])
+
     def test_cloud_fingerprint_changes_when_remote_identity_changes(self) -> None:
         old_engine = settings.STORAGE_ENGINE
         settings.STORAGE_ENGINE = "CLOUD"
@@ -202,9 +228,9 @@ class PlaybackPipelineRegression(unittest.TestCase):
         )
         legacy_probe = asyncio.run(probe_completed_media(str(silent_video)))
         self.assertEqual(len(legacy_probe["audio_metadata"]), 1)
-        self.assertEqual(legacy_probe["audio_metadata"][0]["language"], "eng")
+        self.assertEqual(legacy_probe["audio_metadata"][0]["language"], "en")
         legacy_media = SimpleNamespace(audio_metadata=legacy_probe["audio_metadata"])
-        self.assertEqual(playback_prep_service.audio_renditions(legacy_media)[0].language, "eng")
+        self.assertEqual(playback_prep_service.audio_renditions(legacy_media)[0].language, "en")
 
     def test_preparation_scheduler_deduplicates_and_cache_recovery_is_bounded(self) -> None:
         async def exercise_scheduler(service: PlaybackPrepService) -> None:
@@ -295,7 +321,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             master = cache_path / "master.m3u8"
             self.assertTrue(master.is_file())
             self.assertTrue(any(cache_path.rglob("*.m4s")))
-            self.assertTrue((cache_path / "audio_0_eng" / "segment_00000.m4s").is_file(), [str(path) for path in cache_path.rglob("*")])
+            self.assertTrue((cache_path / "audio_0_en" / "segment_00000.m4s").is_file(), [str(path) for path in cache_path.rglob("*")])
             content = master.read_text(encoding="utf-8")
             self.assertIn("TYPE=AUDIO", content)
             self.assertIn("video_original/playlist.m3u8", content)

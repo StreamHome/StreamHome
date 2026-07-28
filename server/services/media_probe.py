@@ -8,6 +8,7 @@ import hashlib
 from typing import Dict, Any, Optional
 from config import settings
 from services.logger import logger
+from services.languages import language_label, normalize_language_tag
 from services.ingestion_errors import IngestionFailure, classify_failure, compact_diagnostics, sanitize_url, write_task_diagnostics
 from services.ffmpeg_input import (
     ffmpeg_network_input_options,
@@ -305,14 +306,14 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
         audio_meta = []
         for idx, a in enumerate(audio_streams):
             tags = a.get("tags", {})
-            lang = tags.get("language", "und").lower()
+            lang = normalize_language_tag(tags.get("language"))
             channels = int(a.get("channels") or 2)
             audio_meta.append({
                 "index": idx,
                 "streamIndex": int(a.get("index", idx)),
                 "codec": a.get("codec_name", ""),
                 "language": lang,
-                "label": tags.get("title") or lang.upper(),
+                "label": language_label(lang, tags.get("title")),
                 "channels": channels,
                 "default": bool((a.get("disposition") or {}).get("default")),
             })
@@ -330,13 +331,13 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
                     if os.path.isfile(path) and os.path.splitext(path)[1].lower() in supported_audio
                 )
                 for idx, external_path in enumerate(external_files):
-                    language = os.path.splitext(os.path.basename(external_path))[0].lower() or "und"
+                    language = normalize_language_tag(os.path.splitext(os.path.basename(external_path))[0])
                     audio_meta.append({
                         "index": idx,
                         "streamIndex": 0,
                         "codec": os.path.splitext(external_path)[1].lstrip(".").lower(),
                         "language": language,
-                        "label": language.upper(),
+                        "label": language_label(language),
                         "channels": 2,
                         "default": idx == 0,
                     })

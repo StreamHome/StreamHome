@@ -21,10 +21,12 @@ import type {
   Episode,
   Movie,
   PlaybackProgressEvent,
+  PlaybackRendition,
   PlaybackRunResponse,
 } from "../../types/api";
 import { formatDuration } from "../../utils/format";
 import { hasSubtitleOptions, PlayerControlMenu, PlayerIcon, PlayerIconButton } from "./PlayerControls";
+import { languageDisplayName, normalizeLanguageTag } from "./language";
 import {
   canUsePlayerFullscreen,
   isPlayerFullscreen,
@@ -45,7 +47,7 @@ import {
 } from "./mobilePlayer";
 
 
-type PlayerPhase =
+export type PlayerPhase =
   | "resolving"
   | "preparing"
   | "loading"
@@ -78,7 +80,7 @@ interface ResolvedPlayback {
 interface PlayerPreferences {
   qualityHeight: number | "auto";
   audioLanguage: string;
-  subtitleLanguage: string;
+  subtitleTrackId: string;
   captionScale: number;
   playbackRate: number;
 }
@@ -100,7 +102,7 @@ interface MobilePointerGesture {
 const DEFAULT_PREFERENCES: PlayerPreferences = {
   qualityHeight: "auto",
   audioLanguage: "",
-  subtitleLanguage: "off",
+  subtitleTrackId: "off",
   captionScale: 1,
   playbackRate: 1,
 };
@@ -110,6 +112,7 @@ const TICKET_RENEWAL_MARGIN = 3 * 60 * 1_000;
 const NEXT_EPISODE_SECONDS = 10;
 const NETWORK_RETRY_LIMIT = 3;
 const MEDIA_RECOVERY_LIMIT = 2;
+export const PLAYER_CONTROLS_IDLE_MS = 3_000;
 
 
 function episodeTmdbId(mediaId: string): number | null {
@@ -122,6 +125,38 @@ export function nextPlayableEpisode(episodes: Episode[], currentId: string): Epi
   const currentIndex = ordered.findIndex((episode) => episode.id === currentId);
   if (currentIndex < 0) return null;
   return ordered.slice(currentIndex + 1).find((episode) => Boolean(episode.videoUrl || episode.previewTaskId)) ?? null;
+}
+
+export function playbackQualityOptions(
+  renditions: PlaybackRendition[],
+  levels: Array<{ height?: number }>,
+): Array<{ label: string; height: number | "auto"; index: number; ready: boolean }> {
+  const options = renditions
+    .slice()
+    .sort((left, right) => right.height - left.height)
+    .map((rendition) => {
+      const index = levels.findIndex((level) => Number(level.height || 0) === rendition.height);
+      return {
+        label: `${rendition.height}p${rendition.original ? " · Original" : ""}`,
+        height: rendition.height,
+        index,
+        ready: rendition.ready && index >= 0,
+      };
+    });
+  return [{ label: "Auto", height: "auto", index: -1, ready: true }, ...options];
+}
+
+export function applySubtitleTrackSelection(video: HTMLVideoElement, selectedTrackId: string): void {
+  const trackElements = Array.from(video.querySelectorAll<HTMLTrackElement>("track[data-subtitle-id]"));
+  for (const trackElement of trackElements) {
+    trackElement.track.mode = selectedTrackId !== "off" && trackElement.dataset.subtitleId === selectedTrackId
+      ? "showing"
+      : "disabled";
+  }
+}
+
+export function shouldAutoHidePlayerControls(phase: PlayerPhase, menuOpen: boolean, scrubbing: boolean): boolean {
+  return phase === "playing" && !menuOpen && !scrubbing;
 }
 
 function assetFromMovie(movie: Movie): PlayableAsset {
@@ -164,11 +199,13 @@ function activeSkipMarker(markers: Record<string, unknown>, time: number): { lab
 
 function loadPreferences(profileId: string): PlayerPreferences {
   try {
-    const parsed = JSON.parse(localStorage.getItem(`streamhome_player_preferences_${profileId}`) || "{}") as Partial<PlayerPreferences>;
+    const parsed = JSON.parse(localStorage.getItem(`streamhome_player_preferences_${profileId}`) || "{}") as Partial<PlayerPreferences> & { subtitleLanguage?: string };
     return {
       qualityHeight: parsed.qualityHeight === "auto" || typeof parsed.qualityHeight === "number" ? parsed.qualityHeight : "auto",
-      audioLanguage: typeof parsed.audioLanguage === "string" ? parsed.audioLanguage : "",
-      subtitleLanguage: typeof parsed.subtitleLanguage === "string" ? parsed.subtitleLanguage : "off",
+      audioLanguage: typeof parsed.audioLanguage === "string" ? normalizeLanguageTag(parsed.audioLanguage, "") : "",
+      subtitleTrackId: typeof parsed.subtitleTrackId === "string"
+        ? parsed.subtitleTrackId
+        : typeof parsed.subtitleLanguage === "string" ? parsed.subtitleLanguage : "off",
       captionScale: typeof parsed.captionScale === "number" ? Math.min(1.5, Math.max(0.8, parsed.captionScale)) : 1,
       playbackRate: typeof parsed.playbackRate === "number" ? parsed.playbackRate : 1,
     };
@@ -269,8 +306,10 @@ export function PlayerPage() {
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
   const [showControls, setShowControls] = useState(true);
-  const [availableQualities, setAvailableQualities] = useState<Array<{ label: string; height: number; index: number }>>([{ label: "Auto", height: 0, index: -1 }]);
-  const [selectedQualityIndex, setSelectedQualityIndex] = useState(-1);
+  const [controlMenuOpen, setControlMenuOpen] = useState(false);
+  const [timelineScrubbing, setTimelineScrubbing] = useState(false);
+  const [availableQualities, setAvailableQualities] = useState<Array<{ label: string; height: number | "auto"; index: number; ready: boolean }>>([{ label: "Auto", height: "auto", index: -1, ready: true }]);
+  const [selectedQualityHeight, setSelectedQualityHeight] = useState<number | "auto">("auto");
   const [availableAudioTracks, setAvailableAudioTracks] = useState<Array<{ label: string; language: string; index: number }>>([]);
   const [selectedAudioTrackIndex, setSelectedAudioTrackIndex] = useState(0);
   const [preferences, setPreferences] = useState<PlayerPreferences>(() => profile ? loadPreferences(profile.id) : DEFAULT_PREFERENCES);
@@ -361,6 +400,13 @@ export function PlayerPage() {
     currentTimeRef.current = 0;
     setDuration(0);
     setBufferedEnd(0);
+    setAvailableQualities([{ label: "Auto", height: "auto", index: -1, ready: true }]);
+    setSelectedQualityHeight("auto");
+    setAvailableAudioTracks([]);
+    setSelectedAudioTrackIndex(0);
+    setControlMenuOpen(false);
+    setTimelineScrubbing(false);
+    setShowControls(true);
     setShowStartOver(false);
     setNextCountdown(null);
     setNextCancelled(false);
@@ -531,21 +577,20 @@ export function PlayerPage() {
       hls.attachMedia(video);
       hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(runResponse.manifestUrl!));
       hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
-        const levels = data.levels
-          .map((level, index) => ({ label: level.height ? `${level.height}p` : `Quality ${index + 1}`, height: level.height || 0, index }))
-          .sort((left, right) => right.height - left.height);
-        setAvailableQualities([{ label: "Auto", height: 0, index: -1 }, ...levels]);
-        const preferred = preferences.qualityHeight === "auto"
-          ? -1
-          : levels.reduce((best, level) => Math.abs(level.height - Number(preferences.qualityHeight)) < Math.abs(best.height - Number(preferences.qualityHeight)) ? level : best, levels[0])?.index ?? -1;
-        hls.currentLevel = preferred;
-        setSelectedQualityIndex(preferred);
+        const options = playbackQualityOptions(runResponse.renditions, data.levels);
+        setAvailableQualities(options);
+        const readyOptions = options.filter((item) => item.ready && item.height !== "auto");
+        const preferred = preferences.qualityHeight === "auto" || readyOptions.length === 0
+          ? options[0]
+          : readyOptions.reduce((best, item) => Math.abs(Number(item.height) - Number(preferences.qualityHeight)) < Math.abs(Number(best.height) - Number(preferences.qualityHeight)) ? item : best);
+        hls.currentLevel = preferred?.index ?? -1;
+        setSelectedQualityHeight(preferred?.height ?? "auto");
         beginPlayback();
       });
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_, data) => {
         const tracks = data.audioTracks.map((track, index) => ({
-          label: track.name || track.lang?.toUpperCase() || `Audio ${index + 1}`,
-          language: track.lang || "und",
+          label: languageDisplayName(track.lang || "und", track.name || `Audio ${index + 1}`),
+          language: normalizeLanguageTag(track.lang),
           index,
         }));
         setAvailableAudioTracks(tracks);
@@ -616,14 +661,14 @@ export function PlayerPage() {
     const abort = new AbortController();
     let attempts = 0;
     let timer: number | null = null;
-    const knownReady = [...runResponse.renditions, ...runResponse.tracks].filter((item) => item.ready).length;
+    const knownReady = [...runResponse.renditions, ...runResponse.tracks].filter((item) => item.ready).map((item) => item.id).sort().join("|");
 
     const poll = async () => {
       attempts += 1;
       try {
         const refreshed = await getPlaybackRun(runResponse.runId, { signal: abort.signal });
-        const refreshedReady = [...refreshed.renditions, ...refreshed.tracks].filter((item) => item.ready).length;
-        if (refreshedReady > knownReady) {
+        const refreshedReady = [...refreshed.renditions, ...refreshed.tracks].filter((item) => item.ready).map((item) => item.id).sort().join("|");
+        if (refreshedReady !== knownReady || refreshed.preparationState !== runResponse.preparationState) {
           sequenceNumberRef.current = refreshed.nextSequenceNumber;
           resumePositionRef.current = videoRef.current?.currentTime ?? currentTimeRef.current;
           resumeAppliedRef.current = false;
@@ -633,7 +678,7 @@ export function PlayerPage() {
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return;
       }
-      if (attempts < 24 && !abort.signal.aborted) timer = window.setTimeout(poll, 5_000);
+      if (attempts < 720 && !abort.signal.aborted) timer = window.setTimeout(poll, attempts < 24 ? 5_000 : 15_000);
     };
 
     timer = window.setTimeout(poll, 5_000);
@@ -643,32 +688,29 @@ export function PlayerPage() {
     };
   }, [runResponse]);
 
-  const applySubtitlePreference = useCallback(() => {
+  const applyPlaybackRatePreference = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
     video.playbackRate = preferences.playbackRate;
   }, [preferences.playbackRate]);
 
-  useEffect(() => {
+  const applySubtitlePreference = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
-    for (let index = 0; index < video.textTracks.length; index += 1) {
-      const track = video.textTracks[index];
-      track.mode = preferences.subtitleLanguage !== "off" && track.language === preferences.subtitleLanguage ? "showing" : "disabled";
-    }
-  }, [preferences.subtitleLanguage]);
-
-  useEffect(() => {
-    if (!runResponse || preferences.subtitleLanguage === "off") return;
-    const selectedTrackStillExists = runResponse.subtitles.some(
-      (subtitle) => subtitle.language === preferences.subtitleLanguage,
-    );
-    if (!selectedTrackStillExists) {
-      setPreferences((current) => ({ ...current, subtitleLanguage: "off" }));
-    }
-  }, [preferences.subtitleLanguage, runResponse]);
+    applySubtitleTrackSelection(video, preferences.subtitleTrackId);
+  }, [preferences.subtitleTrackId]);
 
   useEffect(() => applySubtitlePreference(), [applySubtitlePreference, runResponse]);
+
+  useEffect(() => {
+    if (!runResponse || preferences.subtitleTrackId === "off") return;
+    if (runResponse.subtitles.some((subtitle) => subtitle.id === preferences.subtitleTrackId)) return;
+    const legacyLanguage = normalizeLanguageTag(preferences.subtitleTrackId, "");
+    const migrated = runResponse.subtitles.find((subtitle) => normalizeLanguageTag(subtitle.language) === legacyLanguage);
+    setPreferences((current) => ({ ...current, subtitleTrackId: migrated?.id ?? "off" }));
+  }, [preferences.subtitleTrackId, runResponse]);
+
+  useEffect(() => applyPlaybackRatePreference(), [applyPlaybackRatePreference, runResponse]);
 
   const captureWatchedTime = useCallback(() => {
     const video = videoRef.current;
@@ -755,9 +797,26 @@ export function PlayerPage() {
 
   const revealControls = useCallback(() => {
     setShowControls(true);
+  }, []);
+
+  useEffect(() => {
     if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
-    if (phase === "playing") controlsTimerRef.current = window.setTimeout(() => setShowControls(false), 3_000);
-  }, [phase]);
+    controlsTimerRef.current = null;
+    if (!shouldAutoHidePlayerControls(phase, controlMenuOpen, timelineScrubbing)) {
+      setShowControls(true);
+      return;
+    }
+    if (showControls) {
+      controlsTimerRef.current = window.setTimeout(() => {
+        setShowControls(false);
+        controlsTimerRef.current = null;
+      }, PLAYER_CONTROLS_IDLE_MS);
+    }
+    return () => {
+      if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
+      controlsTimerRef.current = null;
+    };
+  }, [controlMenuOpen, phase, showControls, timelineScrubbing]);
 
   useEffect(() => {
     if (phase !== "playing") return;
@@ -805,7 +864,7 @@ export function PlayerPage() {
       video?.removeEventListener("webkitbeginfullscreen", updateFullscreenState);
       video?.removeEventListener("webkitendfullscreen", updateFullscreenState);
     };
-  }, [mobilePlayer, revealControls]);
+  }, [mobilePlayer, phase, revealControls, runResponse?.runId]);
 
   const toggleFullscreen = useCallback(() => {
     const container = containerRef.current;
@@ -813,7 +872,7 @@ export function PlayerPage() {
     if (!container || !video) return;
 
     setFullscreenError("");
-    void togglePlayerFullscreen(container, video, document, { allowVideoFallback: !mobilePlayer })
+    void togglePlayerFullscreen(container, video, document, { allowVideoFallback: true })
       .then(() => {
         setFullscreenActive(isPlayerFullscreen(video));
         if (mobilePlayer) void lockPlayerLandscape();
@@ -905,10 +964,9 @@ export function PlayerPage() {
   }, [mobilePlayer, phase, revealControls]);
 
   const handleControlMenuOpenChange = useCallback((open: boolean) => {
-    if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
-    if (open) setShowControls(true);
-    else revealControls();
-  }, [revealControls]);
+    setControlMenuOpen(open);
+    setShowControls(true);
+  }, []);
 
   useEffect(() => () => {
     if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
@@ -1028,6 +1086,7 @@ export function PlayerPage() {
 
   const beginTimelineScrub = useCallback(() => {
     scrubbingRef.current = true;
+    setTimelineScrubbing(true);
     scrubOriginRef.current = videoRef.current?.currentTime ?? currentTimeRef.current;
     if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
     setShowControls(true);
@@ -1044,6 +1103,7 @@ export function PlayerPage() {
   const commitTimelineScrub = useCallback((value: number) => {
     if (!scrubbingRef.current) return;
     scrubbingRef.current = false;
+    setTimelineScrubbing(false);
     seek(value);
     revealControls();
   }, [revealControls, seek]);
@@ -1051,6 +1111,7 @@ export function PlayerPage() {
   const cancelTimelineScrub = useCallback(() => {
     if (!scrubbingRef.current) return;
     scrubbingRef.current = false;
+    setTimelineScrubbing(false);
     previewTimelineScrub(scrubOriginRef.current);
     revealControls();
   }, [previewTimelineScrub, revealControls]);
@@ -1061,17 +1122,18 @@ export function PlayerPage() {
     setTimelinePreview({ x: ratio * rect.width, time: ratio * duration });
   };
 
-  const changeQuality = (index: number) => {
-    setSelectedQualityIndex(index);
-    const selected = availableQualities.find((item) => item.index === index);
-    setPreferences((current) => ({ ...current, qualityHeight: index === -1 ? "auto" : selected?.height || "auto" }));
-    if (hlsRef.current) hlsRef.current.currentLevel = index;
+  const changeQuality = (height: number | "auto") => {
+    const selected = availableQualities.find((item) => item.height === height);
+    if (!selected?.ready) return;
+    setSelectedQualityHeight(height);
+    setPreferences((current) => ({ ...current, qualityHeight: height }));
+    if (hlsRef.current) hlsRef.current.currentLevel = selected.index;
   };
 
   const changeAudio = (index: number) => {
     setSelectedAudioTrackIndex(index);
     const selected = availableAudioTracks.find((item) => item.index === index);
-    setPreferences((current) => ({ ...current, audioLanguage: selected?.language || "" }));
+    setPreferences((current) => ({ ...current, audioLanguage: normalizeLanguageTag(selected?.language, "") }));
     if (hlsRef.current) hlsRef.current.audioTrack = index;
   };
 
@@ -1160,6 +1222,7 @@ export function PlayerPage() {
       data-interaction={definition.interaction.id}
       data-player-theme={definition.playerVariant}
       data-player-phase={phase}
+      data-controls-visible={showControls || phase !== "playing" ? "true" : "false"}
       data-mobile-player={mobilePlayer ? "true" : "false"}
       data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
       data-mobile-landscape-direction={forcedLandscapeDirection}
@@ -1238,8 +1301,10 @@ export function PlayerPage() {
             key={`${subtitle.id}-${runResponse.ticket}`}
             kind="subtitles"
             src={`/api/playback/subtitles/${encodeURIComponent(runResponse.mediaId)}/${encodeURIComponent(subtitle.id)}?ticket=${encodeURIComponent(runResponse.ticket)}`}
-            srcLang={subtitle.language}
-            label={subtitle.label}
+            srcLang={normalizeLanguageTag(subtitle.language)}
+            label={languageDisplayName(subtitle.language, subtitle.label)}
+            data-subtitle-id={subtitle.id}
+            default={preferences.subtitleTrackId === subtitle.id}
             onLoad={applySubtitlePreference}
           />
         ))}
@@ -1465,13 +1530,13 @@ export function PlayerPage() {
                     <PlayerControlMenu
                       label="Subtitles"
                       icon="captions"
-                      value={preferences.subtitleLanguage}
-                      options={[{ value: "off", label: "Subtitles off" }, ...runResponse.subtitles.map((subtitle) => ({ value: subtitle.language, label: subtitle.label }))]}
-                      onSelect={(value) => setPreferences((current) => ({ ...current, subtitleLanguage: value }))}
+                      value={preferences.subtitleTrackId}
+                      options={[{ value: "off", label: "Subtitles off" }, ...runResponse.subtitles.map((subtitle) => ({ value: subtitle.id, label: languageDisplayName(subtitle.language, subtitle.label) }))]}
+                      onSelect={(value) => setPreferences((current) => ({ ...current, subtitleTrackId: value }))}
                       onOpenChange={handleControlMenuOpenChange}
                     />
                   )}
-                  {hasSubtitles && preferences.subtitleLanguage !== "off" && (
+                  {hasSubtitles && preferences.subtitleTrackId !== "off" && (
                     <PlayerControlMenu
                       label="Caption size"
                       icon="captions"
@@ -1485,8 +1550,8 @@ export function PlayerPage() {
                     <PlayerControlMenu
                       label="Quality"
                       icon="quality"
-                      value={selectedQualityIndex}
-                      options={availableQualities.map((item) => ({ value: item.index, label: item.label }))}
+                      value={selectedQualityHeight}
+                      options={availableQualities.map((item) => ({ value: item.height, label: item.label, disabled: !item.ready, status: item.ready ? undefined : "Preparing" }))}
                       onSelect={changeQuality}
                       onOpenChange={handleControlMenuOpenChange}
                     />
@@ -1494,6 +1559,13 @@ export function PlayerPage() {
                   {document.pictureInPictureEnabled && (
                     <PlayerIconButton icon="pip" label="Picture in picture" onClick={togglePictureInPicture} />
                   )}
+                  <PlayerIconButton
+                    icon={fullscreenActive ? "fullscreen-exit" : "fullscreen"}
+                    label={fullscreenActive ? "Exit fullscreen" : "Fullscreen"}
+                    aria-pressed={fullscreenActive}
+                    disabled={!fullscreenAvailable}
+                    onClick={toggleFullscreen}
+                  />
                 </div>
               </div>
             </div>
@@ -1578,13 +1650,13 @@ export function PlayerPage() {
                     <PlayerControlMenu
                       label="Subtitles"
                       icon="captions"
-                      value={preferences.subtitleLanguage}
-                      options={[{ value: "off", label: "Subtitles off" }, ...runResponse.subtitles.map((subtitle) => ({ value: subtitle.language, label: subtitle.label }))]}
-                      onSelect={(value) => setPreferences((current) => ({ ...current, subtitleLanguage: value }))}
+                      value={preferences.subtitleTrackId}
+                      options={[{ value: "off", label: "Subtitles off" }, ...runResponse.subtitles.map((subtitle) => ({ value: subtitle.id, label: languageDisplayName(subtitle.language, subtitle.label) }))]}
+                      onSelect={(value) => setPreferences((current) => ({ ...current, subtitleTrackId: value }))}
                       onOpenChange={handleControlMenuOpenChange}
                     />
                   )}
-                  {hasSubtitles && preferences.subtitleLanguage !== "off" && (
+                  {hasSubtitles && preferences.subtitleTrackId !== "off" && (
                     <PlayerControlMenu
                       label="Caption size"
                       icon="captions"
@@ -1598,8 +1670,8 @@ export function PlayerPage() {
                     <PlayerControlMenu
                       label="Quality"
                       icon="quality"
-                      value={selectedQualityIndex}
-                      options={availableQualities.map((item) => ({ value: item.index, label: item.label }))}
+                      value={selectedQualityHeight}
+                      options={availableQualities.map((item) => ({ value: item.height, label: item.label, disabled: !item.ready, status: item.ready ? undefined : "Preparing" }))}
                       onSelect={changeQuality}
                       onOpenChange={handleControlMenuOpenChange}
                     />

@@ -13,11 +13,12 @@ from typing import Any, Optional
 
 from config import settings
 from services.logger import logger
+from services.languages import language_label, normalize_language_tag
 from services.media_source import ResolvedMediaSource, resolve_media_source
 from services.rclone import rclone_service
 
 
-STANDARD_HEIGHTS = (1080, 720, 480, 360, 240)
+STANDARD_HEIGHTS = (1080, 720, 480, 360, 240, 144)
 PLAYLIST_NAME = "playlist.m3u8"
 MASTER_NAME = "master.m3u8"
 
@@ -153,8 +154,8 @@ class PlaybackPrepService:
         renditions: list[AudioRendition] = []
         for position, item in enumerate(metadata):
             stream_index = int(item.get("index", position))
-            language = str(item.get("language") or "und").lower()
-            label = str(item.get("label") or language.upper())
+            language = normalize_language_tag(item.get("language"))
+            label = language_label(language, item.get("label"))
             renditions.append(
                 AudioRendition(
                     name=f"audio_{stream_index}_{self._audio_slug(language)}",
@@ -253,7 +254,10 @@ class PlaybackPrepService:
             return
 
         await asyncio.sleep(1)
-        for rendition in self.video_renditions(media_obj):
+        baseline_height = self.baseline_video(media_obj).height
+        remaining_video = [item for item in self.video_renditions(media_obj) if item.height != baseline_height]
+        remaining_video.sort(key=lambda item: (item.height > baseline_height, -item.height if item.height < baseline_height else item.height))
+        for rendition in remaining_video:
             self._schedule_video(media_id, fingerprint, source, rendition, media_obj)
         for audio in self.audio_renditions(media_obj):
             self._schedule_audio(media_id, fingerprint, source, audio, media_obj)

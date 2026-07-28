@@ -4,6 +4,7 @@ from typing import Optional, List, Any, Dict, Literal
 from pydantic import BaseModel, ConfigDict, Field as PydanticField, model_validator
 from sqlmodel import SQLModel, Field, Relationship
 from sqlalchemy import UniqueConstraint
+from services.languages import normalize_language_tag
 
 def to_camel(s: str) -> str:
     parts = s.split("_")
@@ -808,8 +809,13 @@ class PlaybackSessionResponse(APIModel):
     is_finished: Optional[bool]
 
 class SubtitleInput(BaseModel):
-    language: str = PydanticField(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_-]+$")
+    language: str = PydanticField(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     url: str = PydanticField(min_length=1, max_length=4096)
+
+    @model_validator(mode="after")
+    def normalize_language(self) -> "SubtitleInput":
+        self.language = normalize_language_tag(self.language)
+        return self
 
 class TelemetryRequest(BaseModel):
     event_type: str
@@ -847,7 +853,7 @@ class DownloadAddRequest(BaseModel):
     headers: Optional[Dict[str, str]] = None
     subtitles: Optional[List[SubtitleInput]] = PydanticField(default=None, max_length=32)
     quality: Optional[str] = PydanticField(default=None, max_length=32)
-    language: Optional[str] = PydanticField(default=None, min_length=1, max_length=32)
+    language: Optional[str] = PydanticField(default=None, min_length=1, max_length=64)
     skip_markers: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
@@ -862,13 +868,5 @@ class DownloadAddRequest(BaseModel):
         elif self.season is None or self.episode is None:
             raise ValueError("TV ingestion requires both season and episode")
         if self.language is not None:
-            normalized_language = "".join(
-                character
-                for character in self.language.strip().lower()
-                if character.isalnum() or character == "-"
-            )
-            language_aliases = {"tur": "tr", "turkish": "tr", "eng": "en", "english": "en"}
-            self.language = language_aliases.get(normalized_language, normalized_language)
-            if not self.language:
-                raise ValueError("language must contain a language code")
+            self.language = normalize_language_tag(self.language, "en")
         return self

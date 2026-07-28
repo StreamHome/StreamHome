@@ -235,6 +235,32 @@
   font-weight: 700;
 }
 
+.player-control-menu__list > button:disabled {
+  cursor: wait;
+  opacity: 0.52;
+  transform: none;
+}
+
+.player-control-menu__list > button span {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+
+.player-control-menu__list > button small {
+  color: rgba(255, 255, 255, 0.42);
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.player-view[data-controls-visible="false"] {
+  cursor: none;
+}
+
 .player-control-menu__list > button .player-icon {
   width: 0.9rem;
   height: 0.9rem;

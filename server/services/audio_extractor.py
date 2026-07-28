@@ -6,6 +6,7 @@ import subprocess
 import re
 from typing import List, Dict, Any, Optional
 from services.logger import logger
+from services.languages import language_label, normalize_language_tag
 
 def get_ffmpeg_path() -> str:
     return shutil.which("ffmpeg") or r"C:\ffmpeg\bin\ffmpeg.exe"
@@ -14,25 +15,10 @@ def get_ffprobe_path() -> str:
     return shutil.which("ffprobe") or r"C:\ffmpeg\bin\ffprobe.exe"
 
 
-LANGUAGE_ALIASES = {
-    "tur": "tr",
-    "turkish": "tr",
-    "eng": "en",
-    "english": "en",
-}
-
-
 def normalize_language_code(value: Optional[str], fallback: str = "und") -> str:
-    """Return a safe, stable language code for metadata and generated filenames."""
+    """Backward-compatible alias for the shared language-tag normalizer."""
 
-    normalized = "".join(c for c in str(value or "").strip().lower() if c.isalnum() or c == "-")
-    if not normalized or normalized == "und":
-        return fallback
-    return LANGUAGE_ALIASES.get(normalized, normalized)
-
-
-def language_label(language: str) -> str:
-    return {"tr": "Turkish", "en": "English"}.get(language, language.upper())
+    return normalize_language_tag(value, fallback)
 
 
 def apply_primary_audio_language(audio_metadata: List[Dict[str, Any]], selected_language: Optional[str]) -> List[Dict[str, Any]]:
@@ -103,7 +89,7 @@ async def repair_completed_ingestion_languages() -> int:
             entity = await db.get(Movie if task.media_type == "movie" else Episode, identity)
             if not entity or not entity.video_url.startswith("/media/"):
                 continue
-            current_languages = [str(value).strip().lower() or "und" for value in entity.languages]
+            current_languages = [normalize_language_tag(value) for value in entity.languages]
             corrected_languages = [selected_language] + [
                 value for value in current_languages if value not in {selected_language, "und"}
             ]
@@ -152,7 +138,7 @@ def audio_track_labels(
     selected_language = normalize_language_code(default_lang, "en")
     for idx, stream in enumerate(streams):
         tags = stream.get("tags", {})
-        tagged_language = "".join(c for c in str(tags.get("language", "")).lower() if c.isalnum() or c == "-")
+        tagged_language = normalize_language_tag(tags.get("language"), "")
         if tagged_language == "und":
             tagged_language = ""
         if override_primary and idx == primary_index:

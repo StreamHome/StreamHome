@@ -99,15 +99,15 @@ def test_audio_track_labels_are_stable_across_reingestion() -> None:
         {"tags": {"language": "eng"}},
         {"tags": {"language": "und"}},
     ]
-    assert audio_track_labels(streams, "en") == ["eng", "eng_1", "track_2"]
+    assert audio_track_labels(streams, "en") == ["en", "en_1", "track_2"]
     assert audio_track_labels([{"tags": {}}], "en") == ["en"]
-    assert audio_track_labels(streams, "tr", override_primary=True) == ["tr", "eng", "track_2"]
+    assert audio_track_labels(streams, "tr", override_primary=True) == ["tr", "en", "track_2"]
     corrected = apply_primary_audio_language(
         [{"index": 0, "language": "eng", "label": "English", "default": True}],
         "tr",
     )
     assert corrected[0]["language"] == "tr"
-    assert corrected[0]["label"] == "Turkish"
+    assert corrected[0]["label"] == "TR"
 
 
 def test_compact_and_redacted_diagnostics() -> None:

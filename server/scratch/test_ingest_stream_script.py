@@ -51,6 +51,22 @@ class IngestionSmokeTestScriptTests(unittest.TestCase):
         self.assertEqual(request.video_source_type, "hls")
         self.assertEqual(request.audio_source_type, "auto")
 
+    def test_ingestion_schema_normalizes_audio_and_subtitle_language_tags(self):
+        request = DownloadAddRequest(
+            tmdb_id=290250,
+            media_type="movie",
+            video_url="https://example.test/movie.mp4",
+            language="French",
+            subtitles=[
+                {"language": "eng", "url": "https://example.test/en.vtt"},
+                {"language": "SPA", "url": "https://example.test/es.vtt"},
+                {"language": "pt_BR", "url": "https://example.test/pt.vtt"},
+            ],
+        )
+
+        self.assertEqual(request.language, "fr")
+        self.assertEqual([item.language for item in request.subtitles or []], ["en", "es", "pt-br"])
+
     def test_movie_payload_omits_tv_and_null_fields(self):
         payload = build_payload(
             tmdb_id=550,

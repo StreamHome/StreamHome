@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { Episode } from "../../types/api";
-import { advancingPlaybackDelta, nextPlayableEpisode } from "./PlayerPage";
+import {
+  advancingPlaybackDelta,
+  applySubtitleTrackSelection,
+  nextPlayableEpisode,
+  playbackQualityOptions,
+  shouldAutoHidePlayerControls,
+} from "./PlayerPage";
 
 function episode(id: string, seasonNumber: number, episodeNumber: number, videoUrl = `/media/${id}.mp4`): Episode {
   return { id, seasonNumber, episodeNumber, videoUrl, title: id, description: "", thumbnailUrl: "", duration: "", quality: "", languages: [], subtitles: [], skipMarkers: {} };
@@ -34,5 +40,49 @@ describe("actual watched-time accounting", () => {
 
   it("never attributes more than two seconds to one delayed browser update", () => {
     expect(advancingPlaybackDelta(1_000, 10, 11_000, 12, true)).toBe(2);
+  });
+});
+
+describe("player interaction contracts", () => {
+  it("auto-hides only during uninterrupted playback", () => {
+    expect(shouldAutoHidePlayerControls("playing", false, false)).toBe(true);
+    expect(shouldAutoHidePlayerControls("paused", false, false)).toBe(false);
+    expect(shouldAutoHidePlayerControls("buffering", false, false)).toBe(false);
+    expect(shouldAutoHidePlayerControls("playing", true, false)).toBe(false);
+    expect(shouldAutoHidePlayerControls("playing", false, true)).toBe(false);
+  });
+
+  it("shows the complete source-bounded ladder while marking unfinished levels", () => {
+    const options = playbackQualityOptions([
+      { id: "original", label: "Original", height: 720, width: 1280, original: true, ready: true },
+      { id: "480", label: "480p", height: 480, width: 854, original: false, ready: true },
+      { id: "360", label: "360p", height: 360, width: 640, original: false, ready: false },
+      { id: "240", label: "240p", height: 240, width: 426, original: false, ready: false },
+      { id: "144", label: "144p", height: 144, width: 256, original: false, ready: false },
+    ], [{ height: 720 }, { height: 480 }]);
+
+    expect(options.map((item) => item.height)).toEqual(["auto", 720, 480, 360, 240, 144]);
+    expect(options.find((item) => item.height === 144)?.ready).toBe(false);
+    expect(options.find((item) => item.height === 480)?.index).toBe(1);
+  });
+
+  it("enables exactly the selected subtitle element by stable track id", () => {
+    const video = document.createElement("video");
+    const english = document.createElement("track");
+    const spanish = document.createElement("track");
+    const englishState = { mode: "disabled" };
+    const spanishState = { mode: "disabled" };
+    english.dataset.subtitleId = "en";
+    spanish.dataset.subtitleId = "es";
+    Object.defineProperty(english, "track", { value: englishState });
+    Object.defineProperty(spanish, "track", { value: spanishState });
+    video.append(english, spanish);
+
+    applySubtitleTrackSelection(video, "en");
+    expect(englishState.mode).toBe("showing");
+    expect(spanishState.mode).toBe("disabled");
+    applySubtitleTrackSelection(video, "es");
+    expect(englishState.mode).toBe("disabled");
+    expect(spanishState.mode).toBe("showing");
   });
 });

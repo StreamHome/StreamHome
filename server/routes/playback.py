@@ -24,6 +24,7 @@ from db import get_session
 from models import APIModel, AuthSession, DownloadTask, Episode, Movie, PlaybackRun, PlaybackSession, User
 from routes.auth import get_current_user
 from services.logger import logger
+from services.languages import language_label, normalize_language_tag
 from services.media_source import MediaSourceError, ResolvedMediaSource, resolve_media_source
 from services.media_probe import probe_completed_media
 from services.playback_prep import AudioRendition, PlaybackPrepService, VideoRendition, playback_prep_service
@@ -37,7 +38,7 @@ from services.recommendation import record_playback_progress
 router = APIRouter(prefix="/api/playback", tags=["Playback"])
 PLAYBACK_TICKET_MINUTES = 15
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
-SAFE_SUBTITLE_LANGUAGE_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
+SAFE_SUBTITLE_LANGUAGE_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 ACTIVE_REPAIR_STATUSES = {"PENDING", "DOWNLOADING", "MERGING", "MOVING_CLOUD"}
 REPAIRABLE_PREPARATION_ERRORS = {"MEDIA_SOURCE_MISSING", "CLOUD_STREAM_FAILED", "EMPTY_RENDITION"}
 
@@ -416,11 +417,12 @@ def subtitle_contract(media_obj: Any) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in media_obj.subtitles or []:
-        language = str(item.get("language") or "und").lower()
-        if language in seen or not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(language):
+        track_id = str(item.get("language") or "und").lower()
+        language = normalize_language_tag(track_id)
+        if track_id in seen or not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(track_id):
             continue
-        seen.add(language)
-        result.append({"id": language, "language": language, "label": str(item.get("label") or language.upper())})
+        seen.add(track_id)
+        result.append({"id": track_id, "language": language, "label": language_label(language, item.get("label"))})
     return result
 
 
@@ -1032,21 +1034,30 @@ async def progressive_playback(
     return StreamingResponse(chunks, status_code=206 if partial else 200, media_type=content_type, headers=headers)
 
 
-@router.get("/subtitles/{media_id}/{language}")
+@router.get("/subtitles/{media_id}/{track_id}")
 async def serve_playback_subtitles(
     media_id: str,
-    language: str,
+    track_id: str,
     ticket: str = Query(...),
     db: AsyncSession = Depends(get_session),
 ):
     _, _, media_obj = await validate_playback_ticket(ticket, media_id, db)
-    if not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(language):
+    if not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(track_id):
         raise playback_error(status.HTTP_400_BAD_REQUEST, "INVALID_SUBTITLE_LANGUAGE", "The subtitle language is invalid.")
+    matched_track = next(
+        (item for item in media_obj.subtitles or [] if str(item.get("language") or "und").lower() == track_id),
+        None,
+    )
+    if not matched_track:
+        raise playback_error(status.HTTP_404_NOT_FOUND, "SUBTITLE_NOT_FOUND", "The requested subtitle track is unavailable.")
+    file_tag = str(matched_track.get("language") or "und")
+    if not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(file_tag):
+        raise playback_error(status.HTTP_404_NOT_FOUND, "SUBTITLE_NOT_FOUND", "The requested subtitle track is unavailable.")
     source = await require_available_source(media_obj)
-    subtitle_path = source.local_path.parent / f"subtitle_{language}.vtt"
+    subtitle_path = source.local_path.parent / f"subtitle_{file_tag}.vtt"
     if not subtitle_path.is_file() and source.cloud_path:
-        remote_subtitle = f"{source.cloud_path.rsplit('/', 1)[0]}/subtitle_{language}.vtt"
-        cache_path = Path(settings.TEMP_DIR) / "subtitle_cache" / media_id / str(media_obj.source_fingerprint) / f"subtitle_{language}.vtt"
+        remote_subtitle = f"{source.cloud_path.rsplit('/', 1)[0]}/subtitle_{file_tag}.vtt"
+        cache_path = Path(settings.TEMP_DIR) / "subtitle_cache" / media_id / str(media_obj.source_fingerprint) / f"subtitle_{track_id}.vtt"
         result = await rclone_service.copyto_atomic(remote_subtitle, str(cache_path), timeout=60)
         if result.ok:
             subtitle_path = cache_path

@@ -81,6 +81,8 @@ export function PlayerIconButton({ icon, label, className = "", ...props }: Play
 export interface PlayerMenuOption<T extends string | number> {
   value: T;
   label: string;
+  disabled?: boolean;
+  status?: string;
 }
 
 interface PlayerControlMenuProps<T extends string | number> {
@@ -113,9 +115,14 @@ export function PlayerControlMenu<T extends string | number>({
     onOpenChange?.(next);
   };
 
-  const focusOption = (index: number) => {
-    const normalized = (index + options.length) % options.length;
-    optionRefs.current[normalized]?.focus();
+  const focusOption = (index: number, direction = 1) => {
+    for (let offset = 0; offset < options.length; offset += 1) {
+      const normalized = (index + offset * direction + options.length * 2) % options.length;
+      if (!options[normalized]?.disabled) {
+        optionRefs.current[normalized]?.focus();
+        return;
+      }
+    }
   };
 
   useEffect(() => {
@@ -173,13 +180,13 @@ export function PlayerControlMenu<T extends string | number>({
               focusOption(activeIndex + 1);
             } else if (event.key === "ArrowUp") {
               event.preventDefault();
-              focusOption(activeIndex - 1);
+              focusOption(activeIndex - 1, -1);
             } else if (event.key === "Home") {
               event.preventDefault();
               focusOption(0);
             } else if (event.key === "End") {
               event.preventDefault();
-              focusOption(options.length - 1);
+              focusOption(options.length - 1, -1);
             } else if (event.key === "Escape") {
               event.preventDefault();
               updateOpen(false);
@@ -197,14 +204,17 @@ export function PlayerControlMenu<T extends string | number>({
                 type="button"
                 role="option"
                 aria-selected={isSelected}
-                tabIndex={index === selectedIndex ? 0 : -1}
+                aria-disabled={option.disabled || undefined}
+                disabled={option.disabled}
+                tabIndex={!option.disabled && index === selectedIndex ? 0 : -1}
                 onClick={() => {
+                  if (option.disabled) return;
                   onSelect(option.value);
                   updateOpen(false);
                   triggerRef.current?.focus();
                 }}
               >
-                <span>{option.label}</span>
+                <span>{option.label}{option.status && <small>{option.status}</small>}</span>
                 {isSelected && <PlayerIcon name="check" />}
               </button>
             );

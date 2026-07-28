@@ -67,4 +67,26 @@ describe("player control menu", () => {
     expect(onOpenChange).toHaveBeenCalledWith(true);
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
+
+  it("shows pending quality levels without allowing premature selection", () => {
+    const onSelect = vi.fn();
+    render(
+      <PlayerControlMenu
+        label="Quality"
+        icon="quality"
+        value={-1}
+        options={[
+          { value: -1, label: "Auto" },
+          { value: 144, label: "144p", disabled: true, status: "Preparing" },
+        ]}
+        onSelect={onSelect}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Quality: Auto" }));
+    const pending = screen.getByRole("option", { name: /144p Preparing/ });
+    expect(pending.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(pending);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
 });
