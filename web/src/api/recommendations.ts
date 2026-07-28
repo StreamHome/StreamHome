@@ -86,8 +86,8 @@ export async function setMediaPreference(profileId: string, movieId: string, pre
 }
 
 export interface RecommendationExposurePayload { movie_id: string; feed_generation: string; surface: string; scope: string; category: string; position: number }
-export async function sendRecommendationExposures(profileId: string, exposures: RecommendationExposurePayload[]): Promise<void> {
-  if (exposures.length) await apiPost(`/api/recommendations/${encodeURIComponent(profileId)}/exposures`, { exposures });
+export async function sendRecommendationExposures(profileId: string, exposures: RecommendationExposurePayload[], options?: RequestInit): Promise<void> {
+  if (exposures.length) await apiPost(`/api/recommendations/${encodeURIComponent(profileId)}/exposures`, { exposures }, options);
 }
 
 export async function getRecommendationDiagnostics(profileId: string): Promise<RecommendationDiagnostics> {

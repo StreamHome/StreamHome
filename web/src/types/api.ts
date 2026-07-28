@@ -227,6 +227,150 @@ export interface PlaybackSession {
   isFinished: boolean;
 }
 
+export interface AdminProfileSummary extends Profile {
+  administrator: boolean;
+  historyCount: number;
+  resumeCount: number;
+  watchlistCount: number;
+  recommendationCount: number;
+  preferenceCount: number;
+  watchSeconds: number;
+  lastActivityAt: number | null;
+}
+
+export interface AdminMediaBrief {
+  id: string;
+  tmdbId: number | null;
+  title: string;
+  type: "movie" | "series" | string;
+  releaseYear: number;
+  thumbnailUrl: string | null;
+  catalogSource: string;
+  availability: string;
+  cacheState: string | null;
+}
+
+export interface AdminProfileOverview {
+  profile: AdminProfileSummary | (Profile & { administrator: boolean });
+  counts: {
+    history: number;
+    resumeStates: number;
+    watchlist: number;
+    recommendations: number;
+    preferences: number;
+    events: number;
+    exposures: number;
+    playbackRuns: number;
+  };
+  watchSeconds: number;
+  completedTitles: number;
+  lastActivityAt: number | null;
+  activePlaybackRuns: number;
+  persistence: Array<{ label: string; location: string; durable: boolean }>;
+}
+
+export interface AdminHistoryItem {
+  id: string;
+  movie: AdminMediaBrief | null;
+  episode: { id: string; title: string; seasonNumber: number; episodeNumber: number } | null;
+  startedAt: number;
+  lastSeenAt: number;
+  maxCompletion: number;
+  durationWatched: number;
+  completedAt: number | null;
+  earlyExitRecorded: boolean;
+  rewatchReward: number;
+}
+
+export interface AdminProfileHistory {
+  total: number;
+  limit: number;
+  offset: number;
+  items: AdminHistoryItem[];
+  resumeStates: Array<{
+    movie: AdminMediaBrief | null;
+    movieId: string;
+    episodeId: string | null;
+    timestamp: number;
+    durationWatched: number;
+    completionRate: number;
+    updatedAt: string;
+    finished: boolean;
+  }>;
+}
+
+export interface AdminProfileWatchlist {
+  total: number;
+  limit: number;
+  offset: number;
+  items: Array<{ id: number; createdAt: string; movie: AdminMediaBrief | null }>;
+}
+
+export interface AdminProfileRecommendations {
+  total: number;
+  limit: number;
+  offset: number;
+  items: Array<{
+    movie: AdminMediaBrief | null;
+    score: number;
+    reasons: string[];
+    reasonDetails: RecommendationReasonDetail[];
+    generatedAt: number;
+    candidateSource: string;
+    sourceConfidence: number;
+    preference: MediaPreference;
+  }>;
+  preferences: Array<{ movieId: string; movie: AdminMediaBrief | null; preference: Exclude<MediaPreference, null>; updatedAt: number }>;
+  onboarding: { genres: string[]; titleIds: string[] };
+  tastes: Array<{ kind: string; value: string; score: number; updatedAt: number }>;
+  vibe: { dialogueWpmMean: number | null; dialogueConfidence: number; sampleWeight: number; algorithmVersion: string; updatedAt: number } | null;
+  refresh: { tasteVersion: number; lastRankedAt: number | null; lastTmdbRefreshAt: number | null; nextTmdbRefreshAt: number | null; refreshRequested: boolean; lastError: string | null } | null;
+  runtimeMetric: { top20Overlap: number; meanDisplacement: number; generatedAt: number } | null;
+}
+
+export interface AdminProfileActivity {
+  total: number;
+  limit: number;
+  offset: number;
+  events: Array<{ id: number; type: string; movie: AdminMediaBrief | null; tmdbId: number | null; timestamp: number; metadata: Record<string, unknown> }>;
+  exposures: Array<{ id: string; movie: AdminMediaBrief | null; feedGeneration: string; surface: string; scope: string; category: string; position: number; shownAt: number }>;
+  playbackRuns: Array<{ id: string; movie: AdminMediaBrief | null; episodeId: string | null; state: string; createdAt: number; updatedAt: number; lastSeenAt: number; secondsPlayed: number }>;
+}
+
+export interface AdminProfileCache {
+  total: number;
+  sharedCacheTotal: number;
+  unreferencedSharedTotal: number;
+  limit: number;
+  offset: number;
+  items: Array<{
+    movie: AdminMediaBrief;
+    associationSources: string[];
+    cachedAt: number | null;
+    metadataRefreshedAt: number | null;
+    cacheState: string | null;
+    retryCount: number;
+    nextRetryAt: number | null;
+    lastError: string | null;
+    files: {
+      poster: { url: string | null; storedOnDisk: boolean; sizeBytes: number };
+      backdrop: { url: string | null; storedOnDisk: boolean; sizeBytes: number };
+      metadata: { storedOnDisk: boolean; sizeBytes: number };
+      totalSizeBytes: number;
+    };
+    shared: true;
+  }>;
+}
+
+export interface AdminProfileData {
+  overview: AdminProfileOverview;
+  history: AdminProfileHistory;
+  watchlist: AdminProfileWatchlist;
+  recommendations: AdminProfileRecommendations;
+  activity: AdminProfileActivity;
+  cache: AdminProfileCache;
+}
+
 export interface WatchlistToggleResponse {
   status: "added" | "removed";
   watchlist: string[];

@@ -7,6 +7,7 @@ Important route families:
 - `/api/setup/*`: first-run setup and Google Drive connection;
 - `/api/auth/*`: cookie authentication, TOTP, sessions, and integration credentials;
 - `/api/profiles/*`: profile management and PIN verification;
+- `/api/admin/profiles/*`: recently reauthenticated cross-profile data inspection;
 - `/api/add-movie`: scoped ingestion;
 - `/api/playback/*` and `/api/stream/*`: playback preparation and delivery;
 - `/api/system/*`: authenticated administration;
@@ -38,6 +39,18 @@ Update lifecycle endpoints require a recently reauthenticated administrator, exc
 - `POST /api/update/presence`: record or clear visible authenticated browser presence.
 
 Machine API keys cannot use update endpoints.
+
+Administrative profile-data endpoints require recent reauthentication and do not require selecting or unlocking the inspected profile:
+
+- `GET /api/admin/profiles`: summary counts for every profile and the storage-location map;
+- `GET /api/admin/profiles/{profile_id}/overview`: aggregate counts, watch time, activity, and persistence classifications;
+- `GET /api/admin/profiles/{profile_id}/history`: paginated viewing attempts plus current resume states;
+- `GET /api/admin/profiles/{profile_id}/watchlist`: paginated saved titles in server order;
+- `GET /api/admin/profiles/{profile_id}/recommendations`: persisted candidates, reasons, tastes, preferences, refresh state, and shadow metrics;
+- `GET /api/admin/profiles/{profile_id}/activity`: accepted telemetry, exposures, and playback runs;
+- `GET /api/admin/profiles/{profile_id}/cache`: shared TMDB cache records associated with the profile and their on-disk asset state.
+
+These endpoints never serialize profile PIN hashes, authentication secrets, ingestion source headers, or absolute filesystem paths.
 
 Use the generated FastAPI OpenAPI document from a development server for the exact schema. Security-sensitive mutations must use the existing authentication, same-origin, rate-limit, and recent-reauthentication dependencies.
 

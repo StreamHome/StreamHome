@@ -125,6 +125,7 @@ run_shell_checks() {
 run_server_checks() {
     local -a server_checks=(
         scratch/test_2fa.py
+        scratch/test_admin_profile_data.py
         scratch/test_auth_security.py
         scratch/test_auth_validation.py
         scratch/test_backup_security.py

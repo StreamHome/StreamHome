@@ -1,5 +1,5 @@
 export const APP_VIEWS = ["home", "movies", "series", "watchlist", "downloads", "search", "details", "watch", "admin"] as const;
-export const ADMIN_SECTIONS = ["account", "recommendations", "storage", "downloads", "updates"] as const;
+export const ADMIN_SECTIONS = ["account", "profiles", "recommendations", "storage", "downloads", "updates"] as const;
 export const CATALOG_VIEWS = ["home", "movies", "series"] as const;
 export const VIRTUAL_CATEGORIES = ["recommended", "all"] as const;
 
@@ -16,6 +16,7 @@ export interface AppQueryState {
   season?: number;
   q?: string;
   section?: AdminSection;
+  adminProfile?: string;
 }
 
 const viewSet = new Set<string>(APP_VIEWS);
@@ -65,6 +66,8 @@ export function parseAppQuery(input: string | URLSearchParams): AppQueryState {
   if (view === "admin") {
     const section = clean(params.get("section"));
     state.section = section && adminSectionSet.has(section) ? section as AdminSection : "account";
+    const adminProfile = clean(params.get("subject"));
+    if (adminProfile) state.adminProfile = adminProfile;
   }
 
   return state;
@@ -78,7 +81,10 @@ export function appSearch(state: AppQueryState): string {
   if (isCatalogView(state.view) && state.genre) params.set("genre", state.genre);
   if (state.view === "details" && state.season) params.set("season", String(state.season));
   if (state.view === "search" && state.q) params.set("q", state.q);
-  if (state.view === "admin") params.set("section", state.section ?? "account");
+  if (state.view === "admin") {
+    params.set("section", state.section ?? "account");
+    if (state.adminProfile) params.set("subject", state.adminProfile);
+  }
   return `?${params.toString()}`;
 }
 

@@ -402,6 +402,12 @@ class RecommendationRefreshState(SQLModel, table=True):
     refresh_requested: bool = Field(default=True)
     last_error: Optional[str] = Field(default=None)
 
+class RecommendationRuntimeMetric(SQLModel, table=True):
+    profile_id: str = Field(primary_key=True)
+    top20_overlap: int = Field(default=0)
+    mean_displacement: float = Field(default=0.0)
+    generated_at: float = Field(default_factory=time.time, index=True)
+
 class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     email: str = Field(index=True, unique=True)

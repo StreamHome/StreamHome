@@ -14,7 +14,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 import services.recommendation as recommendation
 import db as db_module
 from config import settings
-from models import Episode, Movie, Profile, ProfileMediaPreference, ProfileTaste, RecommendationExposure, RecommendationExposureInput, RecommendationFeedResponse, TelemetryRequest, ViewingAttempt
+from models import Episode, Movie, Profile, ProfileMediaPreference, ProfileTaste, RecommendationExposure, RecommendationExposureInput, RecommendationFeedResponse, RecommendationRuntimeMetric, TelemetryRequest, ViewingAttempt
 from services.tmdb import tmdb_client
 
 
@@ -49,10 +49,12 @@ async def main() -> None:
     original_engine = recommendation.engine
     original_db_engine = db_module.engine
     original_media_dir = settings.MEDIA_DIR
+    original_shadow_mode = settings.RECOMMENDATION_V2_SHADOW
     cache_test_dir = os.path.join("temp", f"recommendation-regression-{os.getpid()}")
     recommendation.engine = test_engine
     db_module.engine = test_engine
     settings.MEDIA_DIR = cache_test_dir
+    settings.RECOMMENDATION_V2_SHADOW = True
     try:
         async with test_engine.begin() as connection:
             await connection.run_sync(SQLModel.metadata.create_all)
@@ -123,6 +125,8 @@ async def main() -> None:
             assert all(item["media"].id != "m_2" for item in recommended["items"])
             assert len(list((await db.exec(select(ProfileMediaPreference))).all())) == 1, "preference transitions must update one row"
             assert len(list((await db.exec(select(RecommendationExposure))).all())) == 1
+            shadow_metric = await db.get(RecommendationRuntimeMetric, "profile")
+            assert shadow_metric and shadow_metric.generated_at > 0, "shadow comparison metrics must survive process restart"
 
         first_attempt = await recommendation.record_playback_progress("profile", "m_1", None, 4000, 4000, 0.80, False)
         assert first_attempt
@@ -149,6 +153,7 @@ async def main() -> None:
         recommendation.engine = original_engine
         db_module.engine = original_db_engine
         settings.MEDIA_DIR = original_media_dir
+        settings.RECOMMENDATION_V2_SHADOW = original_shadow_mode
         await test_engine.dispose()
         shutil.rmtree(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), cache_test_dir), ignore_errors=True)
         for suffix in ("", "-shm", "-wal"):

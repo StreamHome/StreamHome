@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
+from sqlalchemy import delete
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -23,7 +24,11 @@ from models import (
     PlaybackSessionResponse, DiscoverMovieResponse, EpisodeResponse, 
     Profile, ProfileResponse, APIModel, DownloadTask, TelemetryRequest,
     RecommendationFeedResponse, MediaPreferenceRequest, RecommendationExposureBatch,
-    RecommendationOnboardingRequest, User, DriveSetupJob, PlaybackRun, AuthSession
+    RecommendationOnboardingRequest, User, DriveSetupJob, PlaybackRun, AuthSession,
+    TelemetryEvent, ProfileTaste, ProfileVibeVector, ProfileMediaPreference,
+    ProfileOnboardingPreference, RecommendationExposure, ViewingAttempt,
+    PlaybackMilestone, ProfileRecommendation, RecommendationRefreshState,
+    RecommendationRuntimeMetric
 )
 from services.recommendation import (
     process_telemetry_event,
@@ -60,6 +65,7 @@ from routes.backup import router as backup_router
 from routes.update import router as update_router
 from routes.setup import router as setup_router
 from routes.playback import router as playback_router
+from routes.admin_profiles import router as admin_profiles_router
 
 # 💥 WINDOWS ASYNC SUBPROCESS FIX
 if sys.platform == 'win32':
@@ -385,6 +391,7 @@ app.include_router(playback_router)
 app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
 app.include_router(update_router, prefix="/api/update", tags=["update"])
 app.include_router(setup_router)
+app.include_router(admin_profiles_router)
 
 os.makedirs(settings.MEDIA_DIR, exist_ok=True)
 os.makedirs(os.path.join(settings.MEDIA_DIR, "Movies"), exist_ok=True)
@@ -1009,6 +1016,29 @@ async def delete_profile(profile_id: str, user = Depends(get_current_user)):
             auth_session.selected_profile_id = None
             auth_session.selected_profile_pin_version = None
             db.add(auth_session)
+        attempts = (
+            await db.exec(select(ViewingAttempt).where(ViewingAttempt.profile_id == profile_id))
+        ).all()
+        attempt_ids = [attempt.id for attempt in attempts]
+        if attempt_ids:
+            await db.execute(delete(PlaybackMilestone).where(PlaybackMilestone.attempt_id.in_(attempt_ids)))
+        profile_models = (
+            PlaybackSession,
+            PlaybackRun,
+            WatchlistItem,
+            TelemetryEvent,
+            ProfileTaste,
+            ProfileVibeVector,
+            ProfileMediaPreference,
+            ProfileOnboardingPreference,
+            RecommendationExposure,
+            ViewingAttempt,
+            ProfileRecommendation,
+            RecommendationRefreshState,
+            RecommendationRuntimeMetric,
+        )
+        for model in profile_models:
+            await db.execute(delete(model).where(model.profile_id == profile_id))
         await db.delete(profile)
         await db.commit()
         return {"status": "deleted"}

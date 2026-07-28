@@ -5,8 +5,10 @@ import { GlassPane } from "../../../components/ui/GlassPane";
 import { useProfileStore } from "../../../stores/profileStore";
 import type { RecommendationDiagnostics } from "../../../types/api";
 
-export function RecommendationsPanel() {
-  const profile = useProfileStore((state) => state.activeProfile)!;
+export function RecommendationsPanel({ profileId }: { profileId?: string } = {}) {
+  const activeProfile = useProfileStore((state) => state.activeProfile)!;
+  const profiles = useProfileStore((state) => state.profiles);
+  const profile = profiles.find((item) => item.id === profileId) ?? activeProfile;
   const [diagnostics, setDiagnostics] = useState<RecommendationDiagnostics | null>(null);
   const [genres, setGenres] = useState("");
   const [loading, setLoading] = useState(true);
@@ -38,7 +40,7 @@ export function RecommendationsPanel() {
   const normalizedGenres = () => Array.from(new Set(genres.split(",").map((genre) => genre.trim()).filter(Boolean))).slice(0, 12);
 
   return <section className="admin-panel admin-panel--recommendations">
-    <header className="admin-panel__header"><p>PROFILE / RECOMMENDATION ENGINE</p><h1>Recommendations</h1><span>Inspect the active profile’s signals, tune its cold-start genres, and rebuild the server candidate pool. Search results are not taste signals; only a selected result contributes a modest signal.</span></header>
+    <header className="admin-panel__header"><p>PROFILE / RECOMMENDATION ENGINE</p><h1>Recommendations</h1><span>Inspect {profile.name}’s signals, tune its cold-start genres, and rebuild the server candidate pool. Search results are not taste signals; only a selected result contributes a modest signal.</span></header>
     {loading && !diagnostics ? <GlassPane className="admin-state-card" spotlight={false}><p>READING SIGNALS</p><h2>Loading recommendation diagnostics…</h2></GlassPane> : error && !diagnostics ? <GlassPane className="admin-state-card" spotlight={false}><p>DIAGNOSTICS UNAVAILABLE</p><h2>Recommendation data could not be loaded.</h2><span role="alert">{error}</span><Button onClick={() => void load()}>Try again</Button></GlassPane> : diagnostics && <>
       <div className="recommendation-diagnostics-grid" aria-label="Recommendation metrics">
         <Metric label="Exposures" value={diagnostics.exposures} detail={`${diagnostics.periodDays} day window`} />

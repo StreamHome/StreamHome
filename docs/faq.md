@@ -241,6 +241,10 @@ A profile stores personalized viewing data such as:
 
 Multiple profiles can use the same authenticated environment while keeping viewing preferences separate.
 
+Administrators can inspect this information for any profile under **Admin center → Profile data**. Selecting a profile there does not enter, unlock, or impersonate it.
+
+TMDB metadata-only catalog entries and their downloaded artwork are shared server cache resources rather than profile-owned records. The admin page shows which shared entries are associated with a profile and why.
+
 ### Should every viewer have an administrator account?
 
 No.

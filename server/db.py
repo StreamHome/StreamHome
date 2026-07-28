@@ -316,6 +316,41 @@ async def init_db():
                     "CREATE UNIQUE INDEX IF NOT EXISTS uq_profile_taste_tag "
                     "ON profiletaste (profile_id, tag_type, tag_value)"
                 )
+
+            profile_data_indexes = {
+                "playbacksession": (
+                    "CREATE INDEX IF NOT EXISTS ix_playbacksession_profile_updated "
+                    "ON playbacksession (profile_id, updated_at DESC)"
+                ),
+                "watchlistitem": (
+                    "CREATE INDEX IF NOT EXISTS ix_watchlistitem_profile_created "
+                    "ON watchlistitem (profile_id, created_at DESC)"
+                ),
+                "viewingattempt": (
+                    "CREATE INDEX IF NOT EXISTS ix_viewingattempt_profile_seen "
+                    "ON viewingattempt (profile_id, last_seen_at DESC)"
+                ),
+                "telemetryevent": (
+                    "CREATE INDEX IF NOT EXISTS ix_telemetryevent_profile_timestamp "
+                    "ON telemetryevent (profile_id, timestamp DESC)"
+                ),
+                "recommendationexposure": (
+                    "CREATE INDEX IF NOT EXISTS ix_recommendationexposure_profile_shown "
+                    "ON recommendationexposure (profile_id, shown_at DESC)"
+                ),
+                "profilerecommendation": (
+                    "CREATE INDEX IF NOT EXISTS ix_profilerecommendation_profile_score "
+                    "ON profilerecommendation (profile_id, score DESC)"
+                ),
+                "playbackrun": (
+                    "CREATE INDEX IF NOT EXISTS ix_playbackrun_profile_updated "
+                    "ON playbackrun (profile_id, updated_at DESC)"
+                ),
+            }
+            existing_tables = set(inspector.get_table_names())
+            for table_name, statement in profile_data_indexes.items():
+                if table_name in existing_tables:
+                    sync_conn.exec_driver_sql(statement)
                     
         await conn.run_sync(migrate)
 

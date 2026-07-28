@@ -18,6 +18,7 @@ This documentation describes the supported `v0.1.0-alpha.1` Linux server release
 - [Updating](updating.md)
 - [Troubleshooting](troubleshooting.md)
 - [Security](security.md)
+- [Profile Data Administration](admin-profile-data.md)
 - [Browser Client](pwa.md)
 - [Frequently Asked Questions](faq.md)
 

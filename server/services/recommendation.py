@@ -11,6 +11,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -28,6 +29,7 @@ from models import (
     ProfileTaste,
     ProfileVibeVector,
     RecommendationRefreshState,
+    RecommendationRuntimeMetric,
     TelemetryEvent,
     TelemetryRequest,
     ViewingAttempt,
@@ -44,7 +46,6 @@ TMDB_STALE_SECONDS = 24 * 60 * 60
 ATTEMPT_GAP_SECONDS = 30 * 60
 REWATCH_COOLDOWN_SECONDS = 24 * 60 * 60
 ALGORITHM_VERSION = "v2.1"
-SHADOW_METRICS: Dict[str, Dict[str, Any]] = {}
 
 EVENT_WEIGHTS = {
     "card_click": 0.35,
@@ -325,6 +326,7 @@ async def get_recommendation_diagnostics(profile_id: str) -> Dict[str, Any]:
         tastes = await _taste_map(db, profile_id, now)
         pool = await db.exec(select(ProfileRecommendation).where(ProfileRecommendation.profile_id == profile_id))
         pool_rows = list(pool.all())
+        shadow_metric = await db.get(RecommendationRuntimeMetric, profile_id)
         movies = await db.exec(select(Movie))
         movie_rows = list(movies.all())
         available = sum(1 for movie in movie_rows if movie.availability == "available" or bool((movie.video_url or "").strip()))
@@ -356,7 +358,11 @@ async def get_recommendation_diagnostics(profile_id: str) -> Dict[str, Any]:
                 "pacing_coverage": pacing_coverage,
                 "enabled": settings.RECOMMENDATION_V2_ENABLED,
                 "shadow": settings.RECOMMENDATION_V2_SHADOW,
-                "shadow_metrics": SHADOW_METRICS.get(profile_id),
+                "shadow_metrics": {
+                    "top20Overlap": shadow_metric.top20_overlap,
+                    "meanDisplacement": shadow_metric.mean_displacement,
+                    "generatedAt": shadow_metric.generated_at,
+                } if shadow_metric else None,
             },
             "top_tastes": top_tastes,
         }
@@ -801,7 +807,22 @@ async def rank_movies_for_profile(
         overlap = len(set(visible_ids) & set(legacy_ids))
         legacy_positions = {movie_id: index for index, movie_id in enumerate(legacy_ids)}
         displacement = [abs(index - legacy_positions[movie_id]) for index, movie_id in enumerate(visible_ids) if movie_id in legacy_positions]
-        SHADOW_METRICS[profile_id] = {"top20Overlap": overlap, "meanDisplacement": round(sum(displacement) / len(displacement), 3) if displacement else 0.0, "generatedAt": now}
+        mean_displacement = round(sum(displacement) / len(displacement), 3) if displacement else 0.0
+        statement = sqlite_insert(RecommendationRuntimeMetric).values(
+            profile_id=profile_id,
+            top20_overlap=overlap,
+            mean_displacement=mean_displacement,
+            generated_at=now,
+        ).on_conflict_do_update(
+            index_elements=["profile_id"],
+            set_={
+                "top20_overlap": overlap,
+                "mean_displacement": mean_displacement,
+                "generated_at": now,
+            },
+        )
+        async with engine.begin() as connection:
+            await connection.execute(statement)
     return ranked
 
 

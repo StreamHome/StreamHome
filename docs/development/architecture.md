@@ -19,4 +19,8 @@ Ingestion is queue-based. Finalization writes portable `.metadata/metadata.json`
 
 Authentication uses HttpOnly sessions and optional local TOTP. TOTP enrollment state is server-owned, encrypted at rest, short-lived, and bound to the initiating setup or authenticated user session. The server renders the enrollment QR as a non-cacheable SVG and promotes the pending secret to the user only after successful verification. SMTP and email OTP are intentionally absent.
 
+Profile-owned history, resume state, watchlists, recommendation candidates, tastes, preferences, telemetry, exposures, and playback runs are durable SQLite records. The recently reauthenticated admin profile-data API reads those records without changing the selected playback profile or bypassing normal profile access for non-admin routes. TMDB `Movie` rows and their artwork/portable metadata are intentionally shared server cache resources; the admin explorer reports profile associations without assigning file ownership to a profile. Recommendation shadow-comparison metrics are persisted rather than held only in process memory, and browser exposure batches remain in a bounded retry queue until the server acknowledges them.
+
+Profile deletion explicitly removes all profile-owned rows and attempt milestones in one transaction. Shared catalog rows, physical media, artwork, and TMDB cache files remain intact.
+
 Release changes must preserve the fixed database/media paths, the application-owned Rclone command path, and the movie-ingestion payload rule.
