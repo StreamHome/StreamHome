@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 REPOSITORY_URL="https://github.com/StreamHome/StreamHome.git"
 INSTALL_DIR="${STREAMHOME_INSTALL_DIR:-${HOME:-}/StreamHome}"
-INSTALL_REF="${STREAMHOME_REF:-v0.1.0-alpha.1}"
+INSTALL_REF="${STREAMHOME_REF:-main}"
 NO_START=false
 SKIP_SYSTEM_PACKAGES=false
 INSTALL_PARENT=""
@@ -24,7 +24,7 @@ Options:
 
 Environment overrides:
   STREAMHOME_INSTALL_DIR Installation directory (default: ~/StreamHome)
-  STREAMHOME_REF         Git branch or tag (default: v0.1.0-alpha.1)
+  STREAMHOME_REF         Git branch or tag (default: main)
 
 The installer clones or safely fast-forwards StreamHome, grants executable
 permissions to its shell entry points, and runs setup.sh.

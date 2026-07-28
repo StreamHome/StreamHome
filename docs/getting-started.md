@@ -11,7 +11,7 @@ This guide walks through the complete first-use experience, from installing Stre
 
 You will need:
 
-* a supported Windows or Linux server;
+* a supported Linux server;
 * administrator access to that server;
 * a modern web browser;
 * enough local storage for application data, temporary media processing, metadata, and cache files;
@@ -22,17 +22,13 @@ Google Drive is optional. StreamHome can operate using local storage only.
 
 ## 1. Install StreamHome
 
-Open the [StreamHome Releases](https://github.com/StreamHome/StreamHome/releases) page and select the release you want to install.
+Run the general Linux installer:
 
-Each release contains its own:
+```bash
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
+```
 
-* installation instructions;
-* supported operating systems;
-* update notes;
-* known limitations;
-* migration information.
-
-Always use the installer associated with the selected release rather than installation files from the mutable development branch.
+The installer checks out the current `main` branch, prepares dependencies and production assets, starts StreamHome, and prints the setup URL only after the API and web client are healthy. See [Installation](installation.md) for custom directories, no-start operation, ports, and supported package managers.
 
 After installation, StreamHome should display or provide the URL for its setup interface.
 

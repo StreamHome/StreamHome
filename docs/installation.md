@@ -1,19 +1,19 @@
-# Installing StreamHome v0.1.0-alpha.1
+# Installing StreamHome
 
 The supported alpha server target is a current Linux distribution with one of the package managers recognized by `setup.sh`. The repository lifecycle scripts own direct start and stop operations; Windows server entry points are not included.
 
-## Install the tagged release
+## Install StreamHome
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/v0.1.0-alpha.1/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
 ```
 
 The installer:
 
 1. installs Git when necessary;
 2. acquires a single-installation lock;
-3. clones into a temporary same-parent directory and promotes a complete checkout atomically;
-4. verifies the checkout resolves exactly to the requested tag or branch commit;
+3. clones the current `main` branch into a temporary same-parent directory and promotes a complete checkout atomically;
+4. verifies the checkout resolves exactly to the fetched commit;
 5. runs `setup.sh`;
 6. installs pinned Python, npm, and application-owned Rclone dependencies;
 7. builds the production web client and starts it only after health checks pass.
@@ -22,13 +22,13 @@ Use a different installation directory only when needed:
 
 ```bash
 STREAMHOME_INSTALL_DIR=/srv/streamhome \
-curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/v0.1.0-alpha.1/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
 ```
 
 To install dependencies and assets without starting the services:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/v0.1.0-alpha.1/install.sh \
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh \
   | bash -s -- --no-start
 ```
 
@@ -43,4 +43,4 @@ The default installer starts StreamHome. With `--no-start`, run `./start.sh` lat
 
 ## Unsupported alpha environments
 
-Windows server operation, containers, Kubernetes, NAS application stores, and automatic multi-node deployment are not release-gated for `v0.1.0-alpha.1`.
+Windows server operation, containers, Kubernetes, NAS application stores, and automatic multi-node deployment are not release-gated for the current alpha.

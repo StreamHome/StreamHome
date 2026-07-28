@@ -104,6 +104,7 @@ class SetupScriptContracts(unittest.TestCase):
         start_sh = (ROOT / "start.sh").read_text(encoding="utf-8")
         stop_sh = (ROOT / "stop.sh").read_text(encoding="utf-8")
         test_sh = (ROOT / "test.sh").read_text(encoding="utf-8")
+        cli_py = (ROOT / "server" / "cli.py").read_text(encoding="utf-8")
 
         self.assertIn(REPOSITORY_URL, install_sh)
         self.assertIn("remote set-url origin", install_sh)
@@ -114,6 +115,8 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("install.lock", install_sh)
         self.assertIn("setup_args+=(--no-start)", install_sh)
         self.assertIn("./setup.sh", install_sh)
+        self.assertIn('INSTALL_REF="${STREAMHOME_REF:-main}"', install_sh)
+        self.assertIn("Git branch or tag (default: main)", install_sh)
         self.assertIn('[[ "$(uname -s)" == "Linux" ]]', install_sh)
         self.assertNotIn("brew install", install_sh)
 
@@ -150,6 +153,10 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("--syntax-only", test_sh)
         self.assertIn("Port 8000 is active", test_sh)
         self.assertIn("shellcheck -x", test_sh)
+
+        self.assertIn("./venv/bin/python server/cli.py", cli_py)
+        self.assertNotIn("start.bat", cli_py)
+        self.assertNotIn("start_background.sh", cli_py)
 
     def test_linux_bootstrap_is_atomic_forwards_options_and_refuses_dirty_update(self) -> None:
         bash = bash_command()

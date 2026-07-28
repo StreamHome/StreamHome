@@ -180,17 +180,11 @@ The database can also be backed up automatically to:
 
 The recovery architecture is designed to preserve media availability, catalog metadata, accounts, profiles, settings, and playback state.
 
-### 📱 Installable Progressive Web App
+### 📱 Responsive Web Client
 
-StreamHome can be installed as a Progressive Web App on supported desktop and mobile browsers.
+StreamHome provides a responsive browser client for current desktop and mobile browsers. The alpha does not register a service worker and does not promise installable PWA behavior, offline playback, or offline downloads.
 
-The PWA provides:
-
-* an application-like standalone experience;
-* home-screen installation;
-* automatic synchronization with the server-delivered client;
-* supported offline functionality;
-* access without maintaining separate native mobile applications.
+The server-delivered client stays current with the StreamHome version running on your server, without requiring separate native applications.
 
 ## ⚙️ How It Works
 

@@ -106,9 +106,7 @@ Other operating systems may work, but compatibility is not guaranteed during alp
 
 ### Can I install StreamHome on Windows?
 
-Yes, when the selected release provides and supports a Windows installer.
-
-Run PowerShell with the permissions required by that release's installation instructions.
+Not in the current alpha. The supported server target is Linux, and Windows lifecycle scripts are not distributed.
 
 ### Can I install StreamHome on Linux?
 
