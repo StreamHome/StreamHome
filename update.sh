@@ -191,10 +191,25 @@ preflight_target() {
 }
 
 wait_for_idle_handoff() {
-    local code handoff_token
+    local code handoff_token install_mode
     handoff_token="$(cat "$HANDOFF_FILE" 2>/dev/null || true)"
     [[ -n "$handoff_token" ]] || return 1
-    write_state "waiting_for_idle" "Preflight passed. Waiting for the server to become idle again."
+    install_mode="$(python3 - "$STATUS_FILE" <<'PY'
+import json
+import sys
+
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError, TypeError):
+    payload = {}
+print(payload.get("install_mode", "when_idle"))
+PY
+)"
+    if [[ "$install_mode" == "now" ]]; then
+        write_state "waiting_for_idle" "Preflight passed. Requesting immediate protected cutover."
+    else
+        write_state "waiting_for_idle" "Preflight passed. Waiting for the server to become idle again."
+    fi
     while true; do
         code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
             -H "X-StreamHome-Update-Handoff: $handoff_token" \
@@ -202,7 +217,7 @@ wait_for_idle_handoff() {
         case "$code" in
             200)
                 rm -f -- "$HANDOFF_FILE"
-                log "The backend reserved an idle maintenance cutover."
+                log "The backend reserved a protected maintenance cutover."
                 return 0
                 ;;
             403)

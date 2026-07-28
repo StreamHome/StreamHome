@@ -3,8 +3,8 @@ import type { UpdatePolicy, UpdateStatus } from "../types/api";
 
 export const getUpdateStatus = () => apiGet<UpdateStatus>("/api/update/status");
 export const checkForUpdates = () => apiPost<UpdateStatus>("/api/update/check");
-export const installUpdateWhenIdle = (retryFailedTarget = false) =>
-  apiPost<UpdateStatus>("/api/update/install", { retry_failed_target: retryFailedTarget });
+export const installUpdate = (mode: "when_idle" | "now", retryFailedTarget = false) =>
+  apiPost<UpdateStatus>("/api/update/install", { retry_failed_target: retryFailedTarget, mode });
 export const cancelPendingUpdate = () => apiDelete<UpdateStatus>("/api/update/pending");
 export const updateUpdatePolicy = (policy: UpdatePolicy) =>
   apiPut<UpdateStatus>("/api/update/policy", {

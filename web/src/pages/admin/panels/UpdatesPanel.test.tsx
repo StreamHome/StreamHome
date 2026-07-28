@@ -8,7 +8,7 @@ import { UpdatesPanel } from "./UpdatesPanel";
 vi.mock("../../../api/updates", () => ({
   getUpdateStatus: vi.fn(),
   checkForUpdates: vi.fn(),
-  installUpdateWhenIdle: vi.fn(),
+  installUpdate: vi.fn(),
   cancelPendingUpdate: vi.fn(),
   updateUpdatePolicy: vi.fn(),
 }));
@@ -25,6 +25,7 @@ const baseStatus: UpdateStatus = {
   targetCommit: "b".repeat(40),
   updateAvailable: true,
   automatic: false,
+  installMode: "when_idle",
   queuedAt: null,
   startedAt: null,
   finishedAt: null,
@@ -52,7 +53,7 @@ describe("UpdatesPanel", () => {
     vi.clearAllMocks();
     vi.mocked(updates.getUpdateStatus).mockResolvedValue(baseStatus);
     vi.mocked(updates.checkForUpdates).mockResolvedValue(baseStatus);
-    vi.mocked(updates.installUpdateWhenIdle).mockResolvedValue({ ...baseStatus, phase: "queued", message: "Queued" });
+    vi.mocked(updates.installUpdate).mockImplementation(async (mode) => ({ ...baseStatus, phase: "queued", installMode: mode, message: "Queued" }));
     vi.mocked(updates.updateUpdatePolicy).mockResolvedValue(baseStatus);
   });
 
@@ -64,9 +65,24 @@ describe("UpdatesPanel", () => {
     await waitFor(() => expect(updates.checkForUpdates).toHaveBeenCalledTimes(1));
 
     fireEvent.click(screen.getByRole("button", { name: "Install when idle" }));
-    fireEvent.click(screen.getByRole("button", { name: "Authorize queue the update" }));
-    await waitFor(() => expect(updates.installUpdateWhenIdle).toHaveBeenCalledWith(false));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize queue the update for idle time" }));
+    await waitFor(() => expect(updates.installUpdate).toHaveBeenCalledWith("when_idle"));
     expect(await screen.findByText(/Update queued/)).toBeTruthy();
+  });
+
+  it("confirms and authorizes an immediate preflight separately from idle installation", async () => {
+    render(<UpdatesPanel />);
+    await screen.findByText("A newer StreamHome commit is available.");
+
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    expect(await screen.findByRole("heading", { name: "Update StreamHome now?" })).toBeTruthy();
+    expect(screen.getByText(/Browser presence, playback/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Continue to authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize install the update now" }));
+
+    await waitFor(() => expect(updates.installUpdate).toHaveBeenCalledWith("now"));
+    expect(await screen.findByText(/Immediate preflight started/)).toBeTruthy();
+    expect(screen.getByText("Immediate mode ignores the window")).toBeTruthy();
   });
 
   it("saves administrator-selected idle and automatic-update policy", async () => {

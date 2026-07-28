@@ -43,6 +43,8 @@ describe("admin presentation contracts", () => {
     expect(storage).toContain('className="admin-panel admin-panel--storage"');
     expect(updates).toContain('className="admin-panel admin-panel--updates"');
     expect(updates).toContain("Install when idle");
+    expect(updates).toContain("Update now");
+    expect(updates).toContain("Active ingestion, downloads, media processing, backups, and restores must finish or be cancelled first.");
     expect(updates).toContain("Retry failed target");
     expect(profileData).toContain('className="admin-panel admin-panel--profile-data"');
     expect(profileData).toContain("TMDB cache is not profile-owned");

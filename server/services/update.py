@@ -14,6 +14,7 @@ from typing import Any
 from config import settings
 from services.backup import BACKUP_LOCK, is_database_idle
 from services.logger import logger
+from services.queue import queue_manager
 import services.state as state
 
 
@@ -21,6 +22,7 @@ REPOSITORY_URL = "https://github.com/StreamHome/StreamHome.git"
 LEGACY_REPOSITORY_URL = "https://github.com/WaqSea/StreamHome.git"
 TERMINAL_PHASES = {"idle", "up_to_date", "update_available", "succeeded", "failed", "rolled_back", "rollback_failed"}
 BUSY_PHASES = {"preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back"}
+INSTALL_MODES = {"automatic", "when_idle", "now"}
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 UPDATE_CHECK_LOCK = asyncio.Lock()
 UPDATE_QUEUE_LOCK = asyncio.Lock()
@@ -39,6 +41,7 @@ def _default_status() -> dict[str, Any]:
         "target_commit": "",
         "update_available": False,
         "automatic": False,
+        "install_mode": "when_idle",
         "queued_at": None,
         "started_at": None,
         "finished_at": None,
@@ -307,6 +310,32 @@ async def idle_blockers() -> list[str]:
     return blockers
 
 
+async def protected_cutover_blockers() -> list[str]:
+    """Return work that an administrator-requested immediate cutover must not interrupt."""
+    blockers: list[str] = []
+    if state.ACTIVE_HTTP_REQUESTS:
+        blockers.append(f"{state.ACTIVE_HTTP_REQUESTS} active API request{'s' if state.ACTIVE_HTTP_REQUESTS != 1 else ''}")
+    if state.ACTIVE_PROCESSES:
+        blockers.append(f"{len(state.ACTIVE_PROCESSES)} active media process{'es' if len(state.ACTIVE_PROCESSES) != 1 else ''}")
+    if BACKUP_LOCK.locked():
+        blockers.append("a backup or restore operation is active")
+    if queue_manager.active_tasks:
+        blockers.append(f"{len(queue_manager.active_tasks)} active ingestion or download task{'s' if len(queue_manager.active_tasks) != 1 else ''}")
+    return blockers
+
+
+async def queued_launch_blockers(status: dict[str, Any]) -> list[str]:
+    if status.get("install_mode") == "now" and not status.get("automatic"):
+        return []
+    return await idle_blockers()
+
+
+async def update_handoff_blockers(install_mode: str) -> list[str]:
+    if install_mode == "now":
+        return await protected_cutover_blockers()
+    return await idle_blockers()
+
+
 async def is_system_idle() -> bool:
     return not await idle_blockers()
 
@@ -342,8 +371,16 @@ def update_lock_active() -> bool:
         return False
 
 
-async def queue_update(*, automatic: bool, allow_failed_target: bool = False) -> dict[str, Any]:
+async def queue_update(
+    *,
+    automatic: bool,
+    allow_failed_target: bool = False,
+    install_mode: str = "when_idle",
+) -> dict[str, Any]:
     async with UPDATE_QUEUE_LOCK:
+        resolved_mode = "automatic" if automatic else install_mode
+        if resolved_mode not in INSTALL_MODES or (not automatic and resolved_mode == "automatic"):
+            raise RuntimeError("invalid_install_mode")
         status = read_update_state()
         if status.get("phase") == "queued" or status.get("phase") in BUSY_PHASES or update_lock_active():
             raise RuntimeError("update_in_progress")
@@ -369,8 +406,13 @@ async def queue_update(*, automatic: bool, allow_failed_target: bool = False) ->
             raise RuntimeError("failed_target_suppressed")
         return write_update_state(
             phase="queued",
-            message="Update queued until StreamHome is idle.",
+            message=(
+                "Immediate update requested. Isolated preflight will start now."
+                if resolved_mode == "now"
+                else "Update queued until StreamHome is idle."
+            ),
             automatic=automatic,
+            install_mode=resolved_mode,
             queued_at=time.time(),
             started_at=None,
             finished_at=None,
@@ -399,7 +441,7 @@ async def launch_queued_update_if_ready() -> bool:
             return False
         if status.get("automatic") and not maintenance_window_open():
             return False
-        blockers = await idle_blockers()
+        blockers = await queued_launch_blockers(status)
         if blockers:
             write_update_state(message=f"Waiting for idle: {blockers[0]}.")
             return False
@@ -453,7 +495,11 @@ async def launch_queued_update_if_ready() -> bool:
             return False
         write_update_state(
             phase="preflight",
-            message="The detached updater is validating the target release.",
+            message=(
+                "The detached updater is validating the target release for immediate installation."
+                if status.get("install_mode") == "now"
+                else "The detached updater is validating the target release."
+            ),
             started_at=time.time(),
             error="",
         )

@@ -564,6 +564,14 @@
 .update-blockers strong { color: var(--text-primary); font-size: 12px; }
 .update-blockers ul { display: grid; gap: 5px; margin: 8px 0 0; padding-left: 17px; color: var(--text-muted); font-size: 11px; line-height: 1.45; }
 .update-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+.update-now-confirmation { padding:0; }
+.update-now-confirmation > section { padding:clamp(24px,4vw,34px); }
+.update-now-confirmation header { border-bottom:1px solid var(--glass-border); padding-bottom:20px; }
+.update-now-confirmation header p { color:var(--text-accent); font:650 9px/1 var(--font-mono); letter-spacing:.15em; }
+.update-now-confirmation header h2 { margin-top:11px; color:var(--text-primary); font:650 30px/1.08 var(--font-headline); }
+.update-now-confirmation header span { display:block; margin-top:11px; color:var(--text-muted); font-size:12px; line-height:1.55; }
+.update-now-confirmation ul { display:grid; gap:9px; margin:20px 0 0; padding-left:20px; color:var(--text-secondary); font-size:11px; line-height:1.5; }
+.update-now-confirmation__actions { display:flex; justify-content:flex-end; flex-wrap:wrap; gap:10px; margin-top:24px; }
 .update-policy-card { margin-top: 30px; }
 .update-card-heading > p { color: var(--text-accent); font: 600 9px/1 var(--font-mono); letter-spacing: .16em; }
 .update-toggle { display: flex; align-items: flex-start; gap: 12px; margin: 24px 0; border: 1px solid var(--glass-border); border-radius: var(--radius); padding: 16px; cursor: pointer; }

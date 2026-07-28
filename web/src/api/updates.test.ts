@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   cancelPendingUpdate,
   checkForUpdates,
-  installUpdateWhenIdle,
+  installUpdate,
   reportBrowserPresence,
   updateUpdatePolicy,
 } from "./updates";
@@ -21,8 +21,8 @@ describe("update API contracts", () => {
     await checkForUpdates();
     expect(fetchMock).toHaveBeenLastCalledWith("/api/update/check", expect.objectContaining({ method: "POST" }));
 
-    await installUpdateWhenIdle(true);
-    expect(JSON.parse(String(fetchMock.mock.calls[fetchMock.mock.calls.length - 1]?.[1]?.body))).toEqual({ retry_failed_target: true });
+    await installUpdate("now", true);
+    expect(JSON.parse(String(fetchMock.mock.calls[fetchMock.mock.calls.length - 1]?.[1]?.body))).toEqual({ retry_failed_target: true, mode: "now" });
 
     await cancelPendingUpdate();
     expect(fetchMock).toHaveBeenLastCalledWith("/api/update/pending", expect.objectContaining({ method: "DELETE" }));

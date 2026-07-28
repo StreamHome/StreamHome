@@ -6,10 +6,12 @@ Administrators can manage updates from **Admin center → Updates**. The page re
 
 1. Open the Updates panel and select **Check now**.
 2. Review the available commit and current activity blockers.
-3. Select **Install when idle** and reauthenticate.
-4. Leave StreamHome when convenient. The update begins only after the configured idle grace period and after playback, ingestion, downloads, media processing, backup/restore work, browser presence, and conflicting lifecycle work have stopped.
+3. Choose an installation mode and reauthenticate:
+   - **Update now** starts isolated preflight immediately and, after confirmation, bypasses browser presence, playback, the maintenance window, and the configured idle grace period. Viewers may be disconnected during the protected cutover.
+   - **Install when idle** waits for the configured idle grace period and for playback, ingestion, downloads, media processing, backup/restore work, browser presence, and conflicting lifecycle work to stop.
+4. For **Update now**, active ingestion, downloads, FFmpeg/media processing, backup/restore work, and unrelated API mutations must still finish or be cancelled. StreamHome reports these protected blockers instead of interrupting a potentially destructive write.
 
-The updater first builds and validates the candidate in an isolated temporary checkout. A failed preflight does not stop or modify the running installation.
+Both modes first build and validate the candidate in an isolated temporary checkout. A failed preflight does not stop or modify the running installation.
 
 ## Automatic updates
 
@@ -25,7 +27,7 @@ The update channel is the official `StreamHome/StreamHome` `main` branch. Update
 
 ## Cutover and recovery
 
-After preflight, the detached Linux update controller asks the running backend to re-confirm that StreamHome is idle. Only then does it:
+After preflight, the detached Linux update controller asks the running backend to reserve a protected cutover. Idle and automatic requests re-confirm full idle state. Immediate requests ignore viewers, playback, the maintenance window, and idle grace, but still refuse active transfers, media processing, backups/restores, or unrelated API mutations. Once approved, the controller:
 
 1. stop the owned StreamHome processes;
 2. create and integrity-check a recovery copy of `server/database.db`;

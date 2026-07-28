@@ -748,7 +748,7 @@ StreamHome does not currently ship native mobile applications. Use the responsiv
 
 ### Does the browser client update automatically?
 
-The browser client is rebuilt as part of the server update. Administrators can enable automatic updates under **Admin center → Updates**. StreamHome preflights the candidate while the current release is online and installs it only after the configured maintenance window and verified-idle conditions are satisfied.
+The browser client is rebuilt as part of the server update. Administrators can enable automatic updates under **Admin center → Updates**, queue **Install when idle**, or explicitly choose **Update now**. Immediate updates start preflight without waiting for browser presence, playback, a maintenance window, or the idle grace period, but they still refuse to interrupt active ingestion, downloads, media processing, backups/restores, or unrelated API mutations. Every mode retains restart health checks and automatic rollback.
 
 Browser caching behavior may temporarily retain an older interface until the application refreshes.
 

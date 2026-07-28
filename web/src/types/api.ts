@@ -421,6 +421,7 @@ export interface UpdateStatus {
   targetCommit: string;
   updateAvailable: boolean;
   automatic: boolean;
+  installMode: "automatic" | "when_idle" | "now";
   queuedAt: number | null;
   startedAt: number | null;
   finishedAt: number | null;

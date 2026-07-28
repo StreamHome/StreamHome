@@ -38,7 +38,7 @@ Update lifecycle endpoints require a recently reauthenticated administrator, exc
 - `GET /api/update/status`: current/target commits, lifecycle state, idle blockers, policy, and bounded log tail;
 - `POST /api/update/check`: fetch and validate the official update channel;
 - `PUT /api/update/policy`: configure automatic checks, idle grace, and the optional maintenance window;
-- `POST /api/update/install`: queue the validated target for installation after verified idle;
+- `POST /api/update/install`: request `mode: "when_idle"` or `mode: "now"`; both paths preflight and health-gate the exact target, while immediate mode bypasses only viewer/playback/idle delays and retains protected-write blockers;
 - `DELETE /api/update/pending`: cancel work that has not entered preflight;
 - `POST /api/update/presence`: record or clear visible authenticated browser presence.
 

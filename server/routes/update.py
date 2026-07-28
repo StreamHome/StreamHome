@@ -3,7 +3,7 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import re
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
@@ -22,10 +22,12 @@ from services.update import (
     idle_blockers,
     launch_queued_update_if_ready,
     maintenance_window_open,
+    protected_cutover_blockers,
     queue_update,
     read_update_log,
     read_update_state,
     update_lock_active,
+    update_handoff_blockers,
 )
 
 
@@ -43,6 +45,7 @@ class UpdatePolicyRequest(BaseModel):
 
 class UpdateInstallRequest(BaseModel):
     retry_failed_target: bool = False
+    mode: Literal["when_idle", "now"] = "when_idle"
 
 
 class BrowserPresenceRequest(BaseModel):
@@ -66,6 +69,7 @@ class UpdateStatusResponse(APIModel):
     target_commit: str
     update_available: bool
     automatic: bool
+    install_mode: Literal["automatic", "when_idle", "now"]
     queued_at: Optional[float] = None
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
@@ -95,6 +99,12 @@ def _policy_response() -> UpdatePolicyResponse:
 async def _status_response() -> UpdateStatusResponse:
     persisted = read_update_state()
     installed_commit = str(persisted.get("current_commit") or "") or await current_commit()
+    install_mode = str(persisted.get("install_mode") or "when_idle")
+    if install_mode not in {"automatic", "when_idle", "now"}:
+        install_mode = "when_idle"
+    active_immediate = install_mode == "now" and (
+        persisted.get("phase") == "queued" or persisted.get("phase") in BUSY_PHASES
+    )
     return UpdateStatusResponse(
         phase=str(persisted.get("phase") or "idle"),
         message=str(persisted.get("message") or ""),
@@ -102,6 +112,7 @@ async def _status_response() -> UpdateStatusResponse:
         target_commit=str(persisted.get("target_commit") or ""),
         update_available=bool(persisted.get("update_available")),
         automatic=bool(persisted.get("automatic")),
+        install_mode=install_mode,
         queued_at=persisted.get("queued_at"),
         started_at=persisted.get("started_at"),
         finished_at=persisted.get("finished_at"),
@@ -109,7 +120,7 @@ async def _status_response() -> UpdateStatusResponse:
         last_success_at=persisted.get("last_success_at"),
         failed_target=str(persisted.get("failed_target") or ""),
         error=str(persisted.get("error") or ""),
-        blockers=await idle_blockers(),
+        blockers=await protected_cutover_blockers() if active_immediate else await idle_blockers(),
         maintenance_window_open=maintenance_window_open(),
         update_in_progress=bool(persisted.get("phase") in BUSY_PHASES or update_lock_active()),
         log_tail=read_update_log(),
@@ -126,6 +137,7 @@ def _runtime_error(exc: RuntimeError) -> HTTPException:
         "update_not_queued": "There is no pending update to cancel.",
         "dirty_worktree": "Local source changes must be committed or moved before updating.",
         "untrusted_origin": "The installation does not use the official StreamHome repository.",
+        "invalid_install_mode": "Choose either immediate installation or installation when idle.",
     }
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
@@ -153,14 +165,20 @@ async def approve_update_handoff(
         raise HTTPException(status_code=403, detail={"code": "handoff_forbidden", "message": "Update handoff is local only."}) from exc
     if not peer.is_loopback or not state.UPDATE_HANDOFF_TOKEN or not hmac.compare_digest(token, state.UPDATE_HANDOFF_TOKEN):
         raise HTTPException(status_code=403, detail={"code": "handoff_forbidden", "message": "Update handoff authorization failed."})
-    blockers = await idle_blockers()
+    update_state = read_update_state()
+    install_mode = str(update_state.get("install_mode") or "when_idle")
+    blockers = await update_handoff_blockers(install_mode)
     if blockers:
         raise HTTPException(
             status_code=409,
             detail={"code": "server_busy", "message": blockers[0], "blockers": blockers},
         )
     state.MAINTENANCE_MODE = True
-    state.MAINTENANCE_REASON = "StreamHome is installing a validated update and will return automatically."
+    state.MAINTENANCE_REASON = (
+        "StreamHome is installing an administrator-requested update and will return automatically."
+        if install_mode == "now"
+        else "StreamHome is installing a validated update and will return automatically."
+    )
     state.UPDATE_HANDOFF_TOKEN = ""
     return {"approved": True}
 
@@ -264,6 +282,7 @@ async def install_update(
         queued = await queue_update(
             automatic=False,
             allow_failed_target=payload.retry_failed_target,
+            install_mode=payload.mode,
         )
         launched = await launch_queued_update_if_ready()
     except RuntimeError as exc:
@@ -279,6 +298,7 @@ async def install_update(
             "target": str(queued.get("target_commit") or "")[:12],
             "launched": launched,
             "retryFailedTarget": payload.retry_failed_target,
+            "installMode": payload.mode,
         },
     )
     await db.commit()

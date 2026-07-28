@@ -38,6 +38,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         state.LAST_HTTP_ACTIVITY_TIMESTAMP = 0
         state.ACTIVE_PROCESSES.clear()
         state.BROWSER_PRESENCE.clear()
+        update.queue_manager.active_tasks.clear()
         settings.SETUP_COMPLETE = True
 
     def tearDown(self) -> None:
@@ -125,6 +126,54 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         queued = await update.queue_update(automatic=False, allow_failed_target=True)
         self.assertEqual(queued["phase"], "queued")
         self.assertFalse(queued["automatic"])
+
+    async def test_immediate_mode_starts_preflight_without_idle_but_keeps_protected_handoff_blockers(self) -> None:
+        target = "d" * 40
+        update.write_update_state(
+            phase="update_available",
+            message="Ready",
+            current_commit="a" * 40,
+            target_commit=target,
+            update_available=True,
+        )
+        queued = await update.queue_update(automatic=False, install_mode="now")
+        self.assertEqual(queued["install_mode"], "now")
+        self.assertIn("Immediate update requested", queued["message"])
+
+        with patch.object(update, "idle_blockers", AsyncMock(return_value=["1 active browser session"])) as idle:
+            self.assertEqual(await update.queued_launch_blockers(queued), [])
+            idle.assert_not_awaited()
+
+        with patch.object(update, "protected_cutover_blockers", AsyncMock(return_value=["1 active ingestion or download task"])):
+            self.assertEqual(
+                await update.update_handoff_blockers("now"),
+                ["1 active ingestion or download task"],
+            )
+
+        with patch.object(update, "idle_blockers", AsyncMock(return_value=["1 active browser session"])):
+            self.assertEqual(
+                await update.update_handoff_blockers("when_idle"),
+                ["1 active browser session"],
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "invalid_install_mode"):
+            await update.queue_update(automatic=False, install_mode="force")
+
+    async def test_immediate_cutover_ignores_viewers_and_idle_grace_but_not_mutating_work(self) -> None:
+        settings.UPDATE_IDLE_MINUTES = 10
+        state.record_browser_presence("session-now", True)
+        state.LAST_HTTP_ACTIVITY_TIMESTAMP = time.time()
+        with patch.object(update, "is_database_idle", AsyncMock(return_value=False)):
+            self.assertTrue(any("browser session" in blocker for blocker in await update.idle_blockers()))
+        self.assertEqual(await update.protected_cutover_blockers(), [])
+
+        state.ACTIVE_HTTP_REQUESTS = 1
+        state.ACTIVE_PROCESSES["media-1"] = object()  # type: ignore[assignment]
+        update.queue_manager.active_tasks.add("download-1")
+        blockers = await update.protected_cutover_blockers()
+        self.assertTrue(any("active API request" in blocker for blocker in blockers))
+        self.assertTrue(any("active media process" in blocker for blocker in blockers))
+        self.assertTrue(any("ingestion or download" in blocker for blocker in blockers))
 
     async def test_update_check_reports_fetch_failure_instead_of_no_update(self) -> None:
         current = "a" * 40

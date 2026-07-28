@@ -4,16 +4,17 @@ import {
   cancelPendingUpdate,
   checkForUpdates,
   getUpdateStatus,
-  installUpdateWhenIdle,
+  installUpdate,
   updateUpdatePolicy,
 } from "../../../api/updates";
 import { Button } from "../../../components/ui/Button";
 import { GlassPane } from "../../../components/ui/GlassPane";
+import { Modal } from "../../../components/ui/Modal";
 import { MOTION_TIMINGS } from "../../../motion/motionSystem";
 import type { UpdatePolicy, UpdateStatus } from "../../../types/api";
 import { SudoModal } from "../SudoModal";
 
-type ProtectedAction = "save" | "install" | "retry" | "cancel" | null;
+type ProtectedAction = "save" | "install-now" | "install-idle" | "retry" | "cancel" | null;
 
 const ACTIVE_PHASES = new Set(["queued", "preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back"]);
 
@@ -33,6 +34,7 @@ export function UpdatesPanel() {
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [protectedAction, setProtectedAction] = useState<ProtectedAction>(null);
+  const [confirmImmediate, setConfirmImmediate] = useState(false);
 
   const applyStatus = useCallback((next: UpdateStatus) => {
     setStatus(next);
@@ -78,8 +80,9 @@ export function UpdatesPanel() {
   const performProtectedAction = async () => {
     if (!protectedAction || !policy) return;
     if (protectedAction === "save") await run(() => updateUpdatePolicy(policy), "Automatic update settings saved.");
-    if (protectedAction === "install") await run(() => installUpdateWhenIdle(false), "Update queued. Installation begins after all activity becomes idle.");
-    if (protectedAction === "retry") await run(() => installUpdateWhenIdle(true), "The failed target was explicitly queued for one retry.");
+    if (protectedAction === "install-now") await run(() => installUpdate("now"), "Immediate preflight started. StreamHome will restart after protected operations finish.");
+    if (protectedAction === "install-idle") await run(() => installUpdate("when_idle"), "Update queued. Installation begins after all activity becomes idle.");
+    if (protectedAction === "retry") await run(() => installUpdate("when_idle", true), "The failed target was explicitly queued for one retry.");
     if (protectedAction === "cancel") await run(cancelPendingUpdate, "Pending update cancelled.");
   };
 
@@ -87,7 +90,7 @@ export function UpdatesPanel() {
     <header className="admin-panel__header">
       <p>SERVER / RELEASE LIFECYCLE</p>
       <h1>Updates and maintenance</h1>
-      <span>Validate releases before downtime, install only after StreamHome is idle, and automatically recover the previous healthy version if startup fails.</span>
+      <span>Validate releases before downtime, choose an immediate or idle installation, and automatically recover the previous healthy version if startup fails.</span>
     </header>
   );
 
@@ -116,7 +119,7 @@ export function UpdatesPanel() {
         <GlassPane className="admin-card update-release-card" spotlight={false}>
           <div className="update-status-line">
             <span className="update-phase" data-phase={status.phase}>{status.phase.replace(/_/g, " ")}</span>
-            <span>{status.maintenanceWindowOpen ? "Maintenance window open" : "Outside maintenance window"}</span>
+            <span>{status.installMode === "now" && ACTIVE_PHASES.has(status.phase) ? "Immediate mode ignores the window" : status.maintenanceWindowOpen ? "Maintenance window open" : "Outside maintenance window"}</span>
           </div>
           <h2>{status.message}</h2>
           <dl className="update-commit-grid">
@@ -127,13 +130,14 @@ export function UpdatesPanel() {
           </dl>
           {status.blockers.length > 0 && (
             <div className="update-blockers">
-              <strong>Waiting for idle</strong>
+              <strong>{status.installMode === "now" && ACTIVE_PHASES.has(status.phase) ? "Protected activity must finish" : "Waiting for idle"}</strong>
               <ul>{status.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul>
             </div>
           )}
           <div className="update-actions">
             <Button type="button" variant="secondary" disabled={busy} onClick={() => void check()}>{working ? "Working…" : "Check now"}</Button>
-            {status.updateAvailable && status.phase !== "queued" && <Button type="button" disabled={busy} onClick={() => setProtectedAction("install")}>Install when idle</Button>}
+            {status.updateAvailable && status.phase !== "queued" && <Button type="button" disabled={busy} onClick={() => setConfirmImmediate(true)}>Update now</Button>}
+            {status.updateAvailable && status.phase !== "queued" && <Button type="button" variant="secondary" disabled={busy} onClick={() => setProtectedAction("install-idle")}>Install when idle</Button>}
             {failedTargetSuppressed && <Button type="button" disabled={busy} onClick={() => setProtectedAction("retry")}>Retry failed target</Button>}
             {status.phase === "queued" && <Button type="button" variant="ghost" disabled={working} onClick={() => setProtectedAction("cancel")}>Cancel pending update</Button>}
           </div>
@@ -187,13 +191,22 @@ export function UpdatesPanel() {
         <pre>{status.logTail.length ? status.logTail.join("\n") : "No update lifecycle has run yet."}</pre>
       </GlassPane>
 
+      <Modal isOpen={confirmImmediate} onClose={() => setConfirmImmediate(false)} className="update-now-confirmation">
+        <section aria-labelledby="update-now-title">
+          <header><p>IMMEDIATE MAINTENANCE</p><h2 id="update-now-title">Update StreamHome now?</h2><span>The isolated preflight starts immediately. When it passes, StreamHome will disconnect viewers and restart both services.</span></header>
+          <ul><li>Browser presence, playback, the maintenance window, and the idle grace period will not delay cutover.</li><li>Active ingestion, downloads, media processing, backups, and restores must finish or be cancelled first.</li><li>Failed startup or health checks still trigger automatic rollback.</li></ul>
+          <div className="update-now-confirmation__actions"><Button type="button" variant="ghost" onClick={() => setConfirmImmediate(false)}>Keep waiting</Button><Button type="button" onClick={() => { setConfirmImmediate(false); setProtectedAction("install-now"); }}>Continue to authorization</Button></div>
+        </section>
+      </Modal>
+
       <SudoModal
         isOpen={protectedAction !== null}
         actionLabel={
           protectedAction === "save" ? "save the update policy"
             : protectedAction === "cancel" ? "cancel the pending update"
               : protectedAction === "retry" ? "retry the failed update"
-                : "queue the update"
+                : protectedAction === "install-now" ? "install the update now"
+                  : "queue the update for idle time"
         }
         onCancel={() => setProtectedAction(null)}
         onSuccess={performProtectedAction}
