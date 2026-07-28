@@ -112,6 +112,12 @@ run_shell_checks() {
     else
         printf '[shell] ShellCheck is not installed; Bash syntax validation passed.\n'
     fi
+
+    CURRENT_STEP="generated-artifact tracking validation"
+    local tracked_build_info
+    tracked_build_info="$(git -C "$ROOT_DIR" ls-files 'web/*.tsbuildinfo')"
+    [[ -z "$tracked_build_info" ]] \
+        || fail "Generated TypeScript build metadata must not be tracked: $tracked_build_info"
 }
 
 run_server_checks() {

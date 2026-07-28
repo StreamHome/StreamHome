@@ -153,6 +153,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("--syntax-only", test_sh)
         self.assertIn("Port 8000 is active", test_sh)
         self.assertIn("shellcheck -x", test_sh)
+        self.assertIn("Generated TypeScript build metadata must not be tracked", test_sh)
 
         self.assertIn("./venv/bin/python server/cli.py", cli_py)
         self.assertNotIn("start.bat", cli_py)
