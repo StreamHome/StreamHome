@@ -53,6 +53,7 @@ def create_fixture_repository(directory: Path) -> None:
             "printf '%s\\n' \"$@\" > .setup-args\n"
         ),
         "install.sh": "#!/usr/bin/env bash\nexit 0\n",
+        "restart.sh": "#!/usr/bin/env bash\nexit 0\n",
         "start.sh": "#!/usr/bin/env bash\nexit 0\n",
         "stop.sh": "#!/usr/bin/env bash\nexit 0\n",
         "test.sh": "#!/usr/bin/env bash\nexit 0\n",
@@ -66,6 +67,7 @@ def create_fixture_repository(directory: Path) -> None:
             "--chmod=+x",
             "setup.sh",
             "install.sh",
+            "restart.sh",
             "start.sh",
             "stop.sh",
             "test.sh",
@@ -101,9 +103,11 @@ class SetupScriptContracts(unittest.TestCase):
     def test_linux_bootstrap_setup_and_lifecycle_contracts(self) -> None:
         install_sh = (ROOT / "install.sh").read_text(encoding="utf-8")
         setup_sh = (ROOT / "setup.sh").read_text(encoding="utf-8")
+        restart_sh = (ROOT / "restart.sh").read_text(encoding="utf-8")
         start_sh = (ROOT / "start.sh").read_text(encoding="utf-8")
         stop_sh = (ROOT / "stop.sh").read_text(encoding="utf-8")
         test_sh = (ROOT / "test.sh").read_text(encoding="utf-8")
+        setup_py = (ROOT / "server" / "routes" / "setup.py").read_text(encoding="utf-8")
         cli_py = (ROOT / "server" / "cli.py").read_text(encoding="utf-8")
 
         self.assertIn(REPOSITORY_URL, install_sh)
@@ -133,6 +137,12 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("do not repeat setup", setup_sh)
         self.assertIn('"$ROOT_DIR/stop.sh" --quiet', setup_sh)
 
+        self.assertIn('nohup bash "$SCRIPT_PATH" --execute', restart_sh)
+        self.assertIn('exec bash "$ROOT_DIR/start.sh"', restart_sh)
+        self.assertIn("restart.log", restart_sh)
+        self.assertIn('"restart.sh"', setup_py)
+        self.assertIn("handoff.wait", setup_py)
+
         self.assertIn('"$ROOT_DIR/stop.sh" --startup --lock-held', start_sh)
         self.assertIn("detect_server_ip", start_sh)
         self.assertIn("STREAMHOME_PUBLIC_URL_EXPLICIT", start_sh)
@@ -156,6 +166,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("shellcheck -x", test_sh)
         self.assertIn("Generated runtime or build metadata must not be tracked", test_sh)
         self.assertIn("server/system_profile.json", test_sh)
+        self.assertIn('"$ROOT_DIR/restart.sh"', test_sh)
 
         self.assertIn("./venv/bin/python server/cli.py", cli_py)
         self.assertNotIn("start.bat", cli_py)
@@ -246,6 +257,46 @@ class SetupScriptContracts(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("unbound variable", (result.stdout + result.stderr).lower())
             self.assertFalse((fixture / ".run" / "lifecycle.lock").exists())
+
+    @unittest.skipIf(os.name == "nt", "Detached restart parentage requires native Linux process semantics")
+    def test_linux_restart_handoff_is_reparented_before_start(self) -> None:
+        bash = bash_command()
+        if not bash:
+            self.skipTest("Bash is not installed")
+
+        with tempfile.TemporaryDirectory(dir=ROOT / "temp") as temporary:
+            fixture = Path(temporary)
+            shutil.copy2(ROOT / "restart.sh", fixture / "restart.sh")
+            start_script = fixture / "start.sh"
+            start_script.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$PPID\" > start.ppid\n"
+                "printf 'restart reached start.sh\\n'\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            environment = os.environ.copy()
+            environment["STREAMHOME_RESTART_DELAY_SECONDS"] = "0.5"
+            handoff = subprocess.Popen(
+                [bash, str(fixture / "restart.sh")],
+                cwd=fixture,
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            handoff_pid = handoff.pid
+            self.assertEqual(handoff.wait(timeout=5), 0)
+
+            marker = fixture / "start.ppid"
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not marker.exists():
+                time.sleep(0.05)
+            self.assertTrue(marker.exists(), (fixture / "restart.log").read_text(encoding="utf-8"))
+            self.assertNotEqual(int(marker.read_text(encoding="utf-8").strip()), handoff_pid)
+            self.assertIn(
+                "restart reached start.sh",
+                (fixture / "restart.log").read_text(encoding="utf-8"),
+            )
 
     @unittest.skipIf(os.name == "nt", "Linux listener ownership uses /proc or lsof")
     def test_linux_stop_recovers_owned_orphan_and_preserves_unrelated_listener(self) -> None:

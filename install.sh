@@ -214,6 +214,7 @@ main() {
     log "Granting executable permissions"
     chmod +x \
         "$INSTALL_DIR/install.sh" \
+        "$INSTALL_DIR/restart.sh" \
         "$INSTALL_DIR/setup.sh" \
         "$INSTALL_DIR/start.sh" \
         "$INSTALL_DIR/stop.sh" \

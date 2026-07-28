@@ -99,6 +99,7 @@ assert_runtime_stopped() {
 run_shell_checks() {
     local -a scripts=(
         "$ROOT_DIR/install.sh"
+        "$ROOT_DIR/restart.sh"
         "$ROOT_DIR/setup.sh"
         "$ROOT_DIR/start.sh"
         "$ROOT_DIR/stop.sh"

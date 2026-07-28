@@ -837,9 +837,26 @@ async def activate_drive(job_id: str, request: Request, db: AsyncSession = Depen
 
 async def _restart_after_response() -> None:
     await asyncio.sleep(1.25)
-    script = Path(settings.BASE_DIR) / "start.sh"
+    script = Path(settings.BASE_DIR) / "restart.sh"
     if os.name != "nt" and script.exists():
-        subprocess.Popen(["bash", str(script)], cwd=settings.BASE_DIR, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            handoff = subprocess.Popen(
+                ["bash", str(script)],
+                cwd=settings.BASE_DIR,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            returncode = await asyncio.to_thread(handoff.wait, 5)
+            if returncode != 0:
+                logger.error(f"[Setup] Detached lifecycle restart handoff exited with status {returncode}.")
+        except subprocess.TimeoutExpired:
+            handoff.kill()
+            await asyncio.to_thread(handoff.wait)
+            logger.error("[Setup] Detached lifecycle restart handoff did not exit within five seconds.")
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.error(f"[Setup] Could not queue the detached lifecycle restart: {exc}")
 
 
 @router.post("/complete", dependencies=[Depends(require_setup_session)])
