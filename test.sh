@@ -114,10 +114,10 @@ run_shell_checks() {
     fi
 
     CURRENT_STEP="generated-artifact tracking validation"
-    local tracked_build_info
-    tracked_build_info="$(git -C "$ROOT_DIR" ls-files 'web/*.tsbuildinfo')"
-    [[ -z "$tracked_build_info" ]] \
-        || fail "Generated TypeScript build metadata must not be tracked: $tracked_build_info"
+    local tracked_generated
+    tracked_generated="$(git -C "$ROOT_DIR" ls-files 'web/*.tsbuildinfo' 'server/system_profile.json')"
+    [[ -z "$tracked_generated" ]] \
+        || fail "Generated runtime or build metadata must not be tracked: $tracked_generated"
 }
 
 run_server_checks() {
