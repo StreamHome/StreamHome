@@ -132,7 +132,11 @@ prepare_existing_checkout() {
     [[ -z "$dirty" ]] || fail "The existing StreamHome checkout has local changes. Commit or move them before updating."
 
     log "Updating the existing StreamHome checkout"
-    git -C "$INSTALL_DIR" fetch --depth 1 origin "$INSTALL_REF"
+    if [[ "$(git -C "$INSTALL_DIR" rev-parse --is-shallow-repository)" == "true" ]]; then
+        git -C "$INSTALL_DIR" fetch --unshallow origin "$INSTALL_REF"
+    else
+        git -C "$INSTALL_DIR" fetch origin "$INSTALL_REF"
+    fi
     fetched_commit="$(git -C "$INSTALL_DIR" rev-parse 'FETCH_HEAD^{commit}')"
     if git -C "$INSTALL_DIR" show-ref --verify --quiet "refs/heads/$INSTALL_REF"; then
         git -C "$INSTALL_DIR" checkout "$INSTALL_REF"

@@ -188,6 +188,11 @@ class SetupScriptContracts(unittest.TestCase):
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             self.assertEqual((install_directory / ".setup-ran").read_text(encoding="utf-8"), "ready")
 
+            (remote / "release.txt").write_text("next release\n", encoding="utf-8")
+            git(["add", "release.txt"], cwd=remote)
+            git(["commit", "-m", "next fixture release"], cwd=remote)
+            expected_commit = run(["git", "rev-parse", "HEAD"], cwd=remote).stdout.strip()
+
             (install_directory / ".setup-ran").unlink()
             forwarded = run(
                 [bash, "-lc", f"'{bash_path(installer)}' --no-start --skip-system-packages"],
@@ -199,6 +204,9 @@ class SetupScriptContracts(unittest.TestCase):
                 (install_directory / ".setup-args").read_text(encoding="utf-8").splitlines(),
                 ["--no-start", "--skip-system-packages"],
             )
+            installed_commit = run(["git", "rev-parse", "HEAD"], cwd=install_directory).stdout.strip()
+            self.assertEqual(installed_commit, expected_commit)
+            self.assertEqual((install_directory / "release.txt").read_text(encoding="utf-8"), "next release\n")
 
             (install_directory / ".setup-ran").unlink()
             local_change = install_directory / "local-change.txt"
