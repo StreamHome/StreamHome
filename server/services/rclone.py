@@ -81,6 +81,13 @@ class RcloneService:
         version = self.version()
         return ".".join(map(str, version)) if version else "unknown"
 
+    @staticmethod
+    def password_reader(platform_name: Optional[str] = None) -> str:
+        selected_platform = platform_name or os.name
+        if selected_platform == "nt":
+            return "cmd /d /c echo %RCLONE_CONFIG_PASS%"
+        return "printenv RCLONE_CONFIG_PASS"
+
     def command(self, *arguments: str, config_path: Optional[Path] = None, password_command: bool = False) -> list[str]:
         executable = self.executable()
         if not executable:
@@ -88,8 +95,7 @@ class RcloneService:
         selected_config = Path(config_path or self.config_path).resolve()
         command = [executable, "--config", str(selected_config)]
         if password_command:
-            reader = "cmd /d /c echo %RCLONE_CONFIG_PASS%" if os.name == "nt" else "sh -c 'printf %s \"$RCLONE_CONFIG_PASS\"'"
-            command.extend(["--password-command", reader])
+            command.extend(["--password-command", self.password_reader()])
         return [*command, *map(str, arguments)]
 
     @staticmethod

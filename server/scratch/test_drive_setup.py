@@ -88,6 +88,32 @@ class DriveSetupContractTests(unittest.TestCase):
                 command = service.command("about", "streamhome-drive:")
         self.assertEqual(command[:3], ["rclone", "--config", str(service.config_path.resolve())])
 
+    def test_linux_password_command_reads_the_environment_without_shell_quoting(self):
+        service = RcloneService()
+        linux_reader = service.password_reader("posix")
+        with patch.object(service, "executable", return_value="rclone"), patch.object(
+            service,
+            "password_reader",
+            return_value=linux_reader,
+        ) as password_reader:
+            command = service.command("config", "encryption", "set", password_command=True)
+        password_reader.assert_called_once_with()
+        self.assertEqual(
+            command,
+            [
+                "rclone",
+                "--config",
+                str(service.config_path.resolve()),
+                "--password-command",
+                "printenv RCLONE_CONFIG_PASS",
+                "config",
+                "encryption",
+                "set",
+            ],
+        )
+        self.assertNotIn("sh -c", linux_reader)
+        self.assertNotIn("'", linux_reader)
+
     def test_drive_config_contains_only_the_selected_remote(self):
         service = RcloneService()
         with tempfile.TemporaryDirectory() as directory:
