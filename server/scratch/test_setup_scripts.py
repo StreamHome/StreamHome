@@ -139,6 +139,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("-m uvicorn main:app --host 127.0.0.1 --port 8000", start_sh)
         self.assertNotIn('"$BACKEND_PYTHON" main.py', start_sh)
         self.assertIn("wait_for_services", start_sh)
+        self.assertIn("wait_for_port_release", start_sh)
         self.assertIn("lifecycle.lock", start_sh)
         self.assertIn("Setup URL: %s/setup", start_sh)
 

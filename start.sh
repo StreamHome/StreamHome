@@ -194,6 +194,15 @@ finally:
 PY
 }
 
+wait_for_port_release() {
+    local port="$1"
+    for _ in {1..50}; do
+        port_available "$port" && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
 write_pid_record() {
     local name="$1" pid="$2" temporary
     temporary="$(mktemp "$RUN_DIR/.${name}.pid.XXXXXX")"
@@ -337,8 +346,8 @@ main() {
     acquire_lifecycle_lock
     "$ROOT_DIR/stop.sh" --startup --lock-held
 
-    port_available 8000 || fail "API port 8000 is still in use by an unrelated or uninspectable service. StreamHome did not stop it."
-    port_available "$WEB_PORT" || fail "Web port $WEB_PORT is still in use by an unrelated or uninspectable service. StreamHome did not stop it."
+    wait_for_port_release 8000 || fail "API port 8000 is still in use by an unrelated or uninspectable service. StreamHome did not stop it."
+    wait_for_port_release "$WEB_PORT" || fail "Web port $WEB_PORT is still in use by an unrelated or uninspectable service. StreamHome did not stop it."
 
     if [[ "$SETUP_ACTIVE" == true ]]; then
         STREAMHOME_SETUP_CODE="$("$BACKEND_PYTHON" -c 'import secrets; print(secrets.token_urlsafe(18))')"
