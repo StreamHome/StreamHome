@@ -52,10 +52,14 @@ describe("dedicated mobile player presentation", () => {
   });
 
   it("keeps player actions theme-aware and gives desktop blank-space clicks standard media behavior", () => {
+    const interactiveShortcutGuard = playerPage.indexOf("if (isInteractiveTarget(event.target)) return;");
+    const fullscreenShortcut = playerPage.indexOf('if (event.key.toLowerCase() === "f")');
+
     expect(playerPage).toContain("onClick={mobilePlayer ? undefined : handleDesktopSurfaceClick}");
     expect(playerPage).toContain("onDoubleClick={mobilePlayer ? undefined : handleDesktopSurfaceDoubleClick}");
     expect(playerPage).toContain("desktopClickTimerRef.current = window.setTimeout");
-    expect(playerPage).toContain('event.key.toLowerCase() === "f"');
+    expect(interactiveShortcutGuard).toBeGreaterThan(-1);
+    expect(fullscreenShortcut).toBeGreaterThan(interactiveShortcutGuard);
     expect(playerPage).toContain("toggleFullscreen();");
     expect(playerPage).toContain("data-theme={theme}");
     expect(playerPage).toContain("data-player-theme={definition.playerVariant}");

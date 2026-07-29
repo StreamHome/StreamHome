@@ -1243,9 +1243,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [duration, phase]);
 
   useEffect(() => {
+    const container = containerRef.current;
     const video = videoRef.current;
     const updateFullscreenState = () => {
-      const active = isPlayerFullscreen(video);
+      const active = isPlayerFullscreen(container, video);
       setFullscreenActive(active);
       if (mobilePlayer) {
         if (active) void lockPlayerLandscape();
@@ -1255,15 +1256,24 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }
       }
     };
+    const reportFullscreenError = () => {
+      setFullscreenActive(isPlayerFullscreen(container, video));
+      setFullscreenError("The browser rejected the fullscreen request. Check the fullscreen permission for this site.");
+      setShowControls(true);
+    };
 
     updateFullscreenState();
     document.addEventListener("fullscreenchange", updateFullscreenState);
+    document.addEventListener("fullscreenerror", reportFullscreenError);
     document.addEventListener("webkitfullscreenchange", updateFullscreenState);
+    document.addEventListener("webkitfullscreenerror", reportFullscreenError);
     video?.addEventListener("webkitbeginfullscreen", updateFullscreenState);
     video?.addEventListener("webkitendfullscreen", updateFullscreenState);
     return () => {
       document.removeEventListener("fullscreenchange", updateFullscreenState);
+      document.removeEventListener("fullscreenerror", reportFullscreenError);
       document.removeEventListener("webkitfullscreenchange", updateFullscreenState);
+      document.removeEventListener("webkitfullscreenerror", reportFullscreenError);
       video?.removeEventListener("webkitbeginfullscreen", updateFullscreenState);
       video?.removeEventListener("webkitendfullscreen", updateFullscreenState);
     };
@@ -1276,13 +1286,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
     setFullscreenError("");
     void togglePlayerFullscreen(container, video, document, { allowVideoFallback: true })
-      .then(() => {
-        setFullscreenActive(isPlayerFullscreen(video));
-        if (mobilePlayer) void lockPlayerLandscape();
+      .then((result) => {
+        const active = result === "entered";
+        setFullscreenActive(active);
+        setFullscreenError("");
+        if (mobilePlayer && active) void lockPlayerLandscape();
+        if (mobilePlayer && !active) unlockPlayerLandscape();
         revealControls();
       })
       .catch((error: unknown) => {
-        setFullscreenActive(isPlayerFullscreen(video));
+        setFullscreenActive(isPlayerFullscreen(container, video));
         setFullscreenError(error instanceof Error
           ? error.message
           : "Fullscreen could not be opened. Check this browser's fullscreen permission.");
@@ -1303,8 +1316,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (mobileFullscreenAttemptedAtRef.current > 0 && now - mobileFullscreenAttemptedAtRef.current < 2_000) return;
     mobileFullscreenAttemptedAtRef.current = now;
     void togglePlayerFullscreen(container, video, document, { allowVideoFallback: true })
-      .then(async () => {
-        const active = isPlayerFullscreen(video);
+      .then(async (result) => {
+        const active = result === "entered";
         setFullscreenActive(active);
         if (active) await lockPlayerLandscape();
       })
@@ -1402,13 +1415,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
+      if (isInteractiveTarget(event.target)) return;
       if (event.key.toLowerCase() === "f") {
         event.preventDefault();
         toggleFullscreen();
         revealControls();
         return;
       }
-      if (isInteractiveTarget(event.target)) return;
       if (event.key === " ") {
         event.preventDefault();
         videoRef.current?.paused ? safePlay() : videoRef.current?.pause();
