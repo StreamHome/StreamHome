@@ -2,6 +2,7 @@ import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'path';
+import { createReadStream } from 'node:fs';
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, path.resolve(__dirname, '..'), '');
@@ -12,7 +13,22 @@ export default defineConfig(({ mode }) => {
       'import.meta.env.VITE_APP_VERSION': JSON.stringify(process.env.npm_package_version ?? '0.0.0'),
       'import.meta.env.VITE_BUILD_ID': JSON.stringify(env.VITE_BUILD_ID || process.env.VITE_BUILD_ID || 'dev'),
     },
-    plugins: [react(), tailwindcss()],
+    plugins: [
+      react(),
+      tailwindcss(),
+      {
+        name: 'streamhome-player-visual-fixture',
+        apply: 'serve',
+        configureServer(server) {
+          server.middlewares.use('/__player-visual-fixture.mp4', (_request, response) => {
+            response.statusCode = 200;
+            response.setHeader('Content-Type', 'video/mp4');
+            response.setHeader('Cache-Control', 'no-store');
+            createReadStream(path.resolve(__dirname, 'test-assets/player-visual-fixture.mp4')).pipe(response);
+          });
+        },
+      },
+    ],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, './src'),

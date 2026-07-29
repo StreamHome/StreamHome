@@ -4,8 +4,17 @@ import App from './App';
 import { MotionProvider } from './motion/motionSystem';
 import './index.css';
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    <MotionProvider><App /></MotionProvider>
-  </React.StrictMode>
-);
+async function renderApplication() {
+  const visualFixture = import.meta.env.DEV && window.location.pathname === "/__player-visual-fixture";
+  const content = visualFixture
+    ? React.createElement((await import("./pages/player/PlayerVisualFixture")).PlayerVisualFixture)
+    : <App />;
+
+  ReactDOM.createRoot(document.getElementById('root')!).render(
+    <React.StrictMode>
+      <MotionProvider>{content}</MotionProvider>
+    </React.StrictMode>
+  );
+}
+
+void renderApplication();

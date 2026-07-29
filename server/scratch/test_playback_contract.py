@@ -172,6 +172,7 @@ class PlaybackContractRegression(unittest.TestCase):
         self.assertIn(payload["sourceMetadata"]["sourceFormat"], {"MP4", "HLS preview"})
         if payload["sourceMetadata"]["sourceFormat"] == "MP4":
             self.assertEqual(payload["renditions"][0]["label"], "1080p")
+            self.assertEqual(payload["sourceMetadata"]["duration"], 120)
         self.assertIn(payload["renditions"][0]["status"], {"streamable", "ready"})
         return payload
 

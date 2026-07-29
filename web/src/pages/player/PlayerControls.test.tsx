@@ -89,4 +89,12 @@ describe("player control menu", () => {
     fireEvent.click(pending);
     expect(onSelect).toHaveBeenCalledWith(144);
   });
+
+  it("does not reopen the player chrome when a closed menu unmounts", () => {
+    const onOpenChange = vi.fn();
+    const view = render(<QualityFixture onOpenChange={onOpenChange} />);
+
+    view.unmount();
+    expect(onOpenChange).not.toHaveBeenCalled();
+  });
 });

@@ -132,8 +132,6 @@ export function PlayerControlMenu<T extends string | number>({
     return () => document.removeEventListener("pointerdown", handlePointerDown);
   }, [open]);
 
-  useEffect(() => () => onOpenChange?.(false), [onOpenChange]);
-
   const openAndFocus = (index: number) => {
     updateOpen(true);
     window.requestAnimationFrame(() => focusOption(index));

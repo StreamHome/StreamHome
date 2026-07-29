@@ -26,7 +26,7 @@ from routes.auth import get_current_user
 from services.logger import logger
 from services.languages import language_label, normalize_language_tag
 from services.media_source import MediaSourceError, ResolvedMediaSource, playback_source_fingerprint, resolve_media_source
-from services.media_probe import probe_cloud_external_audio, probe_completed_media
+from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
 from services.playback_prep import AudioRendition, PlaybackPreparationError, PlaybackPrepService, VideoRendition, playback_prep_service
 from services.ingest_preview import IngestPreviewError, ingest_preview_service
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
@@ -331,10 +331,16 @@ async def synchronize_source_fingerprint(db: AsyncSession, media_obj: Any, sourc
     await db.commit()
 
 
-async def ensure_source_metadata(db: AsyncSession, media_obj: Any, source: ResolvedMediaSource) -> None:
+async def ensure_source_metadata(
+    db: AsyncSession,
+    media_obj: Any,
+    source: ResolvedMediaSource,
+    *,
+    refresh_sidecars: bool = False,
+) -> None:
     if not source.local_exists:
         last_probe = _cloud_audio_probe_times.get(str(media_obj.id), 0)
-        if source.cloud_path and time.monotonic() - last_probe >= CLOUD_AUDIO_PROBE_TTL_SECONDS:
+        if source.cloud_path and (refresh_sidecars or time.monotonic() - last_probe >= CLOUD_AUDIO_PROBE_TTL_SECONDS):
             _cloud_audio_probe_times[str(media_obj.id)] = time.monotonic()
             audio_metadata = await probe_cloud_external_audio(source.cloud_path, list(media_obj.audio_metadata or []))
             if audio_metadata != list(media_obj.audio_metadata or []):
@@ -342,6 +348,11 @@ async def ensure_source_metadata(db: AsyncSession, media_obj: Any, source: Resol
                 db.add(media_obj)
                 await db.commit()
         return
+    refreshed_audio = merge_local_external_audio(str(source.local_path), list(media_obj.audio_metadata or []))
+    if refreshed_audio != list(media_obj.audio_metadata or []):
+        media_obj.audio_metadata = refreshed_audio
+        db.add(media_obj)
+        await db.commit()
     metadata_missing = not media_obj.probed_duration or not media_obj.codec or not media_obj.width or not media_obj.height
     source_replaced = media_obj.source_fingerprint != playback_source_fingerprint(source, media_obj.audio_metadata or [])
     if not metadata_missing and not source_replaced:
@@ -373,6 +384,35 @@ async def next_playable_episode(db: AsyncSession, movie_id: str, current_id: str
     return None
 
 
+def catalog_duration_seconds(value: Any) -> float:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return 0.0
+    colon_match = re.fullmatch(r"(\d{1,3}):(\d{1,2})(?::(\d{1,2}))?", raw)
+    if colon_match:
+        first, second, third = (int(part) if part is not None else None for part in colon_match.groups())
+        if third is not None:
+            return float(first * 3600 + second * 60 + third)
+        return float(first * 3600 + second * 60)
+    hours = re.search(r"(\d+(?:\.\d+)?)\s*h", raw)
+    minutes = re.search(r"(\d+(?:\.\d+)?)\s*m", raw)
+    seconds = re.search(r"(\d+(?:\.\d+)?)\s*s", raw)
+    total = (float(hours.group(1)) * 3600 if hours else 0.0)
+    total += float(minutes.group(1)) * 60 if minutes else 0.0
+    total += float(seconds.group(1)) if seconds else 0.0
+    if total > 0:
+        return total
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.0
+
+
+def media_duration_seconds(media_obj: Any) -> float:
+    probed = max(0.0, float(getattr(media_obj, "probed_duration", 0) or 0))
+    return probed if probed > 0 else catalog_duration_seconds(getattr(media_obj, "duration", ""))
+
+
 def resume_position(session_rec: Optional[PlaybackSession], duration: float) -> float:
     if not session_rec or session_rec.is_finished or duration <= 0:
         return 0
@@ -384,7 +424,7 @@ async def run_resume_position(db: AsyncSession, run: PlaybackRun, media_obj: Any
     filters = [PlaybackSession.profile_id == run.profile_id, PlaybackSession.movie_id == run.movie_id]
     filters.append(PlaybackSession.episode_id == run.episode_id if run.episode_id else PlaybackSession.episode_id.is_(None))
     session_rec = (await db.exec(select(PlaybackSession).where(*filters))).first()
-    return resume_position(session_rec, float(media_obj.probed_duration or 0))
+    return resume_position(session_rec, media_duration_seconds(media_obj))
 
 
 def source_metadata(media_obj: Any) -> PlaybackSourceMetadata:
@@ -397,7 +437,7 @@ def source_metadata(media_obj: Any) -> PlaybackSourceMetadata:
     else:
         source_format = container.split(",", 1)[0].upper() if container else "Server media"
     return PlaybackSourceMetadata(
-        duration=max(0.0, float(media_obj.probed_duration or 0)),
+        duration=media_duration_seconds(media_obj),
         container=container,
         codec=str(media_obj.codec or ""),
         width=max(0, int(media_obj.width or 0)),
@@ -583,7 +623,7 @@ async def create_playback_run(
     else:
         try:
             source = await require_available_source(media_obj)
-            await ensure_source_metadata(db, media_obj, source)
+            await ensure_source_metadata(db, media_obj, source, refresh_sidecars=True)
             await synchronize_source_fingerprint(db, media_obj, source)
         except HTTPException as source_error:
             detail = source_error.detail if isinstance(source_error.detail, dict) else {}
@@ -604,7 +644,7 @@ async def create_playback_run(
     filters = [PlaybackSession.profile_id == req.profile_id, PlaybackSession.movie_id == req.movie_id]
     filters.append(PlaybackSession.episode_id == req.episode_id if req.episode_id else PlaybackSession.episode_id.is_(None))
     session_rec = (await db.exec(select(PlaybackSession).where(*filters))).first()
-    position = resume_position(session_rec, float(media_obj.probed_duration or 0))
+    position = resume_position(session_rec, media_duration_seconds(media_obj))
     now = time.time()
     run = PlaybackRun(
         id=str(uuid.uuid4()),
@@ -713,7 +753,7 @@ async def update_playback_progress(
         )
 
     _, media_obj = await resolve_run_media(db, run.movie_id, run.episode_id)
-    duration = max(1.0, float(media_obj.probed_duration or 0) or 3600.0)
+    duration = max(1.0, media_duration_seconds(media_obj) or 3600.0)
     now = time.time()
     elapsed_bound = max(0.0, min(120.0, now - run.last_progress_at + 2.0))
     accepted_watched = min(float(req.duration_watched), elapsed_bound)

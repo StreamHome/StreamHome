@@ -11,12 +11,12 @@ describe("dedicated mobile player presentation", () => {
     expect(playerPage).toContain('className="mobile-player-topbar"');
     expect(playerPage).toContain('className="mobile-player-transport"');
     expect(playerPage).toContain('className="mobile-player-bottom"');
-    expect(playerPage).toContain('!mobilePlayer && (showControls || phase !== "playing")');
+    expect(playerPage).toContain('!mobilePlayer && (showControls || phase === "paused")');
   });
 
   it("omits phone volume controls and gates subtitles in both presentations", () => {
     const mobileStart = playerPage.indexOf('className="mobile-player-chrome"');
-    const desktopStart = playerPage.indexOf('!mobilePlayer && (showControls || phase !== "playing")');
+    const desktopStart = playerPage.indexOf('!mobilePlayer && (showControls || phase === "paused")');
     const mobilePresentation = playerPage.slice(mobileStart, desktopStart);
 
     expect(mobilePresentation).not.toContain('className="player-volume"');
@@ -61,6 +61,8 @@ describe("dedicated mobile player presentation", () => {
     expect(playerPage).toContain("data-player-theme={definition.playerVariant}");
     expect(playerStyles).toContain("var(--player-accent)");
     expect(playerPage).toContain("sourceMetadata.sourceFormat");
+    expect(playerPage).not.toContain("disabled={!fullscreenAvailable}");
+    expect((playerPage.match(/availableAudioTracks\.length > 0/g) ?? [])).toHaveLength(2);
   });
 
   it("holds the last decoded frame and keeps status polling away from transport credentials", () => {

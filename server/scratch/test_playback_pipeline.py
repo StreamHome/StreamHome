@@ -12,9 +12,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from config import settings
-from routes.playback import parse_byte_range, rewrite_hls_playlist, subtitle_contract
+from routes.playback import catalog_duration_seconds, media_duration_seconds, parse_byte_range, rewrite_hls_playlist, subtitle_contract
 from services.languages import normalize_language_tag
-from services.media_probe import probe_cloud_external_audio, probe_completed_media
+from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
 from services.media_source import MediaSourceError, ResolvedMediaSource, canonicalize_catalog_path, is_safe_presentation_asset, resolve_media_source
 from services.playback_prep import PlaybackMediaSnapshot, PlaybackPrepService, playback_prep_service
 from services.rclone import rclone_service
@@ -203,6 +203,9 @@ class PlaybackPipelineRegression(unittest.TestCase):
         self.assertEqual([item["language"] for item in probe["audio_metadata"]], ["en", "tr"])
         self.assertTrue(all(item.get("source") == "external" for item in probe["audio_metadata"]))
         self.assertEqual([item.get("fileName") for item in probe["audio_metadata"]], ["eng.mp3", "tur.mp3"])
+        refreshed = merge_local_external_audio(str(sidecar_video), [{"index": 0, "language": "en", "default": True}])
+        self.assertEqual([item["language"] for item in refreshed], ["en", "tr"])
+        self.assertTrue(all(item.get("source") == "external" for item in refreshed))
         with (audio_directory / "tur.mp3").open("ab") as handle:
             handle.write(b"\0")
         second_source = asyncio.run(resolve_media_source(catalog_path, check_cloud=False))
@@ -238,6 +241,13 @@ class PlaybackPipelineRegression(unittest.TestCase):
         tracks = subtitle_contract(media)
         self.assertEqual([item["id"] for item in tracks], ["eng", "spa", "fr", "tr", "zh-hant-tw"])
         self.assertEqual([item["language"] for item in tracks], ["en", "es", "fr", "tr", "zh-hant-tw"])
+
+    def test_catalog_runtime_is_a_stable_fallback_when_probe_duration_is_missing(self) -> None:
+        self.assertEqual(catalog_duration_seconds("1h 44m"), 6240)
+        self.assertEqual(catalog_duration_seconds("104m"), 6240)
+        self.assertEqual(catalog_duration_seconds("1:44"), 6240)
+        self.assertEqual(media_duration_seconds(SimpleNamespace(probed_duration=None, duration="1h 44m")), 6240)
+        self.assertEqual(media_duration_seconds(SimpleNamespace(probed_duration=6301.5, duration="1h 44m")), 6301.5)
 
     def test_cloud_fingerprint_changes_when_remote_identity_changes(self) -> None:
         old_engine = settings.STORAGE_ENGINE

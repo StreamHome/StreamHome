@@ -3,6 +3,8 @@ import type { Episode, PlaybackRunResponse } from "../../types/api";
 import {
   advancingPlaybackDelta,
   applySubtitleTrackSelection,
+  authoritativePlaybackDuration,
+  catalogDurationSeconds,
   clampPlaybackTime,
   mergePlaybackRunMetadata,
   nextPlayableEpisode,
@@ -94,9 +96,20 @@ describe("player interaction contracts", () => {
   it("auto-hides only during uninterrupted playback", () => {
     expect(shouldAutoHidePlayerControls("playing", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("paused", false, false)).toBe(false);
-    expect(shouldAutoHidePlayerControls("buffering", false, false)).toBe(false);
+    expect(shouldAutoHidePlayerControls("buffering", false, false)).toBe(true);
+    expect(shouldAutoHidePlayerControls("recovering", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("playing", true, false)).toBe(false);
     expect(shouldAutoHidePlayerControls("playing", false, true)).toBe(false);
+  });
+
+  it("keeps the complete runtime stable while an adaptive playlist grows", () => {
+    expect(catalogDurationSeconds("1h 44m")).toBe(6240);
+    expect(catalogDurationSeconds("104m")).toBe(6240);
+    expect(catalogDurationSeconds("1:44")).toBe(6240);
+    expect(authoritativePlaybackDuration(6240, "1h 44m", "hls", 272)).toBe(6240);
+    expect(authoritativePlaybackDuration(0, "1h 44m", "hls", 272)).toBe(6240);
+    expect(authoritativePlaybackDuration(0, "", "hls", 272)).toBe(0);
+    expect(authoritativePlaybackDuration(0, "", "progressive", 272)).toBe(272);
   });
 
   it("shows the complete source-bounded ladder while marking unfinished levels", () => {

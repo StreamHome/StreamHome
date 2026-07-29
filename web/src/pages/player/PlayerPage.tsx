@@ -30,7 +30,6 @@ import { formatDuration } from "../../utils/format";
 import { hasSubtitleOptions, PlayerControlMenu, PlayerIcon, PlayerIconButton } from "./PlayerControls";
 import { languageDisplayName, normalizeLanguageTag } from "./language";
 import {
-  canUsePlayerFullscreen,
   isPlayerFullscreen,
   togglePlayerFullscreen,
 } from "./fullscreen";
@@ -73,10 +72,14 @@ interface PlayableAsset {
   skipMarkers: Record<string, unknown>;
 }
 
-interface ResolvedPlayback {
+export interface ResolvedPlayback {
   asset: PlayableAsset;
   episodeSequence: Episode[];
   runResponse: PlaybackRunResponse;
+}
+
+interface PlayerPageProps {
+  visualFixture?: ResolvedPlayback;
 }
 
 interface PlayerPreferences {
@@ -173,7 +176,38 @@ export function applySubtitleTrackSelection(video: HTMLVideoElement, selectedTra
 }
 
 export function shouldAutoHidePlayerControls(phase: PlayerPhase, menuOpen: boolean, scrubbing: boolean): boolean {
-  return phase === "playing" && !menuOpen && !scrubbing;
+  return ["playing", "buffering", "recovering"].includes(phase) && !menuOpen && !scrubbing;
+}
+
+export function catalogDurationSeconds(value: string): number {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return 0;
+  const colon = normalized.match(/^(\d{1,3}):(\d{1,2})(?::(\d{1,2}))?$/);
+  if (colon) {
+    const first = Number(colon[1]);
+    const second = Number(colon[2]);
+    const third = colon[3] === undefined ? null : Number(colon[3]);
+    return third === null ? first * 3600 + second * 60 : first * 3600 + second * 60 + third;
+  }
+  const hours = Number(normalized.match(/(\d+(?:\.\d+)?)\s*h/)?.[1] ?? 0);
+  const minutes = Number(normalized.match(/(\d+(?:\.\d+)?)\s*m/)?.[1] ?? 0);
+  const seconds = Number(normalized.match(/(\d+(?:\.\d+)?)\s*s/)?.[1] ?? 0);
+  const total = hours * 3600 + minutes * 60 + seconds;
+  if (total > 0) return total;
+  const numeric = Number(normalized);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+}
+
+export function authoritativePlaybackDuration(
+  serverDuration: number,
+  catalogDuration: string,
+  mode: StreamMode,
+  mediaDuration: number,
+): number {
+  if (Number.isFinite(serverDuration) && serverDuration > 0) return serverDuration;
+  const catalog = catalogDurationSeconds(catalogDuration);
+  if (catalog > 0) return catalog;
+  return mode === "progressive" && Number.isFinite(mediaDuration) && mediaDuration > 0 ? mediaDuration : 0;
 }
 
 function assetFromMovie(movie: Movie): PlayableAsset {
@@ -305,7 +339,7 @@ function errorState(error: unknown): FatalState {
   };
 }
 
-export function PlayerPage() {
+export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const navigate = useNavigate();
   const location = useLocation();
   const query = useMemo(() => parseAppQuery(location.search), [location.search]);
@@ -346,6 +380,7 @@ export function PlayerPage() {
   const mobileTapResetTimerRef = useRef<number | null>(null);
   const mobileFullscreenAttemptedAtRef = useRef(0);
   const mobilePointerGestureRef = useRef<MobilePointerGesture | null>(null);
+  const desktopPointerPositionRef = useRef<{ x: number; y: number } | null>(null);
   const showControlsRef = useRef(true);
   const phaseRef = useRef<PlayerPhase>("resolving");
   const controlMenuOpenRef = useRef(false);
@@ -378,7 +413,6 @@ export function PlayerPage() {
   const [nextCancelled, setNextCancelled] = useState(false);
   const [timelinePreview, setTimelinePreview] = useState<{ x: number; time: number } | null>(null);
   const [fullscreenActive, setFullscreenActive] = useState(false);
-  const [fullscreenAvailable, setFullscreenAvailable] = useState(true);
   const [fullscreenError, setFullscreenError] = useState("");
   const [hasLastFrame, setHasLastFrame] = useState(false);
   const [mobilePlayer, setMobilePlayer] = useState(() => typeof window !== "undefined" && isPhonePlayerViewport(readMobileViewport(window)));
@@ -437,6 +471,35 @@ export function PlayerPage() {
   }, [profile]);
 
   useEffect(() => {
+    if (!asset || !runResponse) return;
+    const authoritative = authoritativePlaybackDuration(
+      runResponse.sourceMetadata.duration,
+      asset.durationLabel,
+      streamMode,
+      videoRef.current?.duration ?? 0,
+    );
+    if (authoritative > 0) setDuration(authoritative);
+  }, [asset, runResponse?.sourceMetadata.duration, streamMode]);
+
+  useEffect(() => {
+    if (visualFixture) {
+      setFatal(null);
+      setAsset(visualFixture.asset);
+      setEpisodeSequence(visualFixture.episodeSequence);
+      setRunResponse(visualFixture.runResponse);
+      sequenceNumberRef.current = visualFixture.runResponse.nextSequenceNumber;
+      resumePositionRef.current = visualFixture.runResponse.resumePosition;
+      currentTimeRef.current = visualFixture.runResponse.resumePosition;
+      setCurrentTime(visualFixture.runResponse.resumePosition);
+      setDuration(authoritativePlaybackDuration(
+        visualFixture.runResponse.sourceMetadata.duration,
+        visualFixture.asset.durationLabel,
+        "progressive",
+        0,
+      ));
+      setPhase("loading");
+      return;
+    }
     if (!profile || !mediaId) {
       setFatal({ title: "Playback unavailable", message: "Choose a profile and a playable title first.", retryable: false });
       setPhase("unavailable");
@@ -577,7 +640,7 @@ export function PlayerPage() {
       active = false;
       abort.abort();
     };
-  }, [mediaId, profile, retryVersion]);
+  }, [mediaId, profile, retryVersion, visualFixture]);
 
   const captureLastFrame = useCallback((force = false) => {
     const video = videoRef.current;
@@ -784,7 +847,7 @@ export function PlayerPage() {
   }, [applyResume, captureLastFrame, mobilePlayer, runResponse?.manifestUrl, runResponse?.progressiveUrl, runResponse?.runId, streamMode, transportRevision]);
 
   useEffect(() => {
-    if (!runResponse || !profile) return;
+    if (!runResponse || !profile || visualFixture) return;
     const renewIn = Math.max(30_000, runResponse.ticketExpiresAt * 1000 - Date.now() - TICKET_RENEWAL_MARGIN);
     const timer = window.setTimeout(() => {
       captureLastFrame(true);
@@ -803,7 +866,7 @@ export function PlayerPage() {
         });
     }, renewIn);
     return () => window.clearTimeout(timer);
-  }, [captureLastFrame, profile, runResponse?.runId, runResponse?.ticketExpiresAt]);
+  }, [captureLastFrame, profile, runResponse?.runId, runResponse?.ticketExpiresAt, visualFixture]);
 
   useEffect(() => {
     if (!runResponse) return;
@@ -839,7 +902,7 @@ export function PlayerPage() {
   }, [runResponse?.renditions, runResponse?.tracks]);
 
   useEffect(() => {
-    if (!runResponse || runResponse.preparationState !== "ready") return;
+    if (!runResponse || runResponse.preparationState !== "ready" || visualFixture) return;
     const pendingRenditions = [...runResponse.renditions, ...runResponse.tracks].some((item) => item.status === "preparing");
     if (!pendingRenditions) return;
     const abort = new AbortController();
@@ -877,7 +940,7 @@ export function PlayerPage() {
       abort.abort();
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [runResponse]);
+  }, [runResponse, visualFixture]);
 
   const applyPlaybackRatePreference = useCallback(() => {
     const video = videoRef.current;
@@ -920,7 +983,7 @@ export function PlayerPage() {
   }, []);
 
   const reportProgress = useCallback((event: PlaybackProgressEvent, finished = false, keepalive = false) => {
-    if (!runResponse) return;
+    if (!runResponse || visualFixture) return;
     captureWatchedTime();
     const watchedSeconds = Math.floor(pendingWatchedSecondsRef.current);
     pendingWatchedSecondsRef.current -= watchedSeconds;
@@ -945,10 +1008,10 @@ export function PlayerPage() {
           }).catch(() => undefined);
         }
       });
-  }, [captureWatchedTime, runResponse]);
+  }, [captureWatchedTime, runResponse, visualFixture]);
 
   useEffect(() => {
-    if (!runResponse) return;
+    if (!runResponse || visualFixture) return;
     const timer = window.setInterval(() => reportProgress("heartbeat"), 10_000);
     const onVisibility = () => {
       if (document.visibilityState === "hidden" && !completedRef.current) reportProgress("visibility", false, true);
@@ -963,7 +1026,7 @@ export function PlayerPage() {
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("pagehide", onPageHide);
     };
-  }, [reportProgress, runResponse]);
+  }, [reportProgress, runResponse, visualFixture]);
 
   const safePlay = useCallback(() => {
     void videoRef.current?.play().catch(() => {
@@ -992,10 +1055,9 @@ export function PlayerPage() {
     if (report) reportProgress("seek");
   }, [captureWatchedTime, duration, reportProgress]);
 
-  const revealControls = useCallback(() => {
+  const scheduleControlsHide = useCallback(() => {
     if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
     controlsTimerRef.current = null;
-    setShowControls(true);
     if (shouldAutoHidePlayerControls(phaseRef.current, controlMenuOpenRef.current, scrubbingRef.current)) {
       controlsTimerRef.current = window.setTimeout(() => {
         setShowControls(false);
@@ -1004,11 +1066,32 @@ export function PlayerPage() {
     }
   }, []);
 
+  const revealControls = useCallback(() => {
+    setShowControls(true);
+    scheduleControlsHide();
+  }, [scheduleControlsHide]);
+
+  const handleDesktopPointerActivity = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const previous = desktopPointerPositionRef.current;
+    const next = { x: event.clientX, y: event.clientY };
+    desktopPointerPositionRef.current = next;
+    if (previous && Math.abs(previous.x - next.x) < 1 && Math.abs(previous.y - next.y) < 1) return;
+    revealControls();
+  }, [revealControls]);
+
   useEffect(() => {
     phaseRef.current = phase;
     controlMenuOpenRef.current = controlMenuOpen;
-    revealControls();
-  }, [controlMenuOpen, phase, revealControls, timelineScrubbing]);
+    if (phase === "paused") {
+      if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
+      controlsTimerRef.current = null;
+      setShowControls(true);
+      return;
+    }
+    if (phase === "playing" && showControlsRef.current && controlsTimerRef.current === null) {
+      scheduleControlsHide();
+    }
+  }, [controlMenuOpen, phase, scheduleControlsHide, timelineScrubbing]);
 
   useEffect(() => {
     if (phase !== "playing") return;
@@ -1035,14 +1118,13 @@ export function PlayerPage() {
     const updateFullscreenState = () => {
       const active = isPlayerFullscreen(video);
       setFullscreenActive(active);
-      setFullscreenAvailable(canUsePlayerFullscreen(containerRef.current, video));
       if (mobilePlayer) {
         if (active) void lockPlayerLandscape();
         else {
           mobileFullscreenAttemptedAtRef.current = 0;
           unlockPlayerLandscape();
         }
-      } else revealControls();
+      }
     };
 
     updateFullscreenState();
@@ -1056,7 +1138,7 @@ export function PlayerPage() {
       video?.removeEventListener("webkitbeginfullscreen", updateFullscreenState);
       video?.removeEventListener("webkitendfullscreen", updateFullscreenState);
     };
-  }, [mobilePlayer, phase, revealControls, runResponse?.runId]);
+  }, [mobilePlayer, runResponse?.runId]);
 
   const toggleFullscreen = useCallback(() => {
     const container = containerRef.current;
@@ -1191,6 +1273,12 @@ export function PlayerPage() {
 
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        toggleFullscreen();
+        revealControls();
+        return;
+      }
       if (isInteractiveTarget(event.target)) return;
       if (event.key === " ") {
         event.preventDefault();
@@ -1203,8 +1291,6 @@ export function PlayerPage() {
         seek(currentTimeRef.current + 10);
       } else if (event.key.toLowerCase() === "m" && videoRef.current) {
         videoRef.current.muted = !videoRef.current.muted;
-      } else if (event.key.toLowerCase() === "f") {
-        toggleFullscreen();
       } else if (event.key.toLowerCase() === "p") {
         togglePictureInPicture();
       } else if (event.key === "Escape" && !fullscreenActive) {
@@ -1483,11 +1569,11 @@ export function PlayerPage() {
       data-player-theme={definition.playerVariant}
       data-player-phase={phase}
       data-frame-hold={holdLastFrame ? "true" : "false"}
-      data-controls-visible={showControls || phase !== "playing" ? "true" : "false"}
+      data-controls-visible={showControls || phase === "paused" ? "true" : "false"}
       data-mobile-player={mobilePlayer ? "true" : "false"}
       data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
       style={{ "--caption-scale": preferences.captionScale } as React.CSSProperties}
-      onMouseMove={mobilePlayer ? undefined : revealControls}
+      onMouseMove={mobilePlayer ? undefined : handleDesktopPointerActivity}
       onClick={mobilePlayer ? undefined : handleDesktopSurfaceClick}
       onDoubleClick={mobilePlayer ? undefined : handleDesktopSurfaceDoubleClick}
       initial={{ opacity: 0 }}
@@ -1508,9 +1594,13 @@ export function PlayerPage() {
         onLoadedMetadata={() => {
           const video = videoRef.current;
           if (!video) return;
-          const authoritativeDuration = runResponse.sourceMetadata.duration;
+          const authoritativeDuration = authoritativePlaybackDuration(
+            runResponse.sourceMetadata.duration,
+            asset.durationLabel,
+            streamMode,
+            video.duration,
+          );
           if (authoritativeDuration > 0) setDuration(authoritativeDuration);
-          else if (Number.isFinite(video.duration) && video.duration > 0) setDuration(video.duration);
           applyResume(video);
           window.setTimeout(applySubtitlePreference, 0);
         }}
@@ -1551,7 +1641,9 @@ export function PlayerPage() {
             return;
           }
           transportResettingRef.current = false;
+          phaseRef.current = "playing";
           setPhase("playing");
+          scheduleControlsHide();
           window.requestAnimationFrame(() => captureLastFrame(true));
         }}
         onCanPlay={() => {
@@ -1602,10 +1694,14 @@ export function PlayerPage() {
           if (Math.abs(nextTime - stableTime) <= 2) transportResettingRef.current = false;
         }}
         onDurationChange={() => {
-          const authoritativeDuration = runResponse.sourceMetadata.duration;
           const mediaDuration = videoRef.current?.duration ?? 0;
+          const authoritativeDuration = authoritativePlaybackDuration(
+            runResponse.sourceMetadata.duration,
+            asset.durationLabel,
+            streamMode,
+            mediaDuration,
+          );
           if (authoritativeDuration > 0) setDuration(authoritativeDuration);
-          else if (Number.isFinite(mediaDuration) && mediaDuration > 0) setDuration(mediaDuration);
         }}
         onProgress={() => {
           const video = videoRef.current;
@@ -1831,7 +1927,7 @@ export function PlayerPage() {
                     onSelect={(value) => setPreferences((current) => ({ ...current, playbackRate: value }))}
                     onOpenChange={handleControlMenuOpenChange}
                   />
-                  {availableAudioTracks.length > 1 && (
+                  {availableAudioTracks.length > 0 && (
                     <PlayerControlMenu
                       label="Audio language"
                       icon="audio"
@@ -1878,7 +1974,6 @@ export function PlayerPage() {
                     icon={fullscreenActive ? "fullscreen-exit" : "fullscreen"}
                     label={fullscreenActive ? "Exit fullscreen" : "Fullscreen"}
                     aria-pressed={fullscreenActive}
-                    disabled={!fullscreenAvailable}
                     onClick={toggleFullscreen}
                   />
                 </div>
@@ -1889,7 +1984,7 @@ export function PlayerPage() {
       </AnimatePresence>
 
       <AnimatePresence>
-        {!mobilePlayer && (showControls || phase !== "playing") && phase !== "ended" && (
+        {!mobilePlayer && (showControls || phase === "paused") && phase !== "ended" && (
           <motion.div
             className="player-controls absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black via-black/85 to-transparent px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-24 md:px-10 md:pb-7"
             initial={reduced ? { opacity: 0 } : { opacity: 0, y: 18 }}
@@ -1951,7 +2046,7 @@ export function PlayerPage() {
                     onSelect={(value) => setPreferences((current) => ({ ...current, playbackRate: value }))}
                     onOpenChange={handleControlMenuOpenChange}
                   />
-                  {availableAudioTracks.length > 1 && (
+                  {availableAudioTracks.length > 0 && (
                     <PlayerControlMenu
                       label="Audio language"
                       icon="audio"
@@ -1996,7 +2091,6 @@ export function PlayerPage() {
                     icon={fullscreenActive ? "fullscreen-exit" : "fullscreen"}
                     label={fullscreenActive ? "Exit fullscreen" : "Fullscreen"}
                     aria-pressed={fullscreenActive}
-                    disabled={!fullscreenAvailable}
                     onClick={toggleFullscreen}
                   />
                 </div>

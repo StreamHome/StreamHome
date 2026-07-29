@@ -22,6 +22,52 @@ from services.ffmpeg_input import (
 
 HLS_FALLBACK_FAILURES = {"INVALID_MEDIA_SOURCE", "MEDIA_PROBE_FAILED", "FFMPEG_OPTION_UNSUPPORTED"}
 
+
+def merge_local_external_audio(file_path: str, retained_audio: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Refresh application-owned local dubbing sidecars without re-probing the video."""
+
+    embedded_audio = [dict(item) for item in retained_audio if str(item.get("source") or "embedded").lower() != "external"]
+    audio_dir = os.path.join(os.path.dirname(file_path), "audio")
+    if not os.path.isdir(audio_dir):
+        refreshed = embedded_audio
+    else:
+        external_files = sorted(
+            path for path in (os.path.join(audio_dir, name) for name in os.listdir(audio_dir))
+            if os.path.isfile(path) and os.path.splitext(path)[1].lower() in EXTERNAL_AUDIO_EXTENSIONS
+        )
+        embedded_by_language = {str(item.get("language") or "und"): item for item in embedded_audio}
+        external_languages: set[str] = set()
+        refreshed = list(embedded_audio)
+        for external_path in external_files:
+            language = normalize_language_tag(os.path.splitext(os.path.basename(external_path))[0])
+            if language in external_languages:
+                continue
+            external_languages.add(language)
+            existing = embedded_by_language.get(language)
+            file_stat = os.stat(external_path)
+            external_item = {
+                "index": 0,
+                "streamIndex": 0,
+                "codec": os.path.splitext(external_path)[1].lstrip(".").lower(),
+                "language": language,
+                "label": language_label(language, existing.get("label") if existing else None),
+                "channels": int(existing.get("channels") or 2) if existing else 2,
+                "default": bool(existing.get("default")) if existing else False,
+                "source": "external",
+                "fileName": os.path.basename(external_path),
+                "fileSize": file_stat.st_size,
+                "modifiedAt": file_stat.st_mtime_ns,
+            }
+            refreshed = [item for item in refreshed if str(item.get("language") or "und") != language]
+            refreshed.append(external_item)
+
+    if refreshed and not any(item.get("default") for item in refreshed):
+        refreshed[0]["default"] = True
+    for index, item in enumerate(refreshed):
+        item["index"] = index
+    return refreshed
+
+
 async def probe_media_stream(
     video_url: str,
     audio_url: Optional[str] = None,
@@ -323,43 +369,7 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
         # External application-owned dubbing is authoritative for its language even
         # when the MP4 has embedded audio. Otherwise one embedded default track hides
         # valid audio/eng.*, audio/tur.*, and other standard language-tagged files.
-        audio_dir = os.path.join(os.path.dirname(file_path), "audio")
-        if os.path.isdir(audio_dir):
-            external_files = sorted(
-                path for path in (os.path.join(audio_dir, name) for name in os.listdir(audio_dir))
-                if os.path.isfile(path) and os.path.splitext(path)[1].lower() in EXTERNAL_AUDIO_EXTENSIONS
-            )
-            embedded_by_language = {str(item.get("language") or "und"): item for item in audio_meta}
-            external_languages: set[str] = set()
-            merged_audio = list(audio_meta)
-            for external_path in external_files:
-                language = normalize_language_tag(os.path.splitext(os.path.basename(external_path))[0])
-                if language in external_languages:
-                    continue
-                external_languages.add(language)
-                existing = embedded_by_language.get(language)
-                file_stat = os.stat(external_path)
-                external_item = {
-                    "index": 0,
-                    "streamIndex": 0,
-                    "codec": os.path.splitext(external_path)[1].lstrip(".").lower(),
-                    "language": language,
-                    "label": language_label(language, existing.get("label") if existing else None),
-                    "channels": int(existing.get("channels") or 2) if existing else 2,
-                    "default": bool(existing.get("default")) if existing else False,
-                    "source": "external",
-                    "fileName": os.path.basename(external_path),
-                    "fileSize": file_stat.st_size,
-                    "modifiedAt": file_stat.st_mtime_ns,
-                }
-                merged_audio = [item for item in merged_audio if str(item.get("language") or "und") != language]
-                merged_audio.append(external_item)
-            audio_meta = merged_audio
-
-        if audio_meta and not any(item.get("default") for item in audio_meta):
-            audio_meta[0]["default"] = True
-        for index, item in enumerate(audio_meta):
-            item["index"] = index
+        audio_meta = merge_local_external_audio(file_path, audio_meta)
             
         base_fingerprint = hashlib.sha256(local_media_identity(Path(file_path)).encode("utf-8")).hexdigest()[:32]
         source_fingerprint = bind_audio_fingerprint(base_fingerprint, audio_meta)
