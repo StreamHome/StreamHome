@@ -32,12 +32,11 @@ After preflight, the detached Linux update controller asks the running backend t
 1. stop the owned StreamHome processes;
 2. create and integrity-check a recovery copy of `server/database.db`;
 3. serve a temporary HTTP 503 maintenance page on the configured web port;
-4. install the exact preflighted commit;
-5. reinstall locked dependencies and rebuild production assets;
-6. start StreamHome through `start.sh`;
-7. require both the database-backed API health check and production web response to pass.
+4. activate the exact preflighted commit, offline Python packages, prepared Node runtime, and production assets;
+5. start StreamHome through `start.sh`;
+6. require both the database-backed API health check and production web response to pass.
 
-An update is successful only after both services are healthy. If installation, build, API startup, or web startup fails, the controller restores the previous commit and database checkpoint, rebuilds that known-working release, restarts it, and verifies it again. The failed target is suppressed from automatic retry until an administrator explicitly selects **Retry failed target**.
+The expensive network fetches, dependency resolution, `npm ci`, and frontend build complete before shutdown. An update is successful only after both services are healthy. Startup allows a bounded cold-start window and retries a failed launch after cleaning up partial processes. If activation, API startup, or web startup fails, the controller restores the previous commit, database checkpoint, prepared web runtime, and offline Python packages, restarts that known-working release, and verifies it again. The failed target is suppressed from automatic retry until an administrator explicitly selects **Retry failed target**.
 
 Lifecycle output is stored in `update.log`. While cutover is active, Cloudflare or another reverse proxy receives a maintenance response rather than an unresponsive origin whenever the temporary responder can bind the configured port.
 
@@ -46,9 +45,9 @@ Lifecycle output is stored in `update.log`. While cutover is active, Cloudflare 
 If the admin panel is unavailable, inspect `update.log` and `.run/update-state.json`. A reviewed manual update remains available:
 
 ```bash
-cd ~/StreamHome
-./stop.sh
 curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
 ```
 
-The installer verifies the official origin, refuses a dirty checkout, and permits only an exact fetched fast-forward. Do not delete `server/database.db`, `server/media`, `.env`, `server/.env`, `server/backup`, or `server/rclone`.
+Do not stop StreamHome first. For an existing installation, the installer verifies the official origin, refuses a dirty checkout, preflights the fetched release while the current services remain online, and hands the exact fast-forward to the same health-gated cutover and rollback controller. The command does not return successfully until both services are healthy again. A concurrent `./start.sh` waits for the active updater and reports its phase instead of fighting the cutover.
+
+Do not delete `server/database.db`, `server/media`, `.env`, `server/.env`, `server/backup`, or `server/rclone`.

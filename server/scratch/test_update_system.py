@@ -159,6 +159,51 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid_install_mode"):
             await update.queue_update(automatic=False, install_mode="force")
 
+    async def test_detached_controller_cannot_have_terminal_state_overwritten_by_queue_handoff(self) -> None:
+        target = "e" * 40
+        current = "a" * 40
+        script = Path(self.temporary.name) / "update.sh"
+        script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        update.write_update_state(
+            phase="queued",
+            message="Queued",
+            current_commit=current,
+            target_commit=target,
+            update_available=False,
+            automatic=False,
+            install_mode="now",
+        )
+
+        class FinishedController:
+            async def wait(self) -> int:
+                self_status = update.read_update_state()
+                if self_status["phase"] != "preflight":
+                    raise AssertionError("preflight state must be persisted before the controller is launched")
+                update.write_update_state(
+                    phase="failed",
+                    message="Controller reported a terminal failure.",
+                    error="preflight_failed",
+                    finished_at=time.time(),
+                )
+                return 0
+
+        with (
+            patch.object(update, "UPDATE_SCRIPT", script),
+            patch.object(update.os, "name", "posix"),
+            patch.object(update, "current_commit", AsyncMock(return_value=current)),
+            patch.object(update, "queued_launch_blockers", AsyncMock(return_value=[])),
+            patch.object(
+                update.asyncio,
+                "create_subprocess_exec",
+                AsyncMock(return_value=FinishedController()),
+            ),
+        ):
+            self.assertTrue(await update.launch_queued_update_if_ready())
+
+        persisted = update.read_update_state()
+        self.assertEqual(persisted["phase"], "failed")
+        self.assertEqual(persisted["error"], "preflight_failed")
+
     async def test_immediate_cutover_ignores_viewers_and_idle_grace_but_not_mutating_work(self) -> None:
         settings.UPDATE_IDLE_MINUTES = 10
         state.record_browser_presence("session-now", True)

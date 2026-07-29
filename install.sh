@@ -9,6 +9,7 @@ SKIP_SYSTEM_PACKAGES=false
 INSTALL_PARENT=""
 INSTALL_LOCK=""
 STAGING_DIR=""
+EXISTING_UPDATE_COMPLETE=false
 
 usage() {
     cat <<'EOF'
@@ -124,28 +125,40 @@ acquire_install_lock() {
 }
 
 prepare_existing_checkout() {
-    local remote dirty fetched_commit head_commit
+    local remote dirty fetched_commit head_commit controller start_after_update
     remote="$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)"
     valid_remote "$remote" || fail "The existing directory is not a StreamHome checkout from $REPOSITORY_URL"
     git -C "$INSTALL_DIR" remote set-url origin "$REPOSITORY_URL"
     dirty="$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=normal)"
     [[ -z "$dirty" ]] || fail "The existing StreamHome checkout has local changes. Commit or move them before updating."
 
-    log "Updating the existing StreamHome checkout"
+    log "Preparing a health-gated update for the existing StreamHome checkout"
     if [[ "$(git -C "$INSTALL_DIR" rev-parse --is-shallow-repository)" == "true" ]]; then
         git -C "$INSTALL_DIR" fetch --unshallow origin "$INSTALL_REF"
     else
         git -C "$INSTALL_DIR" fetch origin "$INSTALL_REF"
     fi
     fetched_commit="$(git -C "$INSTALL_DIR" rev-parse 'FETCH_HEAD^{commit}')"
-    if git -C "$INSTALL_DIR" show-ref --verify --quiet "refs/heads/$INSTALL_REF"; then
-        git -C "$INSTALL_DIR" checkout "$INSTALL_REF"
-        git -C "$INSTALL_DIR" merge --ff-only "$fetched_commit"
-    else
-        git -C "$INSTALL_DIR" -c advice.detachedHead=false checkout --detach "$fetched_commit"
-    fi
     head_commit="$(git -C "$INSTALL_DIR" rev-parse HEAD)"
-    [[ "$head_commit" == "$fetched_commit" ]] || fail "The checkout did not resolve exactly to the requested ref $INSTALL_REF."
+    git -C "$INSTALL_DIR" merge-base --is-ancestor "$head_commit" "$fetched_commit" \
+        || fail "The requested update is not a safe fast-forward from the installed release."
+
+    STAGING_DIR="$(mktemp -d "$INSTALL_PARENT/.streamhome-install.XXXXXX")"
+    controller="$STAGING_DIR/update-controller.sh"
+    git -C "$INSTALL_DIR" show "$fetched_commit:update.sh" > "$controller"
+    chmod 700 "$controller"
+    start_after_update=true
+    [[ "$NO_START" == true ]] && start_after_update=false
+    log "Running the prepared update controller; StreamHome will stay online until cutover"
+    bash "$controller" --manual-execute \
+        "$fetched_commit" \
+        "$head_commit" \
+        "$INSTALL_REF" \
+        "$start_after_update" \
+        "$INSTALL_DIR"
+    [[ "$(git -C "$INSTALL_DIR" rev-parse HEAD)" == "$fetched_commit" ]] \
+        || fail "The health-gated update did not finish at the requested commit."
+    EXISTING_UPDATE_COMPLETE=true
 }
 
 prepare_new_checkout() {
@@ -210,6 +223,11 @@ main() {
     acquire_install_lock
     install_git
     prepare_checkout
+
+    if [[ "$EXISTING_UPDATE_COMPLETE" == true ]]; then
+        log "Existing StreamHome installation updated successfully"
+        return 0
+    fi
 
     log "Granting executable permissions"
     chmod +x \

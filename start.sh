@@ -9,6 +9,10 @@ LOCK_ACQUIRED=false
 STARTED_ANY=false
 START_SUCCEEDED=false
 UPDATE_RECOVERY_CHECKED=false
+WAITED_FOR_UPDATE=false
+STARTUP_TIMEOUT_SECONDS="${STREAMHOME_STARTUP_TIMEOUT_SECONDS:-90}"
+STARTUP_ATTEMPTS="${STREAMHOME_STARTUP_ATTEMPTS:-2}"
+UPDATE_WAIT_SECONDS="${STREAMHOME_UPDATE_WAIT_SECONDS:-900}"
 
 usage() {
     cat <<'EOF'
@@ -197,7 +201,7 @@ PY
 
 wait_for_port_release() {
     local port="$1"
-    for _ in {1..50}; do
+    for _ in {1..150}; do
         port_available "$port" && return 0
         sleep 0.1
     done
@@ -268,10 +272,11 @@ PY
 }
 
 wait_for_services() {
-    local backend_pid web_pid
+    local backend_pid web_pid checks attempt
     backend_pid="$(cat "$RUN_DIR/backend.pid")"
     web_pid="$(cat "$RUN_DIR/web.pid")"
-    for _ in {1..60}; do
+    checks=$((STARTUP_TIMEOUT_SECONDS * 2))
+    for ((attempt = 0; attempt < checks; attempt++)); do
         kill -0 "$backend_pid" 2>/dev/null || return 1
         kill -0 "$web_pid" 2>/dev/null || return 1
         if endpoint_ready "http://127.0.0.1:8000/api/health" api \
@@ -281,6 +286,63 @@ wait_for_services() {
         sleep 0.5
     done
     return 1
+}
+
+update_controller_active() {
+    local owner command
+    owner="$(cat "$RUN_DIR/update.lock/owner.pid" 2>/dev/null || true)"
+    [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null || return 1
+    command="$(ps -p "$owner" -o command= 2>/dev/null || true)"
+    [[ "$command" == *"update-controller"*"--execute"* \
+        || "$command" == *"update-controller"*"--manual-execute"* \
+        || "$command" == *"update.sh"*"--execute"* \
+        || "$command" == *"update.sh"*"--manual-execute"* \
+        || "$command" == *"update.sh"*"--recover-interrupted"* ]]
+}
+
+read_update_phase() {
+    "$BACKEND_PYTHON" - "$RUN_DIR/update-state.json" <<'PY'
+import json
+import sys
+
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, TypeError, ValueError):
+    payload = {}
+print(str(payload.get("phase") or "unknown"))
+PY
+}
+
+wait_for_active_update() {
+    local elapsed=0 phase previous_phase=""
+    update_controller_active || return 0
+    printf '[StreamHome] An update controller is active. Waiting up to %s seconds for its protected cutover to finish.\n' "$UPDATE_WAIT_SECONDS"
+    WAITED_FOR_UPDATE=true
+    while update_controller_active; do
+        phase="$(read_update_phase)"
+        if [[ "$phase" != "$previous_phase" ]]; then
+            printf '[StreamHome] Update phase: %s\n' "$phase"
+            previous_phase="$phase"
+        elif (( elapsed > 0 && elapsed % 30 == 0 )); then
+            printf '[StreamHome] Update is still running (%s, %s seconds elapsed).\n' "$phase" "$elapsed"
+        fi
+        if (( elapsed >= UPDATE_WAIT_SECONDS )); then
+            return 1
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    sleep 0.5
+    return 0
+}
+
+running_services_ready() {
+    local configured_port
+    configured_port="$(read_env WEB_PORT 3000)"
+    [[ "$configured_port" =~ ^[0-9]+$ ]] || return 1
+    configured_port="$((10#$configured_port))"
+    endpoint_ready "http://127.0.0.1:8000/api/health" api \
+        && endpoint_ready "http://127.0.0.1:${configured_port}/" web
 }
 
 show_startup_logs() {
@@ -301,7 +363,26 @@ main() {
     fi
     [[ $# -eq 0 ]] || fail "Unknown argument: $1 (use --help for usage)"
 
+    select_python
+    [[ "$STARTUP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] \
+        && (( STARTUP_TIMEOUT_SECONDS >= 30 && STARTUP_TIMEOUT_SECONDS <= 300 )) \
+        || fail "STREAMHOME_STARTUP_TIMEOUT_SECONDS must be between 30 and 300."
+    [[ "$STARTUP_ATTEMPTS" =~ ^[0-9]+$ ]] \
+        && (( STARTUP_ATTEMPTS >= 1 && STARTUP_ATTEMPTS <= 3 )) \
+        || fail "STREAMHOME_STARTUP_ATTEMPTS must be between 1 and 3."
+    [[ "$UPDATE_WAIT_SECONDS" =~ ^[0-9]+$ ]] \
+        && (( UPDATE_WAIT_SECONDS >= 30 && UPDATE_WAIT_SECONDS <= 3600 )) \
+        || fail "STREAMHOME_UPDATE_WAIT_SECONDS must be between 30 and 3600."
+
     if [[ "$UPDATE_RECOVERY_CHECKED" == false && -x "$ROOT_DIR/update.sh" ]]; then
+        if ! wait_for_active_update; then
+            fail "The update is still active after ${UPDATE_WAIT_SECONDS} seconds. It was not interrupted; review update.log before retrying."
+        fi
+        if [[ "$WAITED_FOR_UPDATE" == true ]] && running_services_ready; then
+            START_SUCCEEDED=true
+            printf '\nStreamHome was restored successfully by the update controller.\n'
+            return 0
+        fi
         set +e
         "$ROOT_DIR/update.sh" --recover-interrupted "$ROOT_DIR"
         recovery_result=$?
@@ -313,7 +394,7 @@ main() {
             10)
                 ;;
             11)
-                fail "An update controller is still active. Wait for it to finish before starting StreamHome."
+                fail "The update controller changed state while startup was checking it. Retry ./start.sh; the updater was not interrupted."
                 ;;
             *)
                 fail "Interrupted update recovery failed. Review update.log before starting StreamHome."
@@ -321,7 +402,6 @@ main() {
         esac
     fi
 
-    select_python
     command -v npm >/dev/null 2>&1 || fail "npm is unavailable. Run ./setup.sh first."
     [[ -s "$ROOT_DIR/web/dist/index.html" ]] || fail "Production web assets are missing. Run ./setup.sh first."
 
@@ -379,12 +459,24 @@ main() {
         export STREAMHOME_SETUP_CODE
     fi
 
-    start_backend
-    start_web
-    if ! wait_for_services; then
+    local startup_attempt
+    for ((startup_attempt = 1; startup_attempt <= STARTUP_ATTEMPTS; startup_attempt++)); do
+        start_backend
+        start_web
+        if wait_for_services; then
+            break
+        fi
         show_startup_logs
-        fail "StreamHome did not become healthy within 30 seconds. The partial startup was stopped."
-    fi
+        if (( startup_attempt == STARTUP_ATTEMPTS )); then
+            fail "StreamHome did not become healthy after ${STARTUP_ATTEMPTS} startup attempt(s), each allowed ${STARTUP_TIMEOUT_SECONDS} seconds. The partial startup was stopped."
+        fi
+        printf '[StreamHome] Startup attempt %s failed. Cleaning up and retrying once.\n' "$startup_attempt" >&2
+        "$ROOT_DIR/stop.sh" --quiet --lock-held || true
+        STARTED_ANY=false
+        wait_for_port_release 8000 || fail "API port 8000 did not release before the startup retry."
+        wait_for_port_release "$WEB_PORT" || fail "Web port $WEB_PORT did not release before the startup retry."
+        sleep 1
+    done
 
     START_SUCCEEDED=true
     printf '\nStreamHome is running at %s\n' "$PUBLIC_URL"

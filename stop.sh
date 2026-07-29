@@ -137,6 +137,12 @@ is_streamhome_process() {
     cwd="$(process_cwd "$pid")"
     command="$(process_command "$pid")"
 
+    if [[ "$command" == *"$ROOT_DIR/server/scratch/maintenance_server.py"* ]]; then
+        case "$cwd" in
+            "$ROOT_DIR"|"$ROOT_DIR/"* ) return 0 ;;
+        esac
+    fi
+
     case "$cwd" in
         "$ROOT_DIR/server"|"$ROOT_DIR/server/"*)
             [[ "$command" == *"main.py"* || "$command" == *"uvicorn"*"main:app"* ]]
@@ -321,6 +327,7 @@ main() {
     fi
 
     [[ "$QUIET" == true ]] || printf 'Stopping StreamHome processes...\n'
+    stop_recorded_process maintenance
     stop_recorded_process web
     stop_recorded_process backend
     local port

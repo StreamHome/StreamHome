@@ -56,7 +56,16 @@ def create_fixture_repository(directory: Path) -> None:
         ),
         "install.sh": "#!/usr/bin/env bash\nexit 0\n",
         "restart.sh": "#!/usr/bin/env bash\nexit 0\n",
-        "update.sh": "#!/usr/bin/env bash\nexit 0\n",
+        "update.sh": (
+            "#!/usr/bin/env bash\n"
+            "set -e\n"
+            "if [[ \"${1:-}\" == \"--manual-execute\" ]]; then\n"
+            "  target=\"$2\"\n"
+            "  root=\"$6\"\n"
+            "  git -C \"$root\" merge --ff-only \"$target\"\n"
+            "  (cd \"$root\" && ./setup.sh --no-start --skip-system-packages)\n"
+            "fi\n"
+        ),
         "start.sh": "#!/usr/bin/env bash\nexit 0\n",
         "stop.sh": "#!/usr/bin/env bash\nexit 0\n",
         "test.sh": "#!/usr/bin/env bash\nexit 0\n",
@@ -119,9 +128,12 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("remote set-url origin", install_sh)
         self.assertIn("https://github.com/WaqSea/StreamHome.git", install_sh)
         self.assertIn("status --porcelain --untracked-files=normal", install_sh)
-        self.assertIn("merge --ff-only", install_sh)
+        self.assertIn("merge-base --is-ancestor", install_sh)
         self.assertIn(".streamhome-install.", install_sh)
         self.assertIn("install.lock", install_sh)
+        self.assertIn("--manual-execute", install_sh)
+        self.assertIn("health-gated update", install_sh)
+        self.assertNotIn('git -C "$INSTALL_DIR" checkout "$INSTALL_REF"', install_sh)
         self.assertIn("setup_args+=(--no-start)", install_sh)
         self.assertIn("./setup.sh", install_sh)
         self.assertIn('INSTALL_REF="${STREAMHOME_REF:-main}"', install_sh)
@@ -149,12 +161,19 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("handoff.wait", setup_py)
 
         self.assertIn('nohup bash "$controller" --execute', update_sh)
+        self.assertIn("--manual-execute", update_sh)
         self.assertIn("preflight_target", update_sh)
         self.assertIn("./setup.sh --no-start --skip-system-packages", update_sh)
         self.assertIn("/api/update/handoff", update_sh)
         self.assertIn("X-StreamHome-Update-Handoff", update_sh)
         self.assertIn("create_database_checkpoint", update_sh)
         self.assertIn("start_maintenance", update_sh)
+        self.assertIn("maintenance.pid", update_sh)
+        self.assertIn("prepare_python_wheelhouse", update_sh)
+        self.assertIn("--no-index", update_sh)
+        self.assertIn("activate_prepared_web", update_sh)
+        self.assertIn("restore_previous_web", update_sh)
+        self.assertIn("emergency rollback", update_sh)
         self.assertIn("rollback_release", update_sh)
         self.assertIn("recover_interrupted_release", update_sh)
         self.assertIn('git -C "$ROOT_DIR" reset --hard "$OLD_COMMIT"', update_sh)
@@ -168,12 +187,18 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertNotIn('"$BACKEND_PYTHON" main.py', start_sh)
         self.assertIn("wait_for_services", start_sh)
         self.assertIn("wait_for_port_release", start_sh)
+        self.assertIn("wait_for_active_update", start_sh)
+        self.assertIn("STREAMHOME_UPDATE_WAIT_SECONDS", start_sh)
+        self.assertIn("STREAMHOME_STARTUP_TIMEOUT_SECONDS", start_sh)
+        self.assertIn("Startup attempt", start_sh)
         self.assertIn("lifecycle.lock", start_sh)
         self.assertIn("--recover-interrupted", start_sh)
         self.assertIn("Setup URL: %s/setup", start_sh)
 
         self.assertIn("is_streamhome_process", stop_sh)
         self.assertIn("stop_process_tree", stop_sh)
+        self.assertIn("maintenance_server.py", stop_sh)
+        self.assertIn("stop_recorded_process maintenance", stop_sh)
         self.assertIn("It was not stopped.", stop_sh)
         self.assertIn("its PID record was preserved", stop_sh)
         self.assertIn("Shutdown did not complete cleanly", stop_sh)
@@ -337,13 +362,22 @@ class SetupScriptContracts(unittest.TestCase):
 
             helper = (ROOT / "server" / "scratch" / "maintenance_server.py").read_text(encoding="utf-8")
             old_files = {
-                ".gitignore": ".run/\n*.log\nserver/database.db\n",
-                "setup.sh": "#!/usr/bin/env bash\nexit 0\n",
+                ".gitignore": ".run/\n*.log\nvenv/\nserver/database.db\n",
+                "setup.sh": (
+                    "#!/usr/bin/env bash\n"
+                    "mkdir -p venv/bin\n"
+                    "printf '#!/usr/bin/env bash\\nexec python3 \"$@\"\\n' > venv/bin/python\n"
+                    "chmod +x venv/bin/python\n"
+                ),
                 "test.sh": "#!/usr/bin/env bash\nexit 0\n",
                 "stop.sh": "#!/usr/bin/env bash\nexit 0\n",
                 "start.sh": "#!/usr/bin/env bash\ncd \"$(dirname \"$0\")\"\nprintf 'healthy-old\\n' > healthy.marker\nexit 0\n",
                 ".env": f"WEB_PORT={unused_port()}\n",
+                "server/requirements.txt": "",
+                "server/requirements.lock": "",
                 "server/scratch/maintenance_server.py": helper,
+                "web/node_modules/runtime.txt": "known-working dependencies\n",
+                "web/dist/index.html": "known-working assets\n",
             }
             for relative, content in old_files.items():
                 target = remote / relative
@@ -374,6 +408,8 @@ class SetupScriptContracts(unittest.TestCase):
             clone = run(["git", "clone", remote.as_uri(), str(installed)], cwd=fixture)
             self.assertEqual(clone.returncode, 0, clone.stdout + clone.stderr)
             git(["reset", "--hard", old_commit], cwd=installed)
+            prepared = run([bash, str(installed / "setup.sh"), "--no-start"], cwd=installed)
+            self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
             (installed / ".run").mkdir()
             token_file = installed / ".run" / "update-handoff.test.token"
             token_file.write_text("test-token", encoding="utf-8")
@@ -419,6 +455,15 @@ class SetupScriptContracts(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(run(["git", "rev-parse", "HEAD"], cwd=installed).stdout.strip(), old_commit)
             self.assertEqual((installed / "healthy.marker").read_text(encoding="utf-8"), "healthy-old\n")
+            self.assertEqual(
+                (installed / "web" / "node_modules" / "runtime.txt").read_text(encoding="utf-8"),
+                "known-working dependencies\n",
+            )
+            self.assertEqual(
+                (installed / "web" / "dist" / "index.html").read_text(encoding="utf-8"),
+                "known-working assets\n",
+            )
+            self.assertFalse((installed / ".run" / "maintenance.pid").exists())
             connection = sqlite3.connect(database)
             try:
                 value = connection.execute("SELECT value FROM update_probe").fetchone()[0]

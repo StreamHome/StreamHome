@@ -124,12 +124,11 @@ packages.
 
 ## Updating an existing installation
 
-Back up the database and configuration, stop StreamHome, and rerun the same
-general installation command:
+Back up the database and configuration, then rerun the same general installation
+command. Do not stop StreamHome first; the installer keeps the current release
+online during isolated preparation and performs its own protected cutover:
 
 ```bash
-cd ~/StreamHome
-./stop.sh
 curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
 ```
 
@@ -137,6 +136,9 @@ The updater preserves installation-owned configuration and refuses to replace a
 checkout with tracked local modifications. Commit, move, or otherwise reconcile
 intentional source changes before updating. Generated build metadata and the
 host-generated system profile are excluded from Git and do not block an update.
+The installer returns only after the API and web client pass health checks; a
+failed activation automatically restores the previous release and database
+checkpoint.
 
 ## Starting and stopping
 
@@ -149,8 +151,11 @@ From the installation directory:
 
 `start.sh` refuses conflicting listeners, records the process IDs it owns, waits
 for the API and web health checks, and prints the public setup or application
-URL. `stop.sh` terminates only StreamHome-owned processes and can recover owned
-orphan processes when PID records are missing.
+URL. If an update controller is active, it waits with phase reports and verifies
+the controller's restored runtime instead of starting competing processes.
+`stop.sh` terminates only StreamHome-owned processes, including the temporary
+maintenance responder, and can recover owned orphan processes when PID records
+are missing.
 
 The default bindings are:
 

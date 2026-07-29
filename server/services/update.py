@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import shutil
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -366,9 +367,26 @@ def update_lock_active() -> bool:
     try:
         owner = int(owner_path.read_text(encoding="utf-8").strip())
         os.kill(owner, 0)
-        return True
     except (OSError, ValueError):
         return False
+    if os.name == "nt":
+        return True
+    try:
+        inspected = subprocess.run(
+            ["ps", "-p", str(owner), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    command = inspected.stdout.strip()
+    return any(
+        script in command and mode in command
+        for script in ("update.sh", "update-controller")
+        for mode in ("--execute", "--manual-execute", "--recover-interrupted")
+    )
 
 
 async def queue_update(
@@ -470,18 +488,40 @@ async def launch_queued_update_if_ready() -> bool:
         if os.name != "nt":
             os.chmod(token_path, 0o600)
         state.UPDATE_HANDOFF_TOKEN = token
-        process = await asyncio.create_subprocess_exec(
-            "bash",
-            str(UPDATE_SCRIPT),
-            "--queue",
-            target,
-            current,
-            "true" if status.get("automatic") else "false",
-            str(token_path),
-            cwd=str(WORKSPACE_ROOT),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        write_update_state(
+            phase="preflight",
+            message=(
+                "The detached updater is preparing and validating the target release for immediate installation."
+                if status.get("install_mode") == "now"
+                else "The detached updater is preparing and validating the target release."
+            ),
+            started_at=time.time(),
+            error="",
         )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "bash",
+                str(UPDATE_SCRIPT),
+                "--queue",
+                target,
+                current,
+                "true" if status.get("automatic") else "false",
+                str(token_path),
+                cwd=str(WORKSPACE_ROOT),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            state.UPDATE_HANDOFF_TOKEN = ""
+            token_path.unlink(missing_ok=True)
+            logger.error(f"[Update Service] Could not launch detached updater: {exc}")
+            write_update_state(
+                phase="failed",
+                message="The detached update controller could not be launched.",
+                error="update_handoff_failed",
+                finished_at=time.time(),
+            )
+            return False
         return_code = await process.wait()
         if return_code != 0:
             state.UPDATE_HANDOFF_TOKEN = ""
@@ -493,16 +533,6 @@ async def launch_queued_update_if_ready() -> bool:
                 finished_at=time.time(),
             )
             return False
-        write_update_state(
-            phase="preflight",
-            message=(
-                "The detached updater is validating the target release for immediate installation."
-                if status.get("install_mode") == "now"
-                else "The detached updater is validating the target release."
-            ),
-            started_at=time.time(),
-            error="",
-        )
         return True
 
 
