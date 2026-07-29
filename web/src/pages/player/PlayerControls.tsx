@@ -15,7 +15,6 @@ export type PlayerIconName =
   | "play"
   | "quality"
   | "rewind"
-  | "rotate"
   | "speed"
   | "volume";
 
@@ -54,7 +53,6 @@ export function PlayerIcon({ name, className = "" }: PlayerIconProps) {
   if (name === "fullscreen") return <svg {...common}><path d="M8 4H4v4M16 4h4v4M8 20H4v-4M16 20h4v-4" /></svg>;
   if (name === "fullscreen-exit") return <svg {...common}><path d="M4 8h4V4M20 8h-4V4M4 16h4v4M20 16h-4v4" /></svg>;
   if (name === "exit") return <svg {...common}><path d="M14 5h5v14h-5M10 8l-4 4 4 4M6 12h9" /></svg>;
-  if (name === "rotate") return <svg {...common}><path d="M20 11a8 8 0 1 0-2.3 5.7" /><path d="M20 4v7h-7" /></svg>;
   if (name === "chevron") return <svg {...common}><path d="m7 9 5 5 5-5" /></svg>;
   return <svg {...common}><path d="m7 12 3 3 7-7" /></svg>;
 }

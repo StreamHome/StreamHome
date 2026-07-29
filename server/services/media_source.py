@@ -15,6 +15,7 @@ from services.rclone import rclone_service
 
 CANONICAL_MEDIA_PREFIX = "/media/"
 WINDOWS_DRIVE_RE = re.compile(r"^[a-zA-Z]:")
+EXTERNAL_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"}
 
 
 class MediaSourceError(ValueError):
@@ -38,11 +39,61 @@ class ResolvedMediaSource:
     @property
     def fingerprint(self) -> str:
         if self.local_exists:
-            stat = self.local_path.stat()
-            value = f"local:{stat.st_size}:{stat.st_mtime_ns}"
+            value = local_media_identity(self.local_path)
         else:
             value = f"cloud:{self.cloud_identity or self.cloud_path or self.catalog_path}"
         return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
+def local_media_identity(media_path: Path) -> str:
+    """Fingerprint the playable file and application-owned audio sidecars."""
+
+    stat = media_path.stat()
+    identity: list[dict[str, object]] = [
+        {"name": media_path.name, "size": stat.st_size, "modified": stat.st_mtime_ns},
+    ]
+    audio_dir = media_path.parent / "audio"
+    if audio_dir.is_dir():
+        for audio_path in sorted(audio_dir.iterdir(), key=lambda item: item.name.lower()):
+            if not audio_path.is_file() or audio_path.suffix.lower() not in EXTERNAL_AUDIO_EXTENSIONS:
+                continue
+            audio_stat = audio_path.stat()
+            identity.append(
+                {
+                    "name": f"audio/{audio_path.name}",
+                    "size": audio_stat.st_size,
+                    "modified": audio_stat.st_mtime_ns,
+                }
+            )
+    return f"local:{json.dumps(identity, sort_keys=True, separators=(',', ':'))}"
+
+
+def playback_source_fingerprint(source: ResolvedMediaSource, audio_metadata: list[dict] | tuple[dict, ...]) -> str:
+    """Bind playback caches and tickets to retained external-audio identity."""
+
+    return bind_audio_fingerprint(source.fingerprint, audio_metadata)
+
+
+def bind_audio_fingerprint(source_fingerprint: str, audio_metadata: list[dict] | tuple[dict, ...]) -> str:
+    """Combine a base media identity with portable external-audio metadata."""
+
+    external_identity = [
+        {
+            "file": str(item.get("fileName") or item.get("file_name") or ""),
+            "size": int(item.get("fileSize") or item.get("file_size") or 0),
+            "modified": str(item.get("modifiedAt") or item.get("modified_at") or ""),
+        }
+        for item in audio_metadata
+        if str(item.get("source") or "").lower() == "external"
+    ]
+    if not external_identity:
+        return source_fingerprint
+    value = json.dumps(
+        {"source": source_fingerprint, "audio": external_identity},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
 
 
 def canonicalize_catalog_path(value: str) -> str:

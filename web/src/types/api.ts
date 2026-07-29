@@ -479,6 +479,7 @@ export interface PlaybackAudioTrack {
   channels: number;
   default: boolean;
   ready: boolean;
+  status: PlaybackRenditionStatus;
 }
 
 export interface PlaybackSourceMetadata {
@@ -488,7 +489,10 @@ export interface PlaybackSourceMetadata {
   width: number;
   height: number;
   frameRate: number;
+  sourceFormat: string;
 }
+
+export type PlaybackRenditionStatus = "preparing" | "streamable" | "ready" | "failed";
 
 export interface PlaybackRendition {
   id: string;
@@ -497,6 +501,7 @@ export interface PlaybackRendition {
   width: number;
   original: boolean;
   ready: boolean;
+  status: PlaybackRenditionStatus;
 }
 
 export interface PlaybackSubtitleTrack {

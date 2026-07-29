@@ -25,9 +25,17 @@ describe("dedicated mobile player presentation", () => {
     expect((playerPage.match(/\{hasSubtitles && preferences\.subtitleTrackId !== "off" && \(/g) ?? [])).toHaveLength(2);
   });
 
-  it("defines locked-portrait landscape fallback, safe areas, gesture feedback, and touch tooltip suppression", () => {
+  it("defines automatic locked-portrait landscape fallback, safe areas, gesture feedback, and touch tooltip suppression", () => {
     expect(playerStyles).toContain('[data-mobile-orientation="forced-landscape"]');
     expect(playerStyles).toContain('transform: translate(-50%, -50%) rotate(90deg)');
+    expect(playerPage).toContain("startMobilePlayback()");
+    expect(playerPage).toContain("{ allowVideoFallback: true }");
+    expect(playerPage).not.toContain('icon="rotate"');
+    expect(playerPage).not.toContain('label="Start over"');
+    expect(playerPage).toContain("const startOver = useCallback");
+    expect(playerPage).toContain("startOverPlaybackRun(runResponse.runId)");
+    expect(playerPage).toContain('className="mobile-player-topbar__actions"');
+    expect(playerPage).toContain('className="mobile-player-exit"');
     expect(playerStyles).toContain('.mobile-player-seek-feedback');
     expect(playerStyles).toContain('env(safe-area-inset-right)');
     expect(playerStyles).toContain('@media (hover: none), (pointer: coarse)');
@@ -41,5 +49,17 @@ describe("dedicated mobile player presentation", () => {
     expect(playerPage).not.toContain("key={mobileSeekFeedback.nonce}");
     expect(playerPage).toContain("seek((videoRef.current?.currentTime ?? 0) + result.seekDelta, false)");
     expect(playerStyles).toContain("touch-action: pan-y");
+  });
+
+  it("keeps player actions theme-aware and gives desktop blank-space clicks standard media behavior", () => {
+    expect(playerPage).toContain("onClick={mobilePlayer ? undefined : handleDesktopSurfaceClick}");
+    expect(playerPage).toContain("onDoubleClick={mobilePlayer ? undefined : handleDesktopSurfaceDoubleClick}");
+    expect(playerPage).toContain("desktopClickTimerRef.current = window.setTimeout");
+    expect(playerPage).toContain('event.key.toLowerCase() === "f"');
+    expect(playerPage).toContain("toggleFullscreen();");
+    expect(playerPage).toContain("data-theme={theme}");
+    expect(playerPage).toContain("data-player-theme={definition.playerVariant}");
+    expect(playerStyles).toContain("var(--player-accent)");
+    expect(playerPage).toContain("sourceMetadata.sourceFormat");
   });
 });

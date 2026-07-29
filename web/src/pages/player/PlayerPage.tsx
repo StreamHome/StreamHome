@@ -8,6 +8,7 @@ import { getEpisodes, getMovies } from "../../api/movies";
 import {
   createPlaybackRun,
   getPlaybackRun,
+  preparePlaybackRendition,
   startOverPlaybackRun,
   updatePlaybackProgress,
 } from "../../api/playback";
@@ -129,21 +130,28 @@ export function nextPlayableEpisode(episodes: Episode[], currentId: string): Epi
 
 export function playbackQualityOptions(
   renditions: PlaybackRendition[],
-  levels: Array<{ height?: number }>,
-): Array<{ label: string; height: number | "auto"; index: number; ready: boolean }> {
+  levels: Array<{ height?: number; name?: string; url?: string | string[]; attrs?: Record<string, string> }>,
+): Array<{ id: string; label: string; height: number | "auto"; index: number; ready: boolean; status: PlaybackRendition["status"] | "ready" }> {
   const options = renditions
     .slice()
     .sort((left, right) => right.height - left.height)
     .map((rendition) => {
-      const index = levels.findIndex((level) => Number(level.height || 0) === rendition.height);
+      const index = levels.findIndex((level) => {
+        const urls = Array.isArray(level.url) ? level.url : [level.url || ""];
+        const identityMatch = urls.some((url) => decodeURIComponent(url).includes(`/${rendition.id}/playlist.m3u8`));
+        const nameMatch = level.name === rendition.label || level.attrs?.NAME === rendition.label;
+        return identityMatch || nameMatch;
+      });
       return {
-        label: `${rendition.height}p${rendition.original ? " · Original" : ""}`,
+        id: rendition.id,
+        label: `${rendition.label}${rendition.original ? " · Original" : ""}`,
         height: rendition.height,
         index,
         ready: rendition.ready && index >= 0,
+        status: rendition.status,
       };
     });
-  return [{ label: "Auto", height: "auto", index: -1, ready: true }, ...options];
+  return [{ id: "auto", label: "Auto", height: "auto", index: -1, ready: true, status: "ready" }, ...options];
 }
 
 export function applySubtitleTrackSelection(video: HTMLVideoElement, selectedTrackId: string): void {
@@ -271,6 +279,7 @@ export function PlayerPage() {
   const timelineRef = useRef<HTMLInputElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const controlsTimerRef = useRef<number | null>(null);
+  const desktopClickTimerRef = useRef<number | null>(null);
   const resumePositionRef = useRef(0);
   const currentTimeRef = useRef(0);
   const resumeAppliedRef = useRef(false);
@@ -288,10 +297,11 @@ export function PlayerPage() {
   const mobileFullscreenAttemptedAtRef = useRef(0);
   const mobilePointerGestureRef = useRef<MobilePointerGesture | null>(null);
   const showControlsRef = useRef(true);
+  const phaseRef = useRef<PlayerPhase>("resolving");
+  const controlMenuOpenRef = useRef(false);
   const scrubbingRef = useRef(false);
   const scrubOriginRef = useRef(0);
   const timelineAnimationFrameRef = useRef<number | null>(null);
-  const mountedRef = useRef(true);
 
   const [asset, setAsset] = useState<PlayableAsset | null>(null);
   const [episodeSequence, setEpisodeSequence] = useState<Episode[]>([]);
@@ -308,12 +318,11 @@ export function PlayerPage() {
   const [showControls, setShowControls] = useState(true);
   const [controlMenuOpen, setControlMenuOpen] = useState(false);
   const [timelineScrubbing, setTimelineScrubbing] = useState(false);
-  const [availableQualities, setAvailableQualities] = useState<Array<{ label: string; height: number | "auto"; index: number; ready: boolean }>>([{ label: "Auto", height: "auto", index: -1, ready: true }]);
-  const [selectedQualityHeight, setSelectedQualityHeight] = useState<number | "auto">("auto");
+  const [availableQualities, setAvailableQualities] = useState<ReturnType<typeof playbackQualityOptions>>([{ id: "auto", label: "Auto", height: "auto", index: -1, ready: true, status: "ready" }]);
+  const [selectedQualityId, setSelectedQualityId] = useState("auto");
   const [availableAudioTracks, setAvailableAudioTracks] = useState<Array<{ label: string; language: string; index: number }>>([]);
   const [selectedAudioTrackIndex, setSelectedAudioTrackIndex] = useState(0);
   const [preferences, setPreferences] = useState<PlayerPreferences>(() => profile ? loadPreferences(profile.id) : DEFAULT_PREFERENCES);
-  const [showStartOver, setShowStartOver] = useState(false);
   const [nextCountdown, setNextCountdown] = useState<number | null>(null);
   const [nextCancelled, setNextCancelled] = useState(false);
   const [timelinePreview, setTimelinePreview] = useState<{ x: number; time: number } | null>(null);
@@ -322,7 +331,6 @@ export function PlayerPage() {
   const [fullscreenError, setFullscreenError] = useState("");
   const [mobilePlayer, setMobilePlayer] = useState(() => typeof window !== "undefined" && isPhonePlayerViewport(readMobileViewport(window)));
   const [forcedLandscape, setForcedLandscape] = useState(() => typeof window !== "undefined" && isForcedLandscape(window.innerWidth, window.innerHeight, isPhonePlayerViewport(readMobileViewport(window))));
-  const [forcedLandscapeDirection, setForcedLandscapeDirection] = useState<"clockwise" | "counterclockwise">("clockwise");
   const [mobileSeekFeedback, setMobileSeekFeedback] = useState<{
     side: MobileTapSide;
     seconds: number;
@@ -337,13 +345,6 @@ export function PlayerPage() {
     if ((location.state as { fromApp?: boolean } | null)?.fromApp) navigate(-1);
     else navigate(appUrl(profile.id, "home"), { replace: true });
   }, [location.state, navigate, profile]);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
 
   useEffect(() => {
     const updateMobileEnvironment = () => {
@@ -400,14 +401,13 @@ export function PlayerPage() {
     currentTimeRef.current = 0;
     setDuration(0);
     setBufferedEnd(0);
-    setAvailableQualities([{ label: "Auto", height: "auto", index: -1, ready: true }]);
-    setSelectedQualityHeight("auto");
+    setAvailableQualities([{ id: "auto", label: "Auto", height: "auto", index: -1, ready: true, status: "ready" }]);
+    setSelectedQualityId("auto");
     setAvailableAudioTracks([]);
     setSelectedAudioTrackIndex(0);
     setControlMenuOpen(false);
     setTimelineScrubbing(false);
     setShowControls(true);
-    setShowStartOver(false);
     setNextCountdown(null);
     setNextCancelled(false);
     setStreamMode("hls");
@@ -546,9 +546,24 @@ export function PlayerPage() {
     video.removeAttribute("src");
     video.load();
 
+    const serverAudioTracks = runResponse.tracks
+      .filter((track) => track.ready)
+      .map((track, index) => ({
+        label: languageDisplayName(track.language, track.label),
+        language: normalizeLanguageTag(track.language),
+        index,
+      }));
+    setAvailableAudioTracks(serverAudioTracks);
+    const serverPreferredAudio = Math.max(0, serverAudioTracks.findIndex((track) => track.language === preferences.audioLanguage));
+    setSelectedAudioTrackIndex(serverPreferredAudio);
+
     const beginPlayback = () => {
       applyResume(video);
       video.playbackRate = preferences.playbackRate;
+      if (mobilePlayer) {
+        setPhase("paused");
+        return;
+      }
       void video.play().catch(() => setPhase("paused"));
     };
 
@@ -584,7 +599,7 @@ export function PlayerPage() {
           ? options[0]
           : readyOptions.reduce((best, item) => Math.abs(Number(item.height) - Number(preferences.qualityHeight)) < Math.abs(Number(best.height) - Number(preferences.qualityHeight)) ? item : best);
         hls.currentLevel = preferred?.index ?? -1;
-        setSelectedQualityHeight(preferred?.height ?? "auto");
+        setSelectedQualityId(preferred?.id ?? "auto");
         beginPlayback();
       });
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_, data) => {
@@ -631,7 +646,7 @@ export function PlayerPage() {
     }
 
     setStreamMode("progressive");
-  }, [applyResume, runResponse, streamMode]);
+  }, [applyResume, mobilePlayer, runResponse, streamMode]);
 
   useEffect(() => {
     if (!runResponse || !profile) return;
@@ -656,19 +671,19 @@ export function PlayerPage() {
 
   useEffect(() => {
     if (!runResponse || runResponse.preparationState !== "ready") return;
-    const pendingRenditions = [...runResponse.renditions, ...runResponse.tracks].some((item) => !item.ready);
+    const pendingRenditions = [...runResponse.renditions, ...runResponse.tracks].some((item) => item.status === "preparing");
     if (!pendingRenditions) return;
     const abort = new AbortController();
     let attempts = 0;
     let timer: number | null = null;
-    const knownReady = [...runResponse.renditions, ...runResponse.tracks].filter((item) => item.ready).map((item) => item.id).sort().join("|");
+    const knownStatus = [...runResponse.renditions, ...runResponse.tracks].map((item) => `${item.id}:${item.status}`).sort().join("|");
 
     const poll = async () => {
       attempts += 1;
       try {
         const refreshed = await getPlaybackRun(runResponse.runId, { signal: abort.signal });
-        const refreshedReady = [...refreshed.renditions, ...refreshed.tracks].filter((item) => item.ready).map((item) => item.id).sort().join("|");
-        if (refreshedReady !== knownReady || refreshed.preparationState !== runResponse.preparationState) {
+        const refreshedStatus = [...refreshed.renditions, ...refreshed.tracks].map((item) => `${item.id}:${item.status}`).sort().join("|");
+        if (refreshedStatus !== knownStatus || refreshed.preparationState !== runResponse.preparationState) {
           sequenceNumberRef.current = refreshed.nextSequenceNumber;
           resumePositionRef.current = videoRef.current?.currentTime ?? currentTimeRef.current;
           resumeAppliedRef.current = false;
@@ -796,27 +811,22 @@ export function PlayerPage() {
   }, [captureWatchedTime, reportProgress]);
 
   const revealControls = useCallback(() => {
-    setShowControls(true);
-  }, []);
-
-  useEffect(() => {
-    if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
+    if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
     controlsTimerRef.current = null;
-    if (!shouldAutoHidePlayerControls(phase, controlMenuOpen, timelineScrubbing)) {
-      setShowControls(true);
-      return;
-    }
-    if (showControls) {
+    setShowControls(true);
+    if (shouldAutoHidePlayerControls(phaseRef.current, controlMenuOpenRef.current, scrubbingRef.current)) {
       controlsTimerRef.current = window.setTimeout(() => {
         setShowControls(false);
         controlsTimerRef.current = null;
       }, PLAYER_CONTROLS_IDLE_MS);
     }
-    return () => {
-      if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
-      controlsTimerRef.current = null;
-    };
-  }, [controlMenuOpen, phase, showControls, timelineScrubbing]);
+  }, []);
+
+  useEffect(() => {
+    phaseRef.current = phase;
+    controlMenuOpenRef.current = controlMenuOpen;
+    revealControls();
+  }, [controlMenuOpen, phase, revealControls, timelineScrubbing]);
 
   useEffect(() => {
     if (phase !== "playing") return;
@@ -899,17 +909,45 @@ export function PlayerPage() {
     const now = performance.now();
     if (mobileFullscreenAttemptedAtRef.current > 0 && now - mobileFullscreenAttemptedAtRef.current < 2_000) return;
     mobileFullscreenAttemptedAtRef.current = now;
-    void togglePlayerFullscreen(container, video, document, { allowVideoFallback: false })
+    void togglePlayerFullscreen(container, video, document, { allowVideoFallback: true })
       .then(async () => {
         const active = isPlayerFullscreen(video);
         setFullscreenActive(active);
         if (active) await lockPlayerLandscape();
       })
       .catch(() => {
-        mobileFullscreenAttemptedAtRef.current = Number.POSITIVE_INFINITY;
+        mobileFullscreenAttemptedAtRef.current = 0;
         // The CSS-rotated landscape presentation remains active when browser policy rejects fullscreen.
       });
   }, [fullscreenActive, mobilePlayer]);
+
+  const startMobilePlayback = useCallback(() => {
+    ensureMobileLandscape();
+    safePlay();
+  }, [ensureMobileLandscape, safePlay]);
+
+  const handleDesktopSurfaceClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (mobilePlayer || (event.target !== event.currentTarget && event.target !== videoRef.current)) return;
+    revealControls();
+    if (event.detail !== 1) return;
+    if (desktopClickTimerRef.current !== null) window.clearTimeout(desktopClickTimerRef.current);
+    desktopClickTimerRef.current = window.setTimeout(() => {
+      desktopClickTimerRef.current = null;
+      const video = videoRef.current;
+      if (!video) return;
+      if (video.paused) safePlay();
+      else video.pause();
+    }, 220);
+  }, [mobilePlayer, revealControls, safePlay]);
+
+  const handleDesktopSurfaceDoubleClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (mobilePlayer || (event.target !== event.currentTarget && event.target !== videoRef.current)) return;
+    event.preventDefault();
+    if (desktopClickTimerRef.current !== null) window.clearTimeout(desktopClickTimerRef.current);
+    desktopClickTimerRef.current = null;
+    toggleFullscreen();
+    revealControls();
+  }, [mobilePlayer, revealControls, toggleFullscreen]);
 
   const togglePictureInPicture = useCallback(() => {
     const video = videoRef.current;
@@ -923,7 +961,6 @@ export function PlayerPage() {
     void startOverPlaybackRun(runResponse.runId).then(() => {
       completedRef.current = false;
       resumePositionRef.current = 0;
-      setShowStartOver(false);
       setNextCountdown(null);
       seek(0);
       safePlay();
@@ -958,18 +995,15 @@ export function PlayerPage() {
     return () => window.clearTimeout(timer);
   }, [nextCountdown, playNextEpisode]);
 
-  useEffect(() => {
-    if (!mobilePlayer || phase !== "playing") return;
-    revealControls();
-  }, [mobilePlayer, phase, revealControls]);
-
   const handleControlMenuOpenChange = useCallback((open: boolean) => {
+    controlMenuOpenRef.current = open;
     setControlMenuOpen(open);
-    setShowControls(true);
-  }, []);
+    revealControls();
+  }, [revealControls]);
 
   useEffect(() => () => {
-    if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
+    if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
+    if (desktopClickTimerRef.current !== null) window.clearTimeout(desktopClickTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -1122,12 +1156,28 @@ export function PlayerPage() {
     setTimelinePreview({ x: ratio * rect.width, time: ratio * duration });
   };
 
-  const changeQuality = (height: number | "auto") => {
-    const selected = availableQualities.find((item) => item.height === height);
-    if (!selected?.ready) return;
-    setSelectedQualityHeight(height);
-    setPreferences((current) => ({ ...current, qualityHeight: height }));
-    if (hlsRef.current) hlsRef.current.currentLevel = selected.index;
+  const changeQuality = (renditionId: string) => {
+    const selected = availableQualities.find((item) => item.id === renditionId);
+    if (!selected) return;
+    setSelectedQualityId(renditionId);
+    setPreferences((current) => ({ ...current, qualityHeight: selected.height }));
+    if (selected.ready) {
+      if (hlsRef.current) hlsRef.current.currentLevel = selected.index;
+      return;
+    }
+    if (!runResponse || renditionId === "auto") return;
+    setAvailableQualities((current) => current.map((item) => item.id === renditionId ? { ...item, status: "preparing" } : item));
+    setRunResponse((current) => current ? {
+      ...current,
+      renditions: current.renditions.map((item) => item.id === renditionId ? { ...item, status: "preparing" } : item),
+    } : current);
+    void preparePlaybackRendition(runResponse.runId, renditionId).catch(() => {
+      setAvailableQualities((current) => current.map((item) => item.id === renditionId ? { ...item, status: "failed" } : item));
+      setRunResponse((current) => current ? {
+        ...current,
+        renditions: current.renditions.map((item) => item.id === renditionId ? { ...item, status: "failed" } : item),
+      } : current);
+    });
   };
 
   const changeAudio = (index: number) => {
@@ -1135,6 +1185,12 @@ export function PlayerPage() {
     const selected = availableAudioTracks.find((item) => item.index === index);
     setPreferences((current) => ({ ...current, audioLanguage: normalizeLanguageTag(selected?.language, "") }));
     if (hlsRef.current) hlsRef.current.audioTrack = index;
+    const nativeTracks = (videoRef.current as HTMLVideoElement & { audioTracks?: ArrayLike<{ enabled: boolean }> } | null)?.audioTracks;
+    if (nativeTracks) {
+      for (let trackIndex = 0; trackIndex < nativeTracks.length; trackIndex += 1) {
+        nativeTracks[trackIndex].enabled = trackIndex === index;
+      }
+    }
   };
 
   const retryPlayback = () => {
@@ -1177,7 +1233,6 @@ export function PlayerPage() {
         className="player-view player-state-view fixed inset-0 grid min-h-screen place-items-center bg-black px-6 text-white"
         data-mobile-player={mobilePlayer ? "true" : "false"}
         data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
-        data-mobile-landscape-direction={forcedLandscapeDirection}
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
@@ -1197,7 +1252,6 @@ export function PlayerPage() {
         className="player-view player-state-view fixed inset-0 grid min-h-screen place-items-center bg-black p-6 text-white"
         data-mobile-player={mobilePlayer ? "true" : "false"}
         data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
-        data-mobile-landscape-direction={forcedLandscapeDirection}
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
       >
@@ -1225,10 +1279,10 @@ export function PlayerPage() {
       data-controls-visible={showControls || phase !== "playing" ? "true" : "false"}
       data-mobile-player={mobilePlayer ? "true" : "false"}
       data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
-      data-mobile-landscape-direction={forcedLandscapeDirection}
       style={{ "--caption-scale": preferences.captionScale } as React.CSSProperties}
       onMouseMove={mobilePlayer ? undefined : revealControls}
-      onClick={mobilePlayer ? undefined : revealControls}
+      onClick={mobilePlayer ? undefined : handleDesktopSurfaceClick}
+      onDoubleClick={mobilePlayer ? undefined : handleDesktopSurfaceDoubleClick}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
@@ -1250,10 +1304,6 @@ export function PlayerPage() {
           setPhase("playing");
           lastAdvanceWallRef.current = performance.now();
           lastAdvanceMediaRef.current = videoRef.current?.currentTime ?? 0;
-          if (runResponse.resumePosition > 0) {
-            setShowStartOver(true);
-            window.setTimeout(() => mountedRef.current && setShowStartOver(false), 10_000);
-          }
         }}
         onPause={() => {
           captureWatchedTime();
@@ -1385,14 +1435,6 @@ export function PlayerPage() {
       </AnimatePresence>
 
       <AnimatePresence>
-        {showStartOver && !mobilePlayer && (
-          <motion.button className="player-start-over absolute left-6 top-6 z-40 rounded-lg border border-white/20 bg-black/70 px-4 py-2 text-sm backdrop-blur-md md:left-10 md:top-10" onClick={startOver} initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }}>
-            Start over
-          </motion.button>
-        )}
-      </AnimatePresence>
-
-      <AnimatePresence>
         {skipMarker && (
           <motion.div className="player-skip-control absolute bottom-36 right-6 z-40 md:right-10" initial={reduced ? { opacity: 0 } : { opacity: 0, x: 18 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 12 }}>
             <Button onClick={() => seek(skipMarker.end)}>{skipMarker.label}</Button>
@@ -1436,28 +1478,18 @@ export function PlayerPage() {
           >
             <header className="mobile-player-topbar">
               <div className="mobile-player-topbar__actions">
-                {showStartOver && (
-                  <PlayerIconButton icon="rewind" label="Start over" className="mobile-player-start-over" onClick={startOver} />
-                )}
-                {forcedLandscape && (
-                  <PlayerIconButton
-                    icon="rotate"
-                    label="Rotate player"
-                    className="mobile-player-rotate"
-                    onClick={() => setForcedLandscapeDirection((direction) => direction === "clockwise" ? "counterclockwise" : "clockwise")}
-                  />
-                )}
+                <PlayerIconButton
+                  icon="exit"
+                  label="Exit player"
+                  className="mobile-player-exit"
+                  onClick={exitPlayer}
+                />
               </div>
               <div className="mobile-player-title">
                 <h1>{asset.title}</h1>
                 {asset.subtitle && <p>{asset.subtitle}</p>}
+                <small>{runResponse.sourceMetadata.sourceFormat} source</small>
               </div>
-              <PlayerIconButton
-                icon="exit"
-                label="Exit player"
-                className="mobile-player-exit"
-                onClick={exitPlayer}
-              />
             </header>
 
             <div className="mobile-player-transport">
@@ -1471,7 +1503,7 @@ export function PlayerPage() {
                 icon={phase === "playing" ? "pause" : "play"}
                 label={phase === "playing" ? "Pause" : "Play"}
                 className="mobile-player-transport__play"
-                onClick={() => phase === "playing" ? videoRef.current?.pause() : safePlay()}
+                onClick={() => phase === "playing" ? videoRef.current?.pause() : startMobilePlayback()}
               />
               <PlayerIconButton
                 icon="forward"
@@ -1550,8 +1582,8 @@ export function PlayerPage() {
                     <PlayerControlMenu
                       label="Quality"
                       icon="quality"
-                      value={selectedQualityHeight}
-                      options={availableQualities.map((item) => ({ value: item.height, label: item.label, disabled: !item.ready, status: item.ready ? undefined : "Preparing" }))}
+                      value={selectedQualityId}
+                      options={availableQualities.map((item) => ({ value: item.id, label: item.label, status: item.ready ? undefined : item.status === "failed" ? "Retry" : "Preparing" }))}
                       onSelect={changeQuality}
                       onOpenChange={handleControlMenuOpenChange}
                     />
@@ -1586,7 +1618,7 @@ export function PlayerPage() {
                 <div>
                   <h1 className="text-lg font-semibold md:text-2xl">{asset.title}</h1>
                   {asset.subtitle && <p className="mt-1 text-xs text-white/60 md:text-sm">{asset.subtitle}</p>}
-                  <p className="mt-1 text-[11px] uppercase tracking-[0.14em] text-white/35">{streamMode === "progressive" ? "Compatibility stream" : "Adaptive stream"}</p>
+                  <p className="mt-1 text-[11px] uppercase tracking-[0.14em] text-white/35">{runResponse.sourceMetadata.sourceFormat} source · {streamMode === "progressive" ? "Compatibility delivery" : "Adaptive delivery"}</p>
                 </div>
                 <button onClick={exitPlayer} className="player-exit-button" aria-label="Exit player">
                   <PlayerIcon name="exit" />
@@ -1670,8 +1702,8 @@ export function PlayerPage() {
                     <PlayerControlMenu
                       label="Quality"
                       icon="quality"
-                      value={selectedQualityHeight}
-                      options={availableQualities.map((item) => ({ value: item.height, label: item.label, disabled: !item.ready, status: item.ready ? undefined : "Preparing" }))}
+                      value={selectedQualityId}
+                      options={availableQualities.map((item) => ({ value: item.id, label: item.label, status: item.ready ? undefined : item.status === "failed" ? "Retry" : "Preparing" }))}
                       onSelect={changeQuality}
                       onOpenChange={handleControlMenuOpenChange}
                     />

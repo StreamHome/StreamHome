@@ -54,16 +54,22 @@ describe("player interaction contracts", () => {
 
   it("shows the complete source-bounded ladder while marking unfinished levels", () => {
     const options = playbackQualityOptions([
-      { id: "original", label: "Original", height: 720, width: 1280, original: true, ready: true },
-      { id: "480", label: "480p", height: 480, width: 854, original: false, ready: true },
-      { id: "360", label: "360p", height: 360, width: 640, original: false, ready: false },
-      { id: "240", label: "240p", height: 240, width: 426, original: false, ready: false },
-      { id: "144", label: "144p", height: 144, width: 256, original: false, ready: false },
-    ], [{ height: 720 }, { height: 480 }]);
+      { id: "video_original", label: "1080p", height: 800, width: 1920, original: true, ready: true, status: "ready" },
+      { id: "video_720p", label: "720p", height: 720, width: 1728, original: false, ready: true, status: "streamable" },
+      { id: "video_480p", label: "480p", height: 480, width: 1152, original: false, ready: false, status: "preparing" },
+      { id: "video_360p", label: "360p", height: 360, width: 864, original: false, ready: false, status: "preparing" },
+      { id: "video_240p", label: "240p", height: 240, width: 576, original: false, ready: false, status: "failed" },
+      { id: "video_144p", label: "144p", height: 144, width: 346, original: false, ready: false, status: "preparing" },
+    ], [
+      { height: 800, url: "/api/playback/hls/movie/video_original/playlist.m3u8" },
+      { height: 612, url: "/api/playback/hls/movie/video_720p/playlist.m3u8" },
+    ]);
 
-    expect(options.map((item) => item.height)).toEqual(["auto", 720, 480, 360, 240, 144]);
+    expect(options.map((item) => item.height)).toEqual(["auto", 800, 720, 480, 360, 240, 144]);
+    expect(options.find((item) => item.id === "video_original")?.label).toBe("1080p · Original");
+    expect(options.find((item) => item.id === "video_720p")?.ready).toBe(true);
     expect(options.find((item) => item.height === 144)?.ready).toBe(false);
-    expect(options.find((item) => item.height === 480)?.index).toBe(1);
+    expect(options.find((item) => item.height === 720)?.index).toBe(1);
   });
 
   it("enables exactly the selected subtitle element by stable track id", () => {

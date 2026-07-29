@@ -25,9 +25,9 @@ from models import APIModel, AuthSession, DownloadTask, Episode, Movie, Playback
 from routes.auth import get_current_user
 from services.logger import logger
 from services.languages import language_label, normalize_language_tag
-from services.media_source import MediaSourceError, ResolvedMediaSource, resolve_media_source
-from services.media_probe import probe_completed_media
-from services.playback_prep import AudioRendition, PlaybackPrepService, VideoRendition, playback_prep_service
+from services.media_source import MediaSourceError, ResolvedMediaSource, playback_source_fingerprint, resolve_media_source
+from services.media_probe import probe_cloud_external_audio, probe_completed_media
+from services.playback_prep import AudioRendition, PlaybackPreparationError, PlaybackPrepService, VideoRendition, playback_prep_service
 from services.ingest_preview import IngestPreviewError, ingest_preview_service
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
 from services.profile_security import require_profile_access
@@ -41,6 +41,8 @@ RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 SAFE_SUBTITLE_LANGUAGE_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 ACTIVE_REPAIR_STATUSES = {"PENDING", "DOWNLOADING", "MERGING", "MOVING_CLOUD"}
 REPAIRABLE_PREPARATION_ERRORS = {"MEDIA_SOURCE_MISSING", "CLOUD_STREAM_FAILED", "EMPTY_RENDITION"}
+CLOUD_AUDIO_PROBE_TTL_SECONDS = 300
+_cloud_audio_probe_times: dict[str, float] = {}
 
 
 class PlaybackRunRequest(APIModel):
@@ -64,6 +66,7 @@ class PlaybackSourceMetadata(APIModel):
     width: int
     height: int
     frame_rate: float
+    source_format: str
 
 
 class PlaybackTrack(APIModel):
@@ -73,6 +76,7 @@ class PlaybackTrack(APIModel):
     channels: int
     default: bool
     ready: bool
+    status: Literal["preparing", "streamable", "ready", "failed"]
 
 
 class PlaybackRendition(APIModel):
@@ -82,6 +86,7 @@ class PlaybackRendition(APIModel):
     width: int
     original: bool
     ready: bool
+    status: Literal["preparing", "streamable", "ready", "failed"]
 
 
 class PlaybackPreparationFailure(APIModel):
@@ -316,20 +321,29 @@ async def queue_media_repair(
 
 
 async def synchronize_source_fingerprint(db: AsyncSession, media_obj: Any, source: ResolvedMediaSource) -> None:
-    if media_obj.source_fingerprint == source.fingerprint:
+    fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
+    if media_obj.source_fingerprint == fingerprint:
         return
     if media_obj.source_fingerprint:
         playback_prep_service.cancel_media(media_obj.id, media_obj.source_fingerprint)
-    media_obj.source_fingerprint = source.fingerprint
+    media_obj.source_fingerprint = fingerprint
     db.add(media_obj)
     await db.commit()
 
 
 async def ensure_source_metadata(db: AsyncSession, media_obj: Any, source: ResolvedMediaSource) -> None:
     if not source.local_exists:
+        last_probe = _cloud_audio_probe_times.get(str(media_obj.id), 0)
+        if source.cloud_path and time.monotonic() - last_probe >= CLOUD_AUDIO_PROBE_TTL_SECONDS:
+            _cloud_audio_probe_times[str(media_obj.id)] = time.monotonic()
+            audio_metadata = await probe_cloud_external_audio(source.cloud_path, list(media_obj.audio_metadata or []))
+            if audio_metadata != list(media_obj.audio_metadata or []):
+                media_obj.audio_metadata = audio_metadata
+                db.add(media_obj)
+                await db.commit()
         return
     metadata_missing = not media_obj.probed_duration or not media_obj.codec or not media_obj.width or not media_obj.height
-    source_replaced = media_obj.source_fingerprint != source.fingerprint
+    source_replaced = media_obj.source_fingerprint != playback_source_fingerprint(source, media_obj.audio_metadata or [])
     if not metadata_missing and not source_replaced:
         return
     probe = await probe_completed_media(str(source.local_path))
@@ -374,43 +388,56 @@ async def run_resume_position(db: AsyncSession, run: PlaybackRun, media_obj: Any
 
 
 def source_metadata(media_obj: Any) -> PlaybackSourceMetadata:
+    container = str(media_obj.container or "")
+    suffix = Path(str(getattr(media_obj, "video_url", ""))).suffix.lower()
+    if suffix == ".mp4" or "mp4" in container.lower():
+        source_format = "MP4"
+    elif suffix:
+        source_format = suffix.lstrip(".").upper()
+    else:
+        source_format = container.split(",", 1)[0].upper() if container else "Server media"
     return PlaybackSourceMetadata(
         duration=max(0.0, float(media_obj.probed_duration or 0)),
-        container=str(media_obj.container or ""),
+        container=container,
         codec=str(media_obj.codec or ""),
         width=max(0, int(media_obj.width or 0)),
         height=max(0, int(media_obj.height or 0)),
         frame_rate=max(0.0, float(media_obj.frame_rate or 0)),
+        source_format=source_format,
     )
 
 
 def track_contract(media_obj: Any, media_id: str, fingerprint: str) -> list[PlaybackTrack]:
     channel_by_index = {int(item.get("index", index)): int(item.get("channels", 2)) for index, item in enumerate(media_obj.audio_metadata or [])}
-    return [
-        PlaybackTrack(
+    result: list[PlaybackTrack] = []
+    for item in playback_prep_service.audio_renditions(media_obj):
+        rendition_status = playback_prep_service.rendition_status(media_id, fingerprint, item.name)
+        result.append(PlaybackTrack(
             id=item.name,
             label=item.label,
             language=item.language,
             channels=channel_by_index.get(item.stream_index, 2),
             default=item.default,
-            ready=playback_prep_service.playlist_ready(media_id, fingerprint, item.name),
-        )
-        for item in playback_prep_service.audio_renditions(media_obj)
-    ]
+            ready=rendition_status in {"streamable", "ready"},
+            status=rendition_status,
+        ))
+    return result
 
 
 def rendition_contract(media_obj: Any, media_id: str, fingerprint: str) -> list[PlaybackRendition]:
-    return [
-        PlaybackRendition(
+    result: list[PlaybackRendition] = []
+    for item in playback_prep_service.video_renditions(media_obj):
+        rendition_status = playback_prep_service.rendition_status(media_id, fingerprint, item.name)
+        result.append(PlaybackRendition(
             id=item.name,
             label=item.label,
             height=item.height,
             width=item.width,
             original=item.original,
-            ready=playback_prep_service.playlist_ready(media_id, fingerprint, item.name),
-        )
-        for item in playback_prep_service.video_renditions(media_obj)
-    ]
+            ready=rendition_status in {"streamable", "ready"},
+            status=rendition_status,
+        ))
+    return result
 
 
 def subtitle_contract(media_obj: Any) -> list[dict[str, str]]:
@@ -465,6 +492,7 @@ async def build_run_response(
                 width=max(0, int(getattr(media_obj, "width", 0) or 0)),
                 height=min(720, max(0, int(getattr(media_obj, "height", 0) or 720))),
                 frame_rate=max(0.0, float(getattr(media_obj, "frame_rate", 0) or 0)),
+                source_format="HLS preview",
             ),
             tracks=[],
             renditions=[
@@ -475,6 +503,11 @@ async def build_run_response(
                     width=max(0, int(getattr(media_obj, "width", 0) or 0)),
                     original=False,
                     ready=preview_status["phase"] == "ready",
+                    status=(
+                        "ready"
+                        if preview_status["phase"] == "ready"
+                        else "failed" if preview_status["phase"] == "error" else "preparing"
+                    ),
                 )
             ],
             subtitles=[],
@@ -494,7 +527,7 @@ async def build_run_response(
 
     fingerprint = str(media_obj.source_fingerprint or "")
     state = playback_prep_service.preparation_state(media_obj.id, fingerprint, media_obj)
-    failure_payload = playback_prep_service.preparation_error(media_obj.id, fingerprint)
+    failure_payload = playback_prep_service.required_preparation_error(media_obj.id, fingerprint, media_obj)
     failure = PlaybackPreparationFailure(**failure_payload) if failure_payload else None
     ticket, expires_at = issue_playback_ticket(user, auth_session, run.profile_id, run.id, media_obj.id, fingerprint)
     encoded_ticket = quote(ticket, safe="")
@@ -615,7 +648,7 @@ async def get_playback_run(
     movie, media_obj = await resolve_run_media(db, run.movie_id, run.episode_id)
     if run.source_kind != "ingest_preview":
         fingerprint = str(media_obj.source_fingerprint or "")
-        cached_failure = playback_prep_service.preparation_error(media_obj.id, fingerprint) if fingerprint else None
+        cached_failure = playback_prep_service.required_preparation_error(media_obj.id, fingerprint, media_obj) if fingerprint else None
         if cached_failure and cached_failure["code"] in REPAIRABLE_PREPARATION_ERRORS and not retry:
             repair_task = await queue_media_repair(db, movie, media_obj, cached_failure["code"])
             if repair_task:
@@ -767,6 +800,34 @@ async def start_over_playback_run(
     return {"status": "ok", "nextSequenceNumber": run.sequence_number}
 
 
+@router.post("/runs/{run_id}/renditions/{rendition_id}/prepare")
+async def prioritize_playback_rendition(
+    run_id: str,
+    rendition_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    del user
+    run = await authorized_run(db, request, run_id)
+    if run.source_kind != "catalog":
+        raise playback_error(status.HTTP_409_CONFLICT, "RENDITION_FIXED", "This temporary preview has one fixed quality.")
+    _, media_obj = await resolve_run_media(db, run.movie_id, run.episode_id)
+    source = await require_available_source(media_obj)
+    await ensure_source_metadata(db, media_obj, source)
+    await synchronize_source_fingerprint(db, media_obj, source)
+    try:
+        rendition_status = await playback_prep_service.prioritize_video_rendition(
+            media_obj.id,
+            media_obj,
+            source,
+            rendition_id,
+        )
+    except PlaybackPreparationError as exc:
+        raise playback_error(status.HTTP_404_NOT_FOUND, exc.code, str(exc)) from exc
+    return {"status": rendition_status}
+
+
 def protected_hls_url(media_id: str, relative_path: str, ticket: str) -> str:
     return f"/api/playback/hls/{quote(media_id, safe='')}/{quote(relative_path, safe='/')}?ticket={quote(ticket, safe='')}"
 
@@ -906,7 +967,7 @@ async def serve_master_manifest(
     cache_root = playback_prep_service.cache_path(media_id, str(payload["fingerprint"]))
     master_path = safe_hls_file(cache_root, "master.m3u8")
     if not master_path.is_file():
-        failure = playback_prep_service.preparation_error(media_id, str(payload["fingerprint"]))
+        failure = playback_prep_service.required_preparation_error(media_id, str(payload["fingerprint"]), media_obj)
         if failure:
             raise playback_error(status.HTTP_503_SERVICE_UNAVAILABLE, failure["code"], failure["message"])
         raise playback_error(status.HTTP_425_TOO_EARLY, "PLAYBACK_PREPARING", "The adaptive stream is still preparing.")

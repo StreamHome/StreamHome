@@ -21,7 +21,7 @@ from services.ingestion_errors import IngestionFailure, IngestionTaskError, prun
 from services.ingest_preview import ingest_preview_service
 from services.rclone import rclone_service
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
-from services.media_source import MediaSourceError, catalog_path_from_storage, resolve_media_source
+from services.media_source import MediaSourceError, catalog_path_from_storage, playback_source_fingerprint, resolve_media_source
 from services.vibe_analysis import VIBE_ANALYSIS_VERSION, compute_trope_vectors, vibe_analysis_manager
 from services.audio_extractor import apply_primary_audio_language, extract_audio_and_strip_video, normalize_language_code
 
@@ -632,11 +632,12 @@ class DownloadQueueManager:
             source = await resolve_media_source(media_obj.video_url)
             if not source.available:
                 return
-            if media_obj.source_fingerprint != source.fingerprint:
-                media_obj.source_fingerprint = source.fingerprint
+            fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
+            if media_obj.source_fingerprint != fingerprint:
+                media_obj.source_fingerprint = fingerprint
                 db.add(media_obj)
                 await db.flush()
-            await playback_prep_service.prepare(media_obj.id, media_obj, source, include_remaining=False)
+            await playback_prep_service.prepare(media_obj.id, media_obj, source, include_remaining=True)
         except Exception as exc:
             logger.warning(
                 f"[Queue Manager] Playback baseline scheduling failed for "

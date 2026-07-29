@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 from config import settings
 from routes.playback import parse_byte_range, rewrite_hls_playlist, subtitle_contract
 from services.languages import normalize_language_tag
-from services.media_probe import probe_completed_media
+from services.media_probe import probe_cloud_external_audio, probe_completed_media
 from services.media_source import MediaSourceError, ResolvedMediaSource, canonicalize_catalog_path, is_safe_presentation_asset, resolve_media_source
 from services.playback_prep import PlaybackMediaSnapshot, PlaybackPrepService, playback_prep_service
 from services.rclone import rclone_service
@@ -133,6 +133,92 @@ class PlaybackPipelineRegression(unittest.TestCase):
         renditions = playback_prep_service.video_renditions(source_720p)
         self.assertEqual([item.height for item in renditions], [720, 480, 360, 240, 144])
         self.assertTrue(all(item.height <= 720 for item in renditions))
+
+        cinematic_source = SimpleNamespace(width=1920, height=800, quality="1080p")
+        cinematic_renditions = playback_prep_service.video_renditions(cinematic_source)
+        self.assertEqual(cinematic_renditions[0].height, 800)
+        self.assertEqual(cinematic_renditions[0].label, "1080p")
+
+    def test_rendition_status_distinguishes_streamable_complete_and_failed(self) -> None:
+        media_id = f"m_status_{uuid.uuid4().hex}"
+        fingerprint = "a" * 32
+        rendition_name = "video_480p"
+        rendition_dir = playback_prep_service.cache_path(media_id, fingerprint) / rendition_name
+        rendition_dir.mkdir(parents=True)
+        try:
+            (rendition_dir / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+            (rendition_dir / "segment_00000.m4s").write_bytes(b"segment")
+            self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "streamable")
+            (rendition_dir / ".complete").write_text("done", encoding="utf-8")
+            self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "ready")
+            (rendition_dir / ".complete").unlink()
+            shutil.rmtree(rendition_dir)
+            playback_prep_service._write_rendition_error(media_id, fingerprint, rendition_name, "TEST_FAILURE", "failed")
+            self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "failed")
+        finally:
+            shutil.rmtree(playback_prep_service.cache_path(media_id, fingerprint).parent, ignore_errors=True)
+
+    def test_optional_rendition_failure_does_not_interrupt_ready_baseline(self) -> None:
+        media_id = f"m_optional_failure_{uuid.uuid4().hex}"
+        fingerprint = "b" * 32
+        media = SimpleNamespace(width=1280, height=720, quality="720p", audio_metadata=[])
+        cache_path = playback_prep_service.cache_path(media_id, fingerprint)
+        baseline_dir = cache_path / "video_original"
+        baseline_dir.mkdir(parents=True)
+        try:
+            (baseline_dir / "playlist.m3u8").write_text("#EXTM3U\n#EXT-X-ENDLIST\n", encoding="utf-8")
+            (baseline_dir / "segment_00000.m4s").write_bytes(b"segment")
+            (cache_path / "master.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+            playback_prep_service._write_rendition_error(media_id, fingerprint, "video_480p", "TEST_FAILURE", "failed")
+            playback_prep_service._write_preparation_error(media_id, fingerprint, "TEST_FAILURE", "failed")
+
+            self.assertEqual(playback_prep_service.preparation_state(media_id, fingerprint, media), "ready")
+            self.assertIsNone(playback_prep_service.required_preparation_error(media_id, fingerprint, media))
+        finally:
+            shutil.rmtree(cache_path.parent, ignore_errors=True)
+
+    def test_external_dubbing_overrides_embedded_language_and_invalidates_identity(self) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        self.assertIsNotNone(ffmpeg)
+        sidecar_directory = self.media_directory / "sidecar-audio"
+        sidecar_directory.mkdir()
+        sidecar_video = sidecar_directory / "fixture.mp4"
+        shutil.copy2(self.media_file, sidecar_video)
+        audio_directory = sidecar_directory / "audio"
+        audio_directory.mkdir()
+        for language, frequency in (("eng", 330), ("tur", 550)):
+            subprocess.run(
+                [
+                    str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", f"sine=frequency={frequency}:sample_rate=48000", "-t", "1",
+                    "-c:a", "libmp3lame", str(audio_directory / f"{language}.mp3"),
+                ],
+                check=True,
+                capture_output=True,
+            )
+        catalog_path = f"/media/Movies/{self.media_directory.name}/sidecar-audio/fixture.mp4"
+        first_source = asyncio.run(resolve_media_source(catalog_path, check_cloud=False))
+        first_fingerprint = first_source.fingerprint
+        probe = asyncio.run(probe_completed_media(str(sidecar_video)))
+        self.assertEqual([item["language"] for item in probe["audio_metadata"]], ["en", "tr"])
+        self.assertTrue(all(item.get("source") == "external" for item in probe["audio_metadata"]))
+        self.assertEqual([item.get("fileName") for item in probe["audio_metadata"]], ["eng.mp3", "tur.mp3"])
+        with (audio_directory / "tur.mp3").open("ab") as handle:
+            handle.write(b"\0")
+        second_source = asyncio.run(resolve_media_source(catalog_path, check_cloud=False))
+        self.assertNotEqual(first_fingerprint, second_source.fingerprint)
+
+    def test_cloud_external_dubbing_uses_the_same_language_contract(self) -> None:
+        response = SimpleNamespace(
+            ok=True,
+            stdout='[{"Name":"eng.mp3","Size":100,"ModTime":"2026-07-29T10:00:00Z"},{"Name":"tur.mp3","Size":120,"ModTime":"2026-07-29T10:01:00Z"}]',
+        )
+        embedded = [{"index": 0, "language": "en", "label": "English", "channels": 2, "default": True}]
+        with patch.object(rclone_service, "run", new=AsyncMock(return_value=response)) as run:
+            tracks = asyncio.run(probe_cloud_external_audio("streamhome:/Movies/Title/movie.mp4", embedded))
+        self.assertEqual([item["language"] for item in tracks], ["en", "tr"])
+        self.assertTrue(all(item["source"] == "external" for item in tracks))
+        run.assert_awaited_once_with("lsjson", "streamhome:/Movies/Title/audio", "--files-only", timeout=30)
 
     def test_audio_and_subtitle_contracts_accept_standard_language_tags(self) -> None:
         self.assertEqual(normalize_language_tag("eng"), "en")
@@ -322,6 +408,8 @@ class PlaybackPipelineRegression(unittest.TestCase):
             self.assertTrue(master.is_file())
             self.assertTrue(any(cache_path.rglob("*.m4s")))
             self.assertTrue((cache_path / "audio_0_en" / "segment_00000.m4s").is_file(), [str(path) for path in cache_path.rglob("*")])
+            self.assertIn("#EXT-X-PLAYLIST-TYPE:EVENT", (cache_path / "video_original" / "playlist.m3u8").read_text(encoding="utf-8"))
+            self.assertEqual(playback_prep_service.rendition_status(media.id, media.source_fingerprint, "video_original"), "ready")
             content = master.read_text(encoding="utf-8")
             self.assertIn("TYPE=AUDIO", content)
             self.assertIn("video_original/playlist.m3u8", content)

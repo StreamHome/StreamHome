@@ -5,10 +5,12 @@ import json
 import subprocess
 import httpx
 import hashlib
+from pathlib import Path
 from typing import Dict, Any, Optional
 from config import settings
 from services.logger import logger
 from services.languages import language_label, normalize_language_tag
+from services.media_source import EXTERNAL_AUDIO_EXTENSIONS, bind_audio_fingerprint, local_media_identity
 from services.ingestion_errors import IngestionFailure, classify_failure, compact_diagnostics, sanitize_url, write_task_diagnostics
 from services.ffmpeg_input import (
     ffmpeg_network_input_options,
@@ -318,33 +320,49 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
                 "default": bool((a.get("disposition") or {}).get("default")),
             })
 
-        # Older StreamHome catalogs may contain a silent video plus language-labelled
-        # audio files in the sibling audio directory. Treat those as real tracks only
-        # when the container itself has no audio, avoiding duplicate playlists for
-        # modern files that retain their embedded default track.
-        if not audio_meta:
-            audio_dir = os.path.join(os.path.dirname(file_path), "audio")
-            supported_audio = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"}
-            if os.path.isdir(audio_dir):
-                external_files = sorted(
-                    path for path in (os.path.join(audio_dir, name) for name in os.listdir(audio_dir))
-                    if os.path.isfile(path) and os.path.splitext(path)[1].lower() in supported_audio
-                )
-                for idx, external_path in enumerate(external_files):
-                    language = normalize_language_tag(os.path.splitext(os.path.basename(external_path))[0])
-                    audio_meta.append({
-                        "index": idx,
-                        "streamIndex": 0,
-                        "codec": os.path.splitext(external_path)[1].lstrip(".").lower(),
-                        "language": language,
-                        "label": language_label(language),
-                        "channels": 2,
-                        "default": idx == 0,
-                    })
+        # External application-owned dubbing is authoritative for its language even
+        # when the MP4 has embedded audio. Otherwise one embedded default track hides
+        # valid audio/eng.*, audio/tur.*, and other standard language-tagged files.
+        audio_dir = os.path.join(os.path.dirname(file_path), "audio")
+        if os.path.isdir(audio_dir):
+            external_files = sorted(
+                path for path in (os.path.join(audio_dir, name) for name in os.listdir(audio_dir))
+                if os.path.isfile(path) and os.path.splitext(path)[1].lower() in EXTERNAL_AUDIO_EXTENSIONS
+            )
+            embedded_by_language = {str(item.get("language") or "und"): item for item in audio_meta}
+            external_languages: set[str] = set()
+            merged_audio = list(audio_meta)
+            for external_path in external_files:
+                language = normalize_language_tag(os.path.splitext(os.path.basename(external_path))[0])
+                if language in external_languages:
+                    continue
+                external_languages.add(language)
+                existing = embedded_by_language.get(language)
+                file_stat = os.stat(external_path)
+                external_item = {
+                    "index": 0,
+                    "streamIndex": 0,
+                    "codec": os.path.splitext(external_path)[1].lstrip(".").lower(),
+                    "language": language,
+                    "label": language_label(language, existing.get("label") if existing else None),
+                    "channels": int(existing.get("channels") or 2) if existing else 2,
+                    "default": bool(existing.get("default")) if existing else False,
+                    "source": "external",
+                    "fileName": os.path.basename(external_path),
+                    "fileSize": file_stat.st_size,
+                    "modifiedAt": file_stat.st_mtime_ns,
+                }
+                merged_audio = [item for item in merged_audio if str(item.get("language") or "und") != language]
+                merged_audio.append(external_item)
+            audio_meta = merged_audio
+
+        if audio_meta and not any(item.get("default") for item in audio_meta):
+            audio_meta[0]["default"] = True
+        for index, item in enumerate(audio_meta):
+            item["index"] = index
             
-        stat = os.stat(file_path)
-        val = f"{stat.st_size}_{stat.st_mtime}"
-        source_fingerprint = hashlib.md5(val.encode()).hexdigest()
+        base_fingerprint = hashlib.sha256(local_media_identity(Path(file_path)).encode("utf-8")).hexdigest()[:32]
+        source_fingerprint = bind_audio_fingerprint(base_fingerprint, audio_meta)
         
         return {
             "probed_duration": duration,
@@ -359,3 +377,53 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"[Media Probe] Exception probing completed media {file_path}: {e}")
         return {}
+
+
+async def probe_cloud_external_audio(cloud_video_path: str, embedded_audio: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge application-owned Drive audio sidecars into retained track metadata."""
+
+    from services.rclone import rclone_service
+
+    remote_parent = cloud_video_path.rsplit("/", 1)[0]
+    result = await rclone_service.run("lsjson", f"{remote_parent}/audio", "--files-only", timeout=30)
+    if not result.ok or not result.stdout.strip():
+        return embedded_audio
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return embedded_audio
+    if not isinstance(payload, list):
+        return embedded_audio
+
+    merged = [dict(item) for item in embedded_audio if str(item.get("source") or "embedded") != "external"]
+    embedded_by_language = {str(item.get("language") or "und"): item for item in merged}
+    external_languages: set[str] = set()
+    for item in sorted(payload, key=lambda value: str(value.get("Name") or value.get("Path") or "").lower()):
+        file_name = str(item.get("Name") or item.get("Path") or "").rsplit("/", 1)[-1]
+        extension = os.path.splitext(file_name)[1].lower()
+        if not file_name or file_name in {".", ".."} or "/" in file_name or "\\" in file_name or extension not in EXTERNAL_AUDIO_EXTENSIONS:
+            continue
+        language = normalize_language_tag(os.path.splitext(file_name)[0])
+        if language in external_languages:
+            continue
+        external_languages.add(language)
+        existing = embedded_by_language.get(language)
+        merged = [entry for entry in merged if str(entry.get("language") or "und") != language]
+        merged.append({
+            "index": 0,
+            "streamIndex": 0,
+            "codec": extension.lstrip("."),
+            "language": language,
+            "label": language_label(language, existing.get("label") if existing else None),
+            "channels": int(existing.get("channels") or 2) if existing else 2,
+            "default": bool(existing.get("default")) if existing else False,
+            "source": "external",
+            "fileName": file_name,
+            "fileSize": int(item.get("Size") or 0),
+            "modifiedAt": str(item.get("ModTime") or ""),
+        })
+    if merged and not any(item.get("default") for item in merged):
+        merged[0]["default"] = True
+    for index, item in enumerate(merged):
+        item["index"] = index
+    return merged

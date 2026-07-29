@@ -94,6 +94,7 @@ class PlaybackContractRegression(unittest.TestCase):
                     height=360,
                     frame_rate=24,
                     source_fingerprint=cls.fingerprint,
+                    quality="1080p",
                 )
                 movie.languages = ["eng"]
                 movie.audio_metadata = [{"index": 0, "streamIndex": 1, "language": "eng", "label": "English", "channels": 2, "default": True}]
@@ -168,6 +169,10 @@ class PlaybackContractRegression(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["preparationState"], "ready")
         self.assertEqual(payload["nextSequenceNumber"], 1)
+        self.assertIn(payload["sourceMetadata"]["sourceFormat"], {"MP4", "HLS preview"})
+        if payload["sourceMetadata"]["sourceFormat"] == "MP4":
+            self.assertEqual(payload["renditions"][0]["label"], "1080p")
+        self.assertIn(payload["renditions"][0]["status"], {"streamable", "ready"})
         return payload
 
     def test_manifest_children_and_fragments_remain_ticket_protected(self) -> None:
@@ -184,6 +189,14 @@ class PlaybackContractRegression(unittest.TestCase):
         self.assertEqual(segment.content, b"video-segment")
         denied = self.client.get("/api/playback/hls/m_playback_contract/video_original/segment_00000.m4s")
         self.assertEqual(denied.status_code, 422)
+
+    def test_pending_quality_can_be_selected_for_server_priority(self) -> None:
+        run = self.create_run()
+        with patch.object(playback_prep_service, "prioritize_video_rendition", new=AsyncMock(return_value="preparing")) as prioritize:
+            response = self.client.post(f"/api/playback/runs/{run['runId']}/renditions/video_original/prepare")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "preparing")
+        prioritize.assert_awaited_once()
 
     def test_ingest_preview_is_protected_and_survives_local_catalog_handoff(self) -> None:
         task_id = f"preview-{uuid.uuid4().hex}"

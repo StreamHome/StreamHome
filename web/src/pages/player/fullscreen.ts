@@ -84,7 +84,7 @@ async function enterPlayerFullscreen(
 
   if (container.requestFullscreen) {
     try {
-      await container.requestFullscreen({ navigationUI: "hide" });
+      await container.requestFullscreen();
       return;
     } catch (error) {
       standardError = error;

@@ -20,7 +20,7 @@ describe("player fullscreen controller", () => {
     const video = {} as HTMLVideoElement;
 
     await expect(togglePlayerFullscreen(container, video, fullscreenDocument())).resolves.toBe("entered");
-    expect(requestFullscreen).toHaveBeenCalledWith({ navigationUI: "hide" });
+    expect(requestFullscreen).toHaveBeenCalledWith();
   });
 
   it("exits an active standard fullscreen session", async () => {

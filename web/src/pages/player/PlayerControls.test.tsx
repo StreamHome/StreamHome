@@ -68,7 +68,7 @@ describe("player control menu", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("shows pending quality levels without allowing premature selection", () => {
+  it("allows a pending quality to be requested and prioritized", () => {
     const onSelect = vi.fn();
     render(
       <PlayerControlMenu
@@ -77,7 +77,7 @@ describe("player control menu", () => {
         value={-1}
         options={[
           { value: -1, label: "Auto" },
-          { value: 144, label: "144p", disabled: true, status: "Preparing" },
+          { value: 144, label: "144p", status: "Preparing" },
         ]}
         onSelect={onSelect}
       />,
@@ -85,8 +85,8 @@ describe("player control menu", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Quality: Auto" }));
     const pending = screen.getByRole("option", { name: /144p Preparing/ });
-    expect(pending.getAttribute("aria-disabled")).toBe("true");
+    expect(pending.getAttribute("aria-disabled")).toBeNull();
     fireEvent.click(pending);
-    expect(onSelect).not.toHaveBeenCalled();
+    expect(onSelect).toHaveBeenCalledWith(144);
   });
 });
