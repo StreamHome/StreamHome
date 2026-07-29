@@ -366,6 +366,16 @@ running_services_ready() {
         && endpoint_ready "http://127.0.0.1:${configured_port}/" web
 }
 
+validate_runtime_dependencies() {
+    command -v npm >/dev/null 2>&1 || fail "npm is unavailable. Run ./setup.sh first."
+    "$BACKEND_PYTHON" -c 'import uvicorn' >/dev/null 2>&1 \
+        || fail "The backend runtime dependencies are incomplete. Run ./setup.sh first."
+    [[ -x "$ROOT_DIR/web/node_modules/.bin/tsx" ]] \
+        || fail "The production web runtime dependencies are incomplete. Run ./setup.sh first."
+    [[ -s "$ROOT_DIR/web/dist/index.html" ]] \
+        || fail "Production web assets are missing. Run ./setup.sh first."
+}
+
 show_startup_logs() {
     printf '\n[StreamHome] Backend log tail:\n' >&2
     tail -n 25 "$ROOT_DIR/backend.log" 2>/dev/null >&2 || true
@@ -428,8 +438,7 @@ main() {
         esac
     fi
 
-    command -v npm >/dev/null 2>&1 || fail "npm is unavailable. Run ./setup.sh first."
-    [[ -s "$ROOT_DIR/web/dist/index.html" ]] || fail "Production web assets are missing. Run ./setup.sh first."
+    validate_runtime_dependencies
 
     WEB_PORT="$(read_env WEB_PORT 3000)"
     SETUP="$(read_env SETUP false)"

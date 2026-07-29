@@ -19,6 +19,10 @@ CUTOVER_STARTED=false
 RUNTIME_HEALTHY=true
 RECOVERY_IN_PROGRESS=false
 WEB_ARTIFACTS_SWAPPED=false
+WEB_DEPENDENCIES_SWAPPED=false
+PYTHON_DEPENDENCIES_CHANGED=true
+WEB_DEPENDENCIES_CHANGED=true
+WEB_BUILD_REQUIRED=true
 TRANSACTION_ID=""
 LEASE_FILE=""
 CONTROLLER_START_TICKS=""
@@ -221,7 +225,7 @@ read_env() {
 
 write_state() {
     local phase="$1" message="$2" error="${3:-}" failed_target="${4:-}" current_commit="${5:-$OLD_COMMIT}"
-    python3 - "$STATUS_FILE" "$phase" "$message" "$error" "$failed_target" "$current_commit" "$TARGET_COMMIT" "$AUTOMATIC" "$TRANSACTION_ID" "$STAGING_DIR" "$WEB_ARTIFACTS_SWAPPED" "$$" "$CONTROLLER_START_TICKS" <<'PY'
+    python3 - "$STATUS_FILE" "$phase" "$message" "$error" "$failed_target" "$current_commit" "$TARGET_COMMIT" "$AUTOMATIC" "$TRANSACTION_ID" "$STAGING_DIR" "$WEB_ARTIFACTS_SWAPPED" "$WEB_DEPENDENCIES_SWAPPED" "$PYTHON_DEPENDENCIES_CHANGED" "$WEB_DEPENDENCIES_CHANGED" "$WEB_BUILD_REQUIRED" "$$" "$CONTROLLER_START_TICKS" <<'PY'
 import json
 import os
 import sys
@@ -245,6 +249,10 @@ except (OSError, ValueError, TypeError):
     transaction_id,
     staging_dir,
     web_artifacts_swapped,
+    web_dependencies_swapped,
+    python_dependencies_changed,
+    web_dependencies_changed,
+    web_build_required,
     controller_pid,
     controller_start_ticks,
 ) = sys.argv[2:]
@@ -274,6 +282,10 @@ if transaction_id:
         "transaction_id": transaction_id,
         "staging_dir": staging_dir,
         "web_artifacts_swapped": web_artifacts_swapped == "true",
+        "web_dependencies_swapped": web_dependencies_swapped == "true",
+        "python_dependencies_changed": python_dependencies_changed == "true",
+        "web_dependencies_changed": web_dependencies_changed == "true",
+        "web_build_required": web_build_required == "true",
         "controller_pid": int(controller_pid),
         "controller_start_ticks": controller_start_ticks,
     })
@@ -474,30 +486,120 @@ prepare_python_wheelhouse() {
 }
 
 install_python_wheelhouse() {
-    local source_root="$1" wheelhouse="$2"
-    [[ -x "$ROOT_DIR/venv/bin/python" ]] || return 1
+    local source_root="$1" wheelhouse="$2" target_python="${3:-$ROOT_DIR/venv/bin/python}"
+    [[ -x "$target_python" ]] || return 1
     [[ -d "$wheelhouse" ]] || return 1
-    "$ROOT_DIR/venv/bin/python" -m pip install \
+    "$target_python" -m pip install \
         --no-index \
         --find-links "$wheelhouse" \
         -c "$source_root/server/requirements.lock" \
         -r "$source_root/server/requirements.txt" \
         || return 1
+    "$target_python" -m pip check
+}
+
+validate_current_python_environment() {
+    [[ -x "$ROOT_DIR/venv/bin/python" ]] || return 1
     "$ROOT_DIR/venv/bin/python" -m pip check
+}
+
+record_prepared_setup_state() {
+    if ! "$ROOT_DIR/setup.sh" --record-prepared-state; then
+        log "The release is prepared, but setup reuse markers could not be refreshed; a future setup may repeat dependency validation."
+    fi
+}
+
+detect_release_changes() {
+    if git -C "$ROOT_DIR" diff --quiet "$OLD_COMMIT" "$TARGET_COMMIT" -- \
+        server/requirements.txt server/requirements.lock
+    then
+        PYTHON_DEPENDENCIES_CHANGED=false
+    else
+        PYTHON_DEPENDENCIES_CHANGED=true
+    fi
+    if git -C "$ROOT_DIR" diff --quiet "$OLD_COMMIT" "$TARGET_COMMIT" -- \
+        web/package.json web/package-lock.json
+    then
+        WEB_DEPENDENCIES_CHANGED=false
+    else
+        WEB_DEPENDENCIES_CHANGED=true
+    fi
+    if git -C "$ROOT_DIR" diff --quiet "$OLD_COMMIT" "$TARGET_COMMIT" -- web
+    then
+        WEB_BUILD_REQUIRED=false
+    else
+        WEB_BUILD_REQUIRED=true
+    fi
+    log "Preflight plan: Python dependencies changed=$PYTHON_DEPENDENCIES_CHANGED, web dependencies changed=$WEB_DEPENDENCIES_CHANGED, web build required=$WEB_BUILD_REQUIRED."
+}
+
+prepare_candidate_python() {
+    local staged_checkout="$1" builder_python
+    if [[ "$PYTHON_DEPENDENCIES_CHANGED" == false ]]; then
+        validate_current_python_environment || return 1
+        ln -s "$ROOT_DIR/venv" "$staged_checkout/venv" || return 1
+        log "Python dependency manifests are unchanged; reusing the verified installed environment."
+        return 0
+    fi
+
+    python3 -m venv "$staged_checkout/venv" || return 1
+    builder_python="$staged_checkout/venv/bin/python"
+    "$builder_python" -m pip --version >/dev/null || "$builder_python" -m ensurepip --upgrade || return 1
+    log "Python dependency manifests changed; preparing candidate and rollback packages."
+    prepare_python_wheelhouse "$staged_checkout" "$STAGING_DIR/candidate-wheels" "$builder_python" || return 1
+    prepare_python_wheelhouse "$ROOT_DIR" "$STAGING_DIR/rollback-wheels" "$builder_python" || return 1
+    install_python_wheelhouse "$staged_checkout" "$STAGING_DIR/candidate-wheels" "$builder_python"
+}
+
+prepare_candidate_web() {
+    local staged_checkout="$1" candidate_web="$1/web"
+    if [[ "$WEB_BUILD_REQUIRED" == false ]]; then
+        [[ -d "$ROOT_DIR/web/node_modules" && -s "$ROOT_DIR/web/dist/index.html" ]] || return 1
+        log "Web sources are unchanged; reusing installed dependencies and production assets."
+        return 0
+    fi
+
+    if [[ "$WEB_DEPENDENCIES_CHANGED" == true ]]; then
+        log "Web dependency manifests changed; installing the candidate dependency tree once."
+        (cd "$candidate_web" && npm ci --prefer-offline --no-audit --no-fund) || return 1
+    else
+        [[ -d "$ROOT_DIR/web/node_modules" ]] || return 1
+        ln -s "$ROOT_DIR/web/node_modules" "$candidate_web/node_modules" || return 1
+        log "Web dependency manifests are unchanged; building with the verified installed dependency tree."
+    fi
+
+    if ! (cd "$candidate_web" && npm run build); then
+        [[ "$WEB_DEPENDENCIES_CHANGED" == false ]] && rm -f -- "$candidate_web/node_modules"
+        return 1
+    fi
+    if [[ "$WEB_DEPENDENCIES_CHANGED" == false ]]; then
+        rm -f -- "$candidate_web/node_modules"
+    fi
+    [[ -s "$candidate_web/dist/index.html" ]]
 }
 
 activate_prepared_web() {
     local candidate_web="$STAGING_DIR/checkout/web"
-    [[ -d "$candidate_web/node_modules" && -s "$candidate_web/dist/index.html" ]] || return 1
+    if [[ "$WEB_BUILD_REQUIRED" == false ]]; then
+        write_state "installing" "Web sources are unchanged; keeping the existing production assets."
+        return 0
+    fi
+    [[ -s "$candidate_web/dist/index.html" ]] || return 1
+    if [[ "$WEB_DEPENDENCIES_CHANGED" == true ]]; then
+        [[ -d "$candidate_web/node_modules" ]] || return 1
+        WEB_DEPENDENCIES_SWAPPED=true
+    fi
     WEB_ARTIFACTS_SWAPPED=true
     write_state "installing" "Activating preflighted web runtime and production assets."
-    if [[ -e "$ROOT_DIR/web/node_modules" ]]; then
+    if [[ "$WEB_DEPENDENCIES_SWAPPED" == true && -e "$ROOT_DIR/web/node_modules" ]]; then
         mv -- "$ROOT_DIR/web/node_modules" "$STAGING_DIR/previous-node_modules" || return 1
     fi
     if [[ -e "$ROOT_DIR/web/dist" ]]; then
         mv -- "$ROOT_DIR/web/dist" "$STAGING_DIR/previous-dist" || return 1
     fi
-    mv -- "$candidate_web/node_modules" "$ROOT_DIR/web/node_modules" || return 1
+    if [[ "$WEB_DEPENDENCIES_SWAPPED" == true ]]; then
+        mv -- "$candidate_web/node_modules" "$ROOT_DIR/web/node_modules" || return 1
+    fi
     mv -- "$candidate_web/dist" "$ROOT_DIR/web/dist" || return 1
     [[ -s "$ROOT_DIR/web/dist/index.html" ]] || return 1
     write_state "installing" "Preflighted runtime assets are active; verifying the exact release."
@@ -505,46 +607,46 @@ activate_prepared_web() {
 
 restore_previous_web() {
     [[ "$WEB_ARTIFACTS_SWAPPED" == true ]] || return 0
-    if [[ -e "$STAGING_DIR/previous-node_modules" && -e "$ROOT_DIR/web/node_modules" ]]; then
+    if [[ "$WEB_DEPENDENCIES_SWAPPED" == true && -e "$STAGING_DIR/previous-node_modules" && -e "$ROOT_DIR/web/node_modules" ]]; then
         mv -- "$ROOT_DIR/web/node_modules" "$STAGING_DIR/failed-node_modules" 2>/dev/null || return 1
     fi
     if [[ -e "$STAGING_DIR/previous-dist" && -e "$ROOT_DIR/web/dist" ]]; then
         mv -- "$ROOT_DIR/web/dist" "$STAGING_DIR/failed-dist" 2>/dev/null || return 1
     fi
-    if [[ -e "$STAGING_DIR/previous-node_modules" ]]; then
+    if [[ "$WEB_DEPENDENCIES_SWAPPED" == true && -e "$STAGING_DIR/previous-node_modules" ]]; then
         mv -- "$STAGING_DIR/previous-node_modules" "$ROOT_DIR/web/node_modules" || return 1
     fi
     if [[ -e "$STAGING_DIR/previous-dist" ]]; then
         mv -- "$STAGING_DIR/previous-dist" "$ROOT_DIR/web/dist" || return 1
     fi
     WEB_ARTIFACTS_SWAPPED=false
+    WEB_DEPENDENCIES_SWAPPED=false
     write_state "rolling_back" "The previous web runtime and production assets were restored."
 }
 
 preflight_target() {
-    local staged_checkout="$STAGING_DIR/checkout" staged_head builder_python
-    log "Cloning the target into an isolated preflight checkout."
-    git clone --depth 1 --branch "$UPDATE_BRANCH" "https://github.com/StreamHome/StreamHome.git" "$staged_checkout" || return 1
+    local staged_checkout="$STAGING_DIR/checkout" staged_head
+    git -C "$ROOT_DIR" cat-file -e "${TARGET_COMMIT}^{commit}" || return 1
+    git -C "$ROOT_DIR" merge-base --is-ancestor "$OLD_COMMIT" "$TARGET_COMMIT" || return 1
+    log "Creating an isolated checkout from the already-fetched exact target commit."
+    git clone --shared --no-checkout "$ROOT_DIR" "$staged_checkout" || return 1
+    git -C "$staged_checkout" checkout --detach "$TARGET_COMMIT" || return 1
     staged_head="$(git -C "$staged_checkout" rev-parse HEAD 2>/dev/null || true)"
     [[ "$staged_head" == "$TARGET_COMMIT" ]] || {
-        log "The remote branch changed during preflight; refusing a stale target."
+        log "The isolated checkout did not resolve to the verified target commit."
         return 1
     }
+    detect_release_changes
+    write_state "preflight" "Change analysis complete. Preparing only changed dependencies and required frontend assets while StreamHome stays online."
+    prepare_candidate_python "$staged_checkout" || return 1
+    prepare_candidate_web "$staged_checkout" || return 1
     (
         cd "$staged_checkout"
-        ./setup.sh --no-start --skip-system-packages
         ./test.sh --syntax-only
         ./venv/bin/python -m compileall -q server
         PYTHONPATH=server ./venv/bin/python server/scratch/test_update_system.py
     ) || return 1
-    builder_python="$staged_checkout/venv/bin/python"
-    log "Preparing offline Python packages for the candidate and rollback releases."
-    prepare_python_wheelhouse "$staged_checkout" "$STAGING_DIR/candidate-wheels" "$builder_python" || return 1
-    prepare_python_wheelhouse "$ROOT_DIR" "$STAGING_DIR/rollback-wheels" "$builder_python" || return 1
-    git -C "$ROOT_DIR" fetch origin "$UPDATE_BRANCH" || return 1
-    git -C "$ROOT_DIR" cat-file -e "${TARGET_COMMIT}^{commit}" || return 1
-    git -C "$ROOT_DIR" merge-base --is-ancestor "$OLD_COMMIT" "$TARGET_COMMIT" || return 1
-    log "Isolated dependencies, offline rollback packages, scripts, and production assets are ready."
+    log "Candidate scripts, code, required dependencies, rollback artifacts, and production assets are ready."
 }
 
 wait_for_idle_handoff() {
@@ -662,7 +764,11 @@ rollback_release() {
         restore_database_checkpoint || return 1
     fi
     restore_previous_web || return 1
-    install_python_wheelhouse "$ROOT_DIR" "$STAGING_DIR/rollback-wheels" || return 1
+    if [[ "$PYTHON_DEPENDENCIES_CHANGED" == true ]]; then
+        install_python_wheelhouse "$ROOT_DIR" "$STAGING_DIR/rollback-wheels" || return 1
+    else
+        validate_current_python_environment || return 1
+    fi
     stop_maintenance
     if ! "$ROOT_DIR/start.sh" --update-recovery-complete; then
         start_maintenance || true
@@ -739,6 +845,13 @@ print(payload.get("target_commit", ""))
 print(payload.get("transaction_id", ""))
 print(payload.get("staging_dir", ""))
 print("true" if payload.get("web_artifacts_swapped") else "false")
+web_dependencies_swapped = payload.get("web_dependencies_swapped")
+if web_dependencies_swapped is None:
+    web_dependencies_swapped = payload.get("web_artifacts_swapped", False)
+print("true" if web_dependencies_swapped else "false")
+print("true" if payload.get("python_dependencies_changed", True) else "false")
+print("true" if payload.get("web_dependencies_changed", True) else "false")
+print("true" if payload.get("web_build_required", True) else "false")
 PY
     )
     phase="${recovery_state[0]:-}"
@@ -747,6 +860,10 @@ PY
     TRANSACTION_ID="${recovery_state[3]:-}"
     recovered_staging="${recovery_state[4]:-}"
     web_swapped="${recovery_state[5]:-false}"
+    WEB_DEPENDENCIES_SWAPPED="${recovery_state[6]:-$web_swapped}"
+    PYTHON_DEPENDENCIES_CHANGED="${recovery_state[7]:-true}"
+    WEB_DEPENDENCIES_CHANGED="${recovery_state[8]:-true}"
+    WEB_BUILD_REQUIRED="${recovery_state[9]:-true}"
     [[ -n "$TRANSACTION_ID" ]] || TRANSACTION_ID="$(new_transaction_id)"
     STAGING_DIR="$recovered_staging"
     WEB_ARTIFACTS_SWAPPED="$web_swapped"
@@ -816,6 +933,11 @@ PY
             record_rollback_failure
             return 1
         }
+    elif [[ "$PYTHON_DEPENDENCIES_CHANGED" == false ]]; then
+        validate_current_python_environment || {
+            record_rollback_failure
+            return 1
+        }
     else
         (
             cd "$ROOT_DIR"
@@ -853,6 +975,13 @@ print(payload.get("target_commit", ""))
 print(payload.get("transaction_id", ""))
 print(payload.get("staging_dir", ""))
 print("true" if payload.get("web_artifacts_swapped") else "false")
+web_dependencies_swapped = payload.get("web_dependencies_swapped")
+if web_dependencies_swapped is None:
+    web_dependencies_swapped = payload.get("web_artifacts_swapped", False)
+print("true" if web_dependencies_swapped else "false")
+print("true" if payload.get("python_dependencies_changed", True) else "false")
+print("true" if payload.get("web_dependencies_changed", True) else "false")
+print("true" if payload.get("web_build_required", True) else "false")
 PY
     )
     OLD_COMMIT="${recovery_state[0]:-}"
@@ -860,6 +989,10 @@ PY
     TRANSACTION_ID="${recovery_state[2]:-}"
     recovered_staging="${recovery_state[3]:-}"
     web_swapped="${recovery_state[4]:-false}"
+    WEB_DEPENDENCIES_SWAPPED="${recovery_state[5]:-$web_swapped}"
+    PYTHON_DEPENDENCIES_CHANGED="${recovery_state[6]:-true}"
+    WEB_DEPENDENCIES_CHANGED="${recovery_state[7]:-true}"
+    WEB_BUILD_REQUIRED="${recovery_state[8]:-true}"
     STAGING_DIR="$recovered_staging"
     WEB_ARTIFACTS_SWAPPED="$web_swapped"
     [[ "$OLD_COMMIT" =~ ^[0-9a-f]{40}$ && "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ && -n "$TRANSACTION_ID" ]] || return 1
@@ -909,7 +1042,7 @@ execute_update() {
         write_state "failed" "A temporary preflight checkout could not be created." "preflight_workspace_failed" "$TARGET_COMMIT"
         return 1
     }
-    write_state "preflight" "Preparing and validating dependencies, rollback packages, server code, scripts, and production web assets while StreamHome stays online."
+    write_state "preflight" "Comparing the installed and target releases before preparing only the dependencies and assets that changed."
     if ! preflight_target; then
         write_state "failed" "The candidate failed isolated preflight. The running installation was not changed." "preflight_failed" "$TARGET_COMMIT"
         return 1
@@ -960,10 +1093,20 @@ execute_update() {
         rollback_release || record_rollback_failure
         return 1
     fi
-    if ! git -C "$ROOT_DIR" merge --ff-only "$TARGET_COMMIT" \
-        || ! install_python_wheelhouse "$ROOT_DIR" "$STAGING_DIR/candidate-wheels" \
-        || ! activate_prepared_web
-    then
+    if ! git -C "$ROOT_DIR" merge --ff-only "$TARGET_COMMIT"; then
+        rollback_release || record_rollback_failure
+        return 1
+    fi
+    if [[ "$PYTHON_DEPENDENCIES_CHANGED" == true ]]; then
+        write_state "installing" "Installing the changed preflighted Python dependency set offline."
+        if ! install_python_wheelhouse "$ROOT_DIR" "$STAGING_DIR/candidate-wheels"; then
+            rollback_release || record_rollback_failure
+            return 1
+        fi
+    else
+        write_state "installing" "Python dependencies are unchanged; keeping the verified installed environment."
+    fi
+    if ! activate_prepared_web; then
         rollback_release || record_rollback_failure
         return 1
     fi
@@ -975,6 +1118,7 @@ execute_update() {
     write_state "starting" "Starting and health-checking the updated API and web client." "" "" "$TARGET_COMMIT"
     stop_maintenance
     if [[ "$START_AFTER_UPDATE" == false ]]; then
+        record_prepared_setup_state
         rm -f -- "$RUN_DIR/pre-update-database.db"
         RUNTIME_HEALTHY=true
         CUTOVER_STARTED=false
@@ -987,6 +1131,7 @@ execute_update() {
         rollback_release || record_rollback_failure
         return 1
     fi
+    record_prepared_setup_state
     RUNTIME_HEALTHY=true
     CUTOVER_STARTED=false
     rm -f -- "$RUN_DIR/pre-update-database.db"
@@ -1010,6 +1155,17 @@ queue_update() {
 }
 
 case "${1:-}" in
+    --classify-changes)
+        [[ $# -eq 4 ]] || exit 2
+        OLD_COMMIT="$2"
+        TARGET_COMMIT="$3"
+        ROOT_DIR="$(cd "$4" && pwd -P)"
+        [[ "$OLD_COMMIT" =~ ^[0-9a-f]{40}$ && "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 2
+        detect_release_changes
+        printf 'python_dependencies_changed=%s\n' "$PYTHON_DEPENDENCIES_CHANGED"
+        printf 'web_dependencies_changed=%s\n' "$WEB_DEPENDENCIES_CHANGED"
+        printf 'web_build_required=%s\n' "$WEB_BUILD_REQUIRED"
+        ;;
     --queue)
         [[ $# -eq 5 ]] || exit 2
         TARGET_COMMIT="$2"

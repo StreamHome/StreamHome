@@ -140,6 +140,11 @@ prepare_existing_checkout() {
     fi
     fetched_commit="$(git -C "$INSTALL_DIR" rev-parse 'FETCH_HEAD^{commit}')"
     head_commit="$(git -C "$INSTALL_DIR" rev-parse HEAD)"
+    if [[ "$fetched_commit" == "$head_commit" ]]; then
+        log "The existing StreamHome installation is already at the requested release"
+        EXISTING_UPDATE_COMPLETE=true
+        return 0
+    fi
     git -C "$INSTALL_DIR" merge-base --is-ancestor "$head_commit" "$fetched_commit" \
         || fail "The requested update is not a safe fast-forward from the installed release."
 

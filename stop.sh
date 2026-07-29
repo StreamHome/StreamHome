@@ -12,6 +12,14 @@ LOCK_ACQUIRED=false
 STOP_FAILED=false
 RECOVERY_PORTS=()
 
+append_recovery_port() {
+    local candidate="$1" existing
+    for existing in "${RECOVERY_PORTS[@]}"; do
+        [[ "$existing" == "$candidate" ]] && return 0
+    done
+    RECOVERY_PORTS+=("$candidate")
+}
+
 usage() {
     cat <<'EOF'
 StreamHome Linux shutdown
@@ -298,7 +306,7 @@ main() {
                     printf 'Invalid or missing port for --recover-port.\n' >&2
                     exit 1
                 fi
-                RECOVERY_PORTS+=("$1")
+                append_recovery_port "$1"
                 ;;
             --help|-h)
                 usage
@@ -318,7 +326,9 @@ main() {
         configured_port="$(read_env WEB_PORT 3000)"
         if [[ "$configured_port" =~ ^[0-9]+$ ]] && (( 10#$configured_port >= 1 && 10#$configured_port <= 65535 )); then
             configured_port="$((10#$configured_port))"
-            RECOVERY_PORTS=(8000 "$configured_port")
+            RECOVERY_PORTS=()
+            append_recovery_port 8000
+            append_recovery_port "$configured_port"
         else
             printf '[StreamHome] WEB_PORT is invalid; only recorded processes and API port 8000 can be recovered safely.\n' >&2
             RECOVERY_PORTS=(8000)

@@ -133,6 +133,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("install.lock", install_sh)
         self.assertIn("--manual-execute", install_sh)
         self.assertIn("health-gated update", install_sh)
+        self.assertIn("already at the requested release", install_sh)
         self.assertNotIn('git -C "$INSTALL_DIR" checkout "$INSTALL_REF"', install_sh)
         self.assertIn("setup_args+=(--no-start)", install_sh)
         self.assertIn("./setup.sh", install_sh)
@@ -143,6 +144,13 @@ class SetupScriptContracts(unittest.TestCase):
 
         self.assertIn("npm ci", setup_sh)
         self.assertIn("npm run build", setup_sh)
+        self.assertIn("--prefer-offline --no-audit --no-fund", setup_sh)
+        self.assertIn("content_fingerprint", setup_sh)
+        self.assertIn("Python dependency manifests are unchanged", setup_sh)
+        self.assertIn("Frontend build inputs are unchanged", setup_sh)
+        self.assertIn("--force", setup_sh)
+        self.assertIn("--record-prepared-state", setup_sh)
+        self.assertIn("record_prepared_state", setup_sh)
         self.assertIn("-m pip check", setup_sh)
         self.assertIn("listener-inspector", setup_sh)
         self.assertIn('MIN_RCLONE_VERSION="1.68"', setup_sh)
@@ -157,13 +165,24 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn('nohup bash "$SCRIPT_PATH" --execute', restart_sh)
         self.assertIn('exec bash "$ROOT_DIR/start.sh"', restart_sh)
         self.assertIn("restart.log", restart_sh)
+        self.assertIn("restart.lock", restart_sh)
+        self.assertIn("owner.start", restart_sh)
         self.assertIn('"restart.sh"', setup_py)
         self.assertIn("handoff.wait", setup_py)
 
         self.assertIn('nohup bash "$controller" --execute', update_sh)
         self.assertIn("--manual-execute", update_sh)
+        self.assertIn("--classify-changes", update_sh)
         self.assertIn("preflight_target", update_sh)
-        self.assertIn("./setup.sh --no-start --skip-system-packages", update_sh)
+        self.assertEqual(update_sh.count("./setup.sh --no-start --skip-system-packages"), 1)
+        self.assertIn("detect_release_changes", update_sh)
+        self.assertIn("Python dependency manifests are unchanged", update_sh)
+        self.assertIn("Web dependency manifests are unchanged", update_sh)
+        self.assertIn("Web sources are unchanged", update_sh)
+        self.assertIn("npm ci --prefer-offline --no-audit --no-fund", update_sh)
+        self.assertIn("git clone --shared --no-checkout", update_sh)
+        self.assertNotIn("git clone --depth 1 --branch", update_sh)
+        self.assertIn("record_prepared_setup_state", update_sh)
         self.assertIn("/api/update/handoff", update_sh)
         self.assertIn("X-StreamHome-Update-Handoff", update_sh)
         self.assertIn("create_database_checkpoint", update_sh)
@@ -193,6 +212,8 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("wait_for_services", start_sh)
         self.assertIn("wait_for_port_release", start_sh)
         self.assertIn("wait_for_active_update", start_sh)
+        self.assertIn("validate_runtime_dependencies", start_sh)
+        self.assertIn("production web runtime dependencies are incomplete", start_sh)
         self.assertIn("STREAMHOME_UPDATE_WAIT_SECONDS", start_sh)
         self.assertIn("STREAMHOME_STARTUP_TIMEOUT_SECONDS", start_sh)
         self.assertIn("Startup attempt", start_sh)
@@ -208,6 +229,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("It was not stopped.", stop_sh)
         self.assertIn("its PID record was preserved", stop_sh)
         self.assertIn("Shutdown did not complete cleanly", stop_sh)
+        self.assertIn("append_recovery_port", stop_sh)
 
         self.assertIn("--server-only", test_sh)
         self.assertIn("--web-only", test_sh)
@@ -218,10 +240,99 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("server/system_profile.json", test_sh)
         self.assertIn('"$ROOT_DIR/restart.sh"', test_sh)
         self.assertIn('"$ROOT_DIR/update.sh"', test_sh)
+        self.assertIn("git -C \"$ROOT_DIR\" ls-files '*.sh'", test_sh)
 
         self.assertIn("./venv/bin/python server/cli.py", cli_py)
         self.assertNotIn("start.bat", cli_py)
         self.assertNotIn("start_background.sh", cli_py)
+
+    def test_update_change_classifier_skips_unchanged_dependency_work(self) -> None:
+        bash = bash_command()
+        if not bash:
+            self.skipTest("Bash is not installed")
+
+        with tempfile.TemporaryDirectory(dir=ROOT / "temp") as temporary:
+            repository = Path(temporary) / "release-plan"
+            repository.mkdir()
+            git(["init", "-b", "main"], cwd=repository)
+            git(["config", "user.email", "update-plan@streamhome.invalid"], cwd=repository)
+            git(["config", "user.name", "StreamHome Update Plan Test"], cwd=repository)
+            initial_files = {
+                "server/requirements.txt": "fastapi\n",
+                "server/requirements.lock": "fastapi==1.0\n",
+                "server/app.py": "VALUE = 1\n",
+                "web/package.json": '{"scripts":{"build":"vite build"}}\n',
+                "web/package-lock.json": '{"lockfileVersion":3}\n',
+                "web/src/app.ts": "export const value = 1;\n",
+            }
+            for relative, content in initial_files.items():
+                target = repository / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+            git(["add", "."], cwd=repository)
+            git(["commit", "-m", "baseline"], cwd=repository)
+            baseline = run(["git", "rev-parse", "HEAD"], cwd=repository).stdout.strip()
+
+            def commit_change(relative: str, content: str, message: str) -> str:
+                (repository / relative).write_text(content, encoding="utf-8")
+                git(["add", relative], cwd=repository)
+                git(["commit", "-m", message], cwd=repository)
+                return run(["git", "rev-parse", "HEAD"], cwd=repository).stdout.strip()
+
+            def classify(previous: str, target: str) -> dict[str, str]:
+                result = run(
+                    [
+                        bash,
+                        bash_path(ROOT / "update.sh"),
+                        "--classify-changes",
+                        previous,
+                        target,
+                        bash_path(repository),
+                    ],
+                    cwd=repository,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                expected_keys = {
+                    "python_dependencies_changed",
+                    "web_dependencies_changed",
+                    "web_build_required",
+                }
+                return {
+                    key: value
+                    for line in result.stdout.splitlines()
+                    if "=" in line
+                    for key, value in [line.split("=", 1)]
+                    if key in expected_keys
+                }
+
+            server_source = commit_change("server/app.py", "VALUE = 2\n", "server source")
+            self.assertEqual(
+                classify(baseline, server_source),
+                {
+                    "python_dependencies_changed": "false",
+                    "web_dependencies_changed": "false",
+                    "web_build_required": "false",
+                },
+            )
+
+            web_source = commit_change("web/src/app.ts", "export const value = 2;\n", "web source")
+            web_source_plan = classify(server_source, web_source)
+            self.assertEqual(web_source_plan["web_build_required"], "true")
+            self.assertEqual(web_source_plan["web_dependencies_changed"], "false")
+
+            web_dependencies = commit_change(
+                "web/package-lock.json",
+                '{"lockfileVersion":3,"packages":{"vite":{}}}\n',
+                "web dependencies",
+            )
+            self.assertEqual(classify(web_source, web_dependencies)["web_dependencies_changed"], "true")
+
+            python_dependencies = commit_change(
+                "server/requirements.lock",
+                "fastapi==1.1\n",
+                "python dependencies",
+            )
+            self.assertEqual(classify(web_dependencies, python_dependencies)["python_dependencies_changed"], "true")
 
     def test_linux_bootstrap_is_atomic_forwards_options_and_refuses_dirty_update(self) -> None:
         bash = bash_command()

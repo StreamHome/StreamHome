@@ -5,23 +5,29 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 RUN_DIR="$ROOT_DIR/.run"
 NO_START=false
 SKIP_SYSTEM_PACKAGES=false
+FORCE_REBUILD=false
+RECORD_PREPARED_STATE=false
 CURRENT_STEP="initialization"
 MIN_RCLONE_VERSION="1.68"
 RCLONE_INSTALL_VERSION="1.74.4"
 SETUP_LOCK=""
 RCLONE_TEMP=""
 RCLONE_STAGED=""
+SETUP_STATE_DIR="$RUN_DIR/setup-state"
 
 usage() {
     cat <<'EOF'
 StreamHome Linux setup
 
 Usage:
-  ./setup.sh [--no-start] [--skip-system-packages] [--help]
+  ./setup.sh [--no-start] [--skip-system-packages] [--force] [--record-prepared-state] [--help]
 
 Options:
   --no-start             Install and build without starting StreamHome.
   --skip-system-packages Do not install missing operating-system packages.
+  --force                Reinstall dependencies and rebuild production assets.
+  --record-prepared-state
+                         Verify prepared dependencies/assets and refresh reuse markers.
   --help                 Show this help text.
 EOF
 }
@@ -260,7 +266,90 @@ stop_existing_runtime() {
     fi
 }
 
+content_fingerprint() {
+    local seed="$1"
+    shift
+    python3 - "$seed" "$@" <<'PY'
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+digest = hashlib.sha256(sys.argv[1].encode("utf-8"))
+excluded_directories = {".git", "dist", "node_modules", "__pycache__"}
+for raw_path in sys.argv[2:]:
+    path = Path(raw_path)
+    if path.is_dir():
+        candidates = sorted(
+            candidate
+            for candidate in path.rglob("*")
+            if candidate.is_file()
+            and not excluded_directories.intersection(candidate.relative_to(path).parts)
+            and candidate.suffix != ".tsbuildinfo"
+        )
+    else:
+        candidates = [path]
+    for candidate in candidates:
+        digest.update(os.fsencode(str(candidate)))
+        try:
+            with candidate.open("rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+        except OSError:
+            digest.update(b"<missing>")
+print(digest.hexdigest())
+PY
+}
+
+stamp_matches() {
+    local stamp="$1" expected="$2"
+    [[ "$FORCE_REBUILD" == false && -f "$stamp" ]] || return 1
+    [[ "$(cat "$stamp" 2>/dev/null || true)" == "$expected" ]]
+}
+
+write_stamp() {
+    local stamp="$1" value="$2" temporary
+    mkdir -p "$SETUP_STATE_DIR"
+    chmod 700 "$SETUP_STATE_DIR" 2>/dev/null || true
+    temporary="$stamp.$$"
+    printf '%s\n' "$value" > "$temporary"
+    mv -f -- "$temporary" "$stamp"
+}
+
+python_dependency_fingerprint() {
+    content_fingerprint "$(python3 -VV 2>&1)|$(uname -s)|$(uname -m)" \
+        "$ROOT_DIR/server/requirements.txt" \
+        "$ROOT_DIR/server/requirements.lock"
+}
+
+web_dependency_fingerprint() {
+    content_fingerprint "$(node --version)|$(npm --version)|$(uname -s)|$(uname -m)" \
+        "$ROOT_DIR/web/package.json" \
+        "$ROOT_DIR/web/package-lock.json"
+}
+
+web_build_fingerprint() {
+    content_fingerprint "$1" "$ROOT_DIR/web"
+}
+
+record_prepared_state() {
+    local python_fingerprint dependency_fingerprint build_fingerprint
+    [[ -x "$ROOT_DIR/venv/bin/python" ]] || fail "The prepared Python environment is missing."
+    "$ROOT_DIR/venv/bin/python" -m pip check
+    [[ -d "$ROOT_DIR/web/node_modules" && -x "$ROOT_DIR/web/node_modules/.bin/vite" ]] \
+        || fail "The prepared web dependency tree is missing or incomplete."
+    [[ -s "$ROOT_DIR/web/dist/index.html" ]] || fail "The prepared production web assets are missing."
+    python_fingerprint="$(python_dependency_fingerprint)"
+    dependency_fingerprint="$(web_dependency_fingerprint)"
+    build_fingerprint="$(web_build_fingerprint "$dependency_fingerprint")"
+    write_stamp "$SETUP_STATE_DIR/python.fingerprint" "$python_fingerprint"
+    write_stamp "$SETUP_STATE_DIR/web-dependencies.fingerprint" "$dependency_fingerprint"
+    write_stamp "$SETUP_STATE_DIR/web-build.fingerprint" "$build_fingerprint"
+    log "Verified prepared dependencies and refreshed setup reuse markers"
+}
+
 prepare_virtual_environment() {
+    local python_fingerprint python_stamp="$SETUP_STATE_DIR/python.fingerprint"
     CURRENT_STEP="Python virtual environment creation"
     if [[ -d "$ROOT_DIR/venv" && ! -x "$ROOT_DIR/venv/bin/python" ]]; then
         local recovery="$ROOT_DIR/venv.broken.$(date +%Y%m%d%H%M%S)"
@@ -278,6 +367,14 @@ prepare_virtual_environment() {
         fi
     fi
 
+    python_fingerprint="$(python_dependency_fingerprint)"
+    if stamp_matches "$python_stamp" "$python_fingerprint" \
+        && "$ROOT_DIR/venv/bin/python" -m pip check >/dev/null 2>&1
+    then
+        log "Python dependency manifests are unchanged; keeping the verified virtual environment"
+        return 0
+    fi
+
     CURRENT_STEP="server dependency installation"
     "$ROOT_DIR/venv/bin/python" -m pip --version >/dev/null \
         || "$ROOT_DIR/venv/bin/python" -m ensurepip --upgrade
@@ -285,14 +382,39 @@ prepare_virtual_environment() {
         -c "$ROOT_DIR/server/requirements.lock" \
         -r "$ROOT_DIR/server/requirements.txt"
     "$ROOT_DIR/venv/bin/python" -m pip check
+    write_stamp "$python_stamp" "$python_fingerprint"
 }
 
 prepare_web() {
-    CURRENT_STEP="web dependency installation"
-    (cd "$ROOT_DIR/web" && npm ci)
+    local dependency_fingerprint build_fingerprint
+    local dependency_stamp="$SETUP_STATE_DIR/web-dependencies.fingerprint"
+    local build_stamp="$SETUP_STATE_DIR/web-build.fingerprint"
+    local web_dependencies_rebuilt=false
+    dependency_fingerprint="$(web_dependency_fingerprint)"
+    if stamp_matches "$dependency_stamp" "$dependency_fingerprint" \
+        && [[ -d "$ROOT_DIR/web/node_modules" ]] \
+        && [[ -x "$ROOT_DIR/web/node_modules/.bin/vite" ]]
+    then
+        log "Web dependency manifests are unchanged; keeping the installed node modules"
+    else
+        CURRENT_STEP="web dependency installation"
+        (cd "$ROOT_DIR/web" && npm ci --prefer-offline --no-audit --no-fund)
+        write_stamp "$dependency_stamp" "$dependency_fingerprint"
+        web_dependencies_rebuilt=true
+    fi
+
+    build_fingerprint="$(web_build_fingerprint "$dependency_fingerprint")"
+    if [[ "$web_dependencies_rebuilt" == false ]] \
+        && stamp_matches "$build_stamp" "$build_fingerprint" \
+        && [[ -s "$ROOT_DIR/web/dist/index.html" ]]
+    then
+        log "Frontend build inputs are unchanged; keeping the existing production assets"
+        return 0
+    fi
     CURRENT_STEP="production web build"
     (cd "$ROOT_DIR/web" && npm run build)
     [[ -s "$ROOT_DIR/web/dist/index.html" ]] || fail "The production web build did not create web/dist/index.html."
+    write_stamp "$build_stamp" "$build_fingerprint"
 }
 
 prepare_environment() {
@@ -328,6 +450,12 @@ main() {
             --skip-system-packages)
                 SKIP_SYSTEM_PACKAGES=true
                 ;;
+            --force)
+                FORCE_REBUILD=true
+                ;;
+            --record-prepared-state)
+                RECORD_PREPARED_STATE=true
+                ;;
             --help|-h)
                 usage
                 return 0
@@ -342,6 +470,11 @@ main() {
     [[ "$(uname -s)" == "Linux" ]] || fail "The alpha server setup supports Linux only."
     cd "$ROOT_DIR"
     acquire_setup_lock
+    if [[ "$RECORD_PREPARED_STATE" == true ]]; then
+        CURRENT_STEP="prepared dependency state verification"
+        record_prepared_state
+        return 0
+    fi
     log "Preparing StreamHome in $ROOT_DIR"
 
     CURRENT_STEP="system dependency detection"

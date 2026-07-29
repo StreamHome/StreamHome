@@ -106,6 +106,20 @@ run_shell_checks() {
         "$ROOT_DIR/stop.sh"
         "$ROOT_DIR/test.sh"
     )
+    local relative candidate known existing
+    while IFS= read -r relative; do
+        [[ -n "$relative" ]] || continue
+        candidate="$ROOT_DIR/$relative"
+        [[ -f "$candidate" ]] || continue
+        known=false
+        for existing in "${scripts[@]}"; do
+            if [[ "$existing" == "$candidate" ]]; then
+                known=true
+                break
+            fi
+        done
+        [[ "$known" == true ]] || scripts+=("$candidate")
+    done < <(git -C "$ROOT_DIR" ls-files '*.sh')
     CURRENT_STEP="Bash syntax validation"
     bash -n "${scripts[@]}"
     if command -v shellcheck >/dev/null 2>&1; then
