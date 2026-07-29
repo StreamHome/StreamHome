@@ -22,7 +22,7 @@ import services.state as state
 REPOSITORY_URL = "https://github.com/StreamHome/StreamHome.git"
 LEGACY_REPOSITORY_URL = "https://github.com/WaqSea/StreamHome.git"
 TERMINAL_PHASES = {"idle", "up_to_date", "update_available", "succeeded", "failed", "rolled_back", "rollback_failed"}
-BUSY_PHASES = {"preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back"}
+BUSY_PHASES = {"preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back", "recovering"}
 INSTALL_MODES = {"automatic", "when_idle", "now"}
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 UPDATE_CHECK_LOCK = asyncio.Lock()
@@ -32,6 +32,8 @@ RUN_DIR = WORKSPACE_ROOT / ".run"
 STATUS_PATH = RUN_DIR / "update-state.json"
 LOG_PATH = WORKSPACE_ROOT / "update.log"
 UPDATE_SCRIPT = WORKSPACE_ROOT / "update.sh"
+RESTART_SCRIPT = WORKSPACE_ROOT / "restart.sh"
+ORPHANED_CONTROLLER_SECONDS = 30
 
 
 def _default_status() -> dict[str, Any]:
@@ -48,6 +50,10 @@ def _default_status() -> dict[str, Any]:
         "finished_at": None,
         "last_checked_at": None,
         "last_success_at": None,
+        "updated_at": None,
+        "recovery_requested_at": None,
+        "transaction_id": "",
+        "diagnostic_id": "",
         "failed_target": "",
         "error": "",
     }
@@ -363,7 +369,8 @@ def maintenance_window_open(current: datetime | None = None) -> bool:
 
 
 def update_lock_active() -> bool:
-    owner_path = RUN_DIR / "update.lock" / "owner.pid"
+    lock_path = RUN_DIR / "update.lock"
+    owner_path = lock_path / "owner.pid"
     try:
         owner = int(owner_path.read_text(encoding="utf-8").strip())
         os.kill(owner, 0)
@@ -371,6 +378,18 @@ def update_lock_active() -> bool:
         return False
     if os.name == "nt":
         return True
+    try:
+        expected_start = (lock_path / "owner.start").read_text(encoding="utf-8").strip()
+    except OSError:
+        expected_start = ""
+    if expected_start:
+        try:
+            stat_line = Path(f"/proc/{owner}/stat").read_text(encoding="utf-8")
+            actual_start = stat_line[stat_line.rfind(")") + 2 :].split()[19]
+        except (IndexError, OSError, ValueError):
+            return False
+        if actual_start != expected_start:
+            return False
     try:
         inspected = subprocess.run(
             ["ps", "-p", str(owner), "-o", "command="],
@@ -385,8 +404,172 @@ def update_lock_active() -> bool:
     return any(
         script in command and mode in command
         for script in ("update.sh", "update-controller")
-        for mode in ("--execute", "--manual-execute", "--recover-interrupted")
+        for mode in ("--execute", "--manual-execute", "--recover-interrupted", "--finalize-recovery")
     )
+
+
+def orphaned_controller_stale(status: dict[str, Any], current_time: float | None = None) -> bool:
+    now = time.time() if current_time is None else current_time
+    lease_path = RUN_DIR / "update-lease.json"
+    try:
+        lease = json.loads(lease_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        lease = {}
+    transaction = str(status.get("transaction_id") or "")
+    if transaction and lease.get("transaction_id") == transaction:
+        try:
+            return now - float(lease.get("heartbeat_at") or 0) >= ORPHANED_CONTROLLER_SECONDS
+        except (TypeError, ValueError):
+            return True
+    try:
+        return now - float(status.get("updated_at") or 0) >= ORPHANED_CONTROLLER_SECONDS
+    except (TypeError, ValueError):
+        return True
+
+
+async def local_web_ready() -> bool:
+    writer: asyncio.StreamWriter | None = None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", settings.WEB_PORT),
+            timeout=2,
+        )
+        writer.write(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        status_line = await asyncio.wait_for(reader.readline(), timeout=2)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+    parts = status_line.decode("ascii", errors="ignore").split()
+    return len(parts) >= 2 and parts[1].isdigit() and 200 <= int(parts[1]) < 400
+
+
+def cleanup_reconciled_transaction(status: dict[str, Any]) -> None:
+    transaction = str(status.get("transaction_id") or "")
+    lease_path = RUN_DIR / "update-lease.json"
+    try:
+        lease = json.loads(lease_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        lease = {}
+    if not transaction or lease.get("transaction_id") == transaction:
+        try:
+            lease_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(f"[Update Service] Could not remove reconciled artifact {lease_path.name}: {exc}")
+    for path in (
+        RUN_DIR / "pre-update-database.db",
+        RUN_DIR / "maintenance.pid",
+        RUN_DIR / "maintenance.start",
+        RUN_DIR / f"update-recovery.{transaction}.requested",
+        RUN_DIR / f"update-recovery.{transaction[:12]}.requested",
+    ):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(f"[Update Service] Could not remove reconciled artifact {path.name}: {exc}")
+    raw_staging = str(status.get("staging_dir") or "")
+    if not raw_staging:
+        return
+    try:
+        staging = Path(raw_staging).resolve()
+        install_parent = WORKSPACE_ROOT.resolve().parent
+    except OSError:
+        return
+    if staging.parent == install_parent and staging.name.startswith(".streamhome-update.") and staging.is_dir():
+        try:
+            shutil.rmtree(staging)
+        except OSError as exc:
+            logger.warning(f"[Update Service] Could not remove reconciled staging artifacts: {exc}")
+
+
+async def reconcile_orphaned_update() -> bool:
+    status = read_update_state()
+    phase = str(status.get("phase") or "")
+    if phase not in BUSY_PHASES or update_lock_active() or not orphaned_controller_stale(status):
+        return False
+    installed = await current_commit()
+    target = str(status.get("target_commit") or "")
+    previous = str(status.get("previous_commit") or "")
+    web_ready = await local_web_ready()
+    if web_ready and installed == target:
+        write_update_state(
+            phase="succeeded",
+            message="The updated release is healthy; interrupted controller bookkeeping was reconciled.",
+            current_commit=target,
+            update_available=False,
+            error="",
+            failed_target="",
+            staging_dir="",
+            web_artifacts_swapped=False,
+            finished_at=time.time(),
+            last_success_at=time.time(),
+        )
+        cleanup_reconciled_transaction(status)
+        return True
+    if web_ready and installed == previous:
+        write_update_state(
+            phase="rolled_back",
+            message="The previous release is healthy; interrupted controller bookkeeping was reconciled.",
+            current_commit=previous,
+            update_available=False,
+            error="update_interrupted_rolled_back",
+            failed_target=target,
+            staging_dir="",
+            web_artifacts_swapped=False,
+            finished_at=time.time(),
+        )
+        cleanup_reconciled_transaction(status)
+        return True
+
+    transaction = str(status.get("transaction_id") or "legacy")
+    safe_transaction = transaction if transaction.replace("-", "").isalnum() else "legacy"
+    request_path = RUN_DIR / f"update-recovery.{safe_transaction}.requested"
+    try:
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        with request_path.open("x", encoding="utf-8") as request_file:
+            request_file.write(f"{time.time():.6f}\n")
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        logger.error(f"[Update Service] Could not reserve orphaned-update recovery: {exc}")
+        return False
+    write_update_state(
+        phase="recovering",
+        message="The update controller stopped unexpectedly. Automatic recovery is starting.",
+        error="controller_lost",
+        recovery_requested_at=time.time(),
+    )
+    try:
+        with LOG_PATH.open("ab", buffering=0) as log_handle:
+            process = await asyncio.create_subprocess_exec(
+                str(RESTART_SCRIPT),
+                cwd=str(WORKSPACE_ROOT),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+        await process.wait()
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.error(f"[Update Service] Orphaned-update recovery handoff failed: {exc}")
+        write_update_state(
+            phase="rollback_failed",
+            message="Automatic recovery could not be queued. Run ./start.sh from the StreamHome directory.",
+            error="recovery_handoff_failed",
+            finished_at=time.time(),
+        )
+        return False
+    return True
 
 
 async def queue_update(
@@ -549,6 +732,10 @@ async def pull_and_install_updates() -> bool:
 
 async def automatic_update_worker(stop_event: asyncio.Event, initial_delay_seconds: float = 60) -> None:
     """Check for updates periodically and execute queued work only after fail-closed idle checks."""
+    try:
+        await reconcile_orphaned_update()
+    except Exception as exc:
+        logger.error(f"[Update Service] Startup update reconciliation failed: {type(exc).__name__}: {exc}")
     if initial_delay_seconds > 0:
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=initial_delay_seconds)
@@ -556,6 +743,12 @@ async def automatic_update_worker(stop_event: asyncio.Event, initial_delay_secon
             pass
     while not stop_event.is_set():
         try:
+            if await reconcile_orphaned_update():
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass
+                continue
             status = read_update_state()
             if state.MAINTENANCE_MODE and status.get("phase") in TERMINAL_PHASES:
                 state.MAINTENANCE_MODE = False

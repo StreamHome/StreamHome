@@ -16,7 +16,7 @@ import { SudoModal } from "../SudoModal";
 
 type ProtectedAction = "save" | "install-now" | "install-idle" | "retry" | "cancel" | null;
 
-const ACTIVE_PHASES = new Set(["queued", "preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back"]);
+const ACTIVE_PHASES = new Set(["queued", "preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back", "recovering"]);
 
 function shortCommit(commit: string): string {
   return commit ? commit.slice(0, 12) : "Unknown";
@@ -127,7 +127,11 @@ export function UpdatesPanel() {
             <div><dt>Available</dt><dd>{shortCommit(status.targetCommit)}</dd></div>
             <div><dt>Channel</dt><dd>{policy.branch}</dd></div>
             <div><dt>Last check</dt><dd>{formatTime(status.lastCheckedAt)}</dd></div>
+            <div><dt>Transaction</dt><dd>{status.transactionId ? status.transactionId.slice(0, 12) : "None"}</dd></div>
+            <div><dt>Lifecycle update</dt><dd>{formatTime(status.updatedAt)}</dd></div>
           </dl>
+          {status.recoveryRequestedAt && <p className="update-recovery-notice">Automatic recovery requested {formatTime(status.recoveryRequestedAt)}.</p>}
+          {status.diagnosticId && <p className="update-recovery-notice">Diagnostic reference: <code>{status.diagnosticId}</code></p>}
           {status.blockers.length > 0 && (
             <div className="update-blockers">
               <strong>{status.installMode === "now" && ACTIVE_PHASES.has(status.phase) ? "Protected activity must finish" : "Waiting for idle"}</strong>

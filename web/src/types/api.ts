@@ -411,6 +411,7 @@ export type UpdatePhase =
   | "installing"
   | "starting"
   | "rolling_back"
+  | "recovering"
   | "succeeded"
   | "failed"
   | "rolled_back"
@@ -429,6 +430,10 @@ export interface UpdateStatus {
   finishedAt: number | null;
   lastCheckedAt: number | null;
   lastSuccessAt: number | null;
+  updatedAt: number | null;
+  recoveryRequestedAt: number | null;
+  transactionId: string;
+  diagnosticId: string;
   failedTarget: string;
   error: string;
   blockers: string[];

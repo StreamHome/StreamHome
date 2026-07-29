@@ -134,6 +134,7 @@ run_server_checks() {
         scratch/test_ffmpeg_headers.py
         scratch/test_ingest_stream_script.py
         scratch/test_integration_credentials.py
+        scratch/test_maintenance_recovery.py
         scratch/test_playback_contract.py
         scratch/test_playback_pipeline.py
         scratch/test_profile_security.py

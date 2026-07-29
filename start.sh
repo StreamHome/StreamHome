@@ -10,6 +10,7 @@ STARTED_ANY=false
 START_SUCCEEDED=false
 UPDATE_RECOVERY_CHECKED=false
 WAITED_FOR_UPDATE=false
+FINALIZE_UPDATE_RECOVERY="${STREAMHOME_FINALIZE_UPDATE_RECOVERY:-false}"
 STARTUP_TIMEOUT_SECONDS="${STREAMHOME_STARTUP_TIMEOUT_SECONDS:-90}"
 STARTUP_ATTEMPTS="${STREAMHOME_STARTUP_ATTEMPTS:-2}"
 UPDATE_WAIT_SECONDS="${STREAMHOME_UPDATE_WAIT_SECONDS:-900}"
@@ -289,15 +290,35 @@ wait_for_services() {
 }
 
 update_controller_active() {
-    local owner command
+    local owner command expected_start actual_start
     owner="$(cat "$RUN_DIR/update.lock/owner.pid" 2>/dev/null || true)"
     [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null || return 1
+    expected_start="$(cat "$RUN_DIR/update.lock/owner.start" 2>/dev/null || true)"
+    if [[ -n "$expected_start" ]]; then
+        if [[ -r "/proc/$owner/stat" ]]; then
+            actual_start="$($BACKEND_PYTHON - "$owner" <<'PY'
+import sys
+from pathlib import Path
+
+try:
+    line = Path(f"/proc/{int(sys.argv[1])}/stat").read_text(encoding="utf-8")
+    print(line[line.rfind(")") + 2:].split()[19])
+except (IndexError, OSError, ValueError):
+    pass
+PY
+)"
+        else
+            actual_start="$(ps -p "$owner" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || true)"
+        fi
+        [[ -n "$actual_start" && "$actual_start" == "$expected_start" ]] || return 1
+    fi
     command="$(ps -p "$owner" -o command= 2>/dev/null || true)"
     [[ "$command" == *"update-controller"*"--execute"* \
         || "$command" == *"update-controller"*"--manual-execute"* \
         || "$command" == *"update.sh"*"--execute"* \
         || "$command" == *"update.sh"*"--manual-execute"* \
-        || "$command" == *"update.sh"*"--recover-interrupted"* ]]
+        || "$command" == *"update.sh"*"--recover-interrupted"* \
+        || "$command" == *"update.sh"*"--finalize-recovery"* ]]
 }
 
 read_update_phase() {
@@ -389,7 +410,12 @@ main() {
         set -e
         case "$recovery_result" in
             0)
-                exec bash "$ROOT_DIR/start.sh" --update-recovery-complete
+                exec env STREAMHOME_FINALIZE_UPDATE_RECOVERY=true bash "$ROOT_DIR/start.sh" --update-recovery-complete
+                ;;
+            12)
+                START_SUCCEEDED=true
+                printf '\nStreamHome was already healthy; interrupted update state was reconciled.\n'
+                return 0
                 ;;
             10)
                 ;;
@@ -479,6 +505,11 @@ main() {
     done
 
     START_SUCCEEDED=true
+    if [[ "$FINALIZE_UPDATE_RECOVERY" == true ]]; then
+        if ! "$ROOT_DIR/update.sh" --finalize-recovery "$ROOT_DIR"; then
+            printf '[StreamHome] Warning: services are healthy, but update recovery bookkeeping could not be finalized. Review update.log.\n' >&2
+        fi
+    fi
     printf '\nStreamHome is running at %s\n' "$PUBLIC_URL"
     if [[ "$SETUP_ACTIVE" == true ]]; then
         printf 'First-run setup is active.\n'

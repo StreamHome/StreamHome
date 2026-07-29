@@ -75,6 +75,10 @@ class UpdateStatusResponse(APIModel):
     finished_at: Optional[float] = None
     last_checked_at: Optional[float] = None
     last_success_at: Optional[float] = None
+    updated_at: Optional[float] = None
+    recovery_requested_at: Optional[float] = None
+    transaction_id: str
+    diagnostic_id: str
     failed_target: str
     error: str
     blockers: list[str]
@@ -118,6 +122,10 @@ async def _status_response() -> UpdateStatusResponse:
         finished_at=persisted.get("finished_at"),
         last_checked_at=persisted.get("last_checked_at"),
         last_success_at=persisted.get("last_success_at"),
+        updated_at=persisted.get("updated_at"),
+        recovery_requested_at=persisted.get("recovery_requested_at"),
+        transaction_id=str(persisted.get("transaction_id") or ""),
+        diagnostic_id=str(persisted.get("diagnostic_id") or ""),
         failed_target=str(persisted.get("failed_target") or ""),
         error=str(persisted.get("error") or ""),
         blockers=await protected_cutover_blockers() if active_immediate else await idle_blockers(),

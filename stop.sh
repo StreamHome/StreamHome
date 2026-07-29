@@ -137,7 +137,7 @@ is_streamhome_process() {
     cwd="$(process_cwd "$pid")"
     command="$(process_command "$pid")"
 
-    if [[ "$command" == *"$ROOT_DIR/server/scratch/maintenance_server.py"* ]]; then
+    if [[ "$command" == *"/server/scratch/maintenance_server.py"* ]]; then
         case "$cwd" in
             "$ROOT_DIR"|"$ROOT_DIR/"* ) return 0 ;;
         esac
@@ -328,6 +328,7 @@ main() {
 
     [[ "$QUIET" == true ]] || printf 'Stopping StreamHome processes...\n'
     stop_recorded_process maintenance
+    rm -f -- "$RUN_DIR/maintenance.start"
     stop_recorded_process web
     stop_recorded_process backend
     local port

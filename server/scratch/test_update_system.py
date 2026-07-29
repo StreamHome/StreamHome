@@ -204,6 +204,69 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted["phase"], "failed")
         self.assertEqual(persisted["error"], "preflight_failed")
 
+    async def test_orphaned_target_is_reconciled_without_rollback_when_both_services_are_healthy(self) -> None:
+        target = "f" * 40
+        previous = "a" * 40
+        update.write_update_state(
+            phase="starting",
+            message="Starting",
+            current_commit=target,
+            target_commit=target,
+            previous_commit=previous,
+            transaction_id="tx-healthy-target",
+            updated_at=time.time() - 60,
+        )
+        with (
+            patch.object(update, "update_lock_active", return_value=False),
+            patch.object(update, "orphaned_controller_stale", return_value=True),
+            patch.object(update, "current_commit", AsyncMock(return_value=target)),
+            patch.object(update, "local_web_ready", AsyncMock(return_value=True)),
+            patch.object(update, "cleanup_reconciled_transaction") as cleanup,
+        ):
+            self.assertTrue(await update.reconcile_orphaned_update())
+
+        persisted = update.read_update_state()
+        self.assertEqual(persisted["phase"], "succeeded")
+        self.assertEqual(persisted["current_commit"], target)
+        cleanup.assert_called_once()
+
+    async def test_orphaned_unhealthy_cutover_queues_one_detached_recovery(self) -> None:
+        target = "f" * 40
+        previous = "a" * 40
+        restart_script = Path(self.temporary.name) / "restart.sh"
+        restart_script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        update.write_update_state(
+            phase="installing",
+            message="Installing",
+            current_commit=target,
+            target_commit=target,
+            previous_commit=previous,
+            transaction_id="tx-unhealthy-target",
+            updated_at=time.time() - 60,
+        )
+
+        class QueuedRecovery:
+            async def wait(self) -> int:
+                return 0
+
+        with (
+            patch.object(update, "RESTART_SCRIPT", restart_script),
+            patch.object(update, "WORKSPACE_ROOT", Path(self.temporary.name)),
+            patch.object(update, "update_lock_active", return_value=False),
+            patch.object(update, "orphaned_controller_stale", return_value=True),
+            patch.object(update, "current_commit", AsyncMock(return_value=target)),
+            patch.object(update, "local_web_ready", AsyncMock(return_value=False)),
+            patch.object(update.asyncio, "create_subprocess_exec", AsyncMock(return_value=QueuedRecovery())) as launch,
+        ):
+            self.assertTrue(await update.reconcile_orphaned_update())
+            self.assertFalse(await update.reconcile_orphaned_update())
+
+        launch.assert_awaited_once()
+        persisted = update.read_update_state()
+        self.assertEqual(persisted["phase"], "recovering")
+        self.assertEqual(persisted["error"], "controller_lost")
+        self.assertTrue((self.run_dir / "update-recovery.tx-unhealthy-target.requested").is_file())
+
     async def test_immediate_cutover_ignores_viewers_and_idle_grace_but_not_mutating_work(self) -> None:
         settings.UPDATE_IDLE_MINUTES = 10
         state.record_browser_presence("session-now", True)

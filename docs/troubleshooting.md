@@ -1,5 +1,28 @@
 # Troubleshooting
 
+## Maintenance page does not finish after an update
+
+The maintenance page is normal only during the short protected activation and health-check window. Current releases display the live phase, transaction identifier, elapsed time, rollback state, and any safe recovery code. They automatically detect a lost update controller and queue recovery once.
+
+From the StreamHome installation directory, inspect the durable state without deleting application data:
+
+```bash
+cat .run/update-state.json
+tail -n 120 update.log
+cat .run/update-diagnostics.json 2>/dev/null || true
+./start.sh
+```
+
+`./start.sh` does not compete with a live updater. It waits for verified controller ownership; if that ownership is stale, it restores the recorded previous release and starts both services through the normal health gates. Do not delete `.run`, the staging checkout, `server/database.db`, `server/media`, `web/dist`, or `web/node_modules` while recovery is active, because they may contain the verified checkpoint and rollback artifacts.
+
+For an installation still running the legacy updater, use the current installer without deleting the StreamHome directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
+```
+
+This retrieves the current recovery-capable controller before cutover.
+
 ## StreamHome does not start
 
 Run:

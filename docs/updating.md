@@ -40,14 +40,22 @@ The expensive network fetches, dependency resolution, `npm ci`, and frontend bui
 
 Lifecycle output is stored in `update.log`. While cutover is active, Cloudflare or another reverse proxy receives a maintenance response rather than an unresponsive origin whenever the temporary responder can bind the configured port.
 
+Each cutover has a durable transaction identifier, controller lease, process-start identity, heartbeat, prepared-artifact location, and recovery state. The maintenance responder checks that lease independently. If the controller is terminated, killed by the kernel, loses its shell, or stops heartbeating, the responder changes from the active phase to recovery, queues the detached restart/recovery handoff once, and releases the public port. `start.sh` then restores the recorded previous commit, verified database checkpoint, Python wheelhouse, Node runtime, and production assets before applying the normal API and web health gates.
+
+The maintenance response is never a cacheable static success claim. It reports the current safe lifecycle phase, elapsed time, transaction and target identifiers, rollback progress, and a diagnostic reference for terminal failures. Responses include browser, CDN, and surrogate no-store controls plus cache-busted polling. A stale or reused PID cannot retain update or maintenance ownership because PID records are bound to process start identity.
+
+An interrupted update has only two accepted healthy terminal states: the target release passes both health gates, or the previous release is restored and passes both gates. Recovery artifacts and the database checkpoint are retained until one of those states is verified. They are not removed merely because the original controller exited.
+
 ## Command-line fallback
 
-If the admin panel is unavailable, inspect `update.log` and `.run/update-state.json`. A reviewed manual update remains available:
+If the admin panel is unavailable, inspect `update.log`, `.run/update-state.json`, and the private `.run/update-diagnostics.json` snapshot. A reviewed manual update remains available:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
 ```
 
 Do not stop StreamHome first. For an existing installation, the installer verifies the official origin, refuses a dirty checkout, preflights the fetched release while the current services remain online, and hands the exact fast-forward to the same health-gated cutover and rollback controller. The command does not return successfully until both services are healthy again. A concurrent `./start.sh` waits for the active updater and reports its phase instead of fighting the cutover.
+
+If a host was left on the legacy indefinite maintenance responder by an older release, run the same installer command without deleting the installation. The fetched controller performs the new transaction-aware recovery. `./start.sh` is also safe: it waits for a live controller, rejects stale ownership, and recovers an interrupted transaction before ordinary startup.
 
 Do not delete `server/database.db`, `server/media`, `.env`, `server/.env`, `server/backup`, or `server/rclone`.
