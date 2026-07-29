@@ -34,6 +34,8 @@ UPDATE_BRANCH="main"
 WEB_PORT=3000
 MANUAL_CUTOVER=false
 START_AFTER_UPDATE=true
+PUBLIC_URL=""
+PUBLIC_ORIGIN_WAS_READY=false
 
 log() {
     printf '[StreamHome Update] %s\n' "$1"
@@ -221,6 +223,41 @@ read_env() {
     value="${value%\'}"
     value="${value#\'}"
     printf '%s' "${value:-$default_value}"
+}
+
+public_origin_matches() {
+    local expected_commit="$1" attempts="${2:-1}"
+    [[ "$PUBLIC_URL" == http://* || "$PUBLIC_URL" == https://* ]] || return 1
+    python3 - "$PUBLIC_URL" "${expected_commit:0:12}" "$attempts" <<'PY'
+import json
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+public_url = sys.argv[1].rstrip("/")
+expected = sys.argv[2]
+attempts = max(1, int(sys.argv[3]))
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+for attempt in range(attempts):
+    query = urllib.parse.urlencode({"update_probe": str(time.time_ns())})
+    request = urllib.request.Request(
+        f"{public_url}/api/health?{query}",
+        headers={"Accept": "application/json", "Cache-Control": "no-cache"},
+    )
+    try:
+        with opener.open(request, timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            web_build = str(response.headers.get("X-StreamHome-Web-Build") or "")
+            api_build = str(payload.get("buildId") or "")
+            if response.status < 400 and payload.get("status") == "ready" and web_build == expected and api_build == expected:
+                raise SystemExit(0)
+    except Exception:
+        pass
+    if attempt + 1 < attempts:
+        time.sleep(2)
+raise SystemExit(1)
+PY
 }
 
 write_state() {
@@ -474,6 +511,58 @@ PY
         sleep 0.2
     done
     return 1
+}
+
+serve_recovery_maintenance() {
+    local recovered_transaction
+    RUN_DIR="$ROOT_DIR/.run"
+    STATUS_FILE="$RUN_DIR/update-state.json"
+    UPDATE_LOG="$ROOT_DIR/update.log"
+    LEASE_FILE="$RUN_DIR/update-lease.json"
+    MAINTENANCE_PID_FILE="$RUN_DIR/maintenance.pid"
+    MAINTENANCE_START_FILE="$RUN_DIR/maintenance.start"
+    WEB_PORT="$(read_env "$ROOT_DIR/.env" WEB_PORT 3000)"
+    recovered_transaction="$(
+        python3 - "$STATUS_FILE" <<'PY'
+import json
+import sys
+
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, TypeError, ValueError):
+    payload = {}
+print(str(payload.get("transaction_id") or "recovery"))
+PY
+    )"
+    TRANSACTION_ID="$recovered_transaction"
+    python3 - "$STATUS_FILE" <<'PY'
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, TypeError, ValueError):
+    payload = {}
+payload.update(
+    {
+        "phase": "rollback_failed",
+        "message": "The recovered release did not pass startup health checks. Run ./start.sh after reviewing the lifecycle logs.",
+        "error": "recovery_start_failed",
+        "finished_at": time.time(),
+        "updated_at": time.time(),
+    }
+)
+path.parent.mkdir(parents=True, exist_ok=True)
+temporary = path.with_name(f"{path.name}.{os.getpid()}.recovery.tmp")
+temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.replace(temporary, path)
+PY
+    start_maintenance || return 1
+    PRESERVE_MAINTENANCE=true
 }
 
 prepare_python_wheelhouse() {
@@ -1031,6 +1120,7 @@ execute_update() {
         UPDATE_BRANCH="$(read_env "$ROOT_DIR/server/.env" UPDATE_BRANCH main)"
     fi
     WEB_PORT="$(read_env "$ROOT_DIR/.env" WEB_PORT 3000)"
+    PUBLIC_URL="$(read_env "$ROOT_DIR/.env" PUBLIC_URL "")"
     trap cleanup EXIT
     trap 'exit 130' INT TERM HUP
 
@@ -1056,6 +1146,12 @@ execute_update() {
             return 1
         fi
     fi
+    if public_origin_matches "$OLD_COMMIT"; then
+        PUBLIC_ORIGIN_WAS_READY=true
+        log "The configured public origin is healthy on the installed build; post-update ingress verification is required."
+    else
+        log "The configured public origin could not be verified from this host; local health gates remain authoritative."
+    fi
 
     write_state "stopping" "Prepared release is ready. Stopping StreamHome for a short protected activation."
     CUTOVER_STARTED=true
@@ -1068,20 +1164,21 @@ execute_update() {
         write_state "failed" "StreamHome did not stop cleanly. The update was not applied." "shutdown_failed" "$TARGET_COMMIT"
         return 1
     fi
-    if ! create_database_checkpoint; then
-        if "$ROOT_DIR/start.sh" --update-recovery-complete; then
-            RUNTIME_HEALTHY=true
-            CUTOVER_STARTED=false
-        fi
-        write_state "failed" "The database recovery checkpoint failed. The update was not applied." "database_checkpoint_failed" "$TARGET_COMMIT"
-        return 1
-    fi
     if ! start_maintenance; then
         if "$ROOT_DIR/start.sh" --update-recovery-complete; then
             RUNTIME_HEALTHY=true
             CUTOVER_STARTED=false
         fi
         write_state "failed" "The maintenance responder could not start. The update was not applied." "maintenance_start_failed" "$TARGET_COMMIT"
+        return 1
+    fi
+    if ! create_database_checkpoint; then
+        stop_maintenance
+        if "$ROOT_DIR/start.sh" --update-recovery-complete; then
+            RUNTIME_HEALTHY=true
+            CUTOVER_STARTED=false
+        fi
+        write_state "failed" "The database recovery checkpoint failed. The update was not applied." "database_checkpoint_failed" "$TARGET_COMMIT"
         return 1
     fi
 
@@ -1131,27 +1228,20 @@ execute_update() {
         rollback_release || record_rollback_failure
         return 1
     fi
+    if [[ "$PUBLIC_ORIGIN_WAS_READY" == true ]]; then
+        write_state "starting" "Local services are healthy. Verifying the exact updated build through the configured public origin." "" "" "$TARGET_COMMIT"
+        if ! public_origin_matches "$TARGET_COMMIT" 15; then
+            log "The public origin stopped serving the expected build after cutover; rolling back."
+            rollback_release || record_rollback_failure
+            return 1
+        fi
+    fi
     record_prepared_setup_state
     RUNTIME_HEALTHY=true
     CUTOVER_STARTED=false
     rm -f -- "$RUN_DIR/pre-update-database.db"
     write_state "succeeded" "Update installed successfully; both StreamHome services passed health checks." "" "" "$TARGET_COMMIT"
     log "Update completed successfully at ${TARGET_COMMIT:0:12}."
-}
-
-queue_update() {
-    local controller controller_pid
-    RUN_DIR="$ROOT_DIR/.run"
-    mkdir -p "$RUN_DIR"
-    chmod 700 "$RUN_DIR" 2>/dev/null || true
-    controller="$RUN_DIR/update-controller.$$.sh"
-    cp -- "$ROOT_DIR/update.sh" "$controller"
-    chmod 700 "$controller"
-    printf '[StreamHome Update] Detached update handoff queued at %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$ROOT_DIR/update.log"
-    nohup bash "$controller" --execute "$TARGET_COMMIT" "$OLD_COMMIT" "$AUTOMATIC" "$HANDOFF_FILE" "$ROOT_DIR" \
-        >> "$ROOT_DIR/update.log" 2>&1 < /dev/null &
-    controller_pid=$!
-    printf '[StreamHome Update] Controller PID %s accepted the detached handoff.\n' "$controller_pid" >> "$ROOT_DIR/update.log"
 }
 
 case "${1:-}" in
@@ -1165,17 +1255,6 @@ case "${1:-}" in
         printf 'python_dependencies_changed=%s\n' "$PYTHON_DEPENDENCIES_CHANGED"
         printf 'web_dependencies_changed=%s\n' "$WEB_DEPENDENCIES_CHANGED"
         printf 'web_build_required=%s\n' "$WEB_BUILD_REQUIRED"
-        ;;
-    --queue)
-        [[ $# -eq 5 ]] || exit 2
-        TARGET_COMMIT="$2"
-        OLD_COMMIT="$3"
-        AUTOMATIC="$4"
-        HANDOFF_FILE="$5"
-        [[ "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ && "$OLD_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 2
-        [[ "$AUTOMATIC" == "true" || "$AUTOMATIC" == "false" ]] || exit 2
-        [[ "$HANDOFF_FILE" == "$ROOT_DIR"/.run/update-handoff.*.token ]] || exit 2
-        queue_update
         ;;
     --execute)
         [[ $# -eq 6 ]] || exit 2
@@ -1212,6 +1291,11 @@ case "${1:-}" in
         [[ $# -eq 2 ]] || exit 2
         ROOT_DIR="$(cd "$2" && pwd -P)"
         finalize_interrupted_recovery
+        ;;
+    --serve-maintenance)
+        [[ $# -eq 2 ]] || exit 2
+        ROOT_DIR="$(cd "$2" && pwd -P)"
+        serve_recovery_maintenance
         ;;
     --help|-h)
         printf 'StreamHome detached, preflighted, health-gated update controller.\n'

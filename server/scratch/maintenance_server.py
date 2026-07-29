@@ -193,15 +193,15 @@ class RecoveryCoordinator:
             recovery_requested_at=time.time(),
             updated_at=time.time(),
         )
-        restart_script = self.root / "restart.sh"
+        start_script = self.root / "start.sh"
         log_path = self.root / "update.log"
         try:
             with log_path.open("ab", buffering=0) as log_handle:
                 log_handle.write(
-                    f"[StreamHome Maintenance] Controller lease expired; queued recovery for {transaction_id}.\n".encode()
+                    f"[StreamHome Maintenance] Controller lease expired; launched direct recovery for {transaction_id}.\n".encode()
                 )
                 subprocess.Popen(
-                    [str(restart_script)],
+                    [str(start_script)],
                     cwd=str(self.root),
                     stdin=subprocess.DEVNULL,
                     stdout=log_handle,
@@ -220,7 +220,6 @@ class RecoveryCoordinator:
                 updated_at=time.time(),
             )
             return False
-        threading.Thread(target=self.server.shutdown, daemon=True).start()
         return True
 
     def run(self) -> None:

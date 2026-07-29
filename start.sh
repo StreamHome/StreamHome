@@ -44,6 +44,9 @@ cleanup() {
     if [[ "$START_SUCCEEDED" == false && "$STARTED_ANY" == true && -x "$ROOT_DIR/stop.sh" ]]; then
         "$ROOT_DIR/stop.sh" --quiet --lock-held >/dev/null 2>&1 || true
     fi
+    if [[ "$START_SUCCEEDED" == false && "$UPDATE_RECOVERY_CHECKED" == true && -x "$ROOT_DIR/update.sh" ]]; then
+        "$ROOT_DIR/update.sh" --serve-maintenance "$ROOT_DIR" >> "$ROOT_DIR/update.log" 2>&1 || true
+    fi
     release_lifecycle_lock
 }
 trap cleanup EXIT

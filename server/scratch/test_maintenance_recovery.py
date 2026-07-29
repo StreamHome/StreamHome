@@ -82,7 +82,7 @@ class MaintenanceRecoveryTests(unittest.TestCase):
             root = Path(temporary)
             run_dir = root / ".run"
             run_dir.mkdir()
-            (root / "restart.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            (root / "start.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             state_path = run_dir / "update-state.json"
             lease_path = run_dir / "update-lease.json"
             state_path.write_text(
@@ -102,6 +102,8 @@ class MaintenanceRecoveryTests(unittest.TestCase):
                 self.assertFalse(coordinator._queue_recovery(status))
 
             popen.assert_called_once()
+            self.assertEqual(Path(popen.call_args.args[0][0]), root / "start.sh")
+            server.shutdown.assert_not_called()
             persisted = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["phase"], "recovering")
             self.assertEqual(persisted["error"], "controller_lost")
@@ -158,20 +160,20 @@ class MaintenanceRecoveryTests(unittest.TestCase):
                 thread.join(timeout=2)
 
     @unittest.skipIf(os.name == "nt", "Controller process death and executable restart handoff require native Linux")
-    def test_killed_controller_at_each_cutover_phase_queues_recovery_and_releases_maintenance(self) -> None:
+    def test_killed_controller_at_each_cutover_phase_launches_direct_recovery_and_keeps_maintenance(self) -> None:
         for phase in ("stopping", "installing", "starting", "rolling_back"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 run_dir = root / ".run"
                 run_dir.mkdir()
                 transaction = f"tx-{phase}"
-                restart_marker = root / "restart-reached.marker"
-                restart_script = root / "restart.sh"
-                restart_script.write_text(
-                    f"#!/usr/bin/env bash\nprintf '%s\\n' recovered > '{restart_marker}'\n",
+                start_marker = root / "start-reached.marker"
+                start_script = root / "start.sh"
+                start_script.write_text(
+                    f"#!/usr/bin/env bash\nprintf '%s\\n' recovered > '{start_marker}'\n",
                     encoding="utf-8",
                 )
-                restart_script.chmod(0o755)
+                start_script.chmod(0o755)
                 controller = subprocess.Popen(["sleep", "60"])
                 maintenance: subprocess.Popen[bytes] | None = None
                 try:
@@ -225,10 +227,10 @@ class MaintenanceRecoveryTests(unittest.TestCase):
                     controller.terminate()
                     controller.wait(timeout=3)
                     deadline = time.monotonic() + 8
-                    while time.monotonic() < deadline and not restart_marker.is_file():
+                    while time.monotonic() < deadline and not start_marker.is_file():
                         time.sleep(0.1)
-                    self.assertTrue(restart_marker.is_file(), f"recovery was not queued for {phase}")
-                    maintenance.wait(timeout=3)
+                    self.assertTrue(start_marker.is_file(), f"recovery was not launched for {phase}")
+                    self.assertIsNone(maintenance.poll(), f"maintenance exited before recovery took ownership for {phase}")
                     persisted = json.loads(state_path.read_text(encoding="utf-8"))
                     self.assertEqual(persisted["phase"], "recovering")
                     self.assertEqual(persisted["error"], "controller_lost")

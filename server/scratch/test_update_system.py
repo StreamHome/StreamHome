@@ -159,11 +159,9 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid_install_mode"):
             await update.queue_update(automatic=False, install_mode="force")
 
-    async def test_detached_controller_cannot_have_terminal_state_overwritten_by_queue_handoff(self) -> None:
+    async def test_target_release_controller_is_launched_directly_in_a_new_session(self) -> None:
         target = "e" * 40
         current = "a" * 40
-        script = Path(self.temporary.name) / "update.sh"
-        script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         update.write_update_state(
             phase="queued",
             message="Queued",
@@ -174,35 +172,40 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
             install_mode="now",
         )
 
-        class FinishedController:
-            async def wait(self) -> int:
-                self_status = update.read_update_state()
-                if self_status["phase"] != "preflight":
-                    raise AssertionError("preflight state must be persisted before the controller is launched")
-                update.write_update_state(
-                    phase="failed",
-                    message="Controller reported a terminal failure.",
-                    error="preflight_failed",
-                    finished_at=time.time(),
-                )
-                return 0
+        async def fake_git(args: list[str], cwd: Path = update.WORKSPACE_ROOT):
+            del cwd
+            if args == ["show", f"{target}:update.sh"]:
+                return 0, "#!/usr/bin/env bash\nprintf 'target controller\\n'", ""
+            raise AssertionError(f"Unexpected Git command: {args}")
 
         with (
-            patch.object(update, "UPDATE_SCRIPT", script),
             patch.object(update.os, "name", "posix"),
             patch.object(update, "current_commit", AsyncMock(return_value=current)),
             patch.object(update, "queued_launch_blockers", AsyncMock(return_value=[])),
+            patch.object(update, "run_git_cmd", fake_git),
             patch.object(
                 update.asyncio,
                 "create_subprocess_exec",
-                AsyncMock(return_value=FinishedController()),
-            ),
+                AsyncMock(),
+            ) as launch,
         ):
             self.assertTrue(await update.launch_queued_update_if_ready())
 
         persisted = update.read_update_state()
-        self.assertEqual(persisted["phase"], "failed")
-        self.assertEqual(persisted["error"], "preflight_failed")
+        self.assertEqual(persisted["phase"], "preflight")
+        launch.assert_awaited_once()
+        arguments = launch.await_args.args
+        self.assertEqual(arguments[0], "bash")
+        self.assertEqual(arguments[2], "--execute")
+        self.assertEqual(arguments[3], target)
+        self.assertEqual(arguments[4], current)
+        self.assertEqual(arguments[5], "false")
+        self.assertEqual(Path(arguments[6]).parent, self.run_dir)
+        self.assertEqual(Path(arguments[7]), update.WORKSPACE_ROOT)
+        self.assertTrue(str(arguments[1]).endswith(".sh"))
+        self.assertEqual(launch.await_args.kwargs["start_new_session"], True)
+        controller = Path(arguments[1])
+        self.assertIn("target controller", controller.read_text(encoding="utf-8"))
 
     async def test_orphaned_target_is_reconciled_without_rollback_when_both_services_are_healthy(self) -> None:
         target = "f" * 40
@@ -233,8 +236,8 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
     async def test_orphaned_unhealthy_cutover_queues_one_detached_recovery(self) -> None:
         target = "f" * 40
         previous = "a" * 40
-        restart_script = Path(self.temporary.name) / "restart.sh"
-        restart_script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        start_script = Path(self.temporary.name) / "start.sh"
+        start_script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         update.write_update_state(
             phase="installing",
             message="Installing",
@@ -245,18 +248,14 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
             updated_at=time.time() - 60,
         )
 
-        class QueuedRecovery:
-            async def wait(self) -> int:
-                return 0
-
         with (
-            patch.object(update, "RESTART_SCRIPT", restart_script),
+            patch.object(update, "START_SCRIPT", start_script),
             patch.object(update, "WORKSPACE_ROOT", Path(self.temporary.name)),
             patch.object(update, "update_lock_active", return_value=False),
             patch.object(update, "orphaned_controller_stale", return_value=True),
             patch.object(update, "current_commit", AsyncMock(return_value=target)),
             patch.object(update, "local_web_ready", AsyncMock(return_value=False)),
-            patch.object(update.asyncio, "create_subprocess_exec", AsyncMock(return_value=QueuedRecovery())) as launch,
+            patch.object(update.asyncio, "create_subprocess_exec", AsyncMock()) as launch,
         ):
             self.assertTrue(await update.reconcile_orphaned_update())
             self.assertFalse(await update.reconcile_orphaned_update())

@@ -10,6 +10,7 @@ INSTALL_PARENT=""
 INSTALL_LOCK=""
 STAGING_DIR=""
 EXISTING_UPDATE_COMPLETE=false
+EXISTING_ALREADY_CURRENT=false
 
 usage() {
     cat <<'EOF'
@@ -143,6 +144,7 @@ prepare_existing_checkout() {
     if [[ "$fetched_commit" == "$head_commit" ]]; then
         log "The existing StreamHome installation is already at the requested release"
         EXISTING_UPDATE_COMPLETE=true
+        EXISTING_ALREADY_CURRENT=true
         return 0
     fi
     git -C "$INSTALL_DIR" merge-base --is-ancestor "$head_commit" "$fetched_commit" \
@@ -164,6 +166,56 @@ prepare_existing_checkout() {
     [[ "$(git -C "$INSTALL_DIR" rev-parse HEAD)" == "$fetched_commit" ]] \
         || fail "The health-gated update did not finish at the requested commit."
     EXISTING_UPDATE_COMPLETE=true
+}
+
+existing_runtime_ready() {
+    local python_bin="$INSTALL_DIR/venv/bin/python" web_port
+    [[ -x "$python_bin" ]] || python_bin="$(command -v python3 || true)"
+    [[ -n "$python_bin" ]] || return 1
+    web_port="$(
+        awk -F= '
+            /^[[:space:]]*WEB_PORT[[:space:]]*=/ {
+                value=$0
+                sub(/^[^=]*=/, "", value)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                gsub(/^["'"'"']|["'"'"']$/, "", value)
+                print value
+                exit
+            }
+        ' "$INSTALL_DIR/.env" 2>/dev/null || true
+    )"
+    [[ -n "$web_port" ]] || web_port=3000
+    [[ "$web_port" =~ ^[0-9]+$ ]] || return 1
+    "$python_bin" - "$web_port" <<'PY'
+import json
+import sys
+import urllib.request
+
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open("http://127.0.0.1:8000/api/health", timeout=1.5) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+        if response.status >= 400 or payload.get("status") != "ready":
+            raise SystemExit(1)
+    with opener.open(f"http://127.0.0.1:{int(sys.argv[1])}/", timeout=1.5) as response:
+        raise SystemExit(0 if 200 <= response.status < 400 else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+recover_current_installation() {
+    [[ "$NO_START" == false && "$EXISTING_ALREADY_CURRENT" == true ]] || return 0
+    if existing_runtime_ready; then
+        log "The existing StreamHome services are already healthy"
+        return 0
+    fi
+    log "The checkout is current but its services are unhealthy; starting recovery"
+    "$INSTALL_DIR/start.sh" \
+        || fail "The installed release is current, but StreamHome could not be recovered. Review backend.log, frontend.log, update.log, and restart.log."
+    existing_runtime_ready \
+        || fail "StreamHome started without restoring both local health endpoints."
+    log "The current StreamHome release was recovered successfully"
 }
 
 prepare_new_checkout() {
@@ -230,6 +282,7 @@ main() {
     prepare_checkout
 
     if [[ "$EXISTING_UPDATE_COMPLETE" == true ]]; then
+        recover_current_installation
         log "Existing StreamHome installation updated successfully"
         return 0
     fi

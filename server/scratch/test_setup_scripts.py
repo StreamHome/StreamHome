@@ -66,7 +66,7 @@ def create_fixture_repository(directory: Path) -> None:
             "  (cd \"$root\" && ./setup.sh --no-start --skip-system-packages)\n"
             "fi\n"
         ),
-        "start.sh": "#!/usr/bin/env bash\nexit 0\n",
+        "start.sh": "#!/usr/bin/env bash\ncd \"$(dirname \"$0\")\"\nprintf 'ready\\n' > .runtime-ready\n",
         "stop.sh": "#!/usr/bin/env bash\nexit 0\n",
         "test.sh": "#!/usr/bin/env bash\nexit 0\n",
     }
@@ -170,7 +170,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn('"restart.sh"', setup_py)
         self.assertIn("handoff.wait", setup_py)
 
-        self.assertIn('nohup bash "$controller" --execute', update_sh)
+        self.assertNotIn("--queue", update_sh)
         self.assertIn("--manual-execute", update_sh)
         self.assertIn("--classify-changes", update_sh)
         self.assertIn("preflight_target", update_sh)
@@ -187,11 +187,16 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("X-StreamHome-Update-Handoff", update_sh)
         self.assertIn("create_database_checkpoint", update_sh)
         self.assertIn("start_maintenance", update_sh)
+        self.assertLess(update_sh.index("if ! start_maintenance; then"), update_sh.index("if ! create_database_checkpoint; then"))
+        self.assertIn("public_origin_matches", update_sh)
+        self.assertIn("X-StreamHome-Web-Build", update_sh)
+        self.assertIn("post-update ingress verification is required", update_sh)
         self.assertIn("maintenance.pid", update_sh)
         self.assertIn("update-lease.json", update_sh)
         self.assertIn("transaction_id", update_sh)
         self.assertIn("--controller-silence-seconds", update_sh)
         self.assertIn("--finalize-recovery", update_sh)
+        self.assertIn("recovery_start_failed", update_sh)
         self.assertIn("update-diagnostics.json", update_sh)
         self.assertIn("prepare_python_wheelhouse", update_sh)
         self.assertIn("--no-index", update_sh)
@@ -347,6 +352,15 @@ class SetupScriptContracts(unittest.TestCase):
             fixture_url = remote.resolve().as_uri()
             source = (ROOT / "install.sh").read_text(encoding="utf-8")
             source = source.replace(REPOSITORY_URL, fixture_url)
+            health_start = source.index("existing_runtime_ready() {")
+            health_end = source.index("\n\nrecover_current_installation()", health_start)
+            source = (
+                source[:health_start]
+                + "existing_runtime_ready() {\n"
+                + "    [[ -f \"$INSTALL_DIR/.runtime-ready\" ]]\n"
+                + "}"
+                + source[health_end:]
+            )
             if os.name == "nt":
                 source = source.replace(
                     '[[ "$(uname -s)" == "Linux" ]] || fail "The alpha server installer supports Linux only."',
@@ -382,6 +396,13 @@ class SetupScriptContracts(unittest.TestCase):
             installed_commit = run(["git", "rev-parse", "HEAD"], cwd=install_directory).stdout.strip()
             self.assertEqual(installed_commit, expected_commit)
             self.assertEqual((install_directory / "release.txt").read_text(encoding="utf-8"), "next release\n")
+
+            (install_directory / ".runtime-ready").unlink(missing_ok=True)
+            recovered = run([bash, "-lc", f"'{bash_path(installer)}'"], cwd=root, env=environment)
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            self.assertTrue((install_directory / ".runtime-ready").is_file())
+            self.assertIn("checkout is current but its services are unhealthy", recovered.stdout)
+            self.assertIn("recovered successfully", recovered.stdout)
 
             (install_directory / ".setup-ran").unlink()
             local_change = install_directory / "local-change.txt"

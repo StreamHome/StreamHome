@@ -31,8 +31,7 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 RUN_DIR = WORKSPACE_ROOT / ".run"
 STATUS_PATH = RUN_DIR / "update-state.json"
 LOG_PATH = WORKSPACE_ROOT / "update.log"
-UPDATE_SCRIPT = WORKSPACE_ROOT / "update.sh"
-RESTART_SCRIPT = WORKSPACE_ROOT / "restart.sh"
+START_SCRIPT = WORKSPACE_ROOT / "start.sh"
 ORPHANED_CONTROLLER_SECONDS = 30
 
 
@@ -551,15 +550,14 @@ async def reconcile_orphaned_update() -> bool:
     )
     try:
         with LOG_PATH.open("ab", buffering=0) as log_handle:
-            process = await asyncio.create_subprocess_exec(
-                str(RESTART_SCRIPT),
+            await asyncio.create_subprocess_exec(
+                str(START_SCRIPT),
                 cwd=str(WORKSPACE_ROOT),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=log_handle,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
             )
-        await process.wait()
     except (OSError, subprocess.SubprocessError) as exc:
         logger.error(f"[Update Service] Orphaned-update recovery handoff failed: {exc}")
         write_update_state(
@@ -656,7 +654,7 @@ async def launch_queued_update_if_ready() -> bool:
                 finished_at=time.time(),
             )
             return False
-        if not UPDATE_SCRIPT.is_file() or os.name == "nt":
+        if os.name == "nt":
             write_update_state(
                 phase="failed",
                 message="Automatic lifecycle updates require the supported Linux installation.",
@@ -670,6 +668,21 @@ async def launch_queued_update_if_ready() -> bool:
         token_path.write_text(token, encoding="utf-8")
         if os.name != "nt":
             os.chmod(token_path, 0o600)
+        controller_path = RUN_DIR / f"update-controller.{secrets.token_hex(8)}.sh"
+        code, controller_source, controller_error = await run_git_cmd(["show", f"{target}:update.sh"])
+        if code != 0 or not controller_source.startswith("#!/usr/bin/env bash"):
+            token_path.unlink(missing_ok=True)
+            controller_path.unlink(missing_ok=True)
+            logger.error(f"[Update Service] Target controller extraction failed: {controller_error}")
+            write_update_state(
+                phase="failed",
+                message="The target release does not contain a valid update controller.",
+                error="target_update_controller_unavailable",
+                finished_at=time.time(),
+            )
+            return False
+        controller_path.write_text(controller_source.rstrip("\n") + "\n", encoding="utf-8")
+        os.chmod(controller_path, 0o700)
         state.UPDATE_HANDOFF_TOKEN = token
         write_update_state(
             phase="preflight",
@@ -682,36 +695,30 @@ async def launch_queued_update_if_ready() -> bool:
             error="",
         )
         try:
-            process = await asyncio.create_subprocess_exec(
-                "bash",
-                str(UPDATE_SCRIPT),
-                "--queue",
-                target,
-                current,
-                "true" if status.get("automatic") else "false",
-                str(token_path),
-                cwd=str(WORKSPACE_ROOT),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
+            with LOG_PATH.open("ab", buffering=0) as log_handle:
+                await asyncio.create_subprocess_exec(
+                    "bash",
+                    str(controller_path),
+                    "--execute",
+                    target,
+                    current,
+                    "true" if status.get("automatic") else "false",
+                    str(token_path),
+                    str(WORKSPACE_ROOT),
+                    cwd=str(WORKSPACE_ROOT),
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=asyncio.subprocess.STDOUT,
+                    start_new_session=True,
+                )
         except (OSError, subprocess.SubprocessError) as exc:
             state.UPDATE_HANDOFF_TOKEN = ""
             token_path.unlink(missing_ok=True)
+            controller_path.unlink(missing_ok=True)
             logger.error(f"[Update Service] Could not launch detached updater: {exc}")
             write_update_state(
                 phase="failed",
                 message="The detached update controller could not be launched.",
-                error="update_handoff_failed",
-                finished_at=time.time(),
-            )
-            return False
-        return_code = await process.wait()
-        if return_code != 0:
-            state.UPDATE_HANDOFF_TOKEN = ""
-            token_path.unlink(missing_ok=True)
-            write_update_state(
-                phase="failed",
-                message="The detached update controller could not be queued.",
                 error="update_handoff_failed",
                 finished_at=time.time(),
             )
