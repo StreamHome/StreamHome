@@ -738,6 +738,45 @@ preflight_target() {
     log "Candidate scripts, code, required dependencies, rollback artifacts, and production assets are ready."
 }
 
+stop_installed_runtime_with_target_lifecycle() {
+    local lifecycle_root="" temporary_root="" result=0
+    if [[ -f "$STAGING_DIR/checkout/stop.sh" \
+        && -f "$STAGING_DIR/checkout/server/scratch/runtime_control.py" ]]; then
+        lifecycle_root="$STAGING_DIR/checkout"
+    else
+        temporary_root="$(mktemp -d "$RUN_DIR/update-lifecycle.XXXXXX")" || return 1
+        mkdir -p "$temporary_root/server/scratch" || {
+            rmdir -- "$temporary_root" 2>/dev/null || true
+            return 1
+        }
+        if ! git -C "$ROOT_DIR" show "$TARGET_COMMIT:stop.sh" > "$temporary_root/stop.sh" \
+            || ! git -C "$ROOT_DIR" show "$TARGET_COMMIT:server/scratch/runtime_control.py" \
+                > "$temporary_root/server/scratch/runtime_control.py"; then
+            rm -f -- "$temporary_root/stop.sh"
+            rm -f -- "$temporary_root/server/scratch/runtime_control.py"
+            rmdir -- "$temporary_root/server/scratch" 2>/dev/null || true
+            rmdir -- "$temporary_root/server" 2>/dev/null || true
+            rmdir -- "$temporary_root" 2>/dev/null || true
+            log "The target release lifecycle controller could not be materialized."
+            return 1
+        fi
+        chmod 700 "$temporary_root/stop.sh"
+        lifecycle_root="$temporary_root"
+    fi
+
+    log "Stopping the installed runtime with the target release lifecycle controller."
+    STREAMHOME_ROOT_OVERRIDE="$ROOT_DIR" bash "$lifecycle_root/stop.sh" --quiet || result=$?
+
+    if [[ -n "$temporary_root" ]]; then
+        rm -f -- "$temporary_root/stop.sh"
+        rm -f -- "$temporary_root/server/scratch/runtime_control.py"
+        rmdir -- "$temporary_root/server/scratch" 2>/dev/null || true
+        rmdir -- "$temporary_root/server" 2>/dev/null || true
+        rmdir -- "$temporary_root" 2>/dev/null || true
+    fi
+    return "$result"
+}
+
 wait_for_idle_handoff() {
     local code handoff_token install_mode
     handoff_token="$(cat "$HANDOFF_FILE" 2>/dev/null || true)"
@@ -846,7 +885,10 @@ PY
 rollback_release() {
     log "Rolling back to known-working commit ${OLD_COMMIT:0:12}."
     write_state "rolling_back" "The update failed. Restoring the previous StreamHome release." "update_failed" "$TARGET_COMMIT"
-    "$ROOT_DIR/stop.sh" --quiet || true
+    if ! stop_installed_runtime_with_target_lifecycle; then
+        log "The failed target runtime could not be stopped; rollback will not mutate code or data while it may still be active."
+        return 1
+    fi
     start_maintenance || true
     git -C "$ROOT_DIR" reset --hard "$OLD_COMMIT" || return 1
     if [[ -f "$RUN_DIR/pre-update-database.db" ]]; then
@@ -996,7 +1038,10 @@ PY
     RECOVERY_IN_PROGRESS=true
     PRESERVE_RECOVERY_ARTIFACTS=true
     write_state "rolling_back" "Recovering an update interrupted before health verification." "update_interrupted" "$TARGET_COMMIT" "$current_head"
-    "$ROOT_DIR/stop.sh" --quiet || true
+    if ! stop_installed_runtime_with_target_lifecycle; then
+        record_rollback_failure
+        return 1
+    fi
     git -C "$ROOT_DIR" reset --hard "$OLD_COMMIT" || {
         record_rollback_failure
         return 1
@@ -1156,7 +1201,7 @@ execute_update() {
     write_state "stopping" "Prepared release is ready. Stopping StreamHome for a short protected activation."
     CUTOVER_STARTED=true
     RUNTIME_HEALTHY=false
-    if ! "$ROOT_DIR/stop.sh" --quiet; then
+    if ! stop_installed_runtime_with_target_lifecycle; then
         if "$ROOT_DIR/start.sh" --update-recovery-complete; then
             RUNTIME_HEALTHY=true
             CUTOVER_STARTED=false

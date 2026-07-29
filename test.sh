@@ -155,6 +155,7 @@ run_server_checks() {
         scratch/test_queue_failure_handling.py
         scratch/test_rclone_fallback.py
         scratch/test_recommendation_system.py
+        scratch/test_runtime_control.py
         scratch/test_search_caching.py
         scratch/test_security_validation.py
         scratch/test_setup_scripts.py

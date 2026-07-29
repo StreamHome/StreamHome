@@ -66,7 +66,11 @@ run_restart() {
 queue_restart() {
     printf '[StreamHome Restart] Detached restart handoff queued at %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
         >> "$RESTART_LOG"
-    nohup bash "$SCRIPT_PATH" --execute >> "$RESTART_LOG" 2>&1 < /dev/null &
+    nohup env \
+        -u STREAMHOME_INSTANCE_ROOT \
+        -u STREAMHOME_INSTANCE_TOKEN \
+        -u STREAMHOME_SERVICE \
+        setsid bash "$SCRIPT_PATH" --execute >> "$RESTART_LOG" 2>&1 < /dev/null &
 }
 
 case "${1:-}" in

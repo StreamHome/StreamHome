@@ -153,6 +153,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("record_prepared_state", setup_sh)
         self.assertIn("-m pip check", setup_sh)
         self.assertIn("listener-inspector", setup_sh)
+        self.assertIn("setsid from util-linux", setup_sh)
         self.assertIn('MIN_RCLONE_VERSION="1.68"', setup_sh)
         self.assertIn('RCLONE_INSTALL_VERSION="1.74.4"', setup_sh)
         self.assertIn("downloads.rclone.org/v${RCLONE_INSTALL_VERSION}", setup_sh)
@@ -162,7 +163,10 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("do not repeat setup", setup_sh)
         self.assertIn('"$ROOT_DIR/stop.sh" --quiet', setup_sh)
 
-        self.assertIn('nohup bash "$SCRIPT_PATH" --execute', restart_sh)
+        self.assertIn('setsid bash "$SCRIPT_PATH" --execute', restart_sh)
+        self.assertIn("-u STREAMHOME_INSTANCE_ROOT", restart_sh)
+        self.assertIn("-u STREAMHOME_INSTANCE_TOKEN", restart_sh)
+        self.assertIn("-u STREAMHOME_SERVICE", restart_sh)
         self.assertIn('exec bash "$ROOT_DIR/start.sh"', restart_sh)
         self.assertIn("restart.log", restart_sh)
         self.assertIn("restart.lock", restart_sh)
@@ -208,6 +212,10 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn('git -C "$ROOT_DIR" reset --hard "$OLD_COMMIT"', update_sh)
         self.assertIn('"$ROOT_DIR/start.sh"', update_sh)
         self.assertIn("rollback_failed", update_sh)
+        self.assertIn("stop_installed_runtime_with_target_lifecycle", update_sh)
+        self.assertIn("$TARGET_COMMIT:server/scratch/runtime_control.py", update_sh)
+        self.assertNotIn('"$ROOT_DIR/stop.sh" --quiet || true', update_sh)
+        self.assertIn("rollback will not mutate code or data while it may still be active", update_sh)
 
         self.assertIn('"$ROOT_DIR/stop.sh" --startup --lock-held', start_sh)
         self.assertIn("detect_server_ip", start_sh)
@@ -226,15 +234,24 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("lifecycle.lock", start_sh)
         self.assertIn("--recover-interrupted", start_sh)
         self.assertIn("Setup URL: %s/setup", start_sh)
+        self.assertIn("STREAMHOME_INSTANCE_ROOT", start_sh)
+        self.assertIn("STREAMHOME_INSTANCE_TOKEN", start_sh)
+        self.assertIn("STREAMHOME_SERVICE=backend", start_sh)
+        self.assertIn("STREAMHOME_SERVICE=web", start_sh)
+        self.assertIn("record_service", start_sh)
+        self.assertNotIn("npm run server >", start_sh)
 
-        self.assertIn("is_streamhome_process", stop_sh)
-        self.assertIn("stop_process_tree", stop_sh)
-        self.assertIn("maintenance_server.py", stop_sh)
-        self.assertIn("stop_recorded_process maintenance", stop_sh)
-        self.assertIn("It was not stopped.", stop_sh)
-        self.assertIn("its PID record was preserved", stop_sh)
+        runtime_control = (ROOT / "server" / "scratch" / "runtime_control.py").read_text(encoding="utf-8")
+        self.assertIn("STREAMHOME_ROOT_OVERRIDE", stop_sh)
+        self.assertIn("runtime_control.py", stop_sh)
+        self.assertIn("run_runtime_stop", stop_sh)
         self.assertIn("Shutdown did not complete cleanly", stop_sh)
         self.assertIn("append_recovery_port", stop_sh)
+        self.assertIn("legacy_service", runtime_control)
+        self.assertIn("discover_owned", runtime_control)
+        self.assertIn("os.killpg", runtime_control)
+        self.assertIn("Port {port} is still owned", runtime_control)
+        self.assertIn("Shutdown cannot be reported as successful", runtime_control)
 
         self.assertIn("--server-only", test_sh)
         self.assertIn("--web-only", test_sh)
@@ -431,6 +448,14 @@ class SetupScriptContracts(unittest.TestCase):
             fixture = Path(temporary)
             script = fixture / "stop.sh"
             shutil.copy2(ROOT / "stop.sh", script)
+            if os.name == "nt":
+                result = run([bash, "-lc", f"'{bash_path(script)}' --help"], cwd=fixture)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("unbound variable", (result.stdout + result.stderr).lower())
+                return
+            helper = fixture / "server" / "scratch" / "runtime_control.py"
+            helper.parent.mkdir(parents=True)
+            shutil.copy2(ROOT / "server" / "scratch" / "runtime_control.py", helper)
             (fixture / ".env").write_text("WEB_PORT=3000\n", encoding="utf-8")
             (fixture / ".run").mkdir()
             result = run(
@@ -514,6 +539,9 @@ class SetupScriptContracts(unittest.TestCase):
                 "server/requirements.txt": "",
                 "server/requirements.lock": "",
                 "server/scratch/maintenance_server.py": helper,
+                "server/scratch/runtime_control.py": (
+                    ROOT / "server" / "scratch" / "runtime_control.py"
+                ).read_text(encoding="utf-8"),
                 "web/node_modules/runtime.txt": "known-working dependencies\n",
                 "web/dist/index.html": "known-working assets\n",
             }
@@ -636,6 +664,9 @@ class SetupScriptContracts(unittest.TestCase):
             server_directory.mkdir()
             unrelated_directory.mkdir()
             shutil.copy2(ROOT / "stop.sh", fixture / "stop.sh")
+            runtime_helper = fixture / "server" / "scratch" / "runtime_control.py"
+            runtime_helper.parent.mkdir(parents=True)
+            shutil.copy2(ROOT / "server" / "scratch" / "runtime_control.py", runtime_helper)
             (fixture / ".env").write_text("WEB_PORT=3000\n", encoding="utf-8")
             (fixture / ".run").mkdir()
             listener_source = (
@@ -685,14 +716,90 @@ class SetupScriptContracts(unittest.TestCase):
                     [bash, str(fixture / "stop.sh"), "--startup", "--recover-port", str(unrelated_port)],
                     cwd=fixture,
                 )
-                self.assertEqual(preserved.returncode, 0, preserved.stdout + preserved.stderr)
+                self.assertNotEqual(preserved.returncode, 0, preserved.stdout + preserved.stderr)
                 self.assertIsNone(unrelated.poll())
                 self.assertIn(f"PID {unrelated.pid}", preserved.stderr)
                 self.assertIn("It was not stopped.", preserved.stderr)
-                self.assertFalse(stale_record.exists())
+                self.assertTrue(stale_record.exists())
             finally:
                 unrelated.kill()
                 unrelated.wait(timeout=5)
+
+    @unittest.skipIf(os.name == "nt", "Marked orphan recovery requires native Linux /proc semantics")
+    def test_linux_stop_recovers_reparented_marked_listener_and_proves_port_release(self) -> None:
+        bash = bash_command()
+        if not bash:
+            self.skipTest("Bash is not installed")
+
+        def wait_for_listener(port: int) -> None:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with socket.socket() as probe:
+                    if probe.connect_ex(("127.0.0.1", port)) == 0:
+                        return
+                time.sleep(0.05)
+            self.fail(f"Listener on port {port} did not start")
+
+        with tempfile.TemporaryDirectory(dir=ROOT / "temp") as temporary:
+            fixture = Path(temporary)
+            runtime_helper = fixture / "server" / "scratch" / "runtime_control.py"
+            runtime_helper.parent.mkdir(parents=True)
+            shutil.copy2(ROOT / "stop.sh", fixture / "stop.sh")
+            shutil.copy2(ROOT / "server" / "scratch" / "runtime_control.py", runtime_helper)
+            (fixture / ".env").write_text("WEB_PORT=3000\n", encoding="utf-8")
+            (fixture / ".run").mkdir()
+            detached_directory = fixture / "detached"
+            detached_directory.mkdir()
+            listener = detached_directory / "listener.py"
+            listener.write_text(
+                "import socket, sys, time\n"
+                "server = socket.socket()\n"
+                "server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                "server.bind(('127.0.0.1', int(sys.argv[1])))\n"
+                "server.listen()\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            launcher = detached_directory / "launcher.py"
+            launcher.write_text(
+                "import os, pathlib, subprocess, sys\n"
+                "child = subprocess.Popen(\n"
+                "    [sys.executable, 'listener.py', sys.argv[1]],\n"
+                "    cwd=pathlib.Path(__file__).parent,\n"
+                "    env=os.environ.copy(),\n"
+                "    start_new_session=True,\n"
+                ")\n"
+                "pathlib.Path(sys.argv[2]).write_text(str(child.pid), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            port = unused_port()
+            child_pid_path = fixture / "child.pid"
+            environment = os.environ.copy()
+            environment["STREAMHOME_INSTANCE_ROOT"] = str(fixture.resolve())
+            environment["STREAMHOME_INSTANCE_TOKEN"] = "reparented-test-token"
+            environment["STREAMHOME_SERVICE"] = "backend"
+            launched = run(
+                [sys.executable, str(launcher), str(port), str(child_pid_path)],
+                cwd=detached_directory,
+                env=environment,
+            )
+            self.assertEqual(launched.returncode, 0, launched.stdout + launched.stderr)
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            try:
+                wait_for_listener(port)
+                stopped = run(
+                    [bash, str(fixture / "stop.sh"), "--recover-port", str(port)],
+                    cwd=fixture,
+                )
+                self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+                self.assertIn("StreamHome stopped.", stopped.stdout)
+                with socket.socket() as proof:
+                    proof.bind(("0.0.0.0", port))
+            finally:
+                try:
+                    os.kill(child_pid, 9)
+                except ProcessLookupError:
+                    pass
 
 
 if __name__ == "__main__":

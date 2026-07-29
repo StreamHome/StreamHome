@@ -198,6 +198,7 @@ missing_commands() {
     command -v ffprobe >/dev/null 2>&1 || missing+=(ffprobe)
     command -v git >/dev/null 2>&1 || missing+=(git)
     command -v curl >/dev/null 2>&1 || missing+=(curl)
+    command -v setsid >/dev/null 2>&1 || missing+=(util-linux)
     if ! command -v lsof >/dev/null 2>&1 \
         && ! command -v ss >/dev/null 2>&1 \
         && ! command -v fuser >/dev/null 2>&1; then
@@ -215,17 +216,17 @@ install_system_packages() {
 
     log "Installing missing system dependencies: ${missing[*]}"
     if command -v apt-get >/dev/null 2>&1; then
-        packages=(ca-certificates curl git python3 python3-pip python3-venv nodejs npm ffmpeg lsof)
+        packages=(ca-certificates curl git python3 python3-pip python3-venv nodejs npm ffmpeg lsof util-linux)
         run_privileged apt-get update
         run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
-        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg lsof)
+        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg lsof util-linux)
         run_privileged dnf install -y "${packages[@]}"
     elif command -v yum >/dev/null 2>&1; then
-        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg lsof)
+        packages=(ca-certificates curl git python3 python3-pip nodejs npm ffmpeg lsof util-linux)
         run_privileged yum install -y "${packages[@]}"
     elif command -v pacman >/dev/null 2>&1; then
-        packages=(ca-certificates curl git python python-pip nodejs npm ffmpeg lsof)
+        packages=(ca-certificates curl git python python-pip nodejs npm ffmpeg lsof util-linux)
         run_privileged pacman -Sy --needed --noconfirm "${packages[@]}"
     else
         fail "No supported Linux package manager was found. Install Python 3.11+, Node.js 18+, FFmpeg, FFprobe, curl, Git, and a listener inspector manually."
@@ -241,6 +242,7 @@ validate_versions() {
     command -v ffprobe >/dev/null 2>&1 || fail "ffprobe is unavailable after dependency installation."
     command -v git >/dev/null 2>&1 || fail "git is unavailable after dependency installation."
     command -v curl >/dev/null 2>&1 || fail "curl is unavailable after dependency installation."
+    command -v setsid >/dev/null 2>&1 || fail "setsid from util-linux is required for isolated StreamHome service groups."
     if ! command -v lsof >/dev/null 2>&1 \
         && ! command -v ss >/dev/null 2>&1 \
         && ! command -v fuser >/dev/null 2>&1; then

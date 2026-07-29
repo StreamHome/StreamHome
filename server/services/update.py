@@ -33,6 +33,18 @@ STATUS_PATH = RUN_DIR / "update-state.json"
 LOG_PATH = WORKSPACE_ROOT / "update.log"
 START_SCRIPT = WORKSPACE_ROOT / "start.sh"
 ORPHANED_CONTROLLER_SECONDS = 30
+RUNTIME_IDENTITY_ENV_KEYS = {
+    "STREAMHOME_INSTANCE_ROOT",
+    "STREAMHOME_INSTANCE_TOKEN",
+    "STREAMHOME_SERVICE",
+}
+
+
+def detached_lifecycle_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for key in RUNTIME_IDENTITY_ENV_KEYS:
+        environment.pop(key, None)
+    return environment
 
 
 def _default_status() -> dict[str, Any]:
@@ -557,6 +569,7 @@ async def reconcile_orphaned_update() -> bool:
                 stdout=log_handle,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
+                env=detached_lifecycle_environment(),
             )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.error(f"[Update Service] Orphaned-update recovery handoff failed: {exc}")
@@ -710,6 +723,7 @@ async def launch_queued_update_if_ready() -> bool:
                     stdout=log_handle,
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
+                    env=detached_lifecycle_environment(),
                 )
         except (OSError, subprocess.SubprocessError) as exc:
             state.UPDATE_HANDOFF_TOKEN = ""

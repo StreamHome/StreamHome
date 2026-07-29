@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+ROOT_DIR="${STREAMHOME_ROOT_OVERRIDE:-$SCRIPT_ROOT}"
+ROOT_DIR="$(cd "$ROOT_DIR" && pwd -P)"
 RUN_DIR="$ROOT_DIR/.run"
 ENV_FILE="$ROOT_DIR/.env"
 LIFECYCLE_LOCK="$RUN_DIR/lifecycle.lock"
+RUNTIME_CONTROL="$SCRIPT_ROOT/server/scratch/runtime_control.py"
 QUIET=false
 STARTUP_MODE=false
 LOCK_HELD=false
 LOCK_ACQUIRED=false
-STOP_FAILED=false
 RECOVERY_PORTS=()
 
 append_recovery_port() {
@@ -100,191 +102,37 @@ read_env() {
     printf '%s' "${value:-$default_value}"
 }
 
-process_command() {
-    ps -p "$1" -o command= 2>/dev/null || true
-}
-
-process_is_running() {
-    local pid="$1" state
-    kill -0 "$pid" 2>/dev/null || return 1
-    state="$(ps -p "$pid" -o stat= 2>/dev/null | awk '{$1=$1; print}' || true)"
-    [[ "$state" != Z* ]]
-}
-
-process_start_marker() {
-    local marker
-    marker="$(ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || true)"
-    printf '%s' "${marker:-unknown}"
-}
-
-process_identity_matches() {
-    local pid="$1" expected="$2"
-    process_is_running "$pid" || return 1
-    [[ "$expected" == "unknown" || "$(process_start_marker "$pid")" == "$expected" ]]
-}
-
-process_label() {
-    local label
-    label="$(ps -p "$1" -o comm= 2>/dev/null | awk '{$1=$1; print}' || true)"
-    printf '%s' "${label:-unknown}"
-}
-
-process_cwd() {
-    local pid="$1" cwd=""
-    if [[ -L "/proc/$pid/cwd" ]]; then
-        cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
-    elif command -v lsof >/dev/null 2>&1; then
-        cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1)"
-    fi
-    printf '%s' "$cwd"
-}
-
-is_streamhome_process() {
-    local pid="$1" cwd command
-    process_is_running "$pid" || return 1
-    cwd="$(process_cwd "$pid")"
-    command="$(process_command "$pid")"
-
-    if [[ "$command" == *"/server/scratch/maintenance_server.py"* ]]; then
-        case "$cwd" in
-            "$ROOT_DIR"|"$ROOT_DIR/"* ) return 0 ;;
-        esac
-    fi
-
-    case "$cwd" in
-        "$ROOT_DIR/server"|"$ROOT_DIR/server/"*)
-            [[ "$command" == *"main.py"* || "$command" == *"uvicorn"*"main:app"* ]]
-            ;;
-        "$ROOT_DIR/web"|"$ROOT_DIR/web/"*)
-            [[ "$command" == *"npm"*"run"*"server"* || "$command" == *"tsx"*"server.ts"* || "$command" == *"server.ts"* ]]
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-child_pids() {
-    local parent_pid="$1"
-    if command -v pgrep >/dev/null 2>&1; then
-        pgrep -P "$parent_pid" 2>/dev/null || true
+select_python() {
+    if [[ -x "$ROOT_DIR/venv/bin/python" ]] \
+        && "$ROOT_DIR/venv/bin/python" -c 'import sys' >/dev/null 2>&1; then
+        RUNTIME_PYTHON="$ROOT_DIR/venv/bin/python"
+    elif command -v python3 >/dev/null 2>&1; then
+        RUNTIME_PYTHON="$(command -v python3)"
     else
-        ps -eo pid=,ppid= 2>/dev/null | awk -v parent="$parent_pid" '$2 == parent {print $1}'
+        printf '[StreamHome] Python 3 is unavailable; runtime ownership cannot be inspected safely.\n' >&2
+        return 1
     fi
 }
 
-collect_process_tree() {
-    local pid="$1" child marker
-    while IFS= read -r child; do
-        [[ "$child" =~ ^[0-9]+$ ]] && collect_process_tree "$child"
-    done < <(child_pids "$pid")
-    marker="$(process_start_marker "$pid")"
-    printf '%s|%s\n' "$pid" "$marker"
+select_runtime_control() {
+    if [[ ! -f "$RUNTIME_CONTROL" ]]; then
+        RUNTIME_CONTROL="$ROOT_DIR/server/scratch/runtime_control.py"
+    fi
+    if [[ ! -f "$RUNTIME_CONTROL" ]]; then
+        printf '[StreamHome] Runtime ownership controller is missing: %s\n' "$RUNTIME_CONTROL" >&2
+        return 1
+    fi
 }
 
-tree_is_running() {
-    local tree="$1" candidate marker
-    while IFS='|' read -r candidate marker; do
-        if [[ "$candidate" =~ ^[0-9]+$ ]] && process_identity_matches "$candidate" "$marker"; then
-            return 0
-        fi
-    done <<< "$tree"
-    return 1
-}
-
-stop_process_tree() {
-    local pid="$1" tree candidate marker
-    tree="$(collect_process_tree "$pid")"
-    while IFS='|' read -r candidate marker; do
-        if [[ "$candidate" =~ ^[0-9]+$ ]] && process_identity_matches "$candidate" "$marker"; then
-            kill "$candidate" 2>/dev/null || true
-        fi
-    done <<< "$tree"
-
-    for _ in {1..30}; do
-        tree_is_running "$tree" || return 0
-        sleep 0.1
+run_runtime_stop() {
+    local -a arguments=(stop --root "$ROOT_DIR")
+    local port
+    for port in "${RECOVERY_PORTS[@]}"; do
+        arguments+=(--port "$port")
     done
-
-    while IFS='|' read -r candidate marker; do
-        if [[ "$candidate" =~ ^[0-9]+$ ]] && process_identity_matches "$candidate" "$marker"; then
-            kill -9 "$candidate" 2>/dev/null || true
-        fi
-    done <<< "$tree"
-
-    for _ in {1..10}; do
-        tree_is_running "$tree" || return 0
-        sleep 0.1
-    done
-    return 1
-}
-
-listener_pids() {
-    local port="$1"
-    if command -v lsof >/dev/null 2>&1; then
-        lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u
-    elif command -v ss >/dev/null 2>&1; then
-        ss -H -ltnp "sport = :$port" 2>/dev/null \
-            | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' \
-            | sort -u
-    elif command -v fuser >/dev/null 2>&1; then
-        fuser "$port"/tcp 2>/dev/null \
-            | tr ' ' '\n' \
-            | sed -n '/^[0-9][0-9]*$/p' \
-            | sort -u
-    fi
-}
-
-report_unrelated_listener() {
-    local port="$1" pid="$2" cwd
-    cwd="$(process_cwd "$pid")"
-    printf '[StreamHome] Port %s is owned by unrelated process PID %s (%s)' \
-        "$port" "$pid" "$(process_label "$pid")" >&2
-    if [[ -n "$cwd" ]]; then
-        printf ' in %s' "$cwd" >&2
-    fi
-    printf '. It was not stopped.\n' >&2
-}
-
-recover_port() {
-    local port="$1" pid
-    while IFS= read -r pid; do
-        [[ "$pid" =~ ^[0-9]+$ ]] || continue
-        if is_streamhome_process "$pid"; then
-            if [[ "$QUIET" == false || "$STARTUP_MODE" == true ]]; then
-                printf '[StreamHome] Port %s is occupied by an earlier StreamHome process (PID %s). Stopping it...\n' "$port" "$pid"
-            fi
-            if ! stop_process_tree "$pid"; then
-                printf '[StreamHome] Process tree rooted at PID %s survived shutdown and still owns StreamHome runtime state.\n' "$pid" >&2
-                STOP_FAILED=true
-            fi
-        elif [[ "$QUIET" == false || "$STARTUP_MODE" == true ]]; then
-            report_unrelated_listener "$port" "$pid"
-        fi
-    done < <(listener_pids "$port")
-}
-
-stop_recorded_process() {
-    local name="$1" pid_file pid
-    pid_file="$RUN_DIR/$name.pid"
-    [[ -f "$pid_file" ]] || return 0
-    pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [[ "$pid" =~ ^[0-9]+$ ]] && process_is_running "$pid"; then
-        if is_streamhome_process "$pid"; then
-            if stop_process_tree "$pid"; then
-                rm -f -- "$pid_file"
-                [[ "$QUIET" == true ]] || printf '[StreamHome] Stopped %s.\n' "$name"
-            else
-                printf '[StreamHome] Failed to stop %s process tree rooted at PID %s; its PID record was preserved.\n' "$name" "$pid" >&2
-                STOP_FAILED=true
-            fi
-            return 0
-        fi
-        if [[ "$QUIET" == false ]]; then
-            printf '[StreamHome] Skipped stale %s PID record %s because it no longer belongs to this installation.\n' "$name" "$pid" >&2
-        fi
-    fi
-    rm -f -- "$pid_file"
+    [[ "$QUIET" == true ]] && arguments+=(--quiet)
+    [[ "$STARTUP_MODE" == true ]] && arguments+=(--startup)
+    "$RUNTIME_PYTHON" "$RUNTIME_CONTROL" "${arguments[@]}"
 }
 
 main() {
@@ -330,26 +178,19 @@ main() {
             append_recovery_port 8000
             append_recovery_port "$configured_port"
         else
-            printf '[StreamHome] WEB_PORT is invalid; only recorded processes and API port 8000 can be recovered safely.\n' >&2
-            RECOVERY_PORTS=(8000)
-            STOP_FAILED=true
+            printf '[StreamHome] WEB_PORT is invalid; shutdown cannot verify the configured web listener.\n' >&2
+            return 1
         fi
     fi
 
+    select_python || return 1
+    select_runtime_control || return 1
     [[ "$QUIET" == true ]] || printf 'Stopping StreamHome processes...\n'
-    stop_recorded_process maintenance
-    rm -f -- "$RUN_DIR/maintenance.start"
-    stop_recorded_process web
-    stop_recorded_process backend
-    local port
-    for port in "${RECOVERY_PORTS[@]}"; do
-        recover_port "$port"
-    done
-
-    if [[ "$STOP_FAILED" == true ]]; then
+    if ! run_runtime_stop; then
         printf '[StreamHome] Shutdown did not complete cleanly.\n' >&2
         return 1
     fi
+    rm -f -- "$RUN_DIR/maintenance.start"
     [[ "$QUIET" == true ]] || printf 'StreamHome stopped.\n'
 }
 

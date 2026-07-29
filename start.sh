@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ENV_FILE="$ROOT_DIR/.env"
 RUN_DIR="$ROOT_DIR/.run"
 LIFECYCLE_LOCK="$RUN_DIR/lifecycle.lock"
+RUNTIME_CONTROL="$ROOT_DIR/server/scratch/runtime_control.py"
 LOCK_ACQUIRED=false
 STARTED_ANY=false
 START_SUCCEEDED=false
@@ -14,6 +15,7 @@ FINALIZE_UPDATE_RECOVERY="${STREAMHOME_FINALIZE_UPDATE_RECOVERY:-false}"
 STARTUP_TIMEOUT_SECONDS="${STREAMHOME_STARTUP_TIMEOUT_SECONDS:-90}"
 STARTUP_ATTEMPTS="${STREAMHOME_STARTUP_ATTEMPTS:-2}"
 UPDATE_WAIT_SECONDS="${STREAMHOME_UPDATE_WAIT_SECONDS:-900}"
+RUNTIME_TOKEN=""
 
 usage() {
     cat <<'EOF'
@@ -212,12 +214,34 @@ wait_for_port_release() {
     return 1
 }
 
-write_pid_record() {
-    local name="$1" pid="$2" temporary
-    temporary="$(mktemp "$RUN_DIR/.${name}.pid.XXXXXX")"
-    printf '%s\n' "$pid" > "$temporary"
-    chmod 600 "$temporary" 2>/dev/null || true
-    mv -f -- "$temporary" "$RUN_DIR/$name.pid"
+record_service() {
+    local service="$1" pid="$2" error=""
+    for _ in {1..40}; do
+        if error="$("$BACKEND_PYTHON" "$RUNTIME_CONTROL" record \
+            --root "$ROOT_DIR" \
+            --service "$service" \
+            --pid "$pid" \
+            --token "$RUNTIME_TOKEN" 2>&1)"; then
+            return 0
+        fi
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    printf '%s\n' "${error:-[StreamHome] The $service process exited before its runtime identity could be recorded.}" >&2
+    return 1
+}
+
+service_record_matches() {
+    local service="$1" pid="$2"
+    "$BACKEND_PYTHON" "$RUNTIME_CONTROL" matches \
+        --root "$ROOT_DIR" \
+        --service "$service" \
+        --pid "$pid"
+}
+
+generate_runtime_token() {
+    RUNTIME_TOKEN="$("$BACKEND_PYTHON" -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    [[ -n "$RUNTIME_TOKEN" ]] || fail "A runtime ownership token could not be generated."
 }
 
 start_backend() {
@@ -226,15 +250,18 @@ start_backend() {
     STARTED_ANY=true
     (
         cd "$ROOT_DIR/server"
-        if command -v setsid >/dev/null 2>&1; then
-            nohup setsid env PYTHONUNBUFFERED=1 "$BACKEND_PYTHON" -m uvicorn main:app --host 127.0.0.1 --port 8000 \
-                > "$ROOT_DIR/backend.log" 2>&1 < /dev/null &
-        else
-            nohup env PYTHONUNBUFFERED=1 "$BACKEND_PYTHON" -m uvicorn main:app --host 127.0.0.1 --port 8000 \
-                > "$ROOT_DIR/backend.log" 2>&1 < /dev/null &
-        fi
+        nohup setsid env \
+            PYTHONUNBUFFERED=1 \
+            STREAMHOME_INSTANCE_ROOT="$ROOT_DIR" \
+            STREAMHOME_INSTANCE_TOKEN="$RUNTIME_TOKEN" \
+            STREAMHOME_SERVICE=backend \
+            "$BACKEND_PYTHON" -m uvicorn main:app --host 127.0.0.1 --port 8000 \
+            > "$ROOT_DIR/backend.log" 2>&1 < /dev/null &
         pid=$!
-        write_pid_record backend "$pid"
+        if ! record_service backend "$pid"; then
+            kill -TERM -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+            return 1
+        fi
     )
 }
 
@@ -244,15 +271,21 @@ start_web() {
     STARTED_ANY=true
     (
         cd "$ROOT_DIR/web"
-        if command -v setsid >/dev/null 2>&1; then
-            nohup setsid env NODE_ENV=production WEB_PORT="$WEB_PORT" SETUP="$SETUP" PUBLIC_URL="$PUBLIC_URL" \
-                npm run server > "$ROOT_DIR/frontend.log" 2>&1 < /dev/null &
-        else
-            nohup env NODE_ENV=production WEB_PORT="$WEB_PORT" SETUP="$SETUP" PUBLIC_URL="$PUBLIC_URL" \
-                npm run server > "$ROOT_DIR/frontend.log" 2>&1 < /dev/null &
-        fi
+        nohup setsid env \
+            NODE_ENV=production \
+            WEB_PORT="$WEB_PORT" \
+            SETUP="$SETUP" \
+            PUBLIC_URL="$PUBLIC_URL" \
+            STREAMHOME_INSTANCE_ROOT="$ROOT_DIR" \
+            STREAMHOME_INSTANCE_TOKEN="$RUNTIME_TOKEN" \
+            STREAMHOME_SERVICE=web \
+            "$ROOT_DIR/web/node_modules/.bin/tsx" "$ROOT_DIR/web/server.ts" \
+            > "$ROOT_DIR/frontend.log" 2>&1 < /dev/null &
         pid=$!
-        write_pid_record web "$pid"
+        if ! record_service web "$pid"; then
+            kill -TERM -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+            return 1
+        fi
     )
 }
 
@@ -281,8 +314,8 @@ wait_for_services() {
     web_pid="$(cat "$RUN_DIR/web.pid")"
     checks=$((STARTUP_TIMEOUT_SECONDS * 2))
     for ((attempt = 0; attempt < checks; attempt++)); do
-        kill -0 "$backend_pid" 2>/dev/null || return 1
-        kill -0 "$web_pid" 2>/dev/null || return 1
+        service_record_matches backend "$backend_pid" || return 1
+        service_record_matches web "$web_pid" || return 1
         if endpoint_ready "http://127.0.0.1:8000/api/health" api \
             && endpoint_ready "http://127.0.0.1:${WEB_PORT}/" web; then
             return 0
@@ -371,8 +404,12 @@ running_services_ready() {
 
 validate_runtime_dependencies() {
     command -v npm >/dev/null 2>&1 || fail "npm is unavailable. Run ./setup.sh first."
+    command -v setsid >/dev/null 2>&1 \
+        || fail "setsid is unavailable. Install util-linux and run ./setup.sh again."
     "$BACKEND_PYTHON" -c 'import uvicorn' >/dev/null 2>&1 \
         || fail "The backend runtime dependencies are incomplete. Run ./setup.sh first."
+    [[ -f "$RUNTIME_CONTROL" ]] \
+        || fail "The runtime ownership controller is missing. Reinstall or update StreamHome."
     [[ -x "$ROOT_DIR/web/node_modules/.bin/tsx" ]] \
         || fail "The production web runtime dependencies are incomplete. Run ./setup.sh first."
     [[ -s "$ROOT_DIR/web/dist/index.html" ]] \
@@ -497,6 +534,7 @@ main() {
         STREAMHOME_SETUP_CODE="$("$BACKEND_PYTHON" -c 'import secrets; print(secrets.token_urlsafe(18))')"
         export STREAMHOME_SETUP_CODE
     fi
+    generate_runtime_token
 
     local startup_attempt
     for ((startup_attempt = 1; startup_attempt <= STARTUP_ATTEMPTS; startup_attempt++)); do

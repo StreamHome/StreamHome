@@ -204,6 +204,10 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(Path(arguments[7]), update.WORKSPACE_ROOT)
         self.assertTrue(str(arguments[1]).endswith(".sh"))
         self.assertEqual(launch.await_args.kwargs["start_new_session"], True)
+        detached_environment = launch.await_args.kwargs["env"]
+        self.assertNotIn("STREAMHOME_INSTANCE_ROOT", detached_environment)
+        self.assertNotIn("STREAMHOME_INSTANCE_TOKEN", detached_environment)
+        self.assertNotIn("STREAMHOME_SERVICE", detached_environment)
         controller = Path(arguments[1])
         self.assertIn("target controller", controller.read_text(encoding="utf-8"))
 
