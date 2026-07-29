@@ -67,6 +67,30 @@
   --player-control-radius: 0.65rem;
 }
 
+.player-video,
+.player-last-frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.player-video {
+  z-index: 0;
+}
+
+.player-last-frame {
+  z-index: 1;
+  background: #000;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.player-view[data-frame-hold="true"] .player-last-frame {
+  opacity: 1;
+}
+
 .player-icon {
   width: 1.15rem;
   height: 1.15rem;

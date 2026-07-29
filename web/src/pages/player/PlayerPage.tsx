@@ -21,6 +21,7 @@ import { getThemeDefinition } from "../../themes/application/themeRegistry";
 import type {
   Episode,
   Movie,
+  PlaybackAudioTrack,
   PlaybackProgressEvent,
   PlaybackRendition,
   PlaybackRunResponse,
@@ -100,6 +101,14 @@ interface MobilePointerGesture {
   at: number;
 }
 
+interface PlayerAudioOption {
+  id: string;
+  label: string;
+  language: string;
+  index: number;
+  status: PlaybackAudioTrack["status"];
+}
+
 const DEFAULT_PREFERENCES: PlayerPreferences = {
   qualityHeight: "auto",
   audioLanguage: "",
@@ -144,7 +153,7 @@ export function playbackQualityOptions(
       });
       return {
         id: rendition.id,
-        label: `${rendition.label}${rendition.original ? " · Original" : ""}`,
+        label: `${rendition.label}${rendition.original ? " \u00b7 Original" : ""}`,
         height: rendition.height,
         index,
         ready: rendition.ready && index >= 0,
@@ -250,6 +259,38 @@ export function advancingPlaybackDelta(
   return Math.min(wallDelta, mediaDelta + 0.25);
 }
 
+export function clampPlaybackTime(requestedTime: number, mediaDuration: number, knownDuration: number): number {
+  const upperBound = Number.isFinite(knownDuration) && knownDuration > 0
+    ? knownDuration
+    : Number.isFinite(mediaDuration) && mediaDuration > 0 ? mediaDuration : requestedTime;
+  return Math.min(Math.max(requestedTime, 0), Math.max(0, upperBound));
+}
+
+export function shouldAcceptObservedPlaybackTime(
+  observedTime: number,
+  stableTime: number,
+  transportResetting: boolean,
+  pendingSeekTarget: number | null,
+): boolean {
+  if (!Number.isFinite(observedTime) || observedTime < 0) return false;
+  if (pendingSeekTarget !== null && Math.abs(observedTime - pendingSeekTarget) > 1) return false;
+  if (transportResetting && stableTime > 1 && observedTime < Math.max(1, stableTime - 2)) return false;
+  return true;
+}
+
+export function mergePlaybackRunMetadata(
+  active: PlaybackRunResponse,
+  refreshed: PlaybackRunResponse,
+): PlaybackRunResponse {
+  return {
+    ...refreshed,
+    ticket: active.ticket,
+    ticketExpiresAt: active.ticketExpiresAt,
+    manifestUrl: active.manifestUrl,
+    progressiveUrl: active.progressiveUrl,
+  };
+}
+
 function errorState(error: unknown): FatalState {
   if (error instanceof ApiError) {
     if (["MEDIA_SOURCE_MISSING", "INVALID_MEDIA_PATH"].includes(error.code)) {
@@ -276,12 +317,21 @@ export function PlayerPage() {
 
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const lastFrameCanvasRef = useRef<HTMLCanvasElement>(null);
   const timelineRef = useRef<HTMLInputElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const controlsTimerRef = useRef<number | null>(null);
   const desktopClickTimerRef = useRef<number | null>(null);
+  const seekSettlementTimerRef = useRef<number | null>(null);
   const resumePositionRef = useRef(0);
   const currentTimeRef = useRef(0);
+  const pendingSeekTargetRef = useRef<number | null>(null);
+  const transportResettingRef = useRef(false);
+  const resumePlaybackAfterResetRef = useRef(false);
+  const pendingQualitySelectionRef = useRef<string | null>(null);
+  const pendingAudioSelectionRef = useRef<string | null>(null);
+  const lastFrameCaptureAtRef = useRef(0);
+  const hasLastFrameRef = useRef(false);
   const resumeAppliedRef = useRef(false);
   const sequenceNumberRef = useRef(1);
   const pendingWatchedSecondsRef = useRef(0);
@@ -308,6 +358,7 @@ export function PlayerPage() {
   const [runResponse, setRunResponse] = useState<PlaybackRunResponse | null>(null);
   const [phase, setPhase] = useState<PlayerPhase>("resolving");
   const [streamMode, setStreamMode] = useState<StreamMode>("hls");
+  const [transportRevision, setTransportRevision] = useState(0);
   const [fatal, setFatal] = useState<FatalState | null>(null);
   const [retryVersion, setRetryVersion] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
@@ -320,8 +371,8 @@ export function PlayerPage() {
   const [timelineScrubbing, setTimelineScrubbing] = useState(false);
   const [availableQualities, setAvailableQualities] = useState<ReturnType<typeof playbackQualityOptions>>([{ id: "auto", label: "Auto", height: "auto", index: -1, ready: true, status: "ready" }]);
   const [selectedQualityId, setSelectedQualityId] = useState("auto");
-  const [availableAudioTracks, setAvailableAudioTracks] = useState<Array<{ label: string; language: string; index: number }>>([]);
-  const [selectedAudioTrackIndex, setSelectedAudioTrackIndex] = useState(0);
+  const [availableAudioTracks, setAvailableAudioTracks] = useState<PlayerAudioOption[]>([]);
+  const [selectedAudioTrackId, setSelectedAudioTrackId] = useState("");
   const [preferences, setPreferences] = useState<PlayerPreferences>(() => profile ? loadPreferences(profile.id) : DEFAULT_PREFERENCES);
   const [nextCountdown, setNextCountdown] = useState<number | null>(null);
   const [nextCancelled, setNextCancelled] = useState(false);
@@ -329,6 +380,7 @@ export function PlayerPage() {
   const [fullscreenActive, setFullscreenActive] = useState(false);
   const [fullscreenAvailable, setFullscreenAvailable] = useState(true);
   const [fullscreenError, setFullscreenError] = useState("");
+  const [hasLastFrame, setHasLastFrame] = useState(false);
   const [mobilePlayer, setMobilePlayer] = useState(() => typeof window !== "undefined" && isPhonePlayerViewport(readMobileViewport(window)));
   const [forcedLandscape, setForcedLandscape] = useState(() => typeof window !== "undefined" && isForcedLandscape(window.innerWidth, window.innerHeight, isPhonePlayerViewport(readMobileViewport(window))));
   const [mobileSeekFeedback, setMobileSeekFeedback] = useState<{
@@ -404,15 +456,28 @@ export function PlayerPage() {
     setAvailableQualities([{ id: "auto", label: "Auto", height: "auto", index: -1, ready: true, status: "ready" }]);
     setSelectedQualityId("auto");
     setAvailableAudioTracks([]);
-    setSelectedAudioTrackIndex(0);
+    setSelectedAudioTrackId("");
     setControlMenuOpen(false);
     setTimelineScrubbing(false);
     setShowControls(true);
     setNextCountdown(null);
     setNextCancelled(false);
     setStreamMode("hls");
+    setTransportRevision(0);
     resumeAppliedRef.current = false;
     resumePositionRef.current = 0;
+    if (seekSettlementTimerRef.current !== null) window.clearTimeout(seekSettlementTimerRef.current);
+    seekSettlementTimerRef.current = null;
+    pendingSeekTargetRef.current = null;
+    transportResettingRef.current = false;
+    resumePlaybackAfterResetRef.current = false;
+    pendingQualitySelectionRef.current = null;
+    pendingAudioSelectionRef.current = null;
+    lastFrameCaptureAtRef.current = 0;
+    hasLastFrameRef.current = false;
+    setHasLastFrame(false);
+    const frameCanvas = lastFrameCanvasRef.current;
+    frameCanvas?.getContext("2d")?.clearRect(0, 0, frameCanvas.width, frameCanvas.height);
     sequenceNumberRef.current = 1;
     pendingWatchedSecondsRef.current = 0;
     completedRef.current = false;
@@ -514,29 +579,64 @@ export function PlayerPage() {
     };
   }, [mediaId, profile, retryVersion]);
 
+  const captureLastFrame = useCallback((force = false) => {
+    const video = videoRef.current;
+    const canvas = lastFrameCanvasRef.current;
+    if (!video || !canvas || video.videoWidth <= 0 || video.videoHeight <= 0 || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return false;
+    if (hasLastFrameRef.current && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return true;
+    const now = performance.now();
+    if (!force && now - lastFrameCaptureAtRef.current < 500) return hasLastFrameRef.current;
+    const scale = Math.min(1, 1280 / video.videoWidth);
+    const width = Math.max(1, Math.round(video.videoWidth * scale));
+    const height = Math.max(1, Math.round(video.videoHeight * scale));
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) return false;
+    try {
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    } catch {
+      return false;
+    }
+    lastFrameCaptureAtRef.current = now;
+    if (!hasLastFrameRef.current) {
+      hasLastFrameRef.current = true;
+      setHasLastFrame(true);
+    }
+    return true;
+  }, []);
+
   const applyResume = useCallback((video: HTMLVideoElement) => {
-    if (resumeAppliedRef.current) return;
+    if (resumeAppliedRef.current) return true;
     const position = resumePositionRef.current;
-    if (position >= 0 && Number.isFinite(video.duration)) {
-      video.currentTime = Math.min(position, Math.max(0, video.duration - 1));
-      currentTimeRef.current = video.currentTime;
-      setCurrentTime(video.currentTime);
-    } else if (position >= 0 && video.seekable.length > 0) {
+    if (position <= 0) {
+      currentTimeRef.current = 0;
+      setCurrentTime(0);
+    } else if (video.seekable.length > 0) {
       const seekableStart = video.seekable.start(0);
       const seekableEnd = video.seekable.end(video.seekable.length - 1);
-      video.currentTime = Math.min(Math.max(position, seekableStart), seekableEnd);
+      if (position < seekableStart || position > seekableEnd) return false;
+      video.currentTime = position;
       currentTimeRef.current = video.currentTime;
       setCurrentTime(video.currentTime);
+    } else if (Number.isFinite(video.duration) && video.duration > 0 && position < video.duration) {
+      video.currentTime = position;
+      currentTimeRef.current = video.currentTime;
+      setCurrentTime(video.currentTime);
+    } else {
+      return false;
     }
     resumeAppliedRef.current = true;
+    return true;
   }, []);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!runResponse || runResponse.preparationState !== "ready" || !video) return;
-    const preservePosition = video.currentTime || currentTime || resumePositionRef.current;
+    const preservePosition = currentTimeRef.current || resumePositionRef.current;
     resumePositionRef.current = preservePosition;
     resumeAppliedRef.current = false;
+    transportResettingRef.current = true;
     setPhase("loading");
     networkRetriesRef.current = 0;
     mediaRecoveriesRef.current = 0;
@@ -546,21 +646,25 @@ export function PlayerPage() {
     video.removeAttribute("src");
     video.load();
 
+    let readyAudioIndex = 0;
     const serverAudioTracks = runResponse.tracks
-      .filter((track) => track.ready)
-      .map((track, index) => ({
+      .map((track) => ({
+        id: track.id,
         label: languageDisplayName(track.language, track.label),
         language: normalizeLanguageTag(track.language),
-        index,
+        index: track.ready ? readyAudioIndex++ : -1,
+        status: track.status,
       }));
     setAvailableAudioTracks(serverAudioTracks);
-    const serverPreferredAudio = Math.max(0, serverAudioTracks.findIndex((track) => track.language === preferences.audioLanguage));
-    setSelectedAudioTrackIndex(serverPreferredAudio);
+    const serverPreferredAudio = serverAudioTracks.find((track) => track.language === preferences.audioLanguage) ?? serverAudioTracks[0];
+    setSelectedAudioTrackId(serverPreferredAudio?.id ?? "");
 
     const beginPlayback = () => {
       applyResume(video);
       video.playbackRate = preferences.playbackRate;
-      if (mobilePlayer) {
+      const shouldResumePlayback = !mobilePlayer || resumePlaybackAfterResetRef.current;
+      resumePlaybackAfterResetRef.current = false;
+      if (!shouldResumePlayback) {
         setPhase("paused");
         return;
       }
@@ -571,7 +675,12 @@ export function PlayerPage() {
       video.src = runResponse.progressiveUrl;
       video.addEventListener("loadedmetadata", beginPlayback, { once: true });
       video.load();
-      return () => video.removeEventListener("loadedmetadata", beginPlayback);
+      return () => {
+        captureLastFrame(true);
+        resumePlaybackAfterResetRef.current = !video.paused && !completedRef.current;
+        transportResettingRef.current = true;
+        video.removeEventListener("loadedmetadata", beginPlayback);
+      };
     }
 
     if (Hls.isSupported() && runResponse.manifestUrl) {
@@ -594,31 +703,48 @@ export function PlayerPage() {
       hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
         const options = playbackQualityOptions(runResponse.renditions, data.levels);
         setAvailableQualities(options);
+        const requestedQuality = pendingQualitySelectionRef.current
+          ? options.find((item) => item.id === pendingQualitySelectionRef.current && item.ready)
+          : undefined;
         const readyOptions = options.filter((item) => item.ready && item.height !== "auto");
-        const preferred = preferences.qualityHeight === "auto" || readyOptions.length === 0
+        const preferred = requestedQuality || (preferences.qualityHeight === "auto" || readyOptions.length === 0
           ? options[0]
-          : readyOptions.reduce((best, item) => Math.abs(Number(item.height) - Number(preferences.qualityHeight)) < Math.abs(Number(best.height) - Number(preferences.qualityHeight)) ? item : best);
+          : readyOptions.reduce((best, item) => Math.abs(Number(item.height) - Number(preferences.qualityHeight)) < Math.abs(Number(best.height) - Number(preferences.qualityHeight)) ? item : best));
         hls.currentLevel = preferred?.index ?? -1;
         setSelectedQualityId(preferred?.id ?? "auto");
+        if (requestedQuality) pendingQualitySelectionRef.current = null;
         beginPlayback();
       });
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_, data) => {
-        const tracks = data.audioTracks.map((track, index) => ({
-          label: languageDisplayName(track.lang || "und", track.name || `Audio ${index + 1}`),
-          language: normalizeLanguageTag(track.lang),
-          index,
-        }));
+        const tracks = runResponse.tracks.map((serverTrack) => {
+          const language = normalizeLanguageTag(serverTrack.language);
+          const index = data.audioTracks.findIndex((track) => normalizeLanguageTag(track.lang) === language);
+          return {
+            id: serverTrack.id,
+            label: languageDisplayName(serverTrack.language, serverTrack.label),
+            language,
+            index,
+            status: serverTrack.status,
+          };
+        });
         setAvailableAudioTracks(tracks);
-        const preferredIndex = Math.max(0, tracks.findIndex((track) => track.language === preferences.audioLanguage));
-        hls.audioTrack = preferredIndex;
-        setSelectedAudioTrackIndex(preferredIndex);
+        const requestedTrack = pendingAudioSelectionRef.current
+          ? tracks.find((track) => track.id === pendingAudioSelectionRef.current && track.index >= 0)
+          : undefined;
+        const preferredTrack = requestedTrack || tracks.find((track) => track.language === preferences.audioLanguage && track.index >= 0) || tracks.find((track) => track.index >= 0);
+        if (preferredTrack) {
+          hls.audioTrack = preferredTrack.index;
+          setSelectedAudioTrackId(preferredTrack.id);
+          if (requestedTrack) pendingAudioSelectionRef.current = null;
+        }
       });
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (!data.fatal) return;
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetriesRef.current < NETWORK_RETRY_LIMIT) {
           networkRetriesRef.current += 1;
           setPhase("recovering");
-          window.setTimeout(() => hls.startLoad(video.currentTime), 500 * networkRetriesRef.current);
+          captureLastFrame(true);
+          window.setTimeout(() => hls.startLoad(currentTimeRef.current), 500 * networkRetriesRef.current);
           return;
         }
         if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveriesRef.current < MEDIA_RECOVERY_LIMIT) {
@@ -627,11 +753,15 @@ export function PlayerPage() {
           hls.recoverMediaError();
           return;
         }
-        resumePositionRef.current = video.currentTime;
+        captureLastFrame(true);
+        resumePositionRef.current = currentTimeRef.current;
         setPhase("recovering");
         setStreamMode("progressive");
       });
       return () => {
+        captureLastFrame(true);
+        resumePlaybackAfterResetRef.current = !video.paused && !completedRef.current;
+        transportResettingRef.current = true;
         hls.destroy();
         if (hlsRef.current === hls) hlsRef.current = null;
       };
@@ -642,19 +772,25 @@ export function PlayerPage() {
       video.src = runResponse.manifestUrl;
       video.addEventListener("loadedmetadata", beginPlayback, { once: true });
       video.load();
-      return () => video.removeEventListener("loadedmetadata", beginPlayback);
+      return () => {
+        captureLastFrame(true);
+        resumePlaybackAfterResetRef.current = !video.paused && !completedRef.current;
+        transportResettingRef.current = true;
+        video.removeEventListener("loadedmetadata", beginPlayback);
+      };
     }
 
     setStreamMode("progressive");
-  }, [applyResume, mobilePlayer, runResponse, streamMode]);
+  }, [applyResume, captureLastFrame, mobilePlayer, runResponse?.manifestUrl, runResponse?.progressiveUrl, runResponse?.runId, streamMode, transportRevision]);
 
   useEffect(() => {
     if (!runResponse || !profile) return;
     const renewIn = Math.max(30_000, runResponse.ticketExpiresAt * 1000 - Date.now() - TICKET_RENEWAL_MARGIN);
     const timer = window.setTimeout(() => {
-      const position = videoRef.current?.currentTime ?? currentTimeRef.current;
-      resumePositionRef.current = position;
+      captureLastFrame(true);
+      resumePositionRef.current = currentTimeRef.current;
       resumeAppliedRef.current = false;
+      transportResettingRef.current = true;
       void getPlaybackRun(runResponse.runId)
         .then((renewed) => {
           sequenceNumberRef.current = renewed.nextSequenceNumber;
@@ -667,7 +803,40 @@ export function PlayerPage() {
         });
     }, renewIn);
     return () => window.clearTimeout(timer);
-  }, [profile, runResponse]);
+  }, [captureLastFrame, profile, runResponse?.runId, runResponse?.ticketExpiresAt]);
+
+  useEffect(() => {
+    if (!runResponse) return;
+    setAvailableQualities((current) => {
+      const auto = current.find((item) => item.id === "auto") ?? { id: "auto", label: "Auto", height: "auto" as const, index: -1, ready: true, status: "ready" as const };
+      const renditions = runResponse.renditions
+        .slice()
+        .sort((left, right) => right.height - left.height)
+        .map((rendition) => {
+          const existing = current.find((item) => item.id === rendition.id);
+          const index = existing?.index ?? -1;
+          return {
+            id: rendition.id,
+            label: `${rendition.label}${rendition.original ? " \u00b7 Original" : ""}`,
+            height: rendition.height,
+            index,
+            ready: rendition.ready && index >= 0,
+            status: rendition.status,
+          };
+        });
+      return [auto, ...renditions];
+    });
+    setAvailableAudioTracks((current) => runResponse.tracks.map((track) => {
+      const existing = current.find((item) => item.id === track.id);
+      return {
+        id: track.id,
+        label: languageDisplayName(track.language, track.label),
+        language: normalizeLanguageTag(track.language),
+        index: existing?.index ?? -1,
+        status: track.status,
+      };
+    }));
+  }, [runResponse?.renditions, runResponse?.tracks]);
 
   useEffect(() => {
     if (!runResponse || runResponse.preparationState !== "ready") return;
@@ -685,9 +854,16 @@ export function PlayerPage() {
         const refreshedStatus = [...refreshed.renditions, ...refreshed.tracks].map((item) => `${item.id}:${item.status}`).sort().join("|");
         if (refreshedStatus !== knownStatus || refreshed.preparationState !== runResponse.preparationState) {
           sequenceNumberRef.current = refreshed.nextSequenceNumber;
-          resumePositionRef.current = videoRef.current?.currentTime ?? currentTimeRef.current;
-          resumeAppliedRef.current = false;
-          setRunResponse(refreshed);
+          const requestedQuality = pendingQualitySelectionRef.current
+            ? refreshed.renditions.find((item) => item.id === pendingQualitySelectionRef.current)
+            : undefined;
+          const requestedAudio = pendingAudioSelectionRef.current
+            ? refreshed.tracks.find((item) => item.id === pendingAudioSelectionRef.current)
+            : undefined;
+          setRunResponse((active) => active?.runId === refreshed.runId ? mergePlaybackRunMetadata(active, refreshed) : active);
+          if (requestedQuality?.ready || requestedAudio?.ready) setTransportRevision((value) => value + 1);
+          if (requestedQuality?.status === "failed") pendingQualitySelectionRef.current = null;
+          if (requestedAudio?.status === "failed") pendingAudioSelectionRef.current = null;
           return;
         }
       } catch (error) {
@@ -729,13 +905,13 @@ export function PlayerPage() {
 
   const captureWatchedTime = useCallback(() => {
     const video = videoRef.current;
-    if (!video || video.paused || video.seeking || video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+    if (!video || video.paused || video.seeking || transportResettingRef.current || pendingSeekTargetRef.current !== null || video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
       lastAdvanceWallRef.current = null;
-      lastAdvanceMediaRef.current = video?.currentTime ?? 0;
+      lastAdvanceMediaRef.current = currentTimeRef.current;
       return;
     }
     const now = performance.now();
-    const mediaTime = video.currentTime;
+    const mediaTime = currentTimeRef.current;
     const previousWall = lastAdvanceWallRef.current;
     const previousMedia = lastAdvanceMediaRef.current;
     pendingWatchedSecondsRef.current += advancingPlaybackDelta(previousWall, previousMedia, now, mediaTime, true);
@@ -746,11 +922,10 @@ export function PlayerPage() {
   const reportProgress = useCallback((event: PlaybackProgressEvent, finished = false, keepalive = false) => {
     if (!runResponse) return;
     captureWatchedTime();
-    const video = videoRef.current;
     const watchedSeconds = Math.floor(pendingWatchedSecondsRef.current);
     pendingWatchedSecondsRef.current -= watchedSeconds;
     const request = {
-      timestamp: Math.max(0, video?.currentTime ?? currentTimeRef.current),
+      timestamp: Math.max(0, currentTimeRef.current),
       durationWatched: watchedSeconds,
       isFinished: finished,
       sequenceNumber: sequenceNumberRef.current,
@@ -801,14 +976,21 @@ export function PlayerPage() {
     const video = videoRef.current;
     if (!video) return;
     captureWatchedTime();
-    const bounded = Math.min(Math.max(nextTime, 0), Number.isFinite(video.duration) ? video.duration : nextTime);
-    video.currentTime = bounded;
+    const bounded = clampPlaybackTime(nextTime, video.duration, duration);
+    pendingSeekTargetRef.current = bounded;
     currentTimeRef.current = bounded;
+    resumePositionRef.current = bounded;
     lastAdvanceWallRef.current = null;
     lastAdvanceMediaRef.current = bounded;
     setCurrentTime(bounded);
+    video.currentTime = bounded;
+    if (seekSettlementTimerRef.current !== null) window.clearTimeout(seekSettlementTimerRef.current);
+    seekSettlementTimerRef.current = window.setTimeout(() => {
+      if (pendingSeekTargetRef.current === bounded) pendingSeekTargetRef.current = null;
+      seekSettlementTimerRef.current = null;
+    }, 2_000);
     if (report) reportProgress("seek");
-  }, [captureWatchedTime, reportProgress]);
+  }, [captureWatchedTime, duration, reportProgress]);
 
   const revealControls = useCallback(() => {
     if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
@@ -834,8 +1016,8 @@ export function PlayerPage() {
       const video = videoRef.current;
       const timeline = timelineRef.current;
       if (video && timeline && !scrubbingRef.current) {
-        const liveDuration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : duration;
-        const liveTime = Math.min(video.currentTime, liveDuration || video.currentTime);
+        const liveDuration = duration > 0 ? duration : Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+        const liveTime = Math.min(currentTimeRef.current, liveDuration || currentTimeRef.current);
         timeline.value = String(liveTime);
         timeline.style.setProperty("--player-progress", `${liveDuration > 0 ? Math.min(100, (liveTime / liveDuration) * 100) : 0}%`);
       }
@@ -1004,6 +1186,7 @@ export function PlayerPage() {
   useEffect(() => () => {
     if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
     if (desktopClickTimerRef.current !== null) window.clearTimeout(desktopClickTimerRef.current);
+    if (seekSettlementTimerRef.current !== null) window.clearTimeout(seekSettlementTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -1014,10 +1197,10 @@ export function PlayerPage() {
         videoRef.current?.paused ? safePlay() : videoRef.current?.pause();
       } else if (event.key === "ArrowLeft") {
         event.preventDefault();
-        seek((videoRef.current?.currentTime ?? 0) - 10);
+        seek(currentTimeRef.current - 10);
       } else if (event.key === "ArrowRight") {
         event.preventDefault();
-        seek((videoRef.current?.currentTime ?? 0) + 10);
+        seek(currentTimeRef.current + 10);
       } else if (event.key.toLowerCase() === "m" && videoRef.current) {
         videoRef.current.muted = !videoRef.current.muted;
       } else if (event.key.toLowerCase() === "f") {
@@ -1072,7 +1255,7 @@ export function PlayerPage() {
     if (result.seekDelta !== 0) {
       if (mobileSingleTapTimerRef.current !== null) window.clearTimeout(mobileSingleTapTimerRef.current);
       mobileSingleTapTimerRef.current = null;
-      seek((videoRef.current?.currentTime ?? 0) + result.seekDelta, false);
+      seek(currentTimeRef.current + result.seekDelta, false);
       setMobileSeekFeedback({ side, seconds: result.accumulatedSeconds });
       return;
     }
@@ -1121,7 +1304,7 @@ export function PlayerPage() {
   const beginTimelineScrub = useCallback(() => {
     scrubbingRef.current = true;
     setTimelineScrubbing(true);
-    scrubOriginRef.current = videoRef.current?.currentTime ?? currentTimeRef.current;
+    scrubOriginRef.current = currentTimeRef.current;
     if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
     setShowControls(true);
   }, []);
@@ -1166,12 +1349,22 @@ export function PlayerPage() {
       return;
     }
     if (!runResponse || renditionId === "auto") return;
+    pendingQualitySelectionRef.current = renditionId;
+    if (selected.index < 0 && ["streamable", "ready"].includes(selected.status)) {
+      captureLastFrame(true);
+      resumePositionRef.current = currentTimeRef.current;
+      resumeAppliedRef.current = false;
+      transportResettingRef.current = true;
+      setTransportRevision((value) => value + 1);
+      return;
+    }
     setAvailableQualities((current) => current.map((item) => item.id === renditionId ? { ...item, status: "preparing" } : item));
     setRunResponse((current) => current ? {
       ...current,
       renditions: current.renditions.map((item) => item.id === renditionId ? { ...item, status: "preparing" } : item),
     } : current);
     void preparePlaybackRendition(runResponse.runId, renditionId).catch(() => {
+      pendingQualitySelectionRef.current = null;
       setAvailableQualities((current) => current.map((item) => item.id === renditionId ? { ...item, status: "failed" } : item));
       setRunResponse((current) => current ? {
         ...current,
@@ -1180,15 +1373,27 @@ export function PlayerPage() {
     });
   };
 
-  const changeAudio = (index: number) => {
-    setSelectedAudioTrackIndex(index);
-    const selected = availableAudioTracks.find((item) => item.index === index);
+  const changeAudio = (trackId: string) => {
+    const selected = availableAudioTracks.find((item) => item.id === trackId);
+    if (!selected) return;
+    setSelectedAudioTrackId(trackId);
     setPreferences((current) => ({ ...current, audioLanguage: normalizeLanguageTag(selected?.language, "") }));
-    if (hlsRef.current) hlsRef.current.audioTrack = index;
+    if (selected.index < 0) {
+      pendingAudioSelectionRef.current = trackId;
+      if (["streamable", "ready"].includes(selected.status)) {
+        captureLastFrame(true);
+        resumePositionRef.current = currentTimeRef.current;
+        resumeAppliedRef.current = false;
+        transportResettingRef.current = true;
+        setTransportRevision((value) => value + 1);
+      }
+      return;
+    }
+    if (hlsRef.current) hlsRef.current.audioTrack = selected.index;
     const nativeTracks = (videoRef.current as HTMLVideoElement & { audioTracks?: ArrayLike<{ enabled: boolean }> } | null)?.audioTracks;
     if (nativeTracks) {
       for (let trackIndex = 0; trackIndex < nativeTracks.length; trackIndex += 1) {
-        nativeTracks[trackIndex].enabled = trackIndex === index;
+        nativeTracks[trackIndex].enabled = trackIndex === selected.index;
       }
     }
   };
@@ -1226,6 +1431,7 @@ export function PlayerPage() {
     unavailable: "Playback unavailable",
     fatal: "Playback interrupted",
   };
+  const holdLastFrame = hasLastFrame && ["loading", "buffering", "recovering"].includes(phase);
 
   if (phase === "resolving" || phase === "preparing" || (phase === "loading" && !asset)) {
     return (
@@ -1276,6 +1482,7 @@ export function PlayerPage() {
       data-interaction={definition.interaction.id}
       data-player-theme={definition.playerVariant}
       data-player-phase={phase}
+      data-frame-hold={holdLastFrame ? "true" : "false"}
       data-controls-visible={showControls || phase !== "playing" ? "true" : "false"}
       data-mobile-player={mobilePlayer ? "true" : "false"}
       data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
@@ -1288,45 +1495,121 @@ export function PlayerPage() {
       exit={{ opacity: 0 }}
       transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.viewEnter }}
     >
+      <canvas
+        ref={lastFrameCanvasRef}
+        className="player-last-frame"
+        aria-hidden="true"
+      />
       <video
         ref={videoRef}
-        className="h-full w-full object-contain"
+        className="player-video"
         crossOrigin="anonymous"
         playsInline
         onLoadedMetadata={() => {
           const video = videoRef.current;
           if (!video) return;
-          setDuration(Number.isFinite(video.duration) ? video.duration : runResponse.sourceMetadata.duration);
+          const authoritativeDuration = runResponse.sourceMetadata.duration;
+          if (authoritativeDuration > 0) setDuration(authoritativeDuration);
+          else if (Number.isFinite(video.duration) && video.duration > 0) setDuration(video.duration);
           applyResume(video);
           window.setTimeout(applySubtitlePreference, 0);
         }}
         onPlay={() => {
-          setPhase("playing");
-          lastAdvanceWallRef.current = performance.now();
-          lastAdvanceMediaRef.current = videoRef.current?.currentTime ?? 0;
+          if (!transportResettingRef.current) {
+            setPhase("playing");
+            lastAdvanceWallRef.current = performance.now();
+            lastAdvanceMediaRef.current = currentTimeRef.current;
+          }
         }}
         onPause={() => {
           captureWatchedTime();
+          if (transportResettingRef.current) return;
           if (!completedRef.current) {
             setPhase("paused");
             reportProgress("pause");
           }
         }}
-        onWaiting={() => setPhase("buffering")}
-        onStalled={() => setPhase("buffering")}
-        onPlaying={() => setPhase("playing")}
-        onCanPlay={() => setPhase(videoRef.current?.paused ? "paused" : "playing")}
+        onWaiting={() => {
+          if (!hasLastFrameRef.current) captureLastFrame(true);
+          setPhase("buffering");
+        }}
+        onStalled={() => {
+          if (!hasLastFrameRef.current) captureLastFrame(true);
+          setPhase("buffering");
+        }}
+        onPlaying={() => {
+          const observedTime = videoRef.current?.currentTime ?? currentTimeRef.current;
+          const accepted = shouldAcceptObservedPlaybackTime(
+            observedTime,
+            currentTimeRef.current,
+            transportResettingRef.current,
+            pendingSeekTargetRef.current,
+          );
+          if (!accepted) {
+            if (videoRef.current) applyResume(videoRef.current);
+            setPhase("recovering");
+            return;
+          }
+          transportResettingRef.current = false;
+          setPhase("playing");
+          window.requestAnimationFrame(() => captureLastFrame(true));
+        }}
+        onCanPlay={() => {
+          const video = videoRef.current;
+          if (!video) return;
+          const resumeReady = applyResume(video);
+          if (transportResettingRef.current && !resumeReady) {
+            setPhase("recovering");
+            return;
+          }
+          if (video.paused && resumeReady) transportResettingRef.current = false;
+          setPhase(video.paused ? "paused" : transportResettingRef.current ? "recovering" : "playing");
+        }}
         onTimeUpdate={() => {
           captureWatchedTime();
-          const nextTime = videoRef.current?.currentTime ?? 0;
+          const video = videoRef.current;
+          if (!video) return;
+          const nextTime = video.currentTime;
+          if (!shouldAcceptObservedPlaybackTime(
+            nextTime,
+            currentTimeRef.current,
+            transportResettingRef.current,
+            pendingSeekTargetRef.current,
+          )) return;
+          if (pendingSeekTargetRef.current !== null && Math.abs(nextTime - pendingSeekTargetRef.current) <= 1) {
+            pendingSeekTargetRef.current = null;
+            if (seekSettlementTimerRef.current !== null) window.clearTimeout(seekSettlementTimerRef.current);
+            seekSettlementTimerRef.current = null;
+          }
           currentTimeRef.current = nextTime;
+          resumePositionRef.current = nextTime;
           setCurrentTime(nextTime);
+          captureLastFrame();
         }}
-        onDurationChange={() => setDuration(Number.isFinite(videoRef.current?.duration) ? (videoRef.current?.duration ?? 0) : runResponse.sourceMetadata.duration)}
+        onSeeked={() => {
+          const video = videoRef.current;
+          if (!video) return;
+          const nextTime = video.currentTime;
+          const stableTime = currentTimeRef.current;
+          const pendingTarget = pendingSeekTargetRef.current;
+          if (!shouldAcceptObservedPlaybackTime(nextTime, stableTime, transportResettingRef.current, pendingTarget)) return;
+          pendingSeekTargetRef.current = null;
+          if (seekSettlementTimerRef.current !== null) window.clearTimeout(seekSettlementTimerRef.current);
+          seekSettlementTimerRef.current = null;
+          currentTimeRef.current = nextTime;
+          resumePositionRef.current = nextTime;
+          setCurrentTime(nextTime);
+          if (Math.abs(nextTime - stableTime) <= 2) transportResettingRef.current = false;
+        }}
+        onDurationChange={() => {
+          const authoritativeDuration = runResponse.sourceMetadata.duration;
+          const mediaDuration = videoRef.current?.duration ?? 0;
+          if (authoritativeDuration > 0) setDuration(authoritativeDuration);
+          else if (Number.isFinite(mediaDuration) && mediaDuration > 0) setDuration(mediaDuration);
+        }}
         onProgress={() => {
           const video = videoRef.current;
           if (!video || video.buffered.length === 0) {
-            setBufferedEnd(0);
             return;
           }
           let nextBufferedEnd = 0;
@@ -1497,7 +1780,7 @@ export function PlayerPage() {
                 icon="rewind"
                 label="Rewind 10 seconds"
                 className="mobile-player-transport__seek"
-                onClick={() => seek((videoRef.current?.currentTime ?? currentTimeRef.current) - 10)}
+                onClick={() => seek(currentTimeRef.current - 10)}
               />
               <PlayerIconButton
                 icon={phase === "playing" ? "pause" : "play"}
@@ -1509,7 +1792,7 @@ export function PlayerPage() {
                 icon="forward"
                 label="Forward 10 seconds"
                 className="mobile-player-transport__seek"
-                onClick={() => seek((videoRef.current?.currentTime ?? currentTimeRef.current) + 10)}
+                onClick={() => seek(currentTimeRef.current + 10)}
               />
             </div>
 
@@ -1552,8 +1835,8 @@ export function PlayerPage() {
                     <PlayerControlMenu
                       label="Audio language"
                       icon="audio"
-                      value={selectedAudioTrackIndex}
-                      options={availableAudioTracks.map((track) => ({ value: track.index, label: track.label }))}
+                      value={selectedAudioTrackId}
+                      options={availableAudioTracks.map((track) => ({ value: track.id, label: track.label, disabled: track.status === "failed", status: track.index >= 0 ? undefined : track.status === "failed" ? "Unavailable" : "Preparing" }))}
                       onSelect={changeAudio}
                       onOpenChange={handleControlMenuOpenChange}
                     />
@@ -1653,8 +1936,8 @@ export function PlayerPage() {
 
               <div className="mt-3 flex flex-wrap items-center gap-2 md:gap-3">
                 <PlayerIconButton icon={phase === "playing" ? "pause" : "play"} label={phase === "playing" ? "Pause" : "Play"} onClick={() => phase === "playing" ? videoRef.current?.pause() : safePlay()} />
-                <PlayerIconButton icon="rewind" label="Rewind 10 seconds" onClick={() => seek(currentTime - 10)} />
-                <PlayerIconButton icon="forward" label="Forward 10 seconds" onClick={() => seek(currentTime + 10)} />
+                <PlayerIconButton icon="rewind" label="Rewind 10 seconds" onClick={() => seek(currentTimeRef.current - 10)} />
+                <PlayerIconButton icon="forward" label="Forward 10 seconds" onClick={() => seek(currentTimeRef.current + 10)} />
                 <PlayerIconButton icon={muted ? "mute" : "volume"} label={muted ? "Unmute" : "Mute"} onClick={() => { if (videoRef.current) videoRef.current.muted = !videoRef.current.muted; }} />
                 <input aria-label="Volume" type="range" min={0} max={1} step={0.01} value={muted ? 0 : volume} onChange={(event) => { const next = Number(event.target.value); if (videoRef.current) { videoRef.current.muted = false; videoRef.current.volume = next; } }} className="player-volume" />
                 <span className="min-w-[8.5rem] text-xs tabular-nums text-white/65 md:text-sm">{formatDuration(currentTime)} / {duration ? formatDuration(duration) : asset.durationLabel}</span>
@@ -1672,8 +1955,8 @@ export function PlayerPage() {
                     <PlayerControlMenu
                       label="Audio language"
                       icon="audio"
-                      value={selectedAudioTrackIndex}
-                      options={availableAudioTracks.map((track) => ({ value: track.index, label: track.label }))}
+                      value={selectedAudioTrackId}
+                      options={availableAudioTracks.map((track) => ({ value: track.id, label: track.label, disabled: track.status === "failed", status: track.index >= 0 ? undefined : track.status === "failed" ? "Unavailable" : "Preparing" }))}
                       onSelect={changeAudio}
                       onOpenChange={handleControlMenuOpenChange}
                     />

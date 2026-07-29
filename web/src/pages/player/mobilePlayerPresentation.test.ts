@@ -47,7 +47,7 @@ describe("dedicated mobile player presentation", () => {
     expect(playerPage).toContain("isMobileTapCandidate(");
     expect(playerPage).toContain('onPointerDown={(event) => handleMobilePointerDown("left", event)}');
     expect(playerPage).not.toContain("key={mobileSeekFeedback.nonce}");
-    expect(playerPage).toContain("seek((videoRef.current?.currentTime ?? 0) + result.seekDelta, false)");
+    expect(playerPage).toContain("seek(currentTimeRef.current + result.seekDelta, false)");
     expect(playerStyles).toContain("touch-action: pan-y");
   });
 
@@ -61,5 +61,14 @@ describe("dedicated mobile player presentation", () => {
     expect(playerPage).toContain("data-player-theme={definition.playerVariant}");
     expect(playerStyles).toContain("var(--player-accent)");
     expect(playerPage).toContain("sourceMetadata.sourceFormat");
+  });
+
+  it("holds the last decoded frame and keeps status polling away from transport credentials", () => {
+    expect(playerPage).toContain('className="player-last-frame"');
+    expect(playerPage).toContain('data-frame-hold={holdLastFrame ? "true" : "false"}');
+    expect(playerPage).toContain("captureLastFrame(true)");
+    expect(playerPage).toContain("mergePlaybackRunMetadata(active, refreshed)");
+    expect(playerPage).toContain("shouldAcceptObservedPlaybackTime(");
+    expect(playerStyles).toContain('.player-view[data-frame-hold="true"] .player-last-frame');
   });
 });

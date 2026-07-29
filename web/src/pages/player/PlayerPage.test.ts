@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
-import type { Episode } from "../../types/api";
+import type { Episode, PlaybackRunResponse } from "../../types/api";
 import {
   advancingPlaybackDelta,
   applySubtitleTrackSelection,
+  clampPlaybackTime,
+  mergePlaybackRunMetadata,
   nextPlayableEpisode,
   playbackQualityOptions,
   shouldAutoHidePlayerControls,
+  shouldAcceptObservedPlaybackTime,
 } from "./PlayerPage";
 
 function episode(id: string, seasonNumber: number, episodeNumber: number, videoUrl = `/media/${id}.mp4`): Episode {
@@ -44,6 +47,50 @@ describe("actual watched-time accounting", () => {
 });
 
 describe("player interaction contracts", () => {
+  it("keeps rapid opposite seeks anchored to the stable clock when media duration is transiently zero", () => {
+    const forwarded = clampPlaybackTime(110, 0, 7_200);
+    const rewound = clampPlaybackTime(forwarded - 10, 0, 7_200);
+
+    expect(forwarded).toBe(110);
+    expect(rewound).toBe(100);
+    expect(clampPlaybackTime(850, 10, 7_200)).toBe(850);
+    expect(clampPlaybackTime(-10, 0, 7_200)).toBe(0);
+    expect(clampPlaybackTime(8_000, 0, 7_200)).toBe(7_200);
+  });
+
+  it("rejects transient zero and stale seek events while transport state is settling", () => {
+    expect(shouldAcceptObservedPlaybackTime(0, 850, true, null)).toBe(false);
+    expect(shouldAcceptObservedPlaybackTime(100, 110, false, 110)).toBe(false);
+    expect(shouldAcceptObservedPlaybackTime(110, 110, false, 110)).toBe(true);
+    expect(shouldAcceptObservedPlaybackTime(851, 850, true, null)).toBe(true);
+  });
+
+  it("merges rendition status without replacing the active transport ticket or URLs", () => {
+    const active = {
+      runId: "run-1",
+      ticket: "active-ticket",
+      ticketExpiresAt: 100,
+      manifestUrl: "/manifest?ticket=active",
+      progressiveUrl: "/progressive?ticket=active",
+      renditions: [{ id: "video_480p", status: "preparing" }],
+    } as unknown as PlaybackRunResponse;
+    const refreshed = {
+      ...active,
+      ticket: "poll-ticket",
+      ticketExpiresAt: 200,
+      manifestUrl: "/manifest?ticket=poll",
+      progressiveUrl: "/progressive?ticket=poll",
+      renditions: [{ id: "video_480p", status: "ready" }],
+    } as unknown as PlaybackRunResponse;
+
+    const merged = mergePlaybackRunMetadata(active, refreshed);
+    expect(merged.ticket).toBe("active-ticket");
+    expect(merged.ticketExpiresAt).toBe(100);
+    expect(merged.manifestUrl).toBe("/manifest?ticket=active");
+    expect(merged.progressiveUrl).toBe("/progressive?ticket=active");
+    expect(merged.renditions[0]?.status).toBe("ready");
+  });
+
   it("auto-hides only during uninterrupted playback", () => {
     expect(shouldAutoHidePlayerControls("playing", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("paused", false, false)).toBe(false);
