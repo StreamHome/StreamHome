@@ -4,12 +4,16 @@ import {
   advancingPlaybackDelta,
   applySubtitleTrackSelection,
   authoritativePlaybackDuration,
+  canUseProgressiveCompatibility,
   catalogDurationSeconds,
   clampPlaybackTime,
+  isPlaybackTimeSeekable,
+  matchAudioTrackIndexes,
   mergePlaybackRunMetadata,
   nextPlayableEpisode,
   preparationStatusMessage,
   playbackQualityOptions,
+  progressSequenceWasAccepted,
   shouldAutoHidePlayerControls,
   shouldAcceptObservedPlaybackTime,
 } from "./PlayerPage";
@@ -22,6 +26,8 @@ describe("adaptive preparation status", () => {
       .toContain("without re-encoding");
     expect(preparationStatusMessage({ stage: "packaging", queuePosition: 0, readySegments: 2, activeWorkers: 1 }))
       .toContain("2 segments ready");
+    expect(preparationStatusMessage({ stage: "audio", queuePosition: 0, readySegments: 2, activeWorkers: 1 }))
+      .toContain("default audio track");
   });
 });
 
@@ -77,6 +83,40 @@ describe("player interaction contracts", () => {
     expect(shouldAcceptObservedPlaybackTime(100, 110, false, 110)).toBe(false);
     expect(shouldAcceptObservedPlaybackTime(110, 110, false, 110)).toBe(true);
     expect(shouldAcceptObservedPlaybackTime(851, 850, true, null)).toBe(true);
+  });
+
+  it("requires an adaptive resume target to be inside a real seekable range", () => {
+    const ranges = {
+      length: 2,
+      start: (index: number) => index === 0 ? 0 : 120,
+      end: (index: number) => index === 0 ? 30 : 180,
+    };
+    expect(isPlaybackTimeSeekable(ranges, 20)).toBe(true);
+    expect(isPlaybackTimeSeekable(ranges, 90)).toBe(false);
+    expect(isPlaybackTimeSeekable(ranges, 150)).toBe(true);
+  });
+
+  it("uses progressive seeking only for browser-compatible source media", () => {
+    const metadata = { duration: 6_000, container: "mov,mp4,m4a", codec: "h264", width: 1920, height: 1080, frameRate: 24, sourceFormat: "MP4" };
+    expect(canUseProgressiveCompatibility(metadata)).toBe(true);
+    expect(canUseProgressiveCompatibility({ ...metadata, codec: "hevc" })).toBe(false);
+    expect(canUseProgressiveCompatibility({ ...metadata, container: "matroska", sourceFormat: "MKV" })).toBe(false);
+  });
+
+  it("maps same-language audio tracks by stable rendition identity without reusing an index", () => {
+    const indexes = matchAudioTrackIndexes([
+      { id: "audio_0_en", language: "en", label: "English main" },
+      { id: "audio_1_en", language: "en", label: "English commentary" },
+    ], [
+      { lang: "en", name: "English commentary", url: "/hls/audio_1_en/playlist.m3u8" },
+      { lang: "en", name: "English main", url: "/hls/audio_0_en/playlist.m3u8" },
+    ]);
+    expect(indexes).toEqual([1, 0]);
+  });
+
+  it("distinguishes an accepted progress request from one that must be retried", () => {
+    expect(progressSequenceWasAccepted(4, 5)).toBe(true);
+    expect(progressSequenceWasAccepted(4, 4)).toBe(false);
   });
 
   it("merges rendition status without replacing the active transport ticket or URLs", () => {

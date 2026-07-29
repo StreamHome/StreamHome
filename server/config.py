@@ -108,6 +108,7 @@ class Settings:
     AUTH_CHALLENGE_MINUTES: int = 5
     REAUTHENTICATION_MINUTES: int = 10
     APP_VERSION: str = os.getenv("STREAMHOME_VERSION", "0.1.0-alpha.1")
+    BUILD_ID: str = os.getenv("STREAMHOME_BUILD_ID", "dev")
     RECOMMENDATION_V2_ENABLED: bool = os.getenv("RECOMMENDATION_V2_ENABLED", "true").lower() in ("true", "1", "yes")
     RECOMMENDATION_V2_SHADOW: bool = os.getenv("RECOMMENDATION_V2_SHADOW", "false").lower() in ("true", "1", "yes")
 

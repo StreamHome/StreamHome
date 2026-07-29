@@ -3,15 +3,30 @@ import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'path';
 import { createReadStream } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+
+function resolveBuildId(configuredBuildId: string): string {
+  if (configuredBuildId && configuredBuildId !== 'dev') return configuredBuildId;
+  try {
+    return execFileSync('git', ['rev-parse', '--short=12', 'HEAD'], {
+      cwd: path.resolve(__dirname, '..'),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() || 'dev';
+  } catch {
+    return 'dev';
+  }
+}
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, path.resolve(__dirname, '..'), '');
   const parsedPort = Number.parseInt(env.WEB_PORT || '3000', 10);
   const webPort = Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535 ? parsedPort : 3000;
+  const buildId = resolveBuildId(env.VITE_BUILD_ID || process.env.VITE_BUILD_ID || process.env.STREAMHOME_BUILD_ID || 'dev');
   return {
     define: {
       'import.meta.env.VITE_APP_VERSION': JSON.stringify(process.env.npm_package_version ?? '0.0.0'),
-      'import.meta.env.VITE_BUILD_ID': JSON.stringify(env.VITE_BUILD_ID || process.env.VITE_BUILD_ID || 'dev'),
+      'import.meta.env.VITE_BUILD_ID': JSON.stringify(buildId),
     },
     plugins: [
       react(),

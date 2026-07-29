@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import mimetypes
 import os
@@ -95,7 +96,7 @@ class PlaybackPreparationFailure(APIModel):
 
 
 class PlaybackPreparationProgress(APIModel):
-    stage: Literal["queued", "packaging", "transcoding", "streamable", "failed"]
+    stage: Literal["queued", "packaging", "transcoding", "audio", "streamable", "failed"]
     queue_position: int = 0
     ready_segments: int = 0
     active_workers: int = 0
@@ -488,13 +489,30 @@ def rendition_contract(media_obj: Any, media_id: str, fingerprint: str) -> list[
     return result
 
 
+def subtitle_track_id(item: dict[str, Any]) -> Optional[str]:
+    file_tag = str(item.get("language") or "und").lower()
+    if not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(file_tag):
+        return None
+    identity = json.dumps(
+        {
+            "fileTag": file_tag,
+            "extension": str(item.get("ext") or item.get("extension") or ".vtt").lower(),
+            "fileName": str(item.get("fileName") or item.get("file_name") or "").lower(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"sub_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]}"
+
+
 def subtitle_contract(media_obj: Any) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in media_obj.subtitles or []:
-        track_id = str(item.get("language") or "und").lower()
-        language = normalize_language_tag(track_id)
-        if track_id in seen or not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(track_id):
+        file_tag = str(item.get("language") or "und").lower()
+        language = normalize_language_tag(file_tag)
+        track_id = subtitle_track_id(item)
+        if not track_id or track_id in seen:
             continue
         seen.add(track_id)
         result.append({"id": track_id, "language": language, "label": language_label(language, item.get("label"))})
@@ -1171,10 +1189,12 @@ async def serve_playback_subtitles(
     _, _, media_obj = await validate_playback_ticket(ticket, media_id, db)
     if not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(track_id):
         raise playback_error(status.HTTP_400_BAD_REQUEST, "INVALID_SUBTITLE_LANGUAGE", "The subtitle language is invalid.")
-    matched_track = next(
-        (item for item in media_obj.subtitles or [] if str(item.get("language") or "und").lower() == track_id),
-        None,
-    )
+    matched_track = next((item for item in media_obj.subtitles or [] if subtitle_track_id(item) == track_id), None)
+    if matched_track is None:
+        matched_track = next(
+            (item for item in media_obj.subtitles or [] if str(item.get("language") or "und").lower() == track_id),
+            None,
+        )
     if not matched_track:
         raise playback_error(status.HTTP_404_NOT_FOUND, "SUBTITLE_NOT_FOUND", "The requested subtitle track is unavailable.")
     file_tag = str(matched_track.get("language") or "und")

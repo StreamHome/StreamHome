@@ -114,8 +114,8 @@ class PlaybackPipelineRegression(unittest.TestCase):
 
         async def run() -> None:
             with (
-                patch.object(service, "_schedule_video", side_effect=lambda _id, _fingerprint, _source, _rendition, snapshot, _priority: scheduled.append(snapshot)),
-                patch.object(service, "_schedule_audio", side_effect=lambda _id, _fingerprint, _source, _rendition, snapshot, _priority: scheduled.append(snapshot)),
+                patch.object(service, "_schedule_video", side_effect=lambda _id, _fingerprint, _source, _rendition, snapshot, _priority, **_kwargs: scheduled.append(snapshot)),
+                patch.object(service, "_schedule_audio", side_effect=lambda _id, _fingerprint, _source, _rendition, snapshot, _priority, **_kwargs: scheduled.append(snapshot)),
                 patch.object(service, "_schedule_remaining"),
                 patch.object(service, "rebuild_master", new=AsyncMock(return_value=None)),
                 patch.object(service, "preparation_state", return_value="preparing"),
@@ -186,6 +186,85 @@ class PlaybackPipelineRegression(unittest.TestCase):
             self.assertIsNone(playback_prep_service.required_preparation_error(media_id, fingerprint, media))
         finally:
             shutil.rmtree(cache_path.parent, ignore_errors=True)
+
+    def test_failed_rendition_requires_an_explicit_retry_before_rescheduling(self) -> None:
+        async def exercise(service: PlaybackPrepService) -> None:
+            media_id = "m_sticky_failure"
+            fingerprint = "b" * 32
+            rendition_name = "video_480p"
+            release = asyncio.Event()
+            started = asyncio.Event()
+
+            async def worker() -> None:
+                started.set()
+                await release.wait()
+
+            service._write_rendition_error(
+                media_id,
+                fingerprint,
+                rendition_name,
+                "FFMPEG_PREPARATION_FAILED",
+                "The rendition failed.",
+            )
+
+            service._schedule_job(media_id, fingerprint, rendition_name, worker(), 0)
+            await asyncio.sleep(0)
+            self.assertFalse(started.is_set())
+            self.assertNotIn(f"{media_id}:{fingerprint}:{rendition_name}", service.active_jobs)
+            self.assertEqual(service.rendition_status(media_id, fingerprint, rendition_name), "failed")
+
+            service._schedule_job(
+                media_id,
+                fingerprint,
+                rendition_name,
+                worker(),
+                0,
+                retry_errors=True,
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            self.assertIsNone(service.rendition_error(media_id, fingerprint, rendition_name))
+            self.assertIn(f"{media_id}:{fingerprint}:{rendition_name}", service.active_jobs)
+            release.set()
+            await asyncio.gather(*service.active_jobs.values())
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = PlaybackPrepService()
+            service.cache_dir = Path(directory)
+            asyncio.run(exercise(service))
+
+    def test_preparation_progress_reports_video_segments_and_audio_work_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = PlaybackPrepService()
+            service.cache_dir = Path(directory)
+            media_id = "m_progress_contract"
+            fingerprint = "c" * 32
+            media = SimpleNamespace(
+                width=640,
+                height=360,
+                quality="360p",
+                codec="h264",
+                audio_metadata=[{"index": 0, "language": "en", "codec": "aac", "default": True}],
+                languages=["en"],
+            )
+            baseline = service.baseline_video(media)
+            audio = service.audio_renditions(media)[0]
+            video_dir = service.cache_path(media_id, fingerprint) / baseline.name
+            audio_dir = service.cache_path(media_id, fingerprint) / audio.name
+            video_dir.mkdir(parents=True)
+            audio_dir.mkdir(parents=True)
+            for index in range(2):
+                (video_dir / f"segment_{index:05d}.m4s").write_bytes(b"video")
+            for index in range(3):
+                (audio_dir / f"segment_{index:05d}.m4s").write_bytes(b"audio")
+            audio_key = f"{media_id}:{fingerprint}:{audio.name}"
+            service.running_jobs.add(audio_key)
+            try:
+                progress = service.preparation_progress(media_id, fingerprint, media)
+                self.assertEqual(progress["stage"], "audio")
+                self.assertEqual(progress["ready_segments"], 2)
+                self.assertEqual(progress["active_workers"], 1)
+            finally:
+                service.running_jobs.discard(audio_key)
 
     def test_streamable_background_rendition_remains_advertised_during_preemption(self) -> None:
         async def exercise(service: PlaybackPrepService) -> None:
@@ -279,7 +358,9 @@ class PlaybackPipelineRegression(unittest.TestCase):
             ]
         )
         tracks = subtitle_contract(media)
-        self.assertEqual([item["id"] for item in tracks], ["eng", "spa", "fr", "tr", "zh-hant-tw"])
+        self.assertTrue(all(item["id"].startswith("sub_") for item in tracks))
+        self.assertEqual([item["id"] for item in tracks], [item["id"] for item in subtitle_contract(media)])
+        self.assertEqual(len({item["id"] for item in tracks}), len(tracks))
         self.assertEqual([item["language"] for item in tracks], ["en", "es", "fr", "tr", "zh-hant-tw"])
 
     def test_catalog_runtime_is_a_stable_fallback_when_probe_duration_is_missing(self) -> None:
@@ -373,7 +454,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             release = asyncio.Event()
             calls = 0
 
-            async def fake_remaining(*_args):
+            async def fake_remaining(*_args, **_kwargs):
                 nonlocal calls
                 calls += 1
                 await release.wait()

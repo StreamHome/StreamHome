@@ -53,6 +53,7 @@ export function LoginPage() {
   const [inputNotice, setInputNotice] = useState("");
   const [lockedSeconds, setLockedSeconds] = useState(0);
   const [serverState, setServerState] = useState<ServerState>("checking");
+  const [serverBuildId, setServerBuildId] = useState("dev");
   const [serverVersion, setServerVersion] = useState("—");
   const [serverClockOffset, setServerClockOffset] = useState(0);
   const [totpSeconds, setTotpSeconds] = useState(30);
@@ -65,6 +66,7 @@ export function LoginPage() {
       const health = await getHealth(controller.signal);
       setServerState("ready");
       setServerVersion(health.version);
+      setServerBuildId(health.buildId || "dev");
       setServerClockOffset(health.serverTime * 1000 - Date.now());
     } catch (requestError) {
       const apiError = requestError instanceof ApiError ? requestError : null;
@@ -177,7 +179,7 @@ export function LoginPage() {
           <button type="button" className="login-secondary-action" onClick={returnToCredentials} disabled={isLoading}>← Back to sign in</button><p className="login-keyboard-hint"><kbd>Enter</kbd> verify · <kbd>Esc</kbd> go back</p>
         </motion.form> : <motion.div key="success" className="login-success" initial={{ opacity: 0, scale: reduced ? 1 : .9 }} animate={{ opacity: 1, scale: 1 }} transition={stageTransition}><motion.i initial={{ pathLength: 0 }} animate={{ pathLength: 1 }}>✓</motion.i><p>Authentication complete</p><span>{progressLabel}</span></motion.div>}
       </AnimatePresence>
-      <footer className="login-auth-footer"><span><i />Local TOTP security</span><span>Server v{serverVersion} · Web {WEB_VERSION}{BUILD_ID !== "dev" ? ` · ${BUILD_ID}` : ""}</span></footer>
+      <footer className="login-auth-footer"><span><i />Local TOTP security</span><span>{serverBuildId !== "dev" && BUILD_ID !== "dev" && serverBuildId !== BUILD_ID ? `Deployment mismatch · API ${serverBuildId} · Web ${BUILD_ID}` : `Server v${serverVersion} · Web ${WEB_VERSION}${BUILD_ID !== "dev" ? ` · ${BUILD_ID}` : ""}`}</span></footer>
     </motion.section>
   </motion.main>;
 }

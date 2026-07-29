@@ -280,18 +280,17 @@ class PlaybackPrepService:
         default_audio = next((item for item in audios if item.default), audios[0] if audios else None)
         required_names = [baseline.name, *([default_audio.name] if default_audio else [])]
         required_keys = [f"{media_id}:{fingerprint}:{name}" for name in required_names]
-        ready_segments = sum(
-            len(list((self.cache_path(media_id, fingerprint) / name).glob("*.m4s")))
-            for name in required_names
-        )
+        ready_segments = len(list((self.cache_path(media_id, fingerprint) / baseline.name).glob("*.m4s")))
         failure = self.required_preparation_error(media_id, fingerprint, media_obj)
         state = self.preparation_state(media_id, fingerprint, media_obj)
         if failure or state == "error":
             stage = "failed"
         elif state == "ready":
             stage = "streamable"
-        elif any(key in self.running_jobs for key in required_keys):
+        elif required_keys[0] in self.running_jobs:
             stage = "packaging" if self._can_fast_package_video(media_obj, baseline) else "transcoding"
+        elif len(required_keys) > 1 and required_keys[1] in self.running_jobs:
+            stage = "audio"
         else:
             stage = "queued"
 
@@ -310,7 +309,7 @@ class PlaybackPrepService:
             "stage": stage,
             "queue_position": min(positions) if positions else 0,
             "ready_segments": ready_segments,
-            "active_workers": len(self.running_jobs),
+            "active_workers": sum(key in self.running_jobs for key in required_keys),
         }
 
     async def _preempt_background_jobs(self, required_keys: set[str]) -> None:
@@ -356,12 +355,29 @@ class PlaybackPrepService:
         if foreground:
             await self._preempt_background_jobs(required_keys)
         priority = FOREGROUND_PRIORITY if foreground else BACKGROUND_PRIORITY
-        self._schedule_video(media_id, fingerprint, source, baseline, media_obj, priority)
+        self._schedule_video(
+            media_id,
+            fingerprint,
+            source,
+            baseline,
+            media_obj,
+            priority,
+            retry_errors=retry_errors,
+        )
         if default_audio:
-            self._schedule_audio(media_id, fingerprint, source, default_audio, media_obj, priority)
+            self._schedule_audio(
+                media_id,
+                fingerprint,
+                source,
+                default_audio,
+                media_obj,
+                priority,
+                retry_errors=retry_errors,
+            )
 
-        if include_remaining:
-            self._schedule_remaining(media_id, fingerprint, source, media_obj)
+        required_failed = any(self.rendition_error(media_id, fingerprint, name) for name in [baseline.name, *([default_audio.name] if default_audio else [])])
+        if include_remaining and (retry_errors or not required_failed):
+            self._schedule_remaining(media_id, fingerprint, source, media_obj, retry_errors=retry_errors)
         await self.rebuild_master(media_id, fingerprint, media_obj)
         return self.preparation_state(media_id, fingerprint, media_obj)
 
@@ -384,11 +400,18 @@ class PlaybackPrepService:
 
         requested_key = f"{media_id}:{fingerprint}:{rendition_name}"
         await self._preempt_background_jobs({requested_key})
-        self._clear_rendition_error(media_id, fingerprint, rendition_name)
         if self.playlist_ready(media_id, fingerprint, rendition_name):
             await self.rebuild_master(media_id, fingerprint, media_obj)
             return "streamable"
-        self._schedule_video(media_id, fingerprint, source, rendition, media_obj, FOREGROUND_PRIORITY)
+        self._schedule_video(
+            media_id,
+            fingerprint,
+            source,
+            rendition,
+            media_obj,
+            FOREGROUND_PRIORITY,
+            retry_errors=True,
+        )
         self._schedule_remaining(media_id, fingerprint, source, media_obj)
         return "preparing"
 
@@ -398,11 +421,21 @@ class PlaybackPrepService:
         fingerprint: str,
         source: ResolvedMediaSource,
         media_obj: Any,
+        *,
+        retry_errors: bool = False,
     ) -> None:
         key = f"{media_id}:{fingerprint}:remaining"
         if key in self.active_jobs:
             return
-        task = asyncio.create_task(self._schedule_remaining_after_baseline(media_id, fingerprint, source, media_obj))
+        task = asyncio.create_task(
+            self._schedule_remaining_after_baseline(
+                media_id,
+                fingerprint,
+                source,
+                media_obj,
+                retry_errors=retry_errors,
+            )
+        )
         self._track_job(key, task, BACKGROUND_PRIORITY)
 
     async def _schedule_remaining_after_baseline(
@@ -411,6 +444,8 @@ class PlaybackPrepService:
         fingerprint: str,
         source: ResolvedMediaSource,
         media_obj: Any,
+        *,
+        retry_errors: bool = False,
     ) -> None:
         for _ in range(120):
             if self.playlist_ready(media_id, fingerprint, self.baseline_video(media_obj).name):
@@ -426,9 +461,25 @@ class PlaybackPrepService:
         remaining_video = [item for item in self.video_renditions(media_obj) if item.height != baseline_height]
         remaining_video.sort(key=lambda item: (item.height > baseline_height, -item.height if item.height < baseline_height else item.height))
         for audio in self.audio_renditions(media_obj):
-            self._schedule_audio(media_id, fingerprint, source, audio, media_obj, BACKGROUND_PRIORITY)
+            self._schedule_audio(
+                media_id,
+                fingerprint,
+                source,
+                audio,
+                media_obj,
+                BACKGROUND_PRIORITY,
+                retry_errors=retry_errors,
+            )
         for rendition in remaining_video:
-            self._schedule_video(media_id, fingerprint, source, rendition, media_obj, BACKGROUND_PRIORITY)
+            self._schedule_video(
+                media_id,
+                fingerprint,
+                source,
+                rendition,
+                media_obj,
+                BACKGROUND_PRIORITY,
+                retry_errors=retry_errors,
+            )
 
     def _schedule_video(
         self,
@@ -438,6 +489,8 @@ class PlaybackPrepService:
         rendition: VideoRendition,
         media_obj: Any,
         priority: int = FOREGROUND_PRIORITY,
+        *,
+        retry_errors: bool = False,
     ) -> None:
         self._schedule_job(
             media_id,
@@ -445,6 +498,7 @@ class PlaybackPrepService:
             rendition.name,
             self._transcode_video(media_id, fingerprint, source, rendition, media_obj),
             priority,
+            retry_errors=retry_errors,
         )
 
     def _schedule_audio(
@@ -455,6 +509,8 @@ class PlaybackPrepService:
         rendition: AudioRendition,
         media_obj: Any,
         priority: int = FOREGROUND_PRIORITY,
+        *,
+        retry_errors: bool = False,
     ) -> None:
         self._schedule_job(
             media_id,
@@ -462,6 +518,7 @@ class PlaybackPrepService:
             rendition.name,
             self._transcode_audio(media_id, fingerprint, source, rendition, media_obj),
             priority,
+            retry_errors=retry_errors,
         )
 
     def _track_job(self, key: str, task: asyncio.Task[None], priority: int) -> None:
@@ -485,6 +542,8 @@ class PlaybackPrepService:
         rendition_name: str,
         coroutine: Any,
         priority: int,
+        *,
+        retry_errors: bool = False,
     ) -> None:
         key = f"{media_id}:{fingerprint}:{rendition_name}"
         if self.rendition_complete(media_id, fingerprint, rendition_name) or key in self.active_jobs:
@@ -493,7 +552,12 @@ class PlaybackPrepService:
             if hasattr(coroutine, "close"):
                 coroutine.close()
             return
-        self._clear_rendition_error(media_id, fingerprint, rendition_name)
+        if self.rendition_error(media_id, fingerprint, rendition_name) and not retry_errors:
+            if hasattr(coroutine, "close"):
+                coroutine.close()
+            return
+        if retry_errors:
+            self._clear_rendition_error(media_id, fingerprint, rendition_name)
         task = asyncio.create_task(coroutine)
         self._track_job(key, task, priority)
 
@@ -652,10 +716,26 @@ class PlaybackPrepService:
                     cloud_stderr = await cloud_stderr_task
                     if cloud_process.returncode != 0:
                         diagnostics = self.sanitize_diagnostics(cloud_stderr.decode("utf-8", errors="replace"))
-                        raise PlaybackPreparationError("CLOUD_STREAM_FAILED", diagnostics or "Google Drive stopped delivering the media source.")
+                        if diagnostics:
+                            logger.error(
+                                f"[Playback Prep] {media_id}/{rendition_name} cloud diagnostics: "
+                                f"{self.sanitize_diagnostics(diagnostics, 800)}"
+                            )
+                        raise PlaybackPreparationError(
+                            "CLOUD_STREAM_FAILED",
+                            "Google Drive stopped delivering the media source.",
+                        )
                 if ffmpeg_process.returncode != 0:
                     diagnostics = self.sanitize_diagnostics(stderr.decode("utf-8", errors="replace"))
-                    raise PlaybackPreparationError("FFMPEG_PREPARATION_FAILED", diagnostics or "FFmpeg could not prepare this rendition.")
+                    if diagnostics:
+                        logger.error(
+                            f"[Playback Prep] {media_id}/{rendition_name} FFmpeg diagnostics: "
+                            f"{self.sanitize_diagnostics(diagnostics, 800)}"
+                        )
+                    raise PlaybackPreparationError(
+                        "FFMPEG_PREPARATION_FAILED",
+                        "FFmpeg could not prepare a browser-compatible stream for this rendition.",
+                    )
                 if not self.playlist_ready(media_id, fingerprint, rendition_name):
                     raise PlaybackPreparationError("EMPTY_RENDITION", "FFmpeg completed without producing playable HLS segments.")
                 (target_dir / COMPLETE_MARKER).write_text(str(time.time()), encoding="utf-8")

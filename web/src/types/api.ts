@@ -26,7 +26,7 @@ export interface VerifyRequest {
 }
 
 export interface LoginRecord { at: number; ipAddress?: string | null; deviceLabel?: string | null }
-export interface HealthResponse { status: "ready"; version: string; serverTime: number }
+export interface HealthResponse { status: "ready"; version: string; buildId: string; serverTime: number }
 export interface ReauthResponse { reauthenticated: true; validForSeconds: number }
 export interface SecuritySummary { email: string; twoFactorEnabled: boolean; recoveryCodesRemaining: number; sessionLifetimeDays: number; previousLogin: LoginRecord | null }
 export interface AccountEmailUpdateResponse { message: string; email: string; otherSessionsRevoked: number }
@@ -516,7 +516,7 @@ export interface PlaybackSubtitleTrack {
 }
 
 export type PlaybackPreparationState = "preparing" | "ready" | "error";
-export type PlaybackPreparationStage = "queued" | "packaging" | "transcoding" | "streamable" | "failed";
+export type PlaybackPreparationStage = "queued" | "packaging" | "transcoding" | "audio" | "streamable" | "failed";
 
 export interface PlaybackPreparationProgress {
   stage: PlaybackPreparationStage;

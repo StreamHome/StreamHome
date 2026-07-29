@@ -21,7 +21,7 @@ describe("LoginPage", () => {
     vi.clearAllMocks();
     localStorage.clear();
     useAuthStore.setState({ token: null, email: null, isAuthenticated: false, isHydrated: true });
-    vi.mocked(getHealth).mockResolvedValue({ status: "ready", version: "1.0.0", serverTime: Date.now() / 1000 });
+    vi.mocked(getHealth).mockResolvedValue({ status: "ready", version: "1.0.0", buildId: "test-build", serverTime: Date.now() / 1000 });
   });
 
   it("submits local credentials, supports password visibility, and completes login", async () => {

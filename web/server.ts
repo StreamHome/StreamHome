@@ -11,6 +11,7 @@ async function startServer() {
   const app = express();
   const requestedPort = Number.parseInt(process.env.WEB_PORT ?? "3000", 10);
   const PORT = Number.isInteger(requestedPort) && requestedPort >= 1 && requestedPort <= 65535 ? requestedPort : 3000;
+  const buildId = process.env.STREAMHOME_BUILD_ID || "dev";
 
   app.disable("x-powered-by");
   app.use((_req, res, next) => {
@@ -19,6 +20,7 @@ async function startServer() {
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()");
     res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
+    res.setHeader("X-StreamHome-Web-Build", buildId);
     next();
   });
 
@@ -61,10 +63,27 @@ async function startServer() {
     const distPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "dist");
     console.log(`[StreamHome Server] Serving web assets from ${distPath}`);
     const indexDocument = readFileSync(path.join(distPath, "index.html"), "utf8");
-    app.use(express.static(distPath));
+    app.use(express.static(distPath, {
+      setHeaders: (res, filePath) => {
+        if (path.extname(filePath) === ".html") {
+          res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+          res.setHeader("Pragma", "no-cache");
+          res.setHeader("Expires", "0");
+          return;
+        }
+        if (filePath.startsWith(path.join(distPath, "assets") + path.sep)) {
+          res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        }
+      },
+    }));
     app.use((req, res, next) => {
       if (req.method !== "GET") return next();
-      res.type("html").send(indexDocument);
+      res
+        .setHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+        .setHeader("Pragma", "no-cache")
+        .setHeader("Expires", "0")
+        .type("html")
+        .send(indexDocument);
     });
   }
 

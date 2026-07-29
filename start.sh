@@ -472,7 +472,8 @@ main() {
     fi
     PUBLIC_URL="${PUBLIC_URL%/}"
     validate_public_url "$PUBLIC_URL" || fail "The resolved PUBLIC_URL is invalid: $PUBLIC_URL"
-    export WEB_PORT SETUP PUBLIC_URL STREAMHOME_PUBLIC_URL_EXPLICIT
+    STREAMHOME_BUILD_ID="$(git -C "$ROOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || printf 'dev')"
+    export WEB_PORT SETUP PUBLIC_URL STREAMHOME_PUBLIC_URL_EXPLICIT STREAMHOME_BUILD_ID
 
     acquire_lifecycle_lock
     "$ROOT_DIR/stop.sh" --startup --lock-held

@@ -346,7 +346,12 @@ async def health():
         available_tables = {str(name) for name in table_result.scalars().all()}
         if not required_tables.issubset(available_tables):
             raise RuntimeError("Required database schema is incomplete")
-        return {"status": "ready", "version": settings.APP_VERSION, "serverTime": now()}
+        return {
+            "status": "ready",
+            "version": settings.APP_VERSION,
+            "buildId": settings.BUILD_ID,
+            "serverTime": now(),
+        }
     except Exception as exc:
         message = str(exc).lower()
         code = "server_busy" if "database is locked" in message or "database table is locked" in message else "server_unavailable"
