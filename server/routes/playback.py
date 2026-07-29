@@ -94,6 +94,13 @@ class PlaybackPreparationFailure(APIModel):
     message: str
 
 
+class PlaybackPreparationProgress(APIModel):
+    stage: Literal["queued", "packaging", "transcoding", "streamable", "failed"]
+    queue_position: int = 0
+    ready_segments: int = 0
+    active_workers: int = 0
+
+
 class PlaybackRunResponse(APIModel):
     run_id: str
     media_id: str
@@ -111,6 +118,7 @@ class PlaybackRunResponse(APIModel):
     next_episode_id: Optional[str] = None
     preparation_state: Literal["preparing", "ready", "error"]
     preparation_error: Optional[PlaybackPreparationFailure] = None
+    preparation_progress: PlaybackPreparationProgress
     next_sequence_number: int
 
 
@@ -562,6 +570,15 @@ async def build_run_response(
             next_episode_id=None,
             preparation_state=preview_status["phase"],
             preparation_error=failure,
+            preparation_progress=PlaybackPreparationProgress(
+                stage=(
+                    "streamable"
+                    if preview_status["phase"] == "ready"
+                    else "failed" if preview_status["phase"] == "error" else "transcoding"
+                ),
+                ready_segments=max(0, int(preview_status.get("segment_count") or 0)),
+                active_workers=1 if preview_status["phase"] == "preparing" else 0,
+            ),
             next_sequence_number=run.sequence_number,
         )
 
@@ -589,6 +606,9 @@ async def build_run_response(
         next_episode_id=next_episode_id,
         preparation_state=state,
         preparation_error=failure,
+        preparation_progress=PlaybackPreparationProgress(
+            **playback_prep_service.preparation_progress(media_obj.id, fingerprint, media_obj)
+        ),
         next_sequence_number=run.sequence_number,
     )
 
@@ -718,12 +738,18 @@ async def get_playback_run(
                 db.add(run)
                 await db.commit()
             if run.source_kind != "ingest_preview":
+                preparation_state = playback_prep_service.preparation_state(
+                    media_obj.id,
+                    str(media_obj.source_fingerprint or source.fingerprint),
+                    media_obj,
+                )
                 await playback_prep_service.prepare(
                     media_obj.id,
                     media_obj,
                     source,
                     include_remaining=True,
                     retry_errors=retry,
+                    foreground=retry or preparation_state != "ready",
                 )
     run.last_seen_at = time.time()
     run.updated_at = time.time()

@@ -88,6 +88,7 @@ class Settings:
     TEMP_DIR: str = os.path.abspath(os.getenv("TEMP_DIR", os.path.join(config_dir, "temp")))
     PLAYBACK_CACHE_GB: float = max(0.25, min(500.0, float(os.getenv("PLAYBACK_CACHE_GB", "20"))))
     PLAYBACK_TRANSCODE_CONCURRENCY: int = env_int("PLAYBACK_TRANSCODE_CONCURRENCY", 2, 1, 8)
+    PLAYBACK_JOB_STALL_SECONDS: int = env_int("PLAYBACK_JOB_STALL_SECONDS", 120, 30, 900)
     
     # 2FA Authentication JWT settings
     JWT_SECRET = os.getenv("JWT_SECRET")

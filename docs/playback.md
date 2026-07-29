@@ -1,15 +1,23 @@
 # Playback
 
-StreamHome serves local media from `/media` and prepares adaptive fMP4 HLS when direct playback is unsuitable.
+StreamHome uses protected adaptive fMP4 HLS as its primary playback transport for completed local and Google Drive media.
 
 Playback behavior includes:
 
-- HTTP range requests for direct media;
-- signed or authenticated playback preparation;
+- playback-run-scoped HLS manifests and segments;
+- demand-prioritized playback preparation;
 - adaptive video variants;
 - multiple audio tracks and subtitles;
 - profile-specific resume state;
 - cleanup of expired playback runs and cache artifacts.
+
+## Demand-first adaptive preparation
+
+Opening a title gives its required video and default-audio renditions foreground priority. Lower-quality and secondary-audio renditions are generated afterward as preemptible background work. Server startup reconciles cache identities but does not queue full-catalog transcoding, so restarting or updating StreamHome cannot place the selected title behind every other item.
+
+Compatible H.264 video and AAC audio are packaged into fMP4 HLS without re-encoding. Sources that are not browser-compatible receive a browser-compatible H.264/AAC baseline transcode. In both cases the protected master manifest is published when the required first segments exist; the complete file does not have to finish processing before playback begins.
+
+The player reports whether preparation is queued, fast-packaging, or transcoding, along with queue position and generated segment count. FFmpeg jobs that stop producing output are terminated with a specific preparation failure instead of leaving an indefinite spinner. Prepared renditions remain cached and later quality changes reuse them.
 
 ## Play While Downloading
 

@@ -168,9 +168,11 @@ class PlaybackContractRegression(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
         self.assertEqual(payload["preparationState"], "ready")
+        self.assertEqual(payload["preparationProgress"]["stage"], "streamable")
         self.assertEqual(payload["nextSequenceNumber"], 1)
         self.assertIn(payload["sourceMetadata"]["sourceFormat"], {"MP4", "HLS preview"})
         if payload["sourceMetadata"]["sourceFormat"] == "MP4":
+            self.assertGreaterEqual(payload["preparationProgress"]["readySegments"], 1)
             self.assertEqual(payload["renditions"][0]["label"], "1080p")
             self.assertEqual(payload["sourceMetadata"]["duration"], 120)
         self.assertIn(payload["renditions"][0]["status"], {"streamable", "ready"})

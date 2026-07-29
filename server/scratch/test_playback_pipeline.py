@@ -16,7 +16,7 @@ from routes.playback import catalog_duration_seconds, media_duration_seconds, pa
 from services.languages import normalize_language_tag
 from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
 from services.media_source import MediaSourceError, ResolvedMediaSource, canonicalize_catalog_path, is_safe_presentation_asset, resolve_media_source
-from services.playback_prep import PlaybackMediaSnapshot, PlaybackPrepService, playback_prep_service
+from services.playback_prep import PlaybackMediaSnapshot, PlaybackPrepService, PlaybackPreparationError, playback_prep_service
 from services.rclone import rclone_service
 from services.queue import srt_to_vtt
 
@@ -114,8 +114,8 @@ class PlaybackPipelineRegression(unittest.TestCase):
 
         async def run() -> None:
             with (
-                patch.object(service, "_schedule_video", side_effect=lambda _id, _fingerprint, _source, _rendition, snapshot: scheduled.append(snapshot)),
-                patch.object(service, "_schedule_audio", side_effect=lambda _id, _fingerprint, _source, _rendition, snapshot: scheduled.append(snapshot)),
+                patch.object(service, "_schedule_video", side_effect=lambda _id, _fingerprint, _source, _rendition, snapshot, _priority: scheduled.append(snapshot)),
+                patch.object(service, "_schedule_audio", side_effect=lambda _id, _fingerprint, _source, _rendition, snapshot, _priority: scheduled.append(snapshot)),
                 patch.object(service, "_schedule_remaining"),
                 patch.object(service, "rebuild_master", new=AsyncMock(return_value=None)),
                 patch.object(service, "preparation_state", return_value="preparing"),
@@ -149,6 +149,14 @@ class PlaybackPipelineRegression(unittest.TestCase):
             (rendition_dir / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
             (rendition_dir / "segment_00000.m4s").write_bytes(b"segment")
             self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "streamable")
+            key = f"{media_id}:{fingerprint}:{rendition_name}"
+            playback_prep_service.active_jobs[key] = SimpleNamespace()  # type: ignore[assignment]
+            playback_prep_service.job_priorities[key] = 100
+            self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "streamable")
+            playback_prep_service.job_priorities[key] = 0
+            self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "streamable")
+            playback_prep_service.active_jobs.pop(key, None)
+            playback_prep_service.job_priorities.pop(key, None)
             (rendition_dir / ".complete").write_text("done", encoding="utf-8")
             self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "ready")
             (rendition_dir / ".complete").unlink()
@@ -156,6 +164,8 @@ class PlaybackPipelineRegression(unittest.TestCase):
             playback_prep_service._write_rendition_error(media_id, fingerprint, rendition_name, "TEST_FAILURE", "failed")
             self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "failed")
         finally:
+            playback_prep_service.active_jobs.pop(f"{media_id}:{fingerprint}:{rendition_name}", None)
+            playback_prep_service.job_priorities.pop(f"{media_id}:{fingerprint}:{rendition_name}", None)
             shutil.rmtree(playback_prep_service.cache_path(media_id, fingerprint).parent, ignore_errors=True)
 
     def test_optional_rendition_failure_does_not_interrupt_ready_baseline(self) -> None:
@@ -176,6 +186,36 @@ class PlaybackPipelineRegression(unittest.TestCase):
             self.assertIsNone(playback_prep_service.required_preparation_error(media_id, fingerprint, media))
         finally:
             shutil.rmtree(cache_path.parent, ignore_errors=True)
+
+    def test_streamable_background_rendition_remains_advertised_during_preemption(self) -> None:
+        async def exercise(service: PlaybackPrepService) -> None:
+            media_id = "m_background_manifest"
+            fingerprint = "c" * 32
+            media = SimpleNamespace(width=1280, height=720, quality="720p", codec="h264", audio_metadata=[])
+            cache_path = service.cache_path(media_id, fingerprint)
+            for name in ("video_original", "video_480p"):
+                rendition_dir = cache_path / name
+                rendition_dir.mkdir(parents=True)
+                (rendition_dir / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+                (rendition_dir / "segment_00000.m4s").write_bytes(b"segment")
+            (cache_path / "video_original" / ".complete").write_text("done", encoding="utf-8")
+            key = f"{media_id}:{fingerprint}:video_480p"
+            service.active_jobs[key] = SimpleNamespace()  # type: ignore[assignment]
+            service.job_priorities[key] = 100
+            await service.rebuild_master(media_id, fingerprint, media)
+            master = (cache_path / "master.m3u8").read_text(encoding="utf-8")
+            self.assertIn("video_original/playlist.m3u8", master)
+            self.assertIn("video_480p/playlist.m3u8", master)
+            await service._preempt_background_jobs(set())
+            self.assertIn(key, service.active_jobs)
+            self.assertEqual(service.rendition_status(media_id, fingerprint, "video_480p"), "streamable")
+            service.active_jobs.pop(key, None)
+            service.job_priorities.pop(key, None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = PlaybackPrepService()
+            service.cache_dir = Path(directory)
+            asyncio.run(exercise(service))
 
     def test_external_dubbing_overrides_embedded_language_and_invalidates_identity(self) -> None:
         ffmpeg = shutil.which("ffmpeg")
@@ -386,6 +426,109 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 self.assertTrue(newest.exists())
             finally:
                 settings.PLAYBACK_CACHE_GB = old_limit
+
+    def test_foreground_playback_preempts_background_renditions(self) -> None:
+        async def exercise(service: PlaybackPrepService) -> None:
+            background_started = asyncio.Event()
+            foreground_started = asyncio.Event()
+            hold_background = asyncio.Event()
+            background_key = "m_background:abc:video_480p"
+            foreground_key = "m_requested:def:video_original"
+
+            async def background_job() -> None:
+                async with service.semaphore:
+                    service.running_jobs.add(background_key)
+                    background_started.set()
+                    try:
+                        await hold_background.wait()
+                    finally:
+                        service.running_jobs.discard(background_key)
+
+            async def foreground_job() -> None:
+                async with service.semaphore:
+                    service.running_jobs.add(foreground_key)
+                    foreground_started.set()
+                    service.running_jobs.discard(foreground_key)
+
+            service._schedule_job("m_background", "abc", "video_480p", background_job(), 100)
+            await asyncio.wait_for(background_started.wait(), timeout=2)
+            await service._preempt_background_jobs({foreground_key})
+            service._schedule_job("m_requested", "def", "video_original", foreground_job(), 0)
+            await asyncio.wait_for(foreground_started.wait(), timeout=2)
+            self.assertNotIn(background_key, service.active_jobs)
+            self.assertNotIn(background_key, service.running_jobs)
+            await asyncio.gather(*service.active_jobs.values(), return_exceptions=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = PlaybackPrepService()
+            service.cache_dir = Path(directory)
+            service.semaphore = asyncio.Semaphore(1)
+            asyncio.run(exercise(service))
+
+    def test_compatible_source_uses_fast_hls_packaging(self) -> None:
+        async def exercise(service: PlaybackPrepService) -> None:
+            source = await resolve_media_source(self.catalog_path, check_cloud=False)
+            media = SimpleNamespace(codec="h264", width=1920, height=1080, quality="1080p")
+            baseline = service.baseline_video(media)
+            self.assertTrue(baseline.original)
+            self.assertEqual(baseline.height, 1080)
+            with patch.object(service, "_run_ffmpeg_job", new=AsyncMock()) as run_job:
+                await service._transcode_video("m_fast", "abc", source, baseline, media)
+                arguments = run_job.await_args.args[4]
+                self.assertIn("copy", arguments)
+                self.assertNotIn("libx264", arguments)
+
+                audio = service.audio_renditions(SimpleNamespace(audio_metadata=[{
+                    "index": 0,
+                    "codec": "aac",
+                    "language": "eng",
+                    "default": True,
+                }]))[0]
+                await service._transcode_audio("m_fast", "abc", source, audio, media)
+                audio_arguments = run_job.await_args.args[4]
+                self.assertIn("copy", audio_arguments)
+                self.assertNotIn("160k", audio_arguments)
+
+            hevc = SimpleNamespace(codec="hevc", width=1920, height=1080, quality="1080p")
+            self.assertEqual(service.baseline_video(hevc).height, 720)
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = PlaybackPrepService()
+            service.cache_dir = Path(directory)
+            asyncio.run(exercise(service))
+
+    def test_stalled_hls_job_is_terminated_with_a_specific_failure(self) -> None:
+        class StalledProcess:
+            def __init__(self) -> None:
+                self.returncode = None
+                self.finished = asyncio.Event()
+                self.killed = False
+
+            async def wait(self) -> int:
+                await self.finished.wait()
+                return int(self.returncode or 0)
+
+            def kill(self) -> None:
+                self.killed = True
+                self.returncode = -9
+                self.finished.set()
+
+        async def exercise(service: PlaybackPrepService, directory: Path) -> None:
+            process = StalledProcess()
+            old_timeout = settings.PLAYBACK_JOB_STALL_SECONDS
+            settings.PLAYBACK_JOB_STALL_SECONDS = 1
+            try:
+                with self.assertRaises(PlaybackPreparationError) as context:
+                    await service._wait_for_ffmpeg_progress(process, directory)  # type: ignore[arg-type]
+                self.assertEqual(context.exception.code, "PREPARATION_STALLED")
+                self.assertTrue(process.killed)
+            finally:
+                settings.PLAYBACK_JOB_STALL_SECONDS = old_timeout
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = PlaybackPrepService()
+            service.cache_dir = Path(directory)
+            asyncio.run(exercise(service, Path(directory)))
 
     def test_real_hls_preparation_contains_decodable_video_and_audio(self) -> None:
         async def run() -> tuple[Path, SimpleNamespace]:

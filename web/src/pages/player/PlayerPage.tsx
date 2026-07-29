@@ -325,6 +325,27 @@ export function mergePlaybackRunMetadata(
   };
 }
 
+export function preparationStatusMessage(progress: PlaybackRunResponse["preparationProgress"] | null | undefined): string {
+  if (!progress) return "Scheduling the first HLS rendition.";
+  if (progress.stage === "queued") {
+    return progress.queuePosition > 0
+      ? `Playback preparation is queued at position ${progress.queuePosition}.`
+      : "Playback preparation is waiting for an HLS worker.";
+  }
+  if (progress.stage === "packaging") {
+    return progress.readySegments > 0
+      ? `Packaging the source into HLS · ${progress.readySegments} segment${progress.readySegments === 1 ? "" : "s"} ready.`
+      : "Packaging the compatible source into HLS without re-encoding.";
+  }
+  if (progress.stage === "transcoding") {
+    return progress.readySegments > 0
+      ? `Generating the first compatible rendition · ${progress.readySegments} segment${progress.readySegments === 1 ? "" : "s"} ready.`
+      : "Generating the first compatible HLS rendition.";
+  }
+  if (progress.stage === "failed") return "HLS preparation failed; recovery details are being loaded.";
+  return "The first HLS rendition is ready.";
+}
+
 function errorState(error: unknown): FatalState {
   if (error instanceof ApiError) {
     if (["MEDIA_SOURCE_MISSING", "INVALID_MEDIA_PATH"].includes(error.code)) {
@@ -497,7 +518,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         "progressive",
         0,
       ));
-      setPhase("loading");
+      setPhase(visualFixture.runResponse.preparationState === "preparing" ? "preparing" : "loading");
       return;
     }
     if (!profile || !mediaId) {
@@ -1517,6 +1538,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     unavailable: "Playback unavailable",
     fatal: "Playback interrupted",
   };
+  const preparationDetail = preparationStatusMessage(runResponse?.preparationProgress);
   const holdLastFrame = hasLastFrame && ["loading", "buffering", "recovering"].includes(phase);
 
   if (phase === "resolving" || phase === "preparing" || (phase === "loading" && !asset)) {
@@ -1532,7 +1554,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         <div className="text-center" role="status" aria-live="polite">
           <motion.i className="mx-auto block h-11 w-11 rounded-full border-2 border-white/20 border-t-white" animate={reduced ? undefined : { rotate: 360 }} transition={{ duration: 0.8, repeat: Infinity, ease: "linear" }} />
           <p className="mt-5 text-sm tracking-[0.16em] text-white/70">{phaseMessage[phase]}</p>
-          {phase === "preparing" && <span className="mt-2 block text-xs text-white/40">The first compatible rendition is generated once and reused.</span>}
+          {phase === "preparing" && <span className="mt-2 block text-xs text-white/40">{preparationDetail}</span>}
         </div>
       </motion.div>
     );

@@ -8,10 +8,22 @@ import {
   clampPlaybackTime,
   mergePlaybackRunMetadata,
   nextPlayableEpisode,
+  preparationStatusMessage,
   playbackQualityOptions,
   shouldAutoHidePlayerControls,
   shouldAcceptObservedPlaybackTime,
 } from "./PlayerPage";
+
+describe("adaptive preparation status", () => {
+  it("reports queue position and fast packaging progress truthfully", () => {
+    expect(preparationStatusMessage({ stage: "queued", queuePosition: 3, readySegments: 0, activeWorkers: 2 }))
+      .toBe("Playback preparation is queued at position 3.");
+    expect(preparationStatusMessage({ stage: "packaging", queuePosition: 0, readySegments: 0, activeWorkers: 1 }))
+      .toContain("without re-encoding");
+    expect(preparationStatusMessage({ stage: "packaging", queuePosition: 0, readySegments: 2, activeWorkers: 1 }))
+      .toContain("2 segments ready");
+  });
+});
 
 function episode(id: string, seasonNumber: number, episodeNumber: number, videoUrl = `/media/${id}.mp4`): Episode {
   return { id, seasonNumber, episodeNumber, videoUrl, title: id, description: "", thumbnailUrl: "", duration: "", quality: "", languages: [], subtitles: [], skipMarkers: {} };

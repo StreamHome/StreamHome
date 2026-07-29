@@ -58,6 +58,7 @@ const fixturePlayback: ResolvedPlayback = {
     nextEpisodeId: null,
     preparationState: "ready",
     preparationError: null,
+    preparationProgress: { stage: "streamable", queuePosition: 0, readySegments: 4, activeWorkers: 0 },
     nextSequenceNumber: 1,
   },
 };
@@ -68,9 +69,20 @@ export function PlayerVisualFixture() {
   if (profile?.id !== fixtureProfile.id) {
     useProfileStore.setState({ profiles: [fixtureProfile], activeProfile: fixtureProfile, isAdmin: false });
   }
+  const fixtureState = new URLSearchParams(window.location.search).get("fixtureState");
+  const playback = fixtureState === "preparing"
+    ? {
+        ...fixturePlayback,
+        runResponse: {
+          ...fixturePlayback.runResponse,
+          preparationState: "preparing" as const,
+          preparationProgress: { stage: "packaging" as const, queuePosition: 0, readySegments: 2, activeWorkers: 2 },
+        },
+      }
+    : fixturePlayback;
   return (
     <MemoryRouter initialEntries={["/?profile=player-visual-fixture&view=watch&media=m_player_visual_fixture"]}>
-      <PlayerPage visualFixture={fixturePlayback} />
+      <PlayerPage visualFixture={playback} />
     </MemoryRouter>
   );
 }

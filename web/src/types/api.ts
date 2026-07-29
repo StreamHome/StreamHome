@@ -516,6 +516,15 @@ export interface PlaybackSubtitleTrack {
 }
 
 export type PlaybackPreparationState = "preparing" | "ready" | "error";
+export type PlaybackPreparationStage = "queued" | "packaging" | "transcoding" | "streamable" | "failed";
+
+export interface PlaybackPreparationProgress {
+  stage: PlaybackPreparationStage;
+  queuePosition: number;
+  readySegments: number;
+  activeWorkers: number;
+}
+
 export type PlaybackProgressEvent = "heartbeat" | "pause" | "seek" | "visibility" | "exit" | "ended";
 
 export interface PlaybackProgressRequest {
@@ -550,5 +559,6 @@ export interface PlaybackRunResponse {
   nextEpisodeId: string | null;
   preparationState: PlaybackPreparationState;
   preparationError: { code: string; message: string } | null;
+  preparationProgress: PlaybackPreparationProgress;
   nextSequenceNumber: number;
 }

@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import time
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -22,6 +23,10 @@ STANDARD_HEIGHTS = (1080, 720, 480, 360, 240, 144)
 PLAYLIST_NAME = "playlist.m3u8"
 MASTER_NAME = "master.m3u8"
 COMPLETE_MARKER = ".complete"
+FOREGROUND_PRIORITY = 0
+BACKGROUND_PRIORITY = 100
+FAST_HLS_VIDEO_CODECS = {"avc", "avc1", "h264"}
+FAST_HLS_AUDIO_CODECS = {"aac", "mp4a"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +46,7 @@ class AudioRendition:
     language: str
     stream_index: int
     default: bool
+    codec: str = ""
     source: str = "embedded"
     file_name: Optional[str] = None
 
@@ -74,7 +80,12 @@ class PlaybackPrepService:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.active_jobs: dict[str, asyncio.Task[None]] = {}
         self.running_jobs: set[str] = set()
-        self.semaphore = asyncio.Semaphore(max(1, settings.PLAYBACK_TRANSCODE_CONCURRENCY))
+        self.job_priorities: dict[str, int] = {}
+        self.job_scheduled_at: dict[str, float] = {}
+        self.job_started_at: dict[str, float] = {}
+        concurrency = max(1, settings.PLAYBACK_TRANSCODE_CONCURRENCY)
+        self.semaphore = asyncio.Semaphore(concurrency)
+        self.background_semaphore = asyncio.Semaphore(max(1, concurrency - 1))
         self._master_locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
@@ -176,6 +187,7 @@ class PlaybackPrepService:
                     language=language,
                     stream_index=stream_index,
                     default=stream_index == default_index,
+                    codec=str(item.get("codec") or "").lower(),
                     source=str(item.get("source") or "embedded").lower(),
                     file_name=str(item.get("fileName") or item.get("file_name") or "") or None,
                 )
@@ -184,6 +196,9 @@ class PlaybackPrepService:
 
     def baseline_video(self, media_obj: Any) -> VideoRendition:
         renditions = self.video_renditions(media_obj)
+        codec = str(getattr(media_obj, "codec", "") or "").lower()
+        if codec in FAST_HLS_VIDEO_CODECS:
+            return renditions[0]
         return next((item for item in renditions if item.height == 720), renditions[0])
 
     def playlist_ready(self, media_id: str, fingerprint: str, rendition_name: str) -> bool:
@@ -259,6 +274,61 @@ class PlaybackPrepService:
                 return failure
         return None
 
+    def preparation_progress(self, media_id: str, fingerprint: str, media_obj: Any) -> dict[str, Any]:
+        baseline = self.baseline_video(media_obj)
+        audios = self.audio_renditions(media_obj)
+        default_audio = next((item for item in audios if item.default), audios[0] if audios else None)
+        required_names = [baseline.name, *([default_audio.name] if default_audio else [])]
+        required_keys = [f"{media_id}:{fingerprint}:{name}" for name in required_names]
+        ready_segments = sum(
+            len(list((self.cache_path(media_id, fingerprint) / name).glob("*.m4s")))
+            for name in required_names
+        )
+        failure = self.required_preparation_error(media_id, fingerprint, media_obj)
+        state = self.preparation_state(media_id, fingerprint, media_obj)
+        if failure or state == "error":
+            stage = "failed"
+        elif state == "ready":
+            stage = "streamable"
+        elif any(key in self.running_jobs for key in required_keys):
+            stage = "packaging" if self._can_fast_package_video(media_obj, baseline) else "transcoding"
+        else:
+            stage = "queued"
+
+        waiting = [
+            key
+            for key in sorted(
+                (candidate for candidate in self.active_jobs if candidate not in self.running_jobs),
+                key=lambda candidate: (
+                    self.job_priorities.get(candidate, BACKGROUND_PRIORITY),
+                    self.job_scheduled_at.get(candidate, 0),
+                ),
+            )
+        ]
+        positions = [waiting.index(key) + 1 for key in required_keys if key in waiting]
+        return {
+            "stage": stage,
+            "queue_position": min(positions) if positions else 0,
+            "ready_segments": ready_segments,
+            "active_workers": len(self.running_jobs),
+        }
+
+    async def _preempt_background_jobs(self, required_keys: set[str]) -> None:
+        cancelled: list[asyncio.Task[None]] = []
+        for key, task in list(self.active_jobs.items()):
+            if self.job_priorities.get(key, BACKGROUND_PRIORITY) <= FOREGROUND_PRIORITY:
+                continue
+            if key in required_keys and key in self.running_jobs:
+                self.job_priorities[key] = FOREGROUND_PRIORITY
+                continue
+            parts = key.split(":", 2)
+            if len(parts) == 3 and parts[2] != "remaining" and self.playlist_ready(parts[0], parts[1], parts[2]):
+                continue
+            task.cancel()
+            cancelled.append(task)
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
+
     async def prepare(
         self,
         media_id: str,
@@ -267,6 +337,7 @@ class PlaybackPrepService:
         *,
         include_remaining: bool,
         retry_errors: bool = False,
+        foreground: bool = True,
     ) -> str:
         media_obj = self.snapshot_media(media_obj)
         fingerprint = getattr(media_obj, "source_fingerprint", None) or source.fingerprint
@@ -279,9 +350,15 @@ class PlaybackPrepService:
         baseline = self.baseline_video(media_obj)
         audios = self.audio_renditions(media_obj)
         default_audio = next((item for item in audios if item.default), audios[0] if audios else None)
-        self._schedule_video(media_id, fingerprint, source, baseline, media_obj)
+        required_keys = {f"{media_id}:{fingerprint}:{baseline.name}"}
         if default_audio:
-            self._schedule_audio(media_id, fingerprint, source, default_audio, media_obj)
+            required_keys.add(f"{media_id}:{fingerprint}:{default_audio.name}")
+        if foreground:
+            await self._preempt_background_jobs(required_keys)
+        priority = FOREGROUND_PRIORITY if foreground else BACKGROUND_PRIORITY
+        self._schedule_video(media_id, fingerprint, source, baseline, media_obj, priority)
+        if default_audio:
+            self._schedule_audio(media_id, fingerprint, source, default_audio, media_obj, priority)
 
         if include_remaining:
             self._schedule_remaining(media_id, fingerprint, source, media_obj)
@@ -305,13 +382,13 @@ class PlaybackPrepService:
         if self.rendition_status(media_id, fingerprint, rendition_name) in {"streamable", "ready"}:
             return self.rendition_status(media_id, fingerprint, rendition_name)
 
-        prefix = f"{media_id}:{fingerprint}:"
-        for key, task in list(self.active_jobs.items()):
-            if key.startswith(prefix) and key not in self.running_jobs:
-                task.cancel()
-        await asyncio.sleep(0)
+        requested_key = f"{media_id}:{fingerprint}:{rendition_name}"
+        await self._preempt_background_jobs({requested_key})
         self._clear_rendition_error(media_id, fingerprint, rendition_name)
-        self._schedule_video(media_id, fingerprint, source, rendition, media_obj)
+        if self.playlist_ready(media_id, fingerprint, rendition_name):
+            await self.rebuild_master(media_id, fingerprint, media_obj)
+            return "streamable"
+        self._schedule_video(media_id, fingerprint, source, rendition, media_obj, FOREGROUND_PRIORITY)
         self._schedule_remaining(media_id, fingerprint, source, media_obj)
         return "preparing"
 
@@ -326,8 +403,7 @@ class PlaybackPrepService:
         if key in self.active_jobs:
             return
         task = asyncio.create_task(self._schedule_remaining_after_baseline(media_id, fingerprint, source, media_obj))
-        self.active_jobs[key] = task
-        task.add_done_callback(lambda _: self.active_jobs.pop(key, None))
+        self._track_job(key, task, BACKGROUND_PRIORITY)
 
     async def _schedule_remaining_after_baseline(
         self,
@@ -350,9 +426,9 @@ class PlaybackPrepService:
         remaining_video = [item for item in self.video_renditions(media_obj) if item.height != baseline_height]
         remaining_video.sort(key=lambda item: (item.height > baseline_height, -item.height if item.height < baseline_height else item.height))
         for audio in self.audio_renditions(media_obj):
-            self._schedule_audio(media_id, fingerprint, source, audio, media_obj)
+            self._schedule_audio(media_id, fingerprint, source, audio, media_obj, BACKGROUND_PRIORITY)
         for rendition in remaining_video:
-            self._schedule_video(media_id, fingerprint, source, rendition, media_obj)
+            self._schedule_video(media_id, fingerprint, source, rendition, media_obj, BACKGROUND_PRIORITY)
 
     def _schedule_video(
         self,
@@ -361,12 +437,14 @@ class PlaybackPrepService:
         source: ResolvedMediaSource,
         rendition: VideoRendition,
         media_obj: Any,
+        priority: int = FOREGROUND_PRIORITY,
     ) -> None:
         self._schedule_job(
             media_id,
             fingerprint,
             rendition.name,
             self._transcode_video(media_id, fingerprint, source, rendition, media_obj),
+            priority,
         )
 
     def _schedule_audio(
@@ -376,24 +454,48 @@ class PlaybackPrepService:
         source: ResolvedMediaSource,
         rendition: AudioRendition,
         media_obj: Any,
+        priority: int = FOREGROUND_PRIORITY,
     ) -> None:
         self._schedule_job(
             media_id,
             fingerprint,
             rendition.name,
             self._transcode_audio(media_id, fingerprint, source, rendition, media_obj),
+            priority,
         )
 
-    def _schedule_job(self, media_id: str, fingerprint: str, rendition_name: str, coroutine: Any) -> None:
+    def _track_job(self, key: str, task: asyncio.Task[None], priority: int) -> None:
+        self.active_jobs[key] = task
+        self.job_priorities[key] = priority
+        self.job_scheduled_at[key] = time.monotonic()
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            if self.active_jobs.get(key) is completed:
+                self.active_jobs.pop(key, None)
+                self.job_priorities.pop(key, None)
+                self.job_scheduled_at.pop(key, None)
+                self.job_started_at.pop(key, None)
+
+        task.add_done_callback(finished)
+
+    def _schedule_job(
+        self,
+        media_id: str,
+        fingerprint: str,
+        rendition_name: str,
+        coroutine: Any,
+        priority: int,
+    ) -> None:
         key = f"{media_id}:{fingerprint}:{rendition_name}"
         if self.rendition_complete(media_id, fingerprint, rendition_name) or key in self.active_jobs:
+            if key in self.active_jobs:
+                self.job_priorities[key] = min(priority, self.job_priorities.get(key, priority))
             if hasattr(coroutine, "close"):
                 coroutine.close()
             return
         self._clear_rendition_error(media_id, fingerprint, rendition_name)
         task = asyncio.create_task(coroutine)
-        self.active_jobs[key] = task
-        task.add_done_callback(lambda _: self.active_jobs.pop(key, None))
+        self._track_job(key, task, priority)
 
     async def _input_process(self, source: ResolvedMediaSource) -> tuple[str, Optional[asyncio.subprocess.Process]]:
         if source.local_exists:
@@ -446,6 +548,46 @@ class PlaybackPrepService:
             PLAYLIST_NAME,
         ]
 
+    @staticmethod
+    def _output_signature(target_dir: Path) -> tuple[int, int, int]:
+        try:
+            files = [path for path in target_dir.iterdir() if path.is_file()]
+            return (
+                len(files),
+                sum(path.stat().st_size for path in files),
+                max((path.stat().st_mtime_ns for path in files), default=0),
+            )
+        except OSError:
+            return (0, 0, 0)
+
+    async def _wait_for_ffmpeg_progress(
+        self,
+        process: asyncio.subprocess.Process,
+        target_dir: Path,
+    ) -> None:
+        stall_seconds = max(1, int(settings.PLAYBACK_JOB_STALL_SECONDS))
+        last_signature = self._output_signature(target_dir)
+        last_activity = time.monotonic()
+        wait_task = asyncio.create_task(process.wait())
+        try:
+            while not wait_task.done():
+                await asyncio.wait({wait_task}, timeout=1)
+                signature = self._output_signature(target_dir)
+                if signature != last_signature:
+                    last_signature = signature
+                    last_activity = time.monotonic()
+                if not wait_task.done() and time.monotonic() - last_activity >= stall_seconds:
+                    process.kill()
+                    await wait_task
+                    raise PlaybackPreparationError(
+                        "PREPARATION_STALLED",
+                        f"FFmpeg produced no HLS output for {stall_seconds} seconds.",
+                    )
+            await wait_task
+        finally:
+            if not wait_task.done():
+                wait_task.cancel()
+
     async def _run_ffmpeg_job(
         self,
         media_id: str,
@@ -460,10 +602,14 @@ class PlaybackPrepService:
         if self.rendition_complete(media_id, fingerprint, rendition_name):
             return
 
-        async with self.semaphore:
+        async with AsyncExitStack() as capacity:
+            if self.job_priorities.get(job_key, BACKGROUND_PRIORITY) > FOREGROUND_PRIORITY:
+                await capacity.enter_async_context(self.background_semaphore)
+            await capacity.enter_async_context(self.semaphore)
             if self.rendition_complete(media_id, fingerprint, rendition_name):
                 return
             self.running_jobs.add(job_key)
+            self.job_started_at[job_key] = time.monotonic()
             shutil.rmtree(target_dir, ignore_errors=True)
             target_dir.mkdir(parents=True, exist_ok=True)
             cloud_process: Optional[asyncio.subprocess.Process] = None
@@ -487,15 +633,17 @@ class PlaybackPrepService:
                 publish_task = asyncio.create_task(
                     self._publish_when_streamable(media_id, fingerprint, rendition_name, media_obj, ffmpeg_process)
                 )
+                assert ffmpeg_process.stderr is not None
+                ffmpeg_stderr_task = asyncio.create_task(ffmpeg_process.stderr.read())
                 if cloud_process:
                     pump_task = asyncio.create_task(self._pump_cloud_input(cloud_process, ffmpeg_process))
                     assert cloud_process.stderr is not None
-                    assert ffmpeg_process.stderr is not None
                     cloud_stderr_task = asyncio.create_task(cloud_process.stderr.read())
-                    ffmpeg_stderr_task = asyncio.create_task(ffmpeg_process.stderr.read())
-                    await pump_task
-                    await ffmpeg_process.wait()
-                    stderr = await ffmpeg_stderr_task
+                await self._wait_for_ffmpeg_progress(ffmpeg_process, target_dir)
+                stderr = await ffmpeg_stderr_task
+                if cloud_process:
+                    if pump_task:
+                        await pump_task
                     try:
                         await asyncio.wait_for(cloud_process.wait(), timeout=5)
                     except asyncio.TimeoutError:
@@ -505,8 +653,6 @@ class PlaybackPrepService:
                     if cloud_process.returncode != 0:
                         diagnostics = self.sanitize_diagnostics(cloud_stderr.decode("utf-8", errors="replace"))
                         raise PlaybackPreparationError("CLOUD_STREAM_FAILED", diagnostics or "Google Drive stopped delivering the media source.")
-                else:
-                    _, stderr = await ffmpeg_process.communicate()
                 if ffmpeg_process.returncode != 0:
                     diagnostics = self.sanitize_diagnostics(stderr.decode("utf-8", errors="replace"))
                     raise PlaybackPreparationError("FFMPEG_PREPARATION_FAILED", diagnostics or "FFmpeg could not prepare this rendition.")
@@ -558,6 +704,7 @@ class PlaybackPrepService:
                         process.kill()
                         await process.wait()
                 self.running_jobs.discard(job_key)
+                self.job_started_at.pop(job_key, None)
 
     async def _publish_when_streamable(
         self,
@@ -584,6 +731,10 @@ class PlaybackPrepService:
         rendition: VideoRendition,
         media_obj: Any,
     ) -> None:
+        if self._can_fast_package_video(media_obj, rendition):
+            arguments = ["-map", "0:v:0", "-an", "-c:v", "copy"]
+            await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, source, arguments, media_obj)
+            return
         bitrate = max(300, rendition.bandwidth // 1000)
         arguments = [
             "-map", "0:v:0",
@@ -601,6 +752,11 @@ class PlaybackPrepService:
             "-force_key_frames", "expr:gte(t,n_forced*4)",
         ]
         await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, source, arguments, media_obj)
+
+    @staticmethod
+    def _can_fast_package_video(media_obj: Any, rendition: VideoRendition) -> bool:
+        codec = str(getattr(media_obj, "codec", "") or "").lower()
+        return rendition.original and codec in FAST_HLS_VIDEO_CODECS
 
     def _external_audio_path(self, source: ResolvedMediaSource, audio: AudioRendition) -> Optional[Path]:
         audio_dir = source.local_path.parent / "audio"
@@ -656,6 +812,10 @@ class PlaybackPrepService:
         if external_source:
             arguments = ["-map", "0:a:0", "-vn", "-c:a", "aac", "-b:a", "160k", "-ac", "2"]
             await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, external_source, arguments, media_obj)
+            return
+        if rendition.codec in FAST_HLS_AUDIO_CODECS:
+            arguments = ["-map", f"0:a:{rendition.stream_index}", "-vn", "-c:a", "copy"]
+            await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, source, arguments, media_obj)
             return
         arguments = [
             "-map", f"0:a:{rendition.stream_index}",
@@ -768,7 +928,7 @@ class PlaybackPrepService:
                 pass
             shutil.rmtree(rendition_dir, ignore_errors=True)
 
-    async def schedule_catalog_baselines(self) -> None:
+    async def reconcile_catalog_cache_identities(self) -> None:
         from db import engine
         from models import Episode, Movie
         from sqlmodel import select
@@ -785,12 +945,18 @@ class PlaybackPrepService:
                         continue
                     fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
                     if media_obj.source_fingerprint != fingerprint:
+                        if media_obj.source_fingerprint:
+                            self.cancel_media(media_obj.id, media_obj.source_fingerprint)
                         media_obj.source_fingerprint = fingerprint
                         db.add(media_obj)
-                    await self.prepare(media_obj.id, media_obj, source, include_remaining=True)
                 except Exception as exc:
-                    logger.warning(f"[Playback Prep] Baseline scheduling skipped for {media_obj.id}: {self.sanitize_diagnostics(str(exc), 400)}")
+                    logger.warning(f"[Playback Prep] Cache identity reconciliation skipped for {media_obj.id}: {self.sanitize_diagnostics(str(exc), 400)}")
             await db.commit()
+
+    async def schedule_catalog_baselines(self) -> None:
+        """Compatibility entry point; startup reconciles cache identity without queuing FFmpeg work."""
+
+        await self.reconcile_catalog_cache_identities()
 
     def enforce_lru_limits(self) -> None:
         limit_bytes = int(settings.PLAYBACK_CACHE_GB * 1024 * 1024 * 1024)

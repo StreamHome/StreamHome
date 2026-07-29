@@ -110,7 +110,7 @@ Artwork and portable recovery metadata are stored alongside the relevant media d
 
 ### 🌊 Adaptive HLS Streaming
 
-A secure fMP4 HLS playback pipeline prepares media in four-second segments and generates a source-resolution-aware quality ladder from 1080p down to 240p when applicable.
+A secure, demand-prioritized fMP4 HLS pipeline publishes compatible sources without re-encoding when possible, then prepares a source-resolution-aware quality ladder down to 144p in preemptible background jobs.
 
 Playback supports local and Google Drive media sources through the same unified experience.
 

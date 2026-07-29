@@ -444,9 +444,9 @@ The exact duplicate-detection behavior may depend on the request, media identity
 
 ### Which playback format does StreamHome use?
 
-StreamHome uses an adaptive fMP4 HLS playback pipeline.
+StreamHome uses an adaptive fMP4 HLS playback pipeline as its primary playback transport.
 
-Media may be prepared in short segments and served through a source-resolution-aware quality ladder.
+The selected title receives preparation priority. Compatible H.264/AAC sources are packaged into short HLS segments without re-encoding, while incompatible sources receive a browser-compatible baseline transcode. Additional qualities are prepared in the background and reused from the playback cache.
 
 ### Can I watch media before its download finishes?
 
