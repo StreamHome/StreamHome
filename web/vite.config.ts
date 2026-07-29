@@ -22,7 +22,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, path.resolve(__dirname, '..'), '');
   const parsedPort = Number.parseInt(env.WEB_PORT || '3000', 10);
   const webPort = Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535 ? parsedPort : 3000;
-  const buildId = resolveBuildId(env.VITE_BUILD_ID || process.env.VITE_BUILD_ID || process.env.STREAMHOME_BUILD_ID || 'dev');
+  const buildId = resolveBuildId(process.env.VITE_BUILD_ID || process.env.STREAMHOME_BUILD_ID || env.VITE_BUILD_ID || 'dev');
   return {
     define: {
       'import.meta.env.VITE_APP_VERSION': JSON.stringify(process.env.npm_package_version ?? '0.0.0'),
@@ -31,6 +31,16 @@ export default defineConfig(({ mode }) => {
     plugins: [
       react(),
       tailwindcss(),
+      {
+        name: 'streamhome-build-identity',
+        generateBundle() {
+          this.emitFile({
+            type: 'asset',
+            fileName: '.streamhome-build',
+            source: `${buildId}\n`,
+          });
+        },
+      },
       {
         name: 'streamhome-player-visual-fixture',
         apply: 'serve',

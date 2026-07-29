@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import tempfile
+import os
+import socket
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -184,6 +187,53 @@ class RuntimeControlTests(unittest.TestCase):
                 ),
                 set(),
             )
+
+    @unittest.skipIf(os.name == "nt", "Listener ownership readiness requires native Linux /proc semantics")
+    def test_port_readiness_rejects_an_active_listener(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = int(listener.getsockname()[1])
+            self.assertFalse(runtime_control.port_is_available(port))
+
+    @unittest.skipIf(os.name == "nt", "TCP TIME_WAIT inspection requires native Linux /proc semantics")
+    def test_port_readiness_accepts_time_wait_without_a_listener(self) -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = int(listener.getsockname()[1])
+        client = socket.create_connection(("127.0.0.1", port), timeout=2)
+        accepted, _ = listener.accept()
+        accepted.shutdown(socket.SHUT_WR)
+        accepted.close()
+        listener.close()
+        client.recv(1)
+        client.close()
+
+        hexadecimal_port = f"{port:04X}"
+        deadline = time.monotonic() + 2
+        found_time_wait = False
+        while time.monotonic() < deadline:
+            for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+                try:
+                    lines = table.read_text(encoding="utf-8").splitlines()[1:]
+                except OSError:
+                    continue
+                if any(
+                    len(fields := line.split()) >= 4
+                    and fields[1].rsplit(":", 1)[-1].upper() == hexadecimal_port
+                    and fields[3] == "06"
+                    for line in lines
+                ):
+                    found_time_wait = True
+                    break
+            if found_time_wait:
+                break
+            time.sleep(0.05)
+        self.assertTrue(found_time_wait, "The test connection did not enter TIME_WAIT")
+        self.assertTrue(runtime_control.port_is_available(port))
 
 
 if __name__ == "__main__":

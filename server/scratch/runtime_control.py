@@ -344,6 +344,8 @@ def terminate_owned_processes(root: Path) -> tuple[set[str], dict[int, str]]:
 
 
 def port_is_available(port: int) -> bool:
+    if listening_socket_inodes(port):
+        return False
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -574,6 +576,10 @@ def build_parser() -> argparse.ArgumentParser:
     matches.add_argument("--service", required=True, choices=("backend", "web"))
     matches.add_argument("--pid", required=True, type=int)
 
+    port_ready = subparsers.add_parser("port-ready")
+    port_ready.add_argument("--root", required=True)
+    port_ready.add_argument("--port", required=True)
+
     stop = subparsers.add_parser("stop")
     stop.add_argument("--root", required=True)
     stop.add_argument("--port", action="append", default=[])
@@ -594,6 +600,9 @@ def main() -> int:
             return record_service(root, arguments.service, arguments.pid, arguments.token)
         if arguments.command == "matches":
             return 0 if service_matches(root, arguments.service, arguments.pid) else 1
+        if arguments.command == "port-ready":
+            ports = parse_ports([arguments.port])
+            return 0 if port_is_available(ports[0]) else 1
         if arguments.command == "stop":
             ports = parse_ports(arguments.port)
             if not ports:

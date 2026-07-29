@@ -237,6 +237,62 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted["current_commit"], target)
         cleanup.assert_called_once()
 
+    async def test_manually_recovered_failed_target_is_reconciled_only_after_local_health(self) -> None:
+        target = "f" * 40
+        update.write_update_state(
+            phase="rollback_failed",
+            message="Rollback failed",
+            current_commit="a" * 40,
+            target_commit=target,
+            previous_commit="a" * 40,
+            transaction_id="tx-manual-recovery",
+            failed_target=target,
+            error="rollback_failed",
+        )
+        with (
+            patch.object(update, "update_lock_active", return_value=False),
+            patch.object(update, "current_commit", AsyncMock(return_value=target)),
+            patch.object(update, "local_web_ready", AsyncMock(return_value=False)),
+            patch.object(update, "cleanup_reconciled_transaction") as cleanup,
+        ):
+            self.assertFalse(await update.reconcile_orphaned_update())
+            cleanup.assert_not_called()
+
+        with (
+            patch.object(update, "update_lock_active", return_value=False),
+            patch.object(update, "current_commit", AsyncMock(return_value=target)),
+            patch.object(update, "local_web_ready", AsyncMock(return_value=True)),
+            patch.object(update, "cleanup_reconciled_transaction") as cleanup,
+        ):
+            self.assertTrue(await update.reconcile_orphaned_update())
+
+        persisted = update.read_update_state()
+        self.assertEqual(persisted["phase"], "succeeded")
+        self.assertEqual(persisted["current_commit"], target)
+        self.assertEqual(persisted["failed_target"], "")
+        self.assertEqual(persisted["error"], "")
+        self.assertIn("manually recovered", persisted["message"])
+        cleanup.assert_called_once()
+
+    async def test_non_lifecycle_failure_is_never_reclassified_as_a_success(self) -> None:
+        target = "f" * 40
+        update.write_update_state(
+            phase="failed",
+            message="Fetch failed",
+            current_commit=target,
+            target_commit=target,
+            failed_target=target,
+            error="update_fetch_failed",
+        )
+        with (
+            patch.object(update, "update_lock_active", return_value=False),
+            patch.object(update, "current_commit", AsyncMock(return_value=target)),
+            patch.object(update, "local_web_ready", AsyncMock(return_value=True)) as ready,
+        ):
+            self.assertFalse(await update.reconcile_orphaned_update())
+        ready.assert_not_awaited()
+        self.assertEqual(update.read_update_state()["phase"], "failed")
+
     async def test_orphaned_unhealthy_cutover_queues_one_detached_recovery(self) -> None:
         target = "f" * 40
         previous = "a" * 40

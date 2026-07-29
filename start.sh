@@ -191,18 +191,7 @@ PY
 }
 
 port_available() {
-    "$BACKEND_PYTHON" - "$1" <<'PY'
-import socket
-import sys
-
-sock = socket.socket()
-try:
-    sock.bind(("0.0.0.0", int(sys.argv[1])))
-except OSError:
-    raise SystemExit(1)
-finally:
-    sock.close()
-PY
+    "$BACKEND_PYTHON" "$RUNTIME_CONTROL" port-ready --root "$ROOT_DIR" --port "$1"
 }
 
 wait_for_port_release() {
@@ -403,6 +392,7 @@ running_services_ready() {
 }
 
 validate_runtime_dependencies() {
+    local expected_build marker_build
     command -v npm >/dev/null 2>&1 || fail "npm is unavailable. Run ./setup.sh first."
     command -v setsid >/dev/null 2>&1 \
         || fail "setsid is unavailable. Install util-linux and run ./setup.sh again."
@@ -414,6 +404,10 @@ validate_runtime_dependencies() {
         || fail "The production web runtime dependencies are incomplete. Run ./setup.sh first."
     [[ -s "$ROOT_DIR/web/dist/index.html" ]] \
         || fail "Production web assets are missing. Run ./setup.sh first."
+    expected_build="$(git -C "$ROOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || printf 'dev')"
+    marker_build="$(tr -d '[:space:]' < "$ROOT_DIR/web/dist/.streamhome-build" 2>/dev/null || true)"
+    [[ -n "$marker_build" && "$marker_build" == "$expected_build" ]] \
+        || fail "Production web assets do not match release $expected_build. Run ./setup.sh before starting StreamHome."
 }
 
 show_startup_logs() {
@@ -527,8 +521,8 @@ main() {
     acquire_lifecycle_lock
     "$ROOT_DIR/stop.sh" --startup --lock-held
 
-    wait_for_port_release 8000 || fail "API port 8000 is still in use by an unrelated or uninspectable service. StreamHome did not stop it."
-    wait_for_port_release "$WEB_PORT" || fail "Web port $WEB_PORT is still in use by an unrelated or uninspectable service. StreamHome did not stop it."
+    wait_for_port_release 8000 || fail "API port 8000 acquired a listener after shutdown. Review the ownership diagnostics and retry."
+    wait_for_port_release "$WEB_PORT" || fail "Web port $WEB_PORT acquired a listener after shutdown. Review the ownership diagnostics and retry."
 
     if [[ "$SETUP_ACTIVE" == true ]]; then
         STREAMHOME_SETUP_CODE="$("$BACKEND_PYTHON" -c 'import secrets; print(secrets.token_urlsafe(18))')"

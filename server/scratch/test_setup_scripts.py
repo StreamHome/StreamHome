@@ -148,6 +148,8 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("content_fingerprint", setup_sh)
         self.assertIn("Python dependency manifests are unchanged", setup_sh)
         self.assertIn("Frontend build inputs are unchanged", setup_sh)
+        self.assertIn(".streamhome-build", setup_sh)
+        self.assertIn('env VITE_BUILD_ID="$build_id" STREAMHOME_BUILD_ID="$build_id" npm run build', setup_sh)
         self.assertIn("--force", setup_sh)
         self.assertIn("--record-prepared-state", setup_sh)
         self.assertIn("record_prepared_state", setup_sh)
@@ -216,6 +218,9 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("$TARGET_COMMIT:server/scratch/runtime_control.py", update_sh)
         self.assertNotIn('"$ROOT_DIR/stop.sh" --quiet || true', update_sh)
         self.assertIn("rollback will not mutate code or data while it may still be active", update_sh)
+        self.assertIn("installed_web_build_matches", update_sh)
+        self.assertIn("rebuilding the target assets without reinstalling Node packages", update_sh)
+        self.assertIn('env VITE_BUILD_ID="$candidate_build" STREAMHOME_BUILD_ID="$candidate_build" npm run build', update_sh)
 
         self.assertIn('"$ROOT_DIR/stop.sh" --startup --lock-held', start_sh)
         self.assertIn("detect_server_ip", start_sh)
@@ -240,6 +245,9 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("STREAMHOME_SERVICE=web", start_sh)
         self.assertIn("record_service", start_sh)
         self.assertNotIn("npm run server >", start_sh)
+        self.assertIn("port-ready", start_sh)
+        self.assertNotIn("sock.bind", start_sh)
+        self.assertIn(".streamhome-build", start_sh)
 
         runtime_control = (ROOT / "server" / "scratch" / "runtime_control.py").read_text(encoding="utf-8")
         self.assertIn("STREAMHOME_ROOT_OVERRIDE", stop_sh)
@@ -252,6 +260,15 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("os.killpg", runtime_control)
         self.assertIn("Port {port} is still owned", runtime_control)
         self.assertIn("Shutdown cannot be reported as successful", runtime_control)
+        self.assertIn('subparsers.add_parser("port-ready")', runtime_control)
+
+        vite_config = (ROOT / "web" / "vite.config.ts").read_text(encoding="utf-8")
+        web_server = (ROOT / "web" / "server.ts").read_text(encoding="utf-8")
+        self.assertIn("streamhome-build-identity", vite_config)
+        self.assertIn("fileName: '.streamhome-build'", vite_config)
+        self.assertLess(vite_config.index("process.env.VITE_BUILD_ID"), vite_config.index("env.VITE_BUILD_ID"))
+        self.assertIn('path.join(distPath, ".streamhome-build")', web_server)
+        self.assertIn("Production web assets belong to", web_server)
 
         self.assertIn("--server-only", test_sh)
         self.assertIn("--web-only", test_sh)
@@ -576,6 +593,10 @@ class SetupScriptContracts(unittest.TestCase):
             git(["reset", "--hard", old_commit], cwd=installed)
             prepared = run([bash, str(installed / "setup.sh"), "--no-start"], cwd=installed)
             self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+            (installed / "web" / "dist" / ".streamhome-build").write_text(
+                f"{old_commit[:12]}\n",
+                encoding="utf-8",
+            )
             (installed / ".run").mkdir()
             token_file = installed / ".run" / "update-handoff.test.token"
             token_file.write_text("test-token", encoding="utf-8")

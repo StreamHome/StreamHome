@@ -334,13 +334,27 @@ web_build_fingerprint() {
     content_fingerprint "$1" "$ROOT_DIR/web"
 }
 
+current_build_id() {
+    git -C "$ROOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || printf 'dev'
+}
+
+web_build_marker_matches() {
+    local expected="$1" marker="$ROOT_DIR/web/dist/.streamhome-build" actual=""
+    [[ -f "$marker" ]] || return 1
+    actual="$(tr -d '[:space:]' < "$marker")"
+    [[ -n "$actual" && "$actual" == "$expected" ]]
+}
+
 record_prepared_state() {
-    local python_fingerprint dependency_fingerprint build_fingerprint
+    local python_fingerprint dependency_fingerprint build_fingerprint build_id
     [[ -x "$ROOT_DIR/venv/bin/python" ]] || fail "The prepared Python environment is missing."
     "$ROOT_DIR/venv/bin/python" -m pip check
     [[ -d "$ROOT_DIR/web/node_modules" && -x "$ROOT_DIR/web/node_modules/.bin/vite" ]] \
         || fail "The prepared web dependency tree is missing or incomplete."
     [[ -s "$ROOT_DIR/web/dist/index.html" ]] || fail "The prepared production web assets are missing."
+    build_id="$(current_build_id)"
+    web_build_marker_matches "$build_id" \
+        || fail "The prepared production web assets do not match release $build_id. Run ./setup.sh --force."
     python_fingerprint="$(python_dependency_fingerprint)"
     dependency_fingerprint="$(web_dependency_fingerprint)"
     build_fingerprint="$(web_build_fingerprint "$dependency_fingerprint")"
@@ -388,11 +402,12 @@ prepare_virtual_environment() {
 }
 
 prepare_web() {
-    local dependency_fingerprint build_fingerprint
+    local dependency_fingerprint build_fingerprint build_id
     local dependency_stamp="$SETUP_STATE_DIR/web-dependencies.fingerprint"
     local build_stamp="$SETUP_STATE_DIR/web-build.fingerprint"
     local web_dependencies_rebuilt=false
     dependency_fingerprint="$(web_dependency_fingerprint)"
+    build_id="$(current_build_id)"
     if stamp_matches "$dependency_stamp" "$dependency_fingerprint" \
         && [[ -d "$ROOT_DIR/web/node_modules" ]] \
         && [[ -x "$ROOT_DIR/web/node_modules/.bin/vite" ]]
@@ -409,13 +424,15 @@ prepare_web() {
     if [[ "$web_dependencies_rebuilt" == false ]] \
         && stamp_matches "$build_stamp" "$build_fingerprint" \
         && [[ -s "$ROOT_DIR/web/dist/index.html" ]]
+        && web_build_marker_matches "$build_id"
     then
         log "Frontend build inputs are unchanged; keeping the existing production assets"
         return 0
     fi
     CURRENT_STEP="production web build"
-    (cd "$ROOT_DIR/web" && npm run build)
+    (cd "$ROOT_DIR/web" && env VITE_BUILD_ID="$build_id" STREAMHOME_BUILD_ID="$build_id" npm run build)
     [[ -s "$ROOT_DIR/web/dist/index.html" ]] || fail "The production web build did not create web/dist/index.html."
+    web_build_marker_matches "$build_id" || fail "The production web build identity does not match release $build_id."
     write_stamp "$build_stamp" "$build_fingerprint"
 }
 

@@ -23,6 +23,17 @@ REPOSITORY_URL = "https://github.com/StreamHome/StreamHome.git"
 LEGACY_REPOSITORY_URL = "https://github.com/WaqSea/StreamHome.git"
 TERMINAL_PHASES = {"idle", "up_to_date", "update_available", "succeeded", "failed", "rolled_back", "rollback_failed"}
 BUSY_PHASES = {"preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back", "recovering"}
+RECOVERABLE_TARGET_ERRORS = {
+    "shutdown_failed",
+    "maintenance_start_failed",
+    "database_checkpoint_failed",
+    "update_failed",
+    "update_rolled_back",
+    "rollback_failed",
+    "recovery_start_failed",
+    "update_interrupted",
+    "update_interrupted_rolled_back",
+}
 INSTALL_MODES = {"automatic", "when_idle", "now"}
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 UPDATE_CHECK_LOCK = asyncio.Lock()
@@ -506,11 +517,32 @@ def cleanup_reconciled_transaction(status: dict[str, Any]) -> None:
 async def reconcile_orphaned_update() -> bool:
     status = read_update_state()
     phase = str(status.get("phase") or "")
-    if phase not in BUSY_PHASES or update_lock_active() or not orphaned_controller_stale(status):
+    if update_lock_active():
         return False
     installed = await current_commit()
     target = str(status.get("target_commit") or "")
     previous = str(status.get("previous_commit") or "")
+    error = str(status.get("error") or "")
+    if phase in TERMINAL_PHASES and error in RECOVERABLE_TARGET_ERRORS:
+        if not target or installed != target or not await local_web_ready():
+            return False
+        completed_at = time.time()
+        write_update_state(
+            phase="succeeded",
+            message="The target release was manually recovered and both local services are healthy.",
+            current_commit=target,
+            update_available=False,
+            error="",
+            failed_target="",
+            staging_dir="",
+            web_artifacts_swapped=False,
+            finished_at=completed_at,
+            last_success_at=completed_at,
+        )
+        cleanup_reconciled_transaction(status)
+        return True
+    if phase not in BUSY_PHASES or not orphaned_controller_stale(status):
+        return False
     web_ready = await local_web_ready()
     if web_ready and installed == target:
         write_update_state(

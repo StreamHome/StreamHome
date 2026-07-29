@@ -592,6 +592,13 @@ validate_current_python_environment() {
     "$ROOT_DIR/venv/bin/python" -m pip check
 }
 
+installed_web_build_matches() {
+    local expected="${1:0:12}" marker="$ROOT_DIR/web/dist/.streamhome-build" actual=""
+    [[ -s "$ROOT_DIR/web/dist/index.html" && -f "$marker" ]] || return 1
+    actual="$(tr -d '[:space:]' < "$marker")"
+    [[ -n "$actual" && "$actual" == "$expected" ]]
+}
+
 record_prepared_setup_state() {
     if ! "$ROOT_DIR/setup.sh" --record-prepared-state; then
         log "The release is prepared, but setup reuse markers could not be refreshed; a future setup may repeat dependency validation."
@@ -641,9 +648,10 @@ prepare_candidate_python() {
 }
 
 prepare_candidate_web() {
-    local staged_checkout="$1" candidate_web="$1/web"
+    local staged_checkout="$1" candidate_web="$1/web" candidate_build="${TARGET_COMMIT:0:12}"
     if [[ "$WEB_BUILD_REQUIRED" == false ]]; then
-        [[ -d "$ROOT_DIR/web/node_modules" && -s "$ROOT_DIR/web/dist/index.html" ]] || return 1
+        [[ -d "$ROOT_DIR/web/node_modules" ]] || return 1
+        installed_web_build_matches "$OLD_COMMIT" || return 1
         log "Web sources are unchanged; reusing installed dependencies and production assets."
         return 0
     fi
@@ -657,14 +665,16 @@ prepare_candidate_web() {
         log "Web dependency manifests are unchanged; building with the verified installed dependency tree."
     fi
 
-    if ! (cd "$candidate_web" && npm run build); then
+    if ! (cd "$candidate_web" \
+        && env VITE_BUILD_ID="$candidate_build" STREAMHOME_BUILD_ID="$candidate_build" npm run build); then
         [[ "$WEB_DEPENDENCIES_CHANGED" == false ]] && rm -f -- "$candidate_web/node_modules"
         return 1
     fi
     if [[ "$WEB_DEPENDENCIES_CHANGED" == false ]]; then
         rm -f -- "$candidate_web/node_modules"
     fi
-    [[ -s "$candidate_web/dist/index.html" ]]
+    [[ -s "$candidate_web/dist/index.html" ]] \
+        && [[ "$(tr -d '[:space:]' < "$candidate_web/dist/.streamhome-build" 2>/dev/null || true)" == "$candidate_build" ]]
 }
 
 activate_prepared_web() {
@@ -674,6 +684,8 @@ activate_prepared_web() {
         return 0
     fi
     [[ -s "$candidate_web/dist/index.html" ]] || return 1
+    [[ "$(tr -d '[:space:]' < "$candidate_web/dist/.streamhome-build" 2>/dev/null || true)" == "${TARGET_COMMIT:0:12}" ]] \
+        || return 1
     if [[ "$WEB_DEPENDENCIES_CHANGED" == true ]]; then
         [[ -d "$candidate_web/node_modules" ]] || return 1
         WEB_DEPENDENCIES_SWAPPED=true
@@ -726,6 +738,10 @@ preflight_target() {
         return 1
     }
     detect_release_changes
+    if [[ "$WEB_BUILD_REQUIRED" == false ]] && ! installed_web_build_matches "$OLD_COMMIT"; then
+        WEB_BUILD_REQUIRED=true
+        log "Installed web assets are missing or stale for ${OLD_COMMIT:0:12}; rebuilding the target assets without reinstalling Node packages."
+    fi
     write_state "preflight" "Change analysis complete. Preparing only changed dependencies and required frontend assets while StreamHome stays online."
     prepare_candidate_python "$staged_checkout" || return 1
     prepare_candidate_web "$staged_checkout" || return 1

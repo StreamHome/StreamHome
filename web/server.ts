@@ -11,7 +11,23 @@ async function startServer() {
   const app = express();
   const requestedPort = Number.parseInt(process.env.WEB_PORT ?? "3000", 10);
   const PORT = Number.isInteger(requestedPort) && requestedPort >= 1 && requestedPort <= 65535 ? requestedPort : 3000;
-  const buildId = process.env.STREAMHOME_BUILD_ID || "dev";
+  const configuredBuildId = process.env.STREAMHOME_BUILD_ID || "dev";
+  const isProd = process.env.NODE_ENV !== "development" || process.argv[1]?.endsWith("server.cjs");
+  const distPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "dist");
+  let buildId = configuredBuildId;
+  if (isProd) {
+    const markerPath = path.join(distPath, ".streamhome-build");
+    const assetBuildId = readFileSync(markerPath, "utf8").trim();
+    if (!assetBuildId) {
+      throw new Error("Production web assets have no build identity. Run ./setup.sh before starting StreamHome.");
+    }
+    if (configuredBuildId !== "dev" && assetBuildId !== configuredBuildId) {
+      throw new Error(
+        `Production web assets belong to ${assetBuildId}, but the running release is ${configuredBuildId}. Run ./setup.sh before starting StreamHome.`,
+      );
+    }
+    buildId = assetBuildId;
+  }
 
   app.disable("x-powered-by");
   app.use((_req, res, next) => {
@@ -44,8 +60,6 @@ async function startServer() {
   // Vite middleware setup
   // `npm run dev` owns Vite development. The packaged Express entrypoint is
   // production-first so a missing inherited NODE_ENV can never expose a dev server.
-  const isProd = process.env.NODE_ENV !== "development" || process.argv[1]?.endsWith("server.cjs");
-  
   if (!isProd) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -60,7 +74,6 @@ async function startServer() {
       }
       next();
     });
-    const distPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "dist");
     console.log(`[StreamHome Server] Serving web assets from ${distPath}`);
     const indexDocument = readFileSync(path.join(distPath, "index.html"), "utf8");
     app.use(express.static(distPath, {
