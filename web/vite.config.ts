@@ -2,7 +2,7 @@ import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'path';
-import { createReadStream } from 'node:fs';
+import { createReadStream, existsSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
 function resolveBuildId(configuredBuildId: string): string {
@@ -35,6 +35,24 @@ export default defineConfig(({ mode }) => {
         name: 'streamhome-player-visual-fixture',
         apply: 'serve',
         configureServer(server) {
+          server.middlewares.use('/__player-visual-fixture', (request, response, next) => {
+            const relative = decodeURIComponent((request.url || '').split('?')[0]).replace(/^\/+/, '');
+            const asset = path.resolve(__dirname, 'test-assets/player-dual-audio-hls', relative);
+            const root = path.resolve(__dirname, 'test-assets/player-dual-audio-hls');
+            if (!asset.startsWith(`${root}${path.sep}`) || !existsSync(asset) || !statSync(asset).isFile()) {
+              next();
+              return;
+            }
+            response.statusCode = 200;
+            response.setHeader(
+              'Content-Type',
+              asset.endsWith('.m3u8')
+                ? 'application/vnd.apple.mpegurl'
+                : asset.endsWith('.mp4') || asset.endsWith('.m4s') ? 'video/mp4' : 'application/octet-stream',
+            );
+            response.setHeader('Cache-Control', 'no-store');
+            createReadStream(asset).pipe(response);
+          });
           server.middlewares.use('/__player-visual-fixture.mp4', (_request, response) => {
             response.statusCode = 200;
             response.setHeader('Content-Type', 'video/mp4');

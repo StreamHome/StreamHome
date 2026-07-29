@@ -415,6 +415,41 @@ class PlaybackPrepService:
         self._schedule_remaining(media_id, fingerprint, source, media_obj)
         return "preparing"
 
+    async def prioritize_audio_rendition(
+        self,
+        media_id: str,
+        media_obj: Any,
+        source: ResolvedMediaSource,
+        rendition_name: str,
+    ) -> str:
+        """Move one requested audio track ahead of background rendition work."""
+
+        media_obj = self.snapshot_media(media_obj)
+        fingerprint = str(media_obj.source_fingerprint or source.fingerprint)
+        rendition = next((item for item in self.audio_renditions(media_obj) if item.name == rendition_name), None)
+        if not rendition:
+            raise PlaybackPreparationError("RENDITION_NOT_FOUND", "The requested audio track does not exist for this source.")
+        current_status = self.rendition_status(media_id, fingerprint, rendition_name)
+        if current_status in {"streamable", "ready"}:
+            return current_status
+
+        requested_key = f"{media_id}:{fingerprint}:{rendition_name}"
+        await self._preempt_background_jobs({requested_key})
+        if self.playlist_ready(media_id, fingerprint, rendition_name):
+            await self.rebuild_master(media_id, fingerprint, media_obj)
+            return "streamable"
+        self._schedule_audio(
+            media_id,
+            fingerprint,
+            source,
+            rendition,
+            media_obj,
+            FOREGROUND_PRIORITY,
+            retry_errors=True,
+        )
+        self._schedule_remaining(media_id, fingerprint, source, media_obj)
+        return "preparing"
+
     def _schedule_remaining(
         self,
         media_id: str,

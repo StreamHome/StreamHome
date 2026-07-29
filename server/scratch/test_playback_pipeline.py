@@ -139,6 +139,49 @@ class PlaybackPipelineRegression(unittest.TestCase):
         self.assertEqual(cinematic_renditions[0].height, 800)
         self.assertEqual(cinematic_renditions[0].label, "1080p")
 
+    def test_requested_audio_is_promoted_to_foreground_work(self) -> None:
+        service = PlaybackPrepService()
+        source = ResolvedMediaSource(
+            catalog_path=self.catalog_path,
+            relative_path=self.catalog_path.removeprefix("/media/"),
+            local_path=self.media_file,
+            cloud_path=None,
+            local_exists=True,
+            cloud_exists=False,
+        )
+        media = SimpleNamespace(
+            id="m_audio_priority",
+            source_fingerprint=source.fingerprint,
+            probed_duration=5.0,
+            container="mov,mp4",
+            codec="h264",
+            width=640,
+            height=360,
+            frame_rate=24.0,
+            quality="360p",
+            audio_metadata=[
+                {"index": 0, "language": "eng", "label": "English", "default": True, "source": "embedded"},
+                {"index": 1, "language": "tur", "label": "Turkish", "default": False, "source": "external", "fileName": "tr.aac"},
+            ],
+            languages=["eng", "tur"],
+        )
+        scheduled = []
+
+        async def run() -> str:
+            with (
+                patch.object(service, "_preempt_background_jobs", new=AsyncMock()) as preempt,
+                patch.object(service, "_schedule_audio", side_effect=lambda *args, **kwargs: scheduled.append((args, kwargs))),
+                patch.object(service, "_schedule_remaining"),
+                patch.object(service, "playlist_ready", return_value=False),
+            ):
+                status = await service.prioritize_audio_rendition(media.id, media, source, "audio_1_tr")
+                preempt.assert_awaited_once_with({f"{media.id}:{source.fingerprint}:audio_1_tr"})
+                return status
+
+        self.assertEqual(asyncio.run(run()), "preparing")
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(scheduled[0][0][3].name, "audio_1_tr")
+
     def test_rendition_status_distinguishes_streamable_complete_and_failed(self) -> None:
         media_id = f"m_status_{uuid.uuid4().hex}"
         fingerprint = "a" * 32

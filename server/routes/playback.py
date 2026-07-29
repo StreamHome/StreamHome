@@ -76,6 +76,8 @@ class PlaybackTrack(APIModel):
     language: str
     channels: int
     default: bool
+    source: Literal["embedded", "external"]
+    stream_index: int
     ready: bool
     status: Literal["preparing", "streamable", "ready", "failed"]
 
@@ -107,6 +109,7 @@ class PlaybackRunResponse(APIModel):
     media_id: str
     movie_id: str
     episode_id: Optional[str] = None
+    source_fingerprint: str
     resume_position: float
     source_metadata: PlaybackSourceMetadata
     tracks: list[PlaybackTrack]
@@ -338,6 +341,23 @@ async def synchronize_source_fingerprint(db: AsyncSession, media_obj: Any, sourc
     media_obj.source_fingerprint = fingerprint
     db.add(media_obj)
     await db.commit()
+    if source.local_exists:
+        metadata_path = source.local_path.parent / ".metadata" / "metadata.json"
+        try:
+            if metadata_path.is_file():
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                payload["audio_metadata"] = list(media_obj.audio_metadata or [])
+                payload["source_fingerprint"] = fingerprint
+                languages = [
+                    normalize_language_tag(item.get("language"))
+                    for item in (media_obj.audio_metadata or [])
+                ]
+                payload["languages"] = list(dict.fromkeys([*languages, *(payload.get("languages") or [])]))
+                temporary = metadata_path.with_suffix(f"{metadata_path.suffix}.tmp")
+                temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+                os.replace(temporary, metadata_path)
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            logger.warning(f"[Playback Metadata] Could not synchronize {metadata_path}: {exc}")
 
 
 async def ensure_source_metadata(
@@ -357,12 +377,16 @@ async def ensure_source_metadata(
                 db.add(media_obj)
                 await db.commit()
         return
-    refreshed_audio = merge_local_external_audio(str(source.local_path), list(media_obj.audio_metadata or []))
-    if refreshed_audio != list(media_obj.audio_metadata or []):
+    previous_audio = list(media_obj.audio_metadata or [])
+    refreshed_audio = merge_local_external_audio(str(source.local_path), previous_audio)
+    audio_changed = refreshed_audio != previous_audio
+    if audio_changed:
         media_obj.audio_metadata = refreshed_audio
         db.add(media_obj)
         await db.commit()
     metadata_missing = not media_obj.probed_duration or not media_obj.codec or not media_obj.width or not media_obj.height
+    if audio_changed and not metadata_missing:
+        return
     source_replaced = media_obj.source_fingerprint != playback_source_fingerprint(source, media_obj.audio_metadata or [])
     if not metadata_missing and not source_replaced:
         return
@@ -467,6 +491,8 @@ def track_contract(media_obj: Any, media_id: str, fingerprint: str) -> list[Play
             language=item.language,
             channels=channel_by_index.get(item.stream_index, 2),
             default=item.default,
+            source="external" if item.source == "external" else "embedded",
+            stream_index=item.stream_index,
             ready=rendition_status in {"streamable", "ready"},
             status=rendition_status,
         ))
@@ -550,6 +576,7 @@ async def build_run_response(
             media_id=media_obj.id,
             movie_id=run.movie_id,
             episode_id=run.episode_id,
+            source_fingerprint=fingerprint,
             resume_position=0,
             source_metadata=PlaybackSourceMetadata(
                 duration=duration,
@@ -612,6 +639,7 @@ async def build_run_response(
         media_id=media_obj.id,
         movie_id=run.movie_id,
         episode_id=run.episode_id,
+        source_fingerprint=fingerprint,
         resume_position=initial_resume_position,
         source_metadata=source_metadata(media_obj),
         tracks=track_contract(media_obj, media_obj.id, fingerprint),
@@ -661,7 +689,7 @@ async def create_playback_run(
     else:
         try:
             source = await require_available_source(media_obj)
-            await ensure_source_metadata(db, media_obj, source, refresh_sidecars=True)
+            await ensure_source_metadata(db, media_obj, source)
             await synchronize_source_fingerprint(db, media_obj, source)
         except HTTPException as source_error:
             detail = source_error.detail if isinstance(source_error.detail, dict) else {}
@@ -901,12 +929,21 @@ async def prioritize_playback_rendition(
     await ensure_source_metadata(db, media_obj, source)
     await synchronize_source_fingerprint(db, media_obj, source)
     try:
-        rendition_status = await playback_prep_service.prioritize_video_rendition(
-            media_obj.id,
-            media_obj,
-            source,
-            rendition_id,
-        )
+        audio_names = {item.name for item in playback_prep_service.audio_renditions(media_obj)}
+        if rendition_id in audio_names:
+            rendition_status = await playback_prep_service.prioritize_audio_rendition(
+                media_obj.id,
+                media_obj,
+                source,
+                rendition_id,
+            )
+        else:
+            rendition_status = await playback_prep_service.prioritize_video_rendition(
+                media_obj.id,
+                media_obj,
+                source,
+                rendition_id,
+            )
     except PlaybackPreparationError as exc:
         raise playback_error(status.HTTP_404_NOT_FOUND, exc.code, str(exc)) from exc
     return {"status": rendition_status}

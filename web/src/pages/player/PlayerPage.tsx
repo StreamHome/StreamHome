@@ -1,10 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import Hls from "hls.js";
+import type Hls from "hls.js";
 import { useLocation, useNavigate } from "react-router-dom";
 
 import { ApiError } from "../../api/client";
-import { getEpisodes, getMovies } from "../../api/movies";
+import { getEpisodes, getMovie } from "../../api/movies";
 import {
   createPlaybackRun,
   getPlaybackRun,
@@ -110,6 +110,8 @@ interface PlayerAudioOption {
   label: string;
   language: string;
   index: number;
+  source: PlaybackAudioTrack["source"];
+  default: boolean;
   status: PlaybackAudioTrack["status"];
 }
 
@@ -316,6 +318,21 @@ export function canUseProgressiveCompatibility(metadata: PlaybackRunResponse["so
   return ["h264", "avc", "avc1"].includes(codec) && formats.some((item) => ["mp4", "mov", "mov,mp4", "m4v"].includes(item));
 }
 
+export function progressiveAudioTrack(
+  tracks: PlaybackAudioTrack[],
+  preferredTrackId: string,
+  preferredLanguage: string,
+): PlaybackAudioTrack | null {
+  const embedded = tracks.filter((track) => track.source === "embedded");
+  if (embedded.length === 0) return null;
+  const preferred = tracks.find((track) => track.id === preferredTrackId)
+    ?? tracks.find((track) => normalizeLanguageTag(track.language) === normalizeLanguageTag(preferredLanguage, ""));
+  if (preferred && preferred.source !== "embedded") return null;
+  return preferred && preferred.source === "embedded"
+    ? preferred
+    : embedded.find((track) => track.default) ?? embedded[0];
+}
+
 export function progressSequenceWasAccepted(requestSequence: number, nextSequence: number): boolean {
   return nextSequence > requestSequence;
 }
@@ -357,6 +374,10 @@ export function mergePlaybackRunMetadata(
   active: PlaybackRunResponse,
   refreshed: PlaybackRunResponse,
 ): PlaybackRunResponse {
+  if (
+    active.sourceFingerprint !== refreshed.sourceFingerprint
+    || (!active.manifestUrl && refreshed.manifestUrl)
+  ) return refreshed;
   return {
     ...refreshed,
     ticket: active.ticket,
@@ -417,6 +438,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const lastFrameCanvasRef = useRef<HTMLCanvasElement>(null);
   const timelineRef = useRef<HTMLInputElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const hlsAudioOptionsRef = useRef<PlayerAudioOption[]>([]);
+  const hlsQualityOptionsRef = useRef<ReturnType<typeof playbackQualityOptions>>([]);
   const controlsTimerRef = useRef<number | null>(null);
   const desktopClickTimerRef = useRef<number | null>(null);
   const seekSettlementTimerRef = useRef<number | null>(null);
@@ -456,6 +479,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [runResponse, setRunResponse] = useState<PlaybackRunResponse | null>(null);
   const [phase, setPhase] = useState<PlayerPhase>("resolving");
   const [streamMode, setStreamMode] = useState<StreamMode>("hls");
+  const [hlsEngine, setHlsEngine] = useState<typeof import("hls.js").default | null>(null);
   const [transportRevision, setTransportRevision] = useState(0);
   const [fatal, setFatal] = useState<FatalState | null>(null);
   const [retryVersion, setRetryVersion] = useState(0);
@@ -478,6 +502,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [timelinePreview, setTimelinePreview] = useState<{ x: number; time: number } | null>(null);
   const [fullscreenActive, setFullscreenActive] = useState(false);
   const [fullscreenError, setFullscreenError] = useState("");
+  const [playerNotice, setPlayerNotice] = useState("");
   const [hasLastFrame, setHasLastFrame] = useState(false);
   const [mobilePlayer, setMobilePlayer] = useState(() => typeof window !== "undefined" && isPhonePlayerViewport(readMobileViewport(window)));
   const [forcedLandscape, setForcedLandscape] = useState(() => typeof window !== "undefined" && isForcedLandscape(window.innerWidth, window.innerHeight, isPhonePlayerViewport(readMobileViewport(window))));
@@ -497,6 +522,25 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     const timer = window.setInterval(update, 1_000);
     return () => window.clearInterval(timer);
   }, [phase]);
+
+  useEffect(() => {
+    if (!playerNotice) return;
+    const timer = window.setTimeout(() => setPlayerNotice(""), 4_000);
+    return () => window.clearTimeout(timer);
+  }, [playerNotice]);
+
+  useEffect(() => {
+    if (!runResponse?.manifestUrl || hlsEngine) return;
+    let active = true;
+    void import("hls.js").then((module) => {
+      if (active) setHlsEngine(() => module.default);
+    }).catch(() => {
+      if (active) setPlayerNotice("The adaptive playback engine could not be loaded.");
+    });
+    return () => {
+      active = false;
+    };
+  }, [hlsEngine, runResponse?.manifestUrl]);
 
   const exitPlayer = useCallback(() => {
     unlockPlayerLandscape();
@@ -596,6 +640,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     setSelectedQualityId("auto");
     setAvailableAudioTracks([]);
     setSelectedAudioTrackId("");
+    setPlayerNotice("");
+    hlsAudioOptionsRef.current = [];
+    hlsQualityOptionsRef.current = [];
     setControlMenuOpen(false);
     setTimelineScrubbing(false);
     setShowControls(true);
@@ -624,46 +671,24 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     mediaRecoveriesRef.current = 0;
 
     const resolveAssetAndCreateRun = async (): Promise<ResolvedPlayback> => {
-      const catalog = await getMovies(undefined, abort.signal);
       let resolvedAsset: PlayableAsset;
       let sequence: Episode[] = [];
       let response: PlaybackRunResponse;
       if (mediaId.startsWith("m_")) {
-        const movie = catalog.find((item) => item.id === mediaId);
-        if (!movie) throw new Error("This movie is not present in the server catalog.");
+        const movie = await getMovie(mediaId, abort.signal);
         resolvedAsset = assetFromMovie(movie);
         response = await createPlaybackRun(movie.id, profile.id, undefined, abort.signal);
       } else if (mediaId.startsWith("ep_")) {
-        let matchedMovie: Movie | null = null;
-        let matchedEpisode: Episode | null = null;
-        for (const movie of catalog.filter((item) => item.type === "series")) {
-          const embedded = movie.episodes?.find((episode) => episode.id === mediaId);
-          if (embedded) {
-            matchedMovie = movie;
-            matchedEpisode = embedded;
-            break;
-          }
-        }
-        if (!matchedMovie || !matchedEpisode) {
-          const tmdbId = episodeTmdbId(mediaId);
-          if (tmdbId !== null) {
-            const movie = catalog.find((item) => item.id === `tv_${tmdbId}`);
-            if (movie) {
-              const episodes = await getEpisodes(tmdbId, abort.signal);
-              const episode = episodes.find((item) => item.id === mediaId);
-              if (episode) {
-                matchedMovie = movie;
-                matchedEpisode = episode;
-              }
-            }
-          }
-        }
+        const tmdbId = episodeTmdbId(mediaId);
+        if (tmdbId === null) throw new Error("This episode has an invalid catalog identity.");
+        const matchedMovie = await getMovie(`tv_${tmdbId}`, abort.signal);
+        const sequenceResult = matchedMovie.episodes?.length
+          ? matchedMovie.episodes
+          : await getEpisodes(tmdbId, abort.signal);
+        const matchedEpisode = sequenceResult.find((item) => item.id === mediaId) ?? null;
         if (!matchedMovie || !matchedEpisode) throw new Error("This episode is not present in the server catalog.");
         resolvedAsset = assetFromEpisode(matchedMovie, matchedEpisode);
-        const tmdbId = episodeTmdbId(mediaId);
-        sequence = tmdbId === null
-          ? matchedMovie.episodes ?? [matchedEpisode]
-          : await getEpisodes(tmdbId, abort.signal).catch(() => matchedMovie!.episodes ?? [matchedEpisode!]);
+        sequence = sequenceResult;
         response = await createPlaybackRun(matchedMovie.id, profile.id, matchedEpisode.id, abort.signal);
       } else {
         throw new Error("Choose a playable item before opening the player.");
@@ -676,6 +701,20 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       resumePositionRef.current = response.resumePosition;
       setCurrentTime(response.resumePosition);
       currentTimeRef.current = response.resumePosition;
+      const immediateProgressiveTrack = progressiveAudioTrack(
+        response.tracks,
+        preferences.audioTrackId,
+        preferences.audioLanguage,
+      );
+      if (
+        response.preparationState === "preparing"
+        && response.progressiveUrl
+        && canUseProgressiveCompatibility(response.sourceMetadata)
+        && immediateProgressiveTrack
+      ) {
+        setStreamMode("progressive");
+        return { asset: resolvedAsset, episodeSequence: sequence, runResponse: response };
+      }
       if (response.preparationState === "preparing") {
         setPhase("preparing");
         const started = performance.now();
@@ -782,27 +821,39 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     video.removeAttribute("src");
     video.load();
 
-    let readyAudioIndex = 0;
     const serverAudioTracks = runResponse.tracks
       .map((track) => ({
         id: track.id,
         label: languageDisplayName(track.language, track.label),
         language: normalizeLanguageTag(track.language),
-        index: track.ready ? readyAudioIndex++ : -1,
+        index: -1,
+        source: track.source,
+        default: track.default,
         status: track.status,
       }));
     setAvailableAudioTracks(serverAudioTracks);
     const serverPreferredAudio = serverAudioTracks.find((track) => track.id === preferences.audioTrackId)
       ?? serverAudioTracks.find((track) => track.language === preferences.audioLanguage)
+      ?? serverAudioTracks.find((track) => track.default)
       ?? serverAudioTracks[0];
-    setSelectedAudioTrackId(serverPreferredAudio?.id ?? "");
+    const progressiveTrack = progressiveAudioTrack(runResponse.tracks, preferences.audioTrackId, preferences.audioLanguage);
+    setSelectedAudioTrackId(
+      streamMode === "progressive"
+        ? progressiveTrack?.id ?? ""
+        : serverAudioTracks.find((track) => track.default)?.id ?? serverAudioTracks[0]?.id ?? "",
+    );
+    if (serverPreferredAudio && serverPreferredAudio.id !== selectedAudioTrackId) {
+      pendingAudioSelectionRef.current = serverPreferredAudio.id;
+    }
 
     const beginPlayback = () => {
       const resumeReady = applyResume(video);
       video.playbackRate = preferences.playbackRate;
       if (!resumeReady) {
         setPhase("recovering");
-        if (streamMode !== "progressive" && canUseProgressiveCompatibility(runResponse.sourceMetadata)) {
+        const activeTrack = runResponse.tracks.find((track) => track.id === selectedAudioTrackId);
+        const progressiveSafe = !activeTrack || (activeTrack.source === "embedded" && activeTrack.default);
+        if (streamMode !== "progressive" && progressiveSafe && canUseProgressiveCompatibility(runResponse.sourceMetadata)) {
           setStreamMode("progressive");
         }
         return;
@@ -828,9 +879,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       };
     }
 
-    if (Hls.isSupported() && runResponse.manifestUrl) {
+    const HlsRuntime = hlsEngine;
+    if (HlsRuntime?.isSupported() && runResponse.manifestUrl) {
       setStreamMode("hls");
-      const hls = new Hls({
+      const hls = new HlsRuntime({
         enableWorker: true,
         capLevelToPlayerSize: true,
         startLevel: -1,
@@ -844,9 +896,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       });
       hlsRef.current = hls;
       hls.attachMedia(video);
-      hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(runResponse.manifestUrl!));
-      hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+      hls.on(HlsRuntime.Events.MEDIA_ATTACHED, () => hls.loadSource(runResponse.manifestUrl!));
+      hls.on(HlsRuntime.Events.MANIFEST_PARSED, (_, data) => {
         const options = playbackQualityOptions(runResponse.renditions, data.levels);
+        hlsQualityOptionsRef.current = options;
         setAvailableQualities(options);
         const requestedQuality = pendingQualitySelectionRef.current
           ? options.find((item) => item.id === pendingQualitySelectionRef.current && item.ready)
@@ -856,11 +909,24 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           ? options[0]
           : readyOptions.reduce((best, item) => Math.abs(Number(item.height) - Number(preferences.qualityHeight)) < Math.abs(Number(best.height) - Number(preferences.qualityHeight)) ? item : best));
         hls.currentLevel = preferred?.index ?? -1;
-        setSelectedQualityId(preferred?.id ?? "auto");
-        if (requestedQuality) pendingQualitySelectionRef.current = null;
+        if ((preferred?.index ?? -1) < 0) setSelectedQualityId("auto");
         beginPlayback();
       });
-      hls.on(Hls.Events.LEVEL_UPDATED, () => {
+      hls.on(HlsRuntime.Events.LEVEL_SWITCHING, () => {
+        setPlayerNotice("Switching video quality…");
+      });
+      hls.on(HlsRuntime.Events.LEVEL_SWITCHED, (_, data) => {
+        const selected = hlsQualityOptionsRef.current.find((item) => item.index === data.level);
+        const requestedQuality = pendingQualitySelectionRef.current;
+        const automatic = requestedQuality === "auto"
+          || (requestedQuality === null && preferences.qualityHeight === "auto");
+        const selectedId = automatic ? "auto" : selected?.id ?? "auto";
+        setSelectedQualityId(selectedId);
+        pendingQualitySelectionRef.current = null;
+        setPreferences((current) => ({ ...current, qualityHeight: automatic ? "auto" : selected?.height ?? "auto" }));
+        setPlayerNotice(automatic ? "Automatic quality active" : selected ? `${selected.label} quality active` : "Automatic quality active");
+      });
+      hls.on(HlsRuntime.Events.LEVEL_UPDATED, () => {
         if (resumeAppliedRef.current || !applyResume(video)) return;
         transportResettingRef.current = false;
         if (resumePlaybackAfterResetRef.current || !mobilePlayer) {
@@ -870,7 +936,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           setPhase("paused");
         }
       });
-      hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_, data) => {
+      hls.on(HlsRuntime.Events.AUDIO_TRACKS_UPDATED, (_, data) => {
         const matchedIndexes = matchAudioTrackIndexes(runResponse.tracks, data.audioTracks);
         const tracks = runResponse.tracks.map((serverTrack, serverIndex) => {
           const language = normalizeLanguageTag(serverTrack.language);
@@ -879,9 +945,12 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             label: languageDisplayName(serverTrack.language, serverTrack.label),
             language,
             index: matchedIndexes[serverIndex],
+            source: serverTrack.source,
+            default: serverTrack.default,
             status: serverTrack.status,
           };
         });
+        hlsAudioOptionsRef.current = tracks;
         setAvailableAudioTracks(tracks);
         const requestedTrack = pendingAudioSelectionRef.current
           ? tracks.find((track) => track.id === pendingAudioSelectionRef.current && track.index >= 0)
@@ -892,20 +961,35 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           || tracks.find((track) => track.index >= 0);
         if (preferredTrack) {
           hls.audioTrack = preferredTrack.index;
-          setSelectedAudioTrackId(preferredTrack.id);
-          if (requestedTrack) pendingAudioSelectionRef.current = null;
+          if (preferredTrack.id !== selectedAudioTrackId) setPlayerNotice(`Switching audio to ${preferredTrack.label}…`);
         }
       });
-      hls.on(Hls.Events.ERROR, (_, data) => {
+      hls.on(HlsRuntime.Events.AUDIO_TRACK_SWITCHING, (_, data) => {
+        const selected = hlsAudioOptionsRef.current.find((track) => track.index === data.id);
+        if (selected) setPlayerNotice(`Switching audio to ${selected.label}…`);
+      });
+      hls.on(HlsRuntime.Events.AUDIO_TRACK_SWITCHED, (_, data) => {
+        const selected = hlsAudioOptionsRef.current.find((track) => track.index === data.id);
+        if (!selected) return;
+        setSelectedAudioTrackId(selected.id);
+        pendingAudioSelectionRef.current = null;
+        setPreferences((current) => ({
+          ...current,
+          audioTrackId: selected.id,
+          audioLanguage: normalizeLanguageTag(selected.language, ""),
+        }));
+        setPlayerNotice(`${selected.label} audio active`);
+      });
+      hls.on(HlsRuntime.Events.ERROR, (_, data) => {
         if (!data.fatal) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetriesRef.current < NETWORK_RETRY_LIMIT) {
+        if (data.type === HlsRuntime.ErrorTypes.NETWORK_ERROR && networkRetriesRef.current < NETWORK_RETRY_LIMIT) {
           networkRetriesRef.current += 1;
           setPhase("recovering");
           captureLastFrame(true);
           window.setTimeout(() => hls.startLoad(currentTimeRef.current), 500 * networkRetriesRef.current);
           return;
         }
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveriesRef.current < MEDIA_RECOVERY_LIMIT) {
+        if (data.type === HlsRuntime.ErrorTypes.MEDIA_ERROR && mediaRecoveriesRef.current < MEDIA_RECOVERY_LIMIT) {
           mediaRecoveriesRef.current += 1;
           setPhase("recovering");
           hls.recoverMediaError();
@@ -913,7 +997,18 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }
         captureLastFrame(true);
         resumePositionRef.current = currentTimeRef.current;
+        const selectedTrack = runResponse.tracks.find((track) => track.id === selectedAudioTrackId);
+        if (selectedTrack && (!selectedTrack.default || selectedTrack.source === "external")) {
+          setFatal({
+            title: "Selected audio interrupted",
+            message: `${selectedTrack.label} requires adaptive playback, which could not recover. Retry to keep this audio track selected.`,
+            retryable: true,
+          });
+          setPhase("fatal");
+          return;
+        }
         setPhase("recovering");
+        setPlayerNotice("Adaptive playback failed; using the compatible source audio.");
         setStreamMode("progressive");
       });
       return () => {
@@ -938,8 +1033,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       };
     }
 
-    setStreamMode("progressive");
-  }, [applyResume, captureLastFrame, mobilePlayer, runResponse?.manifestUrl, runResponse?.progressiveUrl, runResponse?.runId, streamMode, transportRevision]);
+    if (runResponse.manifestUrl && !hlsEngine) return;
+    const selectedTrack = runResponse.tracks.find((track) => track.id === selectedAudioTrackId);
+    const progressiveSafe = !selectedTrack || (selectedTrack.source === "embedded" && selectedTrack.default);
+    if (progressiveSafe && canUseProgressiveCompatibility(runResponse.sourceMetadata)) {
+      setStreamMode("progressive");
+    }
+  }, [applyResume, captureLastFrame, hlsEngine, mobilePlayer, runResponse?.manifestUrl, runResponse?.progressiveUrl, runResponse?.runId, streamMode, transportRevision]);
 
   useEffect(() => {
     if (!runResponse || !profile || visualFixture) return;
@@ -991,15 +1091,17 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         label: languageDisplayName(track.language, track.label),
         language: normalizeLanguageTag(track.language),
         index: existing?.index ?? -1,
+        source: track.source,
+        default: track.default,
         status: track.status,
       };
     }));
   }, [runResponse?.renditions, runResponse?.tracks]);
 
   useEffect(() => {
-    if (!runResponse || runResponse.preparationState !== "ready" || visualFixture) return;
+    if (!runResponse || visualFixture) return;
     const pendingRenditions = [...runResponse.renditions, ...runResponse.tracks].some((item) => item.status === "preparing");
-    if (!pendingRenditions) return;
+    if (runResponse.preparationState !== "preparing" && !pendingRenditions) return;
     const abort = new AbortController();
     let attempts = 0;
     let timer: number | null = null;
@@ -1019,18 +1121,33 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             ? refreshed.tracks.find((item) => item.id === pendingAudioSelectionRef.current)
             : undefined;
           setRunResponse((active) => active?.runId === refreshed.runId ? mergePlaybackRunMetadata(active, refreshed) : active);
-          if (requestedQuality?.ready || requestedAudio?.ready) setTransportRevision((value) => value + 1);
+          if (
+            requestedQuality?.ready
+            || requestedAudio?.ready
+            || refreshed.sourceFingerprint !== runResponse.sourceFingerprint
+          ) setTransportRevision((value) => value + 1);
+          if ((requestedQuality?.ready || requestedAudio?.ready) && refreshed.manifestUrl) {
+            setStreamMode("hls");
+          }
           if (requestedQuality?.status === "failed") pendingQualitySelectionRef.current = null;
-          if (requestedAudio?.status === "failed") pendingAudioSelectionRef.current = null;
+          if (requestedAudio?.status === "failed") {
+            pendingAudioSelectionRef.current = null;
+            setPlayerNotice(`${requestedAudio.label} audio could not be prepared.`);
+          }
           return;
         }
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return;
       }
-      if (attempts < 720 && !abort.signal.aborted) timer = window.setTimeout(poll, attempts < 24 ? 5_000 : 15_000);
+      if (attempts < 720 && !abort.signal.aborted) {
+        const delay = runResponse.preparationState === "preparing"
+          ? attempts < 8 ? 500 : 1_500
+          : attempts < 24 ? 5_000 : 15_000;
+        timer = window.setTimeout(poll, delay);
+      }
     };
 
-    timer = window.setTimeout(poll, 5_000);
+    timer = window.setTimeout(poll, runResponse.preparationState === "preparing" ? 250 : 5_000);
     return () => {
       abort.abort();
       if (timer !== null) window.clearTimeout(timer);
@@ -1357,9 +1474,17 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
   const togglePictureInPicture = useCallback(() => {
     const video = videoRef.current;
-    if (!video || !document.pictureInPictureEnabled) return;
+    if (!video || !document.pictureInPictureEnabled) {
+      setPlayerNotice("Picture-in-picture is not available in this browser.");
+      return;
+    }
     const operation = document.pictureInPictureElement ? document.exitPictureInPicture() : video.requestPictureInPicture();
-    void operation.catch(() => undefined);
+    void operation
+      .then(() => setPlayerNotice(document.pictureInPictureElement ? "Picture-in-picture active" : "Picture-in-picture closed"))
+      .catch((error: unknown) => {
+        setPlayerNotice(error instanceof Error ? error.message : "Picture-in-picture could not be opened.");
+        setShowControls(true);
+      });
   }, []);
 
   const startOver = useCallback(() => {
@@ -1570,14 +1695,28 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const changeQuality = (renditionId: string) => {
     const selected = availableQualities.find((item) => item.id === renditionId);
     if (!selected) return;
-    setSelectedQualityId(renditionId);
-    setPreferences((current) => ({ ...current, qualityHeight: selected.height }));
-    if (selected.ready) {
-      if (hlsRef.current) hlsRef.current.currentLevel = selected.index;
+    pendingQualitySelectionRef.current = renditionId;
+    setPlayerNotice(renditionId === "auto" ? "Enabling automatic quality…" : `Switching quality to ${selected.label}…`);
+    if (renditionId === "auto") {
+      if (hlsRef.current) hlsRef.current.currentLevel = -1;
+      setSelectedQualityId("auto");
+      setPreferences((current) => ({ ...current, qualityHeight: "auto" }));
       return;
     }
-    if (!runResponse || renditionId === "auto") return;
-    pendingQualitySelectionRef.current = renditionId;
+    if (selected.ready) {
+      if (hlsRef.current) {
+        hlsRef.current.currentLevel = selected.index;
+      } else if (runResponse?.manifestUrl) {
+        captureLastFrame(true);
+        resumePositionRef.current = currentTimeRef.current;
+        resumeAppliedRef.current = false;
+        transportResettingRef.current = true;
+        setStreamMode("hls");
+        setTransportRevision((value) => value + 1);
+      }
+      return;
+    }
+    if (!runResponse) return;
     if (selected.index < 0 && ["streamable", "ready"].includes(selected.status)) {
       captureLastFrame(true);
       resumePositionRef.current = currentTimeRef.current;
@@ -1593,6 +1732,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     } : current);
     void preparePlaybackRendition(runResponse.runId, renditionId).catch(() => {
       pendingQualitySelectionRef.current = null;
+      setPlayerNotice(`${selected.label} quality could not be prepared.`);
       setAvailableQualities((current) => current.map((item) => item.id === renditionId ? { ...item, status: "failed" } : item));
       setRunResponse((current) => current ? {
         ...current,
@@ -1603,31 +1743,56 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
   const changeAudio = (trackId: string) => {
     const selected = availableAudioTracks.find((item) => item.id === trackId);
-    if (!selected) return;
-    setSelectedAudioTrackId(trackId);
-    setPreferences((current) => ({
-      ...current,
-      audioTrackId: selected.id,
-      audioLanguage: normalizeLanguageTag(selected.language, ""),
-    }));
-    if (selected.index < 0) {
-      pendingAudioSelectionRef.current = trackId;
-      if (["streamable", "ready"].includes(selected.status)) {
-        captureLastFrame(true);
-        resumePositionRef.current = currentTimeRef.current;
-        resumeAppliedRef.current = false;
-        transportResettingRef.current = true;
-        setTransportRevision((value) => value + 1);
-      }
+    if (!selected || selected.id === selectedAudioTrackId) return;
+    pendingAudioSelectionRef.current = trackId;
+    setPlayerNotice(
+      selected.status === "preparing"
+        ? `Preparing ${selected.label} audio…`
+        : `Switching audio to ${selected.label}…`,
+    );
+    if (hlsRef.current && selected.index >= 0) {
+      hlsRef.current.audioTrack = selected.index;
       return;
     }
-    if (hlsRef.current) hlsRef.current.audioTrack = selected.index;
     const nativeTracks = (videoRef.current as HTMLVideoElement & { audioTracks?: ArrayLike<{ enabled: boolean }> } | null)?.audioTracks;
-    if (nativeTracks) {
+    if (streamMode === "native-hls" && nativeTracks && selected.index >= 0) {
       for (let trackIndex = 0; trackIndex < nativeTracks.length; trackIndex += 1) {
         nativeTracks[trackIndex].enabled = trackIndex === selected.index;
       }
+      setSelectedAudioTrackId(selected.id);
+      pendingAudioSelectionRef.current = null;
+      setPreferences((current) => ({
+        ...current,
+        audioTrackId: selected.id,
+        audioLanguage: normalizeLanguageTag(selected.language, ""),
+      }));
+      setPlayerNotice(`${selected.label} audio active`);
+      return;
     }
+    if (runResponse?.manifestUrl && ["streamable", "ready"].includes(selected.status)) {
+      captureLastFrame(true);
+      resumePositionRef.current = currentTimeRef.current;
+      resumeAppliedRef.current = false;
+      transportResettingRef.current = true;
+      setStreamMode("hls");
+      setTransportRevision((value) => value + 1);
+      return;
+    }
+    if (!runResponse) return;
+    setAvailableAudioTracks((current) => current.map((item) => item.id === trackId ? { ...item, status: "preparing" } : item));
+    setRunResponse((current) => current ? {
+      ...current,
+      tracks: current.tracks.map((item) => item.id === trackId ? { ...item, status: "preparing" } : item),
+    } : current);
+    void preparePlaybackRendition(runResponse.runId, trackId).catch(() => {
+      pendingAudioSelectionRef.current = null;
+      setPlayerNotice(`${selected.label} audio could not be prepared.`);
+      setAvailableAudioTracks((current) => current.map((item) => item.id === trackId ? { ...item, status: "failed" } : item));
+      setRunResponse((current) => current ? {
+        ...current,
+        tracks: current.tracks.map((item) => item.id === trackId ? { ...item, status: "failed" } : item),
+      } : current);
+    });
   };
 
   const retryPlayback = () => {
@@ -1967,6 +2132,20 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             exit={reduced ? { opacity: 0 } : { opacity: 0, y: -8 }}
           >
             {fullscreenError}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {playerNotice && !fullscreenError && (
+          <motion.div
+            className="pointer-events-none absolute left-1/2 top-[max(1rem,env(safe-area-inset-top))] z-[55] w-[min(92vw,34rem)] -translate-x-1/2 rounded-lg border border-white/15 bg-black/85 px-4 py-3 text-center text-sm text-white/85 shadow-2xl backdrop-blur-md"
+            role="status"
+            initial={reduced ? { opacity: 0 } : { opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={reduced ? { opacity: 0 } : { opacity: 0, y: -8 }}
+          >
+            {playerNotice}
           </motion.div>
         )}
       </AnimatePresence>

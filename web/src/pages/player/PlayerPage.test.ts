@@ -13,6 +13,7 @@ import {
   nextPlayableEpisode,
   preparationStatusMessage,
   playbackQualityOptions,
+  progressiveAudioTrack,
   progressSequenceWasAccepted,
   shouldAutoHidePlayerControls,
   shouldAcceptObservedPlaybackTime,
@@ -103,6 +104,16 @@ describe("player interaction contracts", () => {
     expect(canUseProgressiveCompatibility({ ...metadata, container: "matroska", sourceFormat: "MKV" })).toBe(false);
   });
 
+  it("uses progressive playback only when the preferred audio is embedded", () => {
+    const tracks = [
+      { id: "audio_0_en", label: "English", language: "en", channels: 2, default: true, source: "embedded", streamIndex: 0, ready: true, status: "ready" },
+      { id: "audio_0_tr", label: "Turkish", language: "tr", channels: 2, default: false, source: "external", streamIndex: 0, ready: true, status: "ready" },
+    ] as const;
+    expect(progressiveAudioTrack([...tracks], "", "")?.id).toBe("audio_0_en");
+    expect(progressiveAudioTrack([...tracks], "audio_0_en", "en")?.id).toBe("audio_0_en");
+    expect(progressiveAudioTrack([...tracks], "audio_0_tr", "tr")).toBeNull();
+  });
+
   it("maps same-language audio tracks by stable rendition identity without reusing an index", () => {
     const indexes = matchAudioTrackIndexes([
       { id: "audio_0_en", language: "en", label: "English main" },
@@ -122,6 +133,7 @@ describe("player interaction contracts", () => {
   it("merges rendition status without replacing the active transport ticket or URLs", () => {
     const active = {
       runId: "run-1",
+      sourceFingerprint: "fingerprint-a",
       ticket: "active-ticket",
       ticketExpiresAt: 100,
       manifestUrl: "/manifest?ticket=active",
@@ -143,6 +155,47 @@ describe("player interaction contracts", () => {
     expect(merged.manifestUrl).toBe("/manifest?ticket=active");
     expect(merged.progressiveUrl).toBe("/progressive?ticket=active");
     expect(merged.renditions[0]?.status).toBe("ready");
+  });
+
+  it("replaces transport tickets and URLs when the source fingerprint changes", () => {
+    const active = {
+      runId: "run-1",
+      sourceFingerprint: "fingerprint-a",
+      ticket: "active-ticket",
+      ticketExpiresAt: 100,
+      manifestUrl: "/manifest?ticket=active",
+      progressiveUrl: "/progressive?ticket=active",
+    } as unknown as PlaybackRunResponse;
+    const refreshed = {
+      ...active,
+      sourceFingerprint: "fingerprint-b",
+      ticket: "replacement-ticket",
+      ticketExpiresAt: 200,
+      manifestUrl: "/manifest?ticket=replacement",
+      progressiveUrl: "/progressive?ticket=replacement",
+    };
+
+    expect(mergePlaybackRunMetadata(active, refreshed)).toEqual(refreshed);
+  });
+
+  it("accepts a newly ready manifest instead of preserving an initial null URL", () => {
+    const active = {
+      runId: "run-1",
+      sourceFingerprint: "fingerprint-a",
+      ticket: "initial-ticket",
+      ticketExpiresAt: 100,
+      manifestUrl: null,
+      progressiveUrl: "/progressive?ticket=initial",
+    } as unknown as PlaybackRunResponse;
+    const refreshed = {
+      ...active,
+      ticket: "ready-ticket",
+      ticketExpiresAt: 200,
+      manifestUrl: "/manifest?ticket=ready",
+      progressiveUrl: "/progressive?ticket=ready",
+    };
+
+    expect(mergePlaybackRunMetadata(active, refreshed)).toEqual(refreshed);
   });
 
   it("auto-hides only during uninterrupted playback", () => {

@@ -28,6 +28,7 @@ const fixturePlayback: ResolvedPlayback = {
     mediaId: "m_player_visual_fixture",
     movieId: "m_player_visual_fixture",
     episodeId: null,
+    sourceFingerprint: "visual-fixture-dual-audio-v1",
     resumePosition: 0,
     sourceMetadata: {
       duration: 6240,
@@ -39,8 +40,8 @@ const fixturePlayback: ResolvedPlayback = {
       sourceFormat: "MP4",
     },
     tracks: [
-      { id: "audio_0_en", label: "English", language: "en", channels: 2, default: true, ready: true, status: "ready" },
-      { id: "audio_1_tr", label: "Turkish", language: "tr", channels: 2, default: false, ready: true, status: "ready" },
+      { id: "audio_en", label: "English · 440 Hz", language: "en", channels: 2, default: true, source: "embedded", streamIndex: 0, ready: true, status: "ready" },
+      { id: "audio_tr", label: "Turkish · 880 Hz", language: "tr", channels: 2, default: false, source: "external", streamIndex: 0, ready: true, status: "ready" },
     ],
     renditions: [
       { id: "video_original", label: "1080p", height: 1080, width: 1920, original: true, ready: true, status: "ready" },
@@ -53,7 +54,7 @@ const fixturePlayback: ResolvedPlayback = {
     subtitles: [],
     ticket: "player-visual-fixture-ticket",
     ticketExpiresAt: 4_102_444_800,
-    manifestUrl: null,
+    manifestUrl: "/__player-visual-fixture/master.m3u8",
     progressiveUrl: "/__player-visual-fixture.mp4",
     nextEpisodeId: null,
     preparationState: "ready",

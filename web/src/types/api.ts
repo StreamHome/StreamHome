@@ -483,6 +483,8 @@ export interface PlaybackAudioTrack {
   language: string;
   channels: number;
   default: boolean;
+  source: "embedded" | "external";
+  streamIndex: number;
   ready: boolean;
   status: PlaybackRenditionStatus;
 }
@@ -547,6 +549,7 @@ export interface PlaybackRunResponse {
   mediaId: string;
   movieId: string;
   episodeId: string | null;
+  sourceFingerprint: string;
   resumePosition: number;
   sourceMetadata: PlaybackSourceMetadata;
   tracks: PlaybackAudioTrack[];
