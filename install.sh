@@ -169,9 +169,11 @@ prepare_existing_checkout() {
 }
 
 existing_runtime_ready() {
-    local python_bin="$INSTALL_DIR/venv/bin/python" web_port
+    local python_bin="$INSTALL_DIR/venv/bin/python" web_port expected_build
     [[ -x "$python_bin" ]] || python_bin="$(command -v python3 || true)"
     [[ -n "$python_bin" ]] || return 1
+    expected_build="$(git -C "$INSTALL_DIR" rev-parse --short=12 HEAD 2>/dev/null || true)"
+    [[ -n "$expected_build" ]] || return 1
     web_port="$(
         awk -F= '
             /^[[:space:]]*WEB_PORT[[:space:]]*=/ {
@@ -186,7 +188,7 @@ existing_runtime_ready() {
     )"
     [[ -n "$web_port" ]] || web_port=3000
     [[ "$web_port" =~ ^[0-9]+$ ]] || return 1
-    "$python_bin" - "$web_port" <<'PY'
+    "$python_bin" - "$web_port" "$expected_build" <<'PY'
 import json
 import sys
 import urllib.request
@@ -195,26 +197,41 @@ opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 try:
     with opener.open("http://127.0.0.1:8000/api/health", timeout=1.5) as response:
         payload = json.loads(response.read().decode("utf-8"))
-        if response.status >= 400 or payload.get("status") != "ready":
+        if (
+            response.status >= 400
+            or payload.get("status") != "ready"
+            or payload.get("buildId") != sys.argv[2]
+        ):
             raise SystemExit(1)
     with opener.open(f"http://127.0.0.1:{int(sys.argv[1])}/", timeout=1.5) as response:
-        raise SystemExit(0 if 200 <= response.status < 400 else 1)
+        web_build = str(response.headers.get("X-StreamHome-Web-Build") or "")
+        raise SystemExit(0 if 200 <= response.status < 400 and web_build == sys.argv[2] else 1)
 except Exception:
     raise SystemExit(1)
 PY
 }
 
 recover_current_installation() {
-    [[ "$NO_START" == false && "$EXISTING_ALREADY_CURRENT" == true ]] || return 0
-    if existing_runtime_ready; then
-        log "The existing StreamHome services are already healthy"
+    local -a setup_args=(--no-start)
+    [[ "$EXISTING_ALREADY_CURRENT" == true ]] || return 0
+    if [[ "$NO_START" == false ]] && existing_runtime_ready; then
+        log "The existing StreamHome services already match the current release"
         return 0
     fi
-    log "The checkout is current but its services are unhealthy; starting recovery"
+    [[ "$SKIP_SYSTEM_PACKAGES" == true ]] && setup_args+=(--skip-system-packages)
+    log "The checkout is current but its prepared runtime is stale or unhealthy; repairing it incrementally"
+    (
+        cd "$INSTALL_DIR"
+        ./setup.sh "${setup_args[@]}"
+    ) || fail "The current checkout could not be prepared. Review the setup error above; existing data was not removed."
+    if [[ "$NO_START" == true ]]; then
+        log "The current StreamHome release was prepared and left stopped by request"
+        return 0
+    fi
     "$INSTALL_DIR/start.sh" \
         || fail "The installed release is current, but StreamHome could not be recovered. Review backend.log, frontend.log, update.log, and restart.log."
     existing_runtime_ready \
-        || fail "StreamHome started without restoring both local health endpoints."
+        || fail "StreamHome started without serving the exact current API and web build."
     log "The current StreamHome release was recovered successfully"
 }
 

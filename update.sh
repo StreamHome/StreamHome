@@ -16,6 +16,7 @@ UPDATE_HEARTBEAT_PID=""
 PRESERVE_MAINTENANCE=false
 PRESERVE_RECOVERY_ARTIFACTS=false
 CUTOVER_STARTED=false
+ACTIVATION_STARTED=false
 RUNTIME_HEALTHY=true
 RECOVERY_IN_PROGRESS=false
 WEB_ARTIFACTS_SWAPPED=false
@@ -36,6 +37,23 @@ MANUAL_CUTOVER=false
 START_AFTER_UPDATE=true
 PUBLIC_URL=""
 PUBLIC_ORIGIN_WAS_READY=false
+
+usage() {
+    cat <<'EOF'
+StreamHome update
+
+Usage:
+  ./update.sh [--no-start]
+  ./update.sh --help
+
+The public command fetches the configured official branch and runs the same
+isolated, preflighted, health-gated update path as the bootstrap installer.
+
+Options:
+  --no-start  Install and prepare the update, but leave StreamHome stopped.
+  --help      Show this help text.
+EOF
+}
 
 log() {
     printf '[StreamHome Update] %s\n' "$1"
@@ -416,9 +434,16 @@ cleanup() {
     trap - EXIT INT TERM HUP
     if [[ "$CUTOVER_STARTED" == true && "$RUNTIME_HEALTHY" == false && "$RECOVERY_IN_PROGRESS" == false ]]; then
         RECOVERY_IN_PROGRESS=true
-        log "The update controller exited during cutover; starting emergency rollback."
-        if ! rollback_release; then
-            record_rollback_failure
+        if [[ "$ACTIVATION_STARTED" == true ]]; then
+            log "The update controller exited after activation began; starting emergency rollback."
+            if ! rollback_release; then
+                record_rollback_failure
+            fi
+        else
+            log "The update controller exited before activation; recovering the unchanged installed release."
+            recover_unchanged_release \
+                "The update stopped before activation. The installed release was not changed." \
+                "pre_activation_interrupted" || true
         fi
     fi
     if [[ "$PRESERVE_MAINTENANCE" == false ]]; then
@@ -923,8 +948,29 @@ rollback_release() {
     fi
     RUNTIME_HEALTHY=true
     CUTOVER_STARTED=false
+    ACTIVATION_STARTED=false
     write_state "rolled_back" "The update failed, and the previous healthy release was restored." "update_rolled_back" "$TARGET_COMMIT" "$OLD_COMMIT"
     return 0
+}
+
+recover_unchanged_release() {
+    local message="$1" error="$2"
+    stop_maintenance
+    if "$ROOT_DIR/start.sh" --update-recovery-complete; then
+        RUNTIME_HEALTHY=true
+        CUTOVER_STARTED=false
+        ACTIVATION_STARTED=false
+        write_state "failed" "$message The existing release remains installed and healthy." "$error" "$TARGET_COMMIT" "$OLD_COMMIT"
+        return 0
+    fi
+    RUNTIME_HEALTHY=false
+    CUTOVER_STARTED=false
+    ACTIVATION_STARTED=false
+    write_state "failed" "$message Automatic startup recovery remains available." "$error" "$TARGET_COMMIT" "$OLD_COMMIT"
+    if start_maintenance; then
+        PRESERVE_MAINTENANCE=true
+    fi
+    return 1
 }
 
 record_rollback_failure() {
@@ -1218,32 +1264,26 @@ execute_update() {
     CUTOVER_STARTED=true
     RUNTIME_HEALTHY=false
     if ! stop_installed_runtime_with_target_lifecycle; then
-        if "$ROOT_DIR/start.sh" --update-recovery-complete; then
-            RUNTIME_HEALTHY=true
-            CUTOVER_STARTED=false
-        fi
-        write_state "failed" "StreamHome did not stop cleanly. The update was not applied." "shutdown_failed" "$TARGET_COMMIT"
+        recover_unchanged_release \
+            "StreamHome did not stop cleanly, so the update was not applied." \
+            "shutdown_failed" || true
         return 1
     fi
     if ! start_maintenance; then
-        if "$ROOT_DIR/start.sh" --update-recovery-complete; then
-            RUNTIME_HEALTHY=true
-            CUTOVER_STARTED=false
-        fi
-        write_state "failed" "The maintenance responder could not start. The update was not applied." "maintenance_start_failed" "$TARGET_COMMIT"
+        recover_unchanged_release \
+            "The maintenance responder could not start, so the update was not applied." \
+            "maintenance_start_failed" || true
         return 1
     fi
     if ! create_database_checkpoint; then
-        stop_maintenance
-        if "$ROOT_DIR/start.sh" --update-recovery-complete; then
-            RUNTIME_HEALTHY=true
-            CUTOVER_STARTED=false
-        fi
-        write_state "failed" "The database recovery checkpoint failed. The update was not applied." "database_checkpoint_failed" "$TARGET_COMMIT"
+        recover_unchanged_release \
+            "The database recovery checkpoint failed, so the update was not applied." \
+            "database_checkpoint_failed" || true
         return 1
     fi
 
     write_state "installing" "Activating the exact preflighted commit and prepared runtime assets."
+    ACTIVATION_STARTED=true
     if ! git -C "$ROOT_DIR" status --porcelain --untracked-files=normal | grep -q .; then
         :
     else
@@ -1280,6 +1320,7 @@ execute_update() {
         rm -f -- "$RUN_DIR/pre-update-database.db"
         RUNTIME_HEALTHY=true
         CUTOVER_STARTED=false
+        ACTIVATION_STARTED=false
         write_state "succeeded" "Update installed successfully. StreamHome was left stopped by explicit --no-start request." "" "" "$TARGET_COMMIT"
         log "Update completed successfully at ${TARGET_COMMIT:0:12}; startup was skipped by request."
         return 0
@@ -1300,12 +1341,28 @@ execute_update() {
     record_prepared_setup_state
     RUNTIME_HEALTHY=true
     CUTOVER_STARTED=false
+    ACTIVATION_STARTED=false
     rm -f -- "$RUN_DIR/pre-update-database.db"
     write_state "succeeded" "Update installed successfully; both StreamHome services passed health checks." "" "" "$TARGET_COMMIT"
     log "Update completed successfully at ${TARGET_COMMIT:0:12}."
 }
 
 case "${1:-}" in
+    "")
+        update_branch="$(read_env "$ORIGINAL_ROOT/server/.env" UPDATE_BRANCH main)"
+        exec env \
+            STREAMHOME_INSTALL_DIR="$ORIGINAL_ROOT" \
+            STREAMHOME_REF="${STREAMHOME_REF:-$update_branch}" \
+            bash "$ORIGINAL_ROOT/install.sh"
+        ;;
+    --no-start)
+        [[ $# -eq 1 ]] || exit 2
+        update_branch="$(read_env "$ORIGINAL_ROOT/server/.env" UPDATE_BRANCH main)"
+        exec env \
+            STREAMHOME_INSTALL_DIR="$ORIGINAL_ROOT" \
+            STREAMHOME_REF="${STREAMHOME_REF:-$update_branch}" \
+            bash "$ORIGINAL_ROOT/install.sh" --no-start
+        ;;
     --classify-changes)
         [[ $# -eq 4 ]] || exit 2
         OLD_COMMIT="$2"
@@ -1359,10 +1416,10 @@ case "${1:-}" in
         serve_recovery_maintenance
         ;;
     --help|-h)
-        printf 'StreamHome detached, preflighted, health-gated update controller.\n'
+        usage
         ;;
     *)
-        printf 'Use the StreamHome admin center to manage updates.\n' >&2
+        printf 'Unknown update argument: %s (use --help for usage)\n' "$1" >&2
         exit 2
         ;;
 esac

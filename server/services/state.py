@@ -7,7 +7,8 @@ from typing import Dict, Any, Union
 # task_id -> {"progress": float, "speed": str, "eta": str}
 ACTIVE_DOWNLOAD_METRICS: Dict[str, Dict[str, Any]] = {}
 
-# In-memory process registry tracking active FFmpeg subprocesses:
+# In-memory process registry tracking active media subprocesses such as FFmpeg
+# and Rclone. Update cutover must fail closed while any registered process exists.
 # task_id -> asyncio.subprocess.Process or subprocess.Popen object reference
 ACTIVE_PROCESSES: Dict[str, Union[asyncio.subprocess.Process, subprocess.Popen]] = {}
 
@@ -80,7 +81,7 @@ def remove_task_metrics(task_id: str):
         pass
 
 def register_process(task_id: str, process: asyncio.subprocess.Process):
-    """Registers an active subprocess reference to prevent zombie processes on deletion."""
+    """Register an active media subprocess for cancellation and update safety."""
     ACTIVE_PROCESSES[task_id] = process
 
 def unregister_process(task_id: str):

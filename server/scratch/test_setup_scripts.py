@@ -47,7 +47,7 @@ def create_fixture_repository(directory: Path) -> None:
     git(["config", "user.email", "setup-test@streamhome.invalid"], cwd=directory)
     git(["config", "user.name", "StreamHome Setup Test"], cwd=directory)
     files = {
-        ".gitignore": ".setup-ran\n.setup-args\n",
+        ".gitignore": ".setup-ran\n.setup-args\n.runtime-ready\n",
         "setup.sh": (
             "#!/usr/bin/env bash\n"
             "set -e\n"
@@ -164,6 +164,11 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("hashlib.sha256", setup_sh)
         self.assertIn("do not repeat setup", setup_sh)
         self.assertIn('"$ROOT_DIR/stop.sh" --quiet', setup_sh)
+        self.assertIn(
+            '&& [[ -s "$ROOT_DIR/web/dist/index.html" ]] \\\n'
+            "        && web_build_marker_matches",
+            setup_sh,
+        )
 
         self.assertIn('setsid bash "$SCRIPT_PATH" --execute', restart_sh)
         self.assertIn("-u STREAMHOME_INSTANCE_ROOT", restart_sh)
@@ -177,6 +182,9 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("handoff.wait", setup_py)
 
         self.assertNotIn("--queue", update_sh)
+        self.assertIn('bash "$ORIGINAL_ROOT/install.sh"', update_sh)
+        self.assertIn('STREAMHOME_INSTALL_DIR="$ORIGINAL_ROOT"', update_sh)
+        self.assertNotIn("Use the StreamHome admin center to manage updates.", update_sh)
         self.assertIn("--manual-execute", update_sh)
         self.assertIn("--classify-changes", update_sh)
         self.assertIn("preflight_target", update_sh)
@@ -210,6 +218,9 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("restore_previous_web", update_sh)
         self.assertIn("emergency rollback", update_sh)
         self.assertIn("rollback_release", update_sh)
+        self.assertIn("recover_unchanged_release", update_sh)
+        self.assertIn("ACTIVATION_STARTED=true", update_sh)
+        self.assertLess(update_sh.index("if ! create_database_checkpoint; then"), update_sh.index("ACTIVATION_STARTED=true"))
         self.assertIn("recover_interrupted_release", update_sh)
         self.assertIn('git -C "$ROOT_DIR" reset --hard "$OLD_COMMIT"', update_sh)
         self.assertIn('"$ROOT_DIR/start.sh"', update_sh)
@@ -280,6 +291,9 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn('"$ROOT_DIR/restart.sh"', test_sh)
         self.assertIn('"$ROOT_DIR/update.sh"', test_sh)
         self.assertIn("git -C \"$ROOT_DIR\" ls-files '*.sh'", test_sh)
+        self.assertIn('for candidate in "${scripts[@]}"; do', test_sh)
+        self.assertIn('bash -n "$candidate"', test_sh)
+        self.assertNotIn('bash -n "${scripts[@]}"', test_sh)
 
         self.assertIn("./venv/bin/python server/cli.py", cli_py)
         self.assertNotIn("start.bat", cli_py)
@@ -435,8 +449,25 @@ class SetupScriptContracts(unittest.TestCase):
             recovered = run([bash, "-lc", f"'{bash_path(installer)}'"], cwd=root, env=environment)
             self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
             self.assertTrue((install_directory / ".runtime-ready").is_file())
-            self.assertIn("checkout is current but its services are unhealthy", recovered.stdout)
+            self.assertEqual(
+                (install_directory / ".setup-args").read_text(encoding="utf-8").splitlines(),
+                ["--no-start"],
+            )
+            self.assertIn("prepared runtime is stale or unhealthy", recovered.stdout)
             self.assertIn("recovered successfully", recovered.stdout)
+
+            (install_directory / ".setup-ran").unlink()
+            prepared_only = run(
+                [bash, "-lc", f"'{bash_path(installer)}' --no-start"],
+                cwd=root,
+                env=environment,
+            )
+            self.assertEqual(prepared_only.returncode, 0, prepared_only.stdout + prepared_only.stderr)
+            self.assertEqual(
+                (install_directory / ".setup-args").read_text(encoding="utf-8").splitlines(),
+                ["--no-start"],
+            )
+            self.assertIn("prepared and left stopped by request", prepared_only.stdout)
 
             (install_directory / ".setup-ran").unlink()
             local_change = install_directory / "local-change.txt"

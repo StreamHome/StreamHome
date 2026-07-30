@@ -310,8 +310,7 @@ async def lifespan(app: FastAPI):
         background_task.cancel()
     if background_tasks:
         await asyncio.gather(*background_tasks, return_exceptions=True)
-    for playback_task in list(playback_prep_service.active_jobs.values()):
-        playback_task.cancel()
+    await playback_prep_service.shutdown()
     
     try:
         await queue_manager.stop()

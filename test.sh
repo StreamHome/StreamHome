@@ -121,7 +121,9 @@ run_shell_checks() {
         [[ "$known" == true ]] || scripts+=("$candidate")
     done < <(git -C "$ROOT_DIR" ls-files '*.sh')
     CURRENT_STEP="Bash syntax validation"
-    bash -n "${scripts[@]}"
+    for candidate in "${scripts[@]}"; do
+        bash -n "$candidate"
+    done
     if command -v shellcheck >/dev/null 2>&1; then
         CURRENT_STEP="ShellCheck validation"
         shellcheck -x "${scripts[@]}"

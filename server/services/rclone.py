@@ -15,6 +15,7 @@ from typing import AsyncIterator, Optional
 from config import settings
 from services.logger import logger
 from services.secret_crypto import protect_secret, reveal_secret
+from services.state import register_process, unregister_process
 
 
 REMOTE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
@@ -139,16 +140,34 @@ class RcloneService:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            process_key = f"rclone:{process.pid}:{id(process)}"
+            register_process(process_key, process)
             try:
                 stdout, stderr = await asyncio.wait_for(process.communicate(input_data), timeout=timeout)
             except asyncio.TimeoutError:
                 process.kill()
-                await process.wait()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    logger.error(f"[Rclone] Timed out reaping process {process.pid} after a command timeout.")
                 return RcloneResult(124, error_code="rclone_timeout")
             except asyncio.CancelledError:
                 process.kill()
-                await process.wait()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    logger.error(f"[Rclone] Timed out reaping cancelled process {process.pid}.")
                 raise
+            except Exception:
+                if process.returncode is None:
+                    process.kill()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        logger.error(f"[Rclone] Timed out reaping failed process {process.pid}.")
+                raise
+            finally:
+                unregister_process(process_key)
         stdout_text = stdout.decode("utf-8", errors="replace")[-output_limit:]
         stderr_text = stderr.decode("utf-8", errors="replace")[-output_limit:]
         return RcloneResult(
@@ -169,6 +188,8 @@ class RcloneService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
+        process_key = f"rclone:{process.pid}:{id(process)}"
+        register_process(process_key, process)
 
         async def chunks() -> AsyncIterator[bytes]:
             try:
@@ -179,7 +200,11 @@ class RcloneService:
             finally:
                 if process.returncode is None:
                     process.kill()
-                    await process.wait()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        logger.error(f"[Rclone] Timed out reaping streaming process {process.pid}.")
+                unregister_process(process_key)
 
         return process, chunks()
 

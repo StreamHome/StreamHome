@@ -102,7 +102,7 @@ def _policy_response() -> UpdatePolicyResponse:
 
 async def _status_response() -> UpdateStatusResponse:
     persisted = read_update_state()
-    installed_commit = str(persisted.get("current_commit") or "") or await current_commit()
+    installed_commit = await current_commit() or str(persisted.get("current_commit") or "")
     install_mode = str(persisted.get("install_mode") or "when_idle")
     if install_mode not in {"automatic", "when_idle", "now"}:
         install_mode = "when_idle"

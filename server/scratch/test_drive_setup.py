@@ -30,6 +30,7 @@ from routes.setup import (
     unlock_setup,
     validate_tmdb,
 )
+from services import state
 from services.rclone import RcloneConfigEncryptionError, RcloneResult, RcloneService
 
 
@@ -349,6 +350,29 @@ class SetupUnlockResumeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RcloneActivationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_is_registered_as_active_media_work_until_reaped(self):
+        service = RcloneService()
+        process = SimpleNamespace(pid=4321, returncode=0)
+
+        async def communicate(_input):
+            self.assertTrue(any(active is process for active in state.ACTIVE_PROCESSES.values()))
+            return b"ready", b""
+
+        process.communicate = communicate
+        process.kill = lambda: None
+        process.wait = AsyncMock(return_value=0)
+        state.ACTIVE_PROCESSES.clear()
+
+        with (
+            patch.object(service, "command", return_value=["rclone", "version"]),
+            patch("services.rclone.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+        ):
+            result = await service.run("version")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.stdout, "ready")
+        self.assertEqual(state.ACTIVE_PROCESSES, {})
+
     async def test_encryption_failure_never_installs_plaintext_config(self):
         service = RcloneService()
         with tempfile.TemporaryDirectory() as directory:

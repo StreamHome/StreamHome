@@ -868,6 +868,22 @@ class PlaybackPipelineRegression(unittest.TestCase):
         finally:
             shutil.rmtree(cache_path.parent, ignore_errors=True)
 
+    def test_shutdown_cancels_and_boundedly_waits_for_active_preparation(self) -> None:
+        service = PlaybackPrepService()
+
+        async def run() -> None:
+            blocker = asyncio.Event()
+            task = asyncio.create_task(blocker.wait())
+            service.active_jobs["shutdown-regression"] = task
+            await asyncio.sleep(0)
+
+            await service.shutdown(timeout=0.5)
+
+            self.assertTrue(task.cancelled())
+            service.active_jobs.clear()
+
+        asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

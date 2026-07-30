@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from config import settings
+from routes import update as update_route
 from services import state
 from services import update
 
@@ -39,6 +40,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         state.ACTIVE_PROCESSES.clear()
         state.BROWSER_PRESENCE.clear()
         update.queue_manager.active_tasks.clear()
+        update.playback_prep_service.active_jobs.clear()
         settings.SETUP_COMPLETE = True
 
     def tearDown(self) -> None:
@@ -49,6 +51,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
             settings.UPDATE_MAINTENANCE_START,
             settings.UPDATE_MAINTENANCE_END,
         ) = self.original_settings
+        update.playback_prep_service.active_jobs.clear()
         for active_patch in reversed(self.patches):
             active_patch.stop()
         self.temporary.cleanup()
@@ -99,7 +102,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("browser session" in blocker for blocker in blockers))
         self.assertTrue(any("active API request" in blocker for blocker in blockers))
         self.assertTrue(any("required idle minutes" in blocker for blocker in blockers))
-        self.assertTrue(any("active media process" in blocker for blocker in blockers))
+        self.assertTrue(any("active media operation" in blocker for blocker in blockers))
         self.assertTrue(any("playback, ingestion, or download" in blocker for blocker in blockers))
 
         state.record_browser_presence("session-1", False)
@@ -108,6 +111,36 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         state.ACTIVE_PROCESSES.clear()
         with patch.object(update, "is_database_idle", AsyncMock(return_value=True)):
             self.assertEqual(await update.idle_blockers(), [])
+
+    async def test_playback_preparation_blocks_idle_and_protected_cutover(self) -> None:
+        update.playback_prep_service.active_jobs["movie:fingerprint:video_720"] = object()  # type: ignore[assignment]
+
+        with patch.object(update, "is_database_idle", AsyncMock(return_value=True)):
+            idle = await update.idle_blockers()
+        protected = await update.protected_cutover_blockers()
+
+        self.assertTrue(any("1 active media operation" in blocker for blocker in idle))
+        self.assertTrue(any("1 active media operation" in blocker for blocker in protected))
+
+    async def test_status_reports_the_checked_out_commit_over_stale_persisted_state(self) -> None:
+        actual = "c" * 40
+        update.write_update_state(
+            phase="failed",
+            message="Previous update failed",
+            current_commit="a" * 40,
+            target_commit="b" * 40,
+            error="pre_activation_interrupted",
+        )
+
+        with (
+            patch.object(update_route, "current_commit", AsyncMock(return_value=actual)),
+            patch.object(update_route, "idle_blockers", AsyncMock(return_value=[])),
+            patch.object(update_route, "read_update_log", return_value=[]),
+            patch.object(update_route, "update_lock_active", return_value=False),
+        ):
+            response = await update_route._status_response()
+
+        self.assertEqual(response.current_commit, actual)
 
     async def test_failed_target_requires_an_explicit_manual_retry(self) -> None:
         target = "b" * 40
@@ -339,7 +372,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         update.queue_manager.active_tasks.add("download-1")
         blockers = await update.protected_cutover_blockers()
         self.assertTrue(any("active API request" in blocker for blocker in blockers))
-        self.assertTrue(any("active media process" in blocker for blocker in blockers))
+        self.assertTrue(any("active media operation" in blocker for blocker in blockers))
         self.assertTrue(any("ingestion or download" in blocker for blocker in blockers))
 
     async def test_update_check_reports_fetch_failure_instead_of_no_update(self) -> None:

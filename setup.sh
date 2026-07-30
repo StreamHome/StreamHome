@@ -423,7 +423,7 @@ prepare_web() {
     build_fingerprint="$(web_build_fingerprint "$dependency_fingerprint")"
     if [[ "$web_dependencies_rebuilt" == false ]] \
         && stamp_matches "$build_stamp" "$build_fingerprint" \
-        && [[ -s "$ROOT_DIR/web/dist/index.html" ]]
+        && [[ -s "$ROOT_DIR/web/dist/index.html" ]] \
         && web_build_marker_matches "$build_id"
     then
         log "Frontend build inputs are unchanged; keeping the existing production assets"

@@ -1116,6 +1116,21 @@ class PlaybackPrepService:
             if key.startswith(prefix):
                 task.cancel()
 
+    async def shutdown(self, timeout: float = 8.0) -> None:
+        """Cancel adaptive preparation and wait a bounded time for child cleanup."""
+
+        tasks = list(self.active_jobs.values())
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return
+        _, pending = await asyncio.wait(tasks, timeout=max(0.1, timeout))
+        if pending:
+            logger.error(
+                f"[Playback Prep] {len(pending)} preparation task(s) did not stop "
+                f"within {timeout:.1f} seconds; lifecycle cleanup will terminate their process group."
+            )
+
     def recover_interrupted_outputs(self) -> None:
         if not self.cache_dir.exists():
             return

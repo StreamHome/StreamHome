@@ -15,6 +15,7 @@ from typing import Any
 from config import settings
 from services.backup import BACKUP_LOCK, is_database_idle
 from services.logger import logger
+from services.playback_prep import playback_prep_service
 from services.queue import queue_manager
 import services.state as state
 
@@ -314,6 +315,12 @@ def _minutes_since_http_activity() -> float:
     return max(0.0, (time.time() - state.LAST_HTTP_ACTIVITY_TIMESTAMP) / 60)
 
 
+def active_media_work_count() -> int:
+    """Count registered subprocesses and scheduled adaptive preparation work."""
+
+    return len(state.ACTIVE_PROCESSES) + len(playback_prep_service.active_jobs)
+
+
 async def idle_blockers() -> list[str]:
     blockers: list[str] = []
     browsers = state.active_browser_sessions()
@@ -326,16 +333,15 @@ async def idle_blockers() -> list[str]:
         blockers.append(
             f"only {int(idle_minutes)} of {settings.UPDATE_IDLE_MINUTES} required idle minutes elapsed"
         )
-    if state.ACTIVE_PROCESSES:
-        blockers.append(f"{len(state.ACTIVE_PROCESSES)} active media process{'es' if len(state.ACTIVE_PROCESSES) != 1 else ''}")
+    media_work = active_media_work_count()
+    if media_work:
+        blockers.append(f"{media_work} active media operation{'s' if media_work != 1 else ''}")
     if BACKUP_LOCK.locked():
         blockers.append("a backup or restore operation is active")
     if not await is_database_idle():
         blockers.append("playback, ingestion, or download activity is present")
     if BACKUP_LOCK.locked() and "a backup or restore operation is active" not in blockers:
         blockers.append("a backup or restore operation is active")
-    if state.ACTIVE_PROCESSES and not any("active media process" in blocker for blocker in blockers):
-        blockers.append(f"{len(state.ACTIVE_PROCESSES)} active media process{'es' if len(state.ACTIVE_PROCESSES) != 1 else ''}")
     return blockers
 
 
@@ -344,8 +350,9 @@ async def protected_cutover_blockers() -> list[str]:
     blockers: list[str] = []
     if state.ACTIVE_HTTP_REQUESTS:
         blockers.append(f"{state.ACTIVE_HTTP_REQUESTS} active API request{'s' if state.ACTIVE_HTTP_REQUESTS != 1 else ''}")
-    if state.ACTIVE_PROCESSES:
-        blockers.append(f"{len(state.ACTIVE_PROCESSES)} active media process{'es' if len(state.ACTIVE_PROCESSES) != 1 else ''}")
+    media_work = active_media_work_count()
+    if media_work:
+        blockers.append(f"{media_work} active media operation{'s' if media_work != 1 else ''}")
     if BACKUP_LOCK.locked():
         blockers.append("a backup or restore operation is active")
     if queue_manager.active_tasks:
