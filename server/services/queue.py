@@ -756,7 +756,8 @@ class DownloadQueueManager:
                     if os.path.exists(vtt_abs):
                         subs_on_disk.append({
                             "language": sub_lang,
-                            "ext": ".vtt"
+                            "ext": ".vtt",
+                            "fileName": f"subtitle_{sub_lang}.vtt",
                         })
 
             duration_str = meta.get("duration", "1h 30m")
@@ -941,7 +942,8 @@ class DownloadQueueManager:
                     if os.path.exists(vtt_abs):
                         subs_on_disk.append({
                             "language": sub_lang,
-                            "ext": ".vtt"
+                            "ext": ".vtt",
+                            "fileName": f"subtitle_{sub_lang}.vtt",
                         })
             
             ep_id = f"ep_{tmdb_id}_s{season_num}_e{episode_num}"

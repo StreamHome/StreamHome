@@ -40,6 +40,7 @@ router = APIRouter(prefix="/api/playback", tags=["Playback"])
 PLAYBACK_TICKET_MINUTES = 15
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 SAFE_SUBTITLE_LANGUAGE_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+SAFE_SUBTITLE_FILE_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,180}\.vtt$", re.IGNORECASE)
 ACTIVE_REPAIR_STATUSES = {"PENDING", "DOWNLOADING", "MERGING", "MOVING_CLOUD"}
 REPAIRABLE_PREPARATION_ERRORS = {"MEDIA_SOURCE_MISSING", "CLOUD_STREAM_FAILED", "EMPTY_RENDITION"}
 CLOUD_AUDIO_PROBE_TTL_SECONDS = 300
@@ -519,16 +520,29 @@ def subtitle_track_id(item: dict[str, Any]) -> Optional[str]:
     file_tag = str(item.get("language") or "und").lower()
     if not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(file_tag):
         return None
+    file_name = subtitle_file_name(item)
+    if not file_name:
+        return None
     identity = json.dumps(
         {
             "fileTag": file_tag,
-            "extension": str(item.get("ext") or item.get("extension") or ".vtt").lower(),
-            "fileName": str(item.get("fileName") or item.get("file_name") or "").lower(),
+            "fileName": file_name.lower(),
         },
         sort_keys=True,
         separators=(",", ":"),
     )
     return f"sub_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]}"
+
+
+def subtitle_file_name(item: dict[str, Any]) -> Optional[str]:
+    file_tag = str(item.get("language") or "und").lower()
+    if not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(file_tag):
+        return None
+    explicit = str(item.get("fileName") or item.get("file_name") or "").strip()
+    candidate = explicit or f"subtitle_{file_tag}.vtt"
+    if Path(candidate).name != candidate or not SAFE_SUBTITLE_FILE_RE.fullmatch(candidate):
+        return None
+    return candidate
 
 
 def subtitle_contract(media_obj: Any) -> list[dict[str, str]]:
@@ -1234,13 +1248,13 @@ async def serve_playback_subtitles(
         )
     if not matched_track:
         raise playback_error(status.HTTP_404_NOT_FOUND, "SUBTITLE_NOT_FOUND", "The requested subtitle track is unavailable.")
-    file_tag = str(matched_track.get("language") or "und")
-    if not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(file_tag):
+    file_name = subtitle_file_name(matched_track)
+    if not file_name:
         raise playback_error(status.HTTP_404_NOT_FOUND, "SUBTITLE_NOT_FOUND", "The requested subtitle track is unavailable.")
     source = await require_available_source(media_obj)
-    subtitle_path = source.local_path.parent / f"subtitle_{file_tag}.vtt"
+    subtitle_path = source.local_path.parent / file_name
     if not subtitle_path.is_file() and source.cloud_path:
-        remote_subtitle = f"{source.cloud_path.rsplit('/', 1)[0]}/subtitle_{file_tag}.vtt"
+        remote_subtitle = f"{source.cloud_path.rsplit('/', 1)[0]}/{file_name}"
         cache_path = Path(settings.TEMP_DIR) / "subtitle_cache" / media_id / str(media_obj.source_fingerprint) / f"subtitle_{track_id}.vtt"
         result = await rclone_service.copyto_atomic(remote_subtitle, str(cache_path), timeout=60)
         if result.ok:

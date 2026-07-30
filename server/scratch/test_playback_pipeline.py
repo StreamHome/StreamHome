@@ -12,7 +12,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from config import settings
-from routes.playback import catalog_duration_seconds, media_duration_seconds, parse_byte_range, rewrite_hls_playlist, subtitle_contract
+from routes.playback import (
+    catalog_duration_seconds,
+    media_duration_seconds,
+    parse_byte_range,
+    rewrite_hls_playlist,
+    subtitle_contract,
+    subtitle_file_name,
+)
 from services.languages import normalize_language_tag
 from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
 from services.media_source import MediaSourceError, ResolvedMediaSource, canonicalize_catalog_path, is_safe_presentation_asset, resolve_media_source
@@ -372,6 +379,99 @@ class PlaybackPipelineRegression(unittest.TestCase):
             handle.write(b"\0")
         second_source = asyncio.run(resolve_media_source(catalog_path, check_cloud=False))
         self.assertNotEqual(first_fingerprint, second_source.fingerprint)
+        self.assertEqual(first_source.video_fingerprint, second_source.video_fingerprint)
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = PlaybackPrepService()
+            service.cache_dir = Path(directory)
+            media = SimpleNamespace(width=640, height=360, quality="360p")
+            original = service.cache_path(
+                "m_sidecar_reuse",
+                first_source.video_fingerprint,
+            ) / "video_original"
+            original.mkdir(parents=True)
+            (original / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+            (original / "segment_00000.m4s").write_bytes(b"unchanged-video")
+            (original / ".complete").write_text("done", encoding="utf-8")
+
+            reused = service.reuse_video_renditions(
+                "m_sidecar_reuse",
+                first_source.video_fingerprint,
+                second_source.fingerprint,
+                media,
+            )
+            target = service.cache_path(
+                "m_sidecar_reuse",
+                second_source.fingerprint,
+            ) / "video_original"
+            self.assertEqual(reused, ["video_original"])
+            self.assertEqual((target / "segment_00000.m4s").read_bytes(), b"unchanged-video")
+            self.assertTrue((target / ".complete").is_file())
+
+    def test_verified_source_optimization_preserves_complete_video_and_audio_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = PlaybackPrepService()
+            service.cache_dir = Path(directory)
+            media = SimpleNamespace(
+                width=640,
+                height=360,
+                quality="360p",
+                codec="hevc",
+                audio_metadata=[
+                    {
+                        "index": 0,
+                        "language": "en",
+                        "label": "English",
+                        "codec": "aac",
+                        "default": True,
+                        "source": "embedded",
+                    }
+                ],
+                languages=["en"],
+            )
+            source_fingerprint = "1" * 64
+            target_fingerprint = "2" * 64
+            for rendition_name in ("video_original", "audio_0_en"):
+                rendition = service.cache_path(
+                    "m_verified_optimization",
+                    source_fingerprint,
+                ) / rendition_name
+                rendition.mkdir(parents=True)
+                (rendition / "playlist.m3u8").write_text(
+                    "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_00000.m4s\n",
+                    encoding="utf-8",
+                )
+                (rendition / "init.mp4").write_bytes(b"init")
+                (rendition / "segment_00000.m4s").write_bytes(rendition_name.encode("utf-8"))
+                (rendition / ".complete").write_text("done", encoding="utf-8")
+
+            reused = service.reuse_verified_playback_cache(
+                "m_verified_optimization",
+                source_fingerprint,
+                target_fingerprint,
+                media,
+            )
+            self.assertEqual(set(reused), {"video_original", "audio_0_en"})
+
+            master = asyncio.run(
+                service.rebuild_master(
+                    "m_verified_optimization",
+                    target_fingerprint,
+                    media,
+                )
+            )
+            self.assertIsNotNone(master)
+            master_text = master.read_text(encoding="utf-8")
+            self.assertIn("video_original/playlist.m3u8", master_text)
+            self.assertIn("audio_0_en/playlist.m3u8", master_text)
+            self.assertEqual(
+                (
+                    service.cache_path("m_verified_optimization", target_fingerprint)
+                    / "audio_0_en"
+                    / "segment_00000.m4s"
+                ).read_bytes(),
+                b"audio_0_en",
+            )
 
     def test_cloud_external_dubbing_uses_the_same_language_contract(self) -> None:
         response = SimpleNamespace(
@@ -393,7 +493,8 @@ class PlaybackPipelineRegression(unittest.TestCase):
         self.assertEqual(normalize_language_tag("pt_BR"), "pt-br")
         media = SimpleNamespace(
             subtitles=[
-                {"language": "eng", "ext": ".vtt"},
+                {"language": "eng", "ext": ".vtt", "fileName": "subtitle_eng_main.vtt"},
+                {"language": "eng", "ext": ".vtt", "fileName": "subtitle_eng_commentary.vtt"},
                 {"language": "spa", "ext": ".vtt"},
                 {"language": "fr", "ext": ".vtt"},
                 {"language": "tr", "ext": ".vtt"},
@@ -404,7 +505,10 @@ class PlaybackPipelineRegression(unittest.TestCase):
         self.assertTrue(all(item["id"].startswith("sub_") for item in tracks))
         self.assertEqual([item["id"] for item in tracks], [item["id"] for item in subtitle_contract(media)])
         self.assertEqual(len({item["id"] for item in tracks}), len(tracks))
-        self.assertEqual([item["language"] for item in tracks], ["en", "es", "fr", "tr", "zh-hant-tw"])
+        self.assertEqual([item["language"] for item in tracks], ["en", "en", "es", "fr", "tr", "zh-hant-tw"])
+        self.assertEqual(subtitle_file_name(media.subtitles[0]), "subtitle_eng_main.vtt")
+        self.assertEqual(subtitle_file_name(media.subtitles[1]), "subtitle_eng_commentary.vtt")
+        self.assertIsNone(subtitle_file_name({"language": "eng", "fileName": "../other.vtt"}))
 
     def test_catalog_runtime_is_a_stable_fallback_when_probe_duration_is_missing(self) -> None:
         self.assertEqual(catalog_duration_seconds("1h 44m"), 6240)

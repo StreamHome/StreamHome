@@ -8,7 +8,6 @@ import { getEpisodes, getMovie } from "../../api/movies";
 import {
   createPlaybackRun,
   getPlaybackRun,
-  preparePlaybackRendition,
   startOverPlaybackRun,
   updatePlaybackProgress,
 } from "../../api/playback";
@@ -130,6 +129,7 @@ const NEXT_EPISODE_SECONDS = 10;
 const NETWORK_RETRY_LIMIT = 3;
 const MEDIA_RECOVERY_LIMIT = 2;
 export const PLAYER_CONTROLS_IDLE_MS = 3_000;
+export const PLAYBACK_STARTUP_TIMEOUT_MS = 12_000;
 
 
 function episodeTmdbId(mediaId: string): number | null {
@@ -166,12 +166,16 @@ export function playbackQualityOptions(
         ready: rendition.ready && index >= 0,
         status: rendition.status,
       };
-    });
+    })
+    .filter((option) => option.ready);
   return [{ id: "auto", label: "Auto", height: "auto", index: -1, ready: true, status: "ready" }, ...options];
 }
 
 export function applySubtitleTrackSelection(video: HTMLVideoElement, selectedTrackId: string): void {
   const trackElements = Array.from(video.querySelectorAll<HTMLTrackElement>("track[data-subtitle-id]"));
+  for (let index = 0; index < video.textTracks.length; index += 1) {
+    video.textTracks[index].mode = "disabled";
+  }
   for (const trackElement of trackElements) {
     trackElement.track.mode = selectedTrackId !== "off" && trackElement.dataset.subtitleId === selectedTrackId
       ? "showing"
@@ -180,7 +184,26 @@ export function applySubtitleTrackSelection(video: HTMLVideoElement, selectedTra
 }
 
 export function shouldAutoHidePlayerControls(phase: PlayerPhase, menuOpen: boolean, scrubbing: boolean): boolean {
-  return ["playing", "buffering", "recovering"].includes(phase) && !menuOpen && !scrubbing;
+  return ["playing", "paused", "buffering", "recovering"].includes(phase) && !menuOpen && !scrubbing;
+}
+
+export function shouldResumePlaybackAfterTransport(playRequested: boolean, completed: boolean): boolean {
+  return playRequested && !completed;
+}
+
+export function shouldRetryPlaybackStartup(completedRetries: number): boolean {
+  return completedRetries < 1;
+}
+
+export function isMeaningfulPointerActivity(
+  previous: { x: number; y: number } | null,
+  next: { x: number; y: number },
+  movementX: number,
+  movementY: number,
+): boolean {
+  if (movementX !== 0 || movementY !== 0) return true;
+  if (!previous) return false;
+  return Math.abs(previous.x - next.x) >= 1 || Math.abs(previous.y - next.y) >= 1;
 }
 
 export function catalogDurationSeconds(value: string): number {
@@ -441,15 +464,18 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const hlsAudioOptionsRef = useRef<PlayerAudioOption[]>([]);
   const hlsQualityOptionsRef = useRef<ReturnType<typeof playbackQualityOptions>>([]);
   const controlsTimerRef = useRef<number | null>(null);
+  const playbackStartupTimerRef = useRef<number | null>(null);
+  const playbackStartupRetriesRef = useRef(0);
   const desktopClickTimerRef = useRef<number | null>(null);
   const seekSettlementTimerRef = useRef<number | null>(null);
   const resumePositionRef = useRef(0);
   const currentTimeRef = useRef(0);
   const pendingSeekTargetRef = useRef<number | null>(null);
   const transportResettingRef = useRef(false);
-  const resumePlaybackAfterResetRef = useRef(false);
+  const playbackIntentRef = useRef(true);
   const pendingQualitySelectionRef = useRef<string | null>(null);
   const pendingAudioSelectionRef = useRef<string | null>(null);
+  const selectedAudioTrackIdRef = useRef("");
   const lastFrameCaptureAtRef = useRef(0);
   const hasLastFrameRef = useRef(false);
   const resumeAppliedRef = useRef(false);
@@ -602,6 +628,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [asset, runResponse?.sourceMetadata.duration, streamMode]);
 
   useEffect(() => {
+    const playOnLoad = typeof window === "undefined"
+      ? true
+      : !isPhonePlayerViewport(readMobileViewport(window));
     if (visualFixture) {
       setFatal(null);
       setAsset(visualFixture.asset);
@@ -617,6 +646,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         "progressive",
         0,
       ));
+      playbackIntentRef.current = playOnLoad;
       setPhase(visualFixture.runResponse.preparationState === "preparing" ? "preparing" : "loading");
       return;
     }
@@ -656,7 +686,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     seekSettlementTimerRef.current = null;
     pendingSeekTargetRef.current = null;
     transportResettingRef.current = false;
-    resumePlaybackAfterResetRef.current = false;
+    playbackIntentRef.current = playOnLoad;
+    if (playbackStartupTimerRef.current !== null) window.clearTimeout(playbackStartupTimerRef.current);
+    playbackStartupTimerRef.current = null;
+    playbackStartupRetriesRef.current = 0;
     pendingQualitySelectionRef.current = null;
     pendingAudioSelectionRef.current = null;
     lastFrameCaptureAtRef.current = 0;
@@ -805,9 +838,25 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     return true;
   }, [streamMode]);
 
+  const clearPlaybackStartupWatchdog = useCallback(() => {
+    if (playbackStartupTimerRef.current !== null) {
+      window.clearTimeout(playbackStartupTimerRef.current);
+      playbackStartupTimerRef.current = null;
+    }
+  }, []);
+
+  const markPlaybackStartupReady = useCallback(() => {
+    clearPlaybackStartupWatchdog();
+    playbackStartupRetriesRef.current = 0;
+  }, [clearPlaybackStartupWatchdog]);
+
   useEffect(() => {
     const video = videoRef.current;
-    if (!runResponse || runResponse.preparationState !== "ready" || !video) return;
+    if (!runResponse || !video) return;
+    const transportReady = streamMode === "progressive"
+      ? Boolean(runResponse.progressiveUrl)
+      : runResponse.preparationState === "ready";
+    if (!transportReady) return;
     const preservePosition = currentTimeRef.current || resumePositionRef.current;
     resumePositionRef.current = preservePosition;
     resumeAppliedRef.current = false;
@@ -815,6 +864,42 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     setPhase("loading");
     networkRetriesRef.current = 0;
     mediaRecoveriesRef.current = 0;
+    clearPlaybackStartupWatchdog();
+    playbackStartupTimerRef.current = window.setTimeout(() => {
+      playbackStartupTimerRef.current = null;
+      if (shouldRetryPlaybackStartup(playbackStartupRetriesRef.current)) {
+        playbackStartupRetriesRef.current += 1;
+        captureLastFrame(true);
+        resumePositionRef.current = currentTimeRef.current;
+        resumeAppliedRef.current = false;
+        transportResettingRef.current = true;
+        setPhase("recovering");
+        setPlayerNotice("Playback startup stalled. Refreshing the stream once…");
+        void getPlaybackRun(runResponse.runId, { retry: true })
+          .then((refreshed) => {
+            sequenceNumberRef.current = refreshed.nextSequenceNumber;
+            setRunResponse((current) => current ? mergePlaybackRunMetadata(current, refreshed) : refreshed);
+            setTransportRevision((value) => value + 1);
+          })
+          .catch((error: unknown) => {
+            setFatal({
+              title: "Playback did not start",
+              message: error instanceof Error
+                ? error.message
+                : "The stream could not be refreshed. Retry this title.",
+              retryable: true,
+            });
+            setPhase("fatal");
+          });
+        return;
+      }
+      setFatal({
+        title: "Playback did not start",
+        message: "The server prepared the stream, but the browser did not reach a playable state. Retry this title.",
+        retryable: true,
+      });
+      setPhase("fatal");
+    }, PLAYBACK_STARTUP_TIMEOUT_MS);
 
     hlsRef.current?.destroy();
     hlsRef.current = null;
@@ -822,6 +907,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     video.load();
 
     const serverAudioTracks = runResponse.tracks
+      .filter((track) => ["streamable", "ready"].includes(track.status))
       .map((track) => ({
         id: track.id,
         label: languageDisplayName(track.language, track.label),
@@ -842,7 +928,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         ? progressiveTrack?.id ?? ""
         : serverAudioTracks.find((track) => track.default)?.id ?? serverAudioTracks[0]?.id ?? "",
     );
-    if (serverPreferredAudio && serverPreferredAudio.id !== selectedAudioTrackId) {
+    if (serverPreferredAudio && serverPreferredAudio.id !== selectedAudioTrackIdRef.current) {
       pendingAudioSelectionRef.current = serverPreferredAudio.id;
     }
 
@@ -851,15 +937,17 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       video.playbackRate = preferences.playbackRate;
       if (!resumeReady) {
         setPhase("recovering");
-        const activeTrack = runResponse.tracks.find((track) => track.id === selectedAudioTrackId);
+        const activeTrack = runResponse.tracks.find((track) => track.id === selectedAudioTrackIdRef.current);
         const progressiveSafe = !activeTrack || (activeTrack.source === "embedded" && activeTrack.default);
         if (streamMode !== "progressive" && progressiveSafe && canUseProgressiveCompatibility(runResponse.sourceMetadata)) {
           setStreamMode("progressive");
         }
         return;
       }
-      const shouldResumePlayback = !mobilePlayer || resumePlaybackAfterResetRef.current;
-      resumePlaybackAfterResetRef.current = false;
+      const shouldResumePlayback = shouldResumePlaybackAfterTransport(
+        playbackIntentRef.current,
+        completedRef.current,
+      );
       if (!shouldResumePlayback) {
         setPhase("paused");
         return;
@@ -872,8 +960,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       video.addEventListener("loadedmetadata", beginPlayback, { once: true });
       video.load();
       return () => {
+        clearPlaybackStartupWatchdog();
         captureLastFrame(true);
-        resumePlaybackAfterResetRef.current = !video.paused && !completedRef.current;
         transportResettingRef.current = true;
         video.removeEventListener("loadedmetadata", beginPlayback);
       };
@@ -929,8 +1017,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       hls.on(HlsRuntime.Events.LEVEL_UPDATED, () => {
         if (resumeAppliedRef.current || !applyResume(video)) return;
         transportResettingRef.current = false;
-        if (resumePlaybackAfterResetRef.current || !mobilePlayer) {
-          resumePlaybackAfterResetRef.current = false;
+        if (playbackIntentRef.current) {
           void video.play().catch(() => setPhase("paused"));
         } else {
           setPhase("paused");
@@ -938,18 +1025,20 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       });
       hls.on(HlsRuntime.Events.AUDIO_TRACKS_UPDATED, (_, data) => {
         const matchedIndexes = matchAudioTrackIndexes(runResponse.tracks, data.audioTracks);
-        const tracks = runResponse.tracks.map((serverTrack, serverIndex) => {
-          const language = normalizeLanguageTag(serverTrack.language);
-          return {
-            id: serverTrack.id,
-            label: languageDisplayName(serverTrack.language, serverTrack.label),
-            language,
-            index: matchedIndexes[serverIndex],
-            source: serverTrack.source,
-            default: serverTrack.default,
-            status: serverTrack.status,
-          };
-        });
+        const tracks = runResponse.tracks
+          .map((serverTrack, serverIndex) => {
+            const language = normalizeLanguageTag(serverTrack.language);
+            return {
+              id: serverTrack.id,
+              label: languageDisplayName(serverTrack.language, serverTrack.label),
+              language,
+              index: matchedIndexes[serverIndex],
+              source: serverTrack.source,
+              default: serverTrack.default,
+              status: serverTrack.status,
+            };
+          })
+          .filter((track) => track.index >= 0 && ["streamable", "ready"].includes(track.status));
         hlsAudioOptionsRef.current = tracks;
         setAvailableAudioTracks(tracks);
         const requestedTrack = pendingAudioSelectionRef.current
@@ -961,7 +1050,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           || tracks.find((track) => track.index >= 0);
         if (preferredTrack) {
           hls.audioTrack = preferredTrack.index;
-          if (preferredTrack.id !== selectedAudioTrackId) setPlayerNotice(`Switching audio to ${preferredTrack.label}…`);
+          if (preferredTrack.id !== selectedAudioTrackIdRef.current) setPlayerNotice(`Switching audio to ${preferredTrack.label}…`);
         }
       });
       hls.on(HlsRuntime.Events.AUDIO_TRACK_SWITCHING, (_, data) => {
@@ -971,6 +1060,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       hls.on(HlsRuntime.Events.AUDIO_TRACK_SWITCHED, (_, data) => {
         const selected = hlsAudioOptionsRef.current.find((track) => track.index === data.id);
         if (!selected) return;
+        selectedAudioTrackIdRef.current = selected.id;
         setSelectedAudioTrackId(selected.id);
         pendingAudioSelectionRef.current = null;
         setPreferences((current) => ({
@@ -997,7 +1087,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }
         captureLastFrame(true);
         resumePositionRef.current = currentTimeRef.current;
-        const selectedTrack = runResponse.tracks.find((track) => track.id === selectedAudioTrackId);
+        const selectedTrack = runResponse.tracks.find((track) => track.id === selectedAudioTrackIdRef.current);
         if (selectedTrack && (!selectedTrack.default || selectedTrack.source === "external")) {
           setFatal({
             title: "Selected audio interrupted",
@@ -1012,8 +1102,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         setStreamMode("progressive");
       });
       return () => {
+        clearPlaybackStartupWatchdog();
         captureLastFrame(true);
-        resumePlaybackAfterResetRef.current = !video.paused && !completedRef.current;
         transportResettingRef.current = true;
         hls.destroy();
         if (hlsRef.current === hls) hlsRef.current = null;
@@ -1026,20 +1116,33 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       video.addEventListener("loadedmetadata", beginPlayback, { once: true });
       video.load();
       return () => {
+        clearPlaybackStartupWatchdog();
         captureLastFrame(true);
-        resumePlaybackAfterResetRef.current = !video.paused && !completedRef.current;
         transportResettingRef.current = true;
         video.removeEventListener("loadedmetadata", beginPlayback);
       };
     }
 
     if (runResponse.manifestUrl && !hlsEngine) return;
-    const selectedTrack = runResponse.tracks.find((track) => track.id === selectedAudioTrackId);
+    const selectedTrack = runResponse.tracks.find((track) => track.id === selectedAudioTrackIdRef.current);
     const progressiveSafe = !selectedTrack || (selectedTrack.source === "embedded" && selectedTrack.default);
     if (progressiveSafe && canUseProgressiveCompatibility(runResponse.sourceMetadata)) {
       setStreamMode("progressive");
     }
-  }, [applyResume, captureLastFrame, hlsEngine, mobilePlayer, runResponse?.manifestUrl, runResponse?.progressiveUrl, runResponse?.runId, streamMode, transportRevision]);
+    return clearPlaybackStartupWatchdog;
+  }, [
+    applyResume,
+    captureLastFrame,
+    clearPlaybackStartupWatchdog,
+    hlsEngine,
+    runResponse?.manifestUrl,
+    runResponse?.progressiveUrl,
+    runResponse?.runId,
+    runResponse?.sourceFingerprint,
+    runResponse?.ticket,
+    streamMode,
+    transportRevision,
+  ]);
 
   useEffect(() => {
     if (!runResponse || !profile || visualFixture) return;
@@ -1067,36 +1170,28 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (!runResponse) return;
     setAvailableQualities((current) => {
       const auto = current.find((item) => item.id === "auto") ?? { id: "auto", label: "Auto", height: "auto" as const, index: -1, ready: true, status: "ready" as const };
-      const renditions = runResponse.renditions
-        .slice()
-        .sort((left, right) => right.height - left.height)
-        .map((rendition) => {
-          const existing = current.find((item) => item.id === rendition.id);
-          const index = existing?.index ?? -1;
-          return {
-            id: rendition.id,
-            label: `${rendition.label}${rendition.original ? " \u00b7 Original" : ""}`,
-            height: rendition.height,
-            index,
-            ready: rendition.ready && index >= 0,
-            status: rendition.status,
-          };
-        });
+      const renditions = current
+        .filter((item) => item.id !== "auto")
+        .map((existing) => {
+          const rendition = runResponse.renditions.find((item) => item.id === existing.id);
+          return rendition
+            ? { ...existing, ready: rendition.ready && existing.index >= 0, status: rendition.status }
+            : existing;
+        })
+        .filter((item) => item.ready && ["streamable", "ready"].includes(item.status));
       return [auto, ...renditions];
     });
-    setAvailableAudioTracks((current) => runResponse.tracks.map((track) => {
-      const existing = current.find((item) => item.id === track.id);
-      return {
-        id: track.id,
-        label: languageDisplayName(track.language, track.label),
-        language: normalizeLanguageTag(track.language),
-        index: existing?.index ?? -1,
-        source: track.source,
-        default: track.default,
-        status: track.status,
-      };
-    }));
+    setAvailableAudioTracks((current) => current
+      .map((existing) => {
+        const track = runResponse.tracks.find((item) => item.id === existing.id);
+        return track ? { ...existing, status: track.status } : existing;
+      })
+      .filter((track) => track.index >= 0 && ["streamable", "ready"].includes(track.status)));
   }, [runResponse?.renditions, runResponse?.tracks]);
+
+  useEffect(() => {
+    selectedAudioTrackIdRef.current = selectedAudioTrackId;
+  }, [selectedAudioTrackId]);
 
   useEffect(() => {
     if (!runResponse || visualFixture) return;
@@ -1121,12 +1216,31 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             ? refreshed.tracks.find((item) => item.id === pendingAudioSelectionRef.current)
             : undefined;
           setRunResponse((active) => active?.runId === refreshed.runId ? mergePlaybackRunMetadata(active, refreshed) : active);
+          const missingReadyQuality = refreshed.renditions.some(
+            (item) => item.ready && !hlsQualityOptionsRef.current.some((option) => option.id === item.id && option.index >= 0),
+          );
+          const missingReadyAudio = refreshed.tracks.some(
+            (item) => item.ready && !hlsAudioOptionsRef.current.some((option) => option.id === item.id && option.index >= 0),
+          );
           if (
             requestedQuality?.ready
             || requestedAudio?.ready
             || refreshed.sourceFingerprint !== runResponse.sourceFingerprint
+            || missingReadyQuality
+            || missingReadyAudio
           ) setTransportRevision((value) => value + 1);
-          if ((requestedQuality?.ready || requestedAudio?.ready) && refreshed.manifestUrl) {
+          if (
+            refreshed.manifestUrl
+            && (
+              requestedQuality?.ready
+              || requestedAudio?.ready
+              || (streamMode === "progressive" && refreshed.preparationState === "ready")
+            )
+          ) {
+            captureLastFrame(true);
+            resumePositionRef.current = currentTimeRef.current;
+            resumeAppliedRef.current = false;
+            transportResettingRef.current = true;
             setStreamMode("hls");
           }
           if (requestedQuality?.status === "failed") pendingQualitySelectionRef.current = null;
@@ -1152,7 +1266,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       abort.abort();
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [runResponse, visualFixture]);
+  }, [captureLastFrame, runResponse, streamMode, visualFixture]);
 
   const applyPlaybackRatePreference = useCallback(() => {
     const video = videoRef.current;
@@ -1252,10 +1366,17 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [reportProgress, runResponse, visualFixture]);
 
   const safePlay = useCallback(() => {
+    playbackIntentRef.current = true;
     void videoRef.current?.play().catch(() => {
+      playbackIntentRef.current = false;
       setFatal({ title: "Playback blocked", message: "The browser could not start this stream. Try again or go back.", retryable: true });
       setPhase("fatal");
     });
+  }, []);
+
+  const pausePlayback = useCallback(() => {
+    playbackIntentRef.current = false;
+    videoRef.current?.pause();
   }, []);
 
   const seek = useCallback((nextTime: number, report = true) => {
@@ -1277,7 +1398,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     } else {
       captureLastFrame(true);
       transportResettingRef.current = true;
-      resumePlaybackAfterResetRef.current = !video.paused && !completedRef.current;
       setPhase("recovering");
       if (canUseProgressiveCompatibility(runResponse?.sourceMetadata ?? {
         duration: 0,
@@ -1306,6 +1426,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     controlsTimerRef.current = null;
     if (shouldAutoHidePlayerControls(phaseRef.current, controlMenuOpenRef.current, scrubbingRef.current)) {
       controlsTimerRef.current = window.setTimeout(() => {
+        showControlsRef.current = false;
         setShowControls(false);
         controlsTimerRef.current = null;
       }, PLAYER_CONTROLS_IDLE_MS);
@@ -1313,6 +1434,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, []);
 
   const revealControls = useCallback(() => {
+    showControlsRef.current = true;
     setShowControls(true);
     scheduleControlsHide();
   }, [scheduleControlsHide]);
@@ -1321,20 +1443,19 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     const previous = desktopPointerPositionRef.current;
     const next = { x: event.clientX, y: event.clientY };
     desktopPointerPositionRef.current = next;
-    if (previous && Math.abs(previous.x - next.x) < 1 && Math.abs(previous.y - next.y) < 1) return;
+    if (!isMeaningfulPointerActivity(previous, next, event.movementX, event.movementY)) return;
     revealControls();
   }, [revealControls]);
 
   useEffect(() => {
     phaseRef.current = phase;
     controlMenuOpenRef.current = controlMenuOpen;
-    if (phase === "paused") {
+    if (!shouldAutoHidePlayerControls(phase, controlMenuOpenRef.current, scrubbingRef.current)) {
       if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
       controlsTimerRef.current = null;
-      setShowControls(true);
       return;
     }
-    if (phase === "playing" && showControlsRef.current && controlsTimerRef.current === null) {
+    if (showControlsRef.current && controlsTimerRef.current === null) {
       scheduleControlsHide();
     }
   }, [controlMenuOpen, phase, scheduleControlsHide, timelineScrubbing]);
@@ -1459,9 +1580,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       const video = videoRef.current;
       if (!video) return;
       if (video.paused) safePlay();
-      else video.pause();
+      else pausePlayback();
     }, 220);
-  }, [mobilePlayer, revealControls, safePlay]);
+  }, [mobilePlayer, pausePlayback, revealControls, safePlay]);
 
   const handleDesktopSurfaceDoubleClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     if (mobilePlayer || (event.target !== event.currentTarget && event.target !== videoRef.current)) return;
@@ -1510,6 +1631,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [location.state, navigate, profile, runResponse?.nextEpisodeId]);
 
   const finishPlayback = useCallback(() => {
+    playbackIntentRef.current = false;
     completedRef.current = true;
     setPhase("ended");
     reportProgress("ended", true, true);
@@ -1534,6 +1656,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
   useEffect(() => () => {
     if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
+    if (playbackStartupTimerRef.current !== null) window.clearTimeout(playbackStartupTimerRef.current);
     if (desktopClickTimerRef.current !== null) window.clearTimeout(desktopClickTimerRef.current);
     if (seekSettlementTimerRef.current !== null) window.clearTimeout(seekSettlementTimerRef.current);
   }, []);
@@ -1549,7 +1672,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       }
       if (event.key === " ") {
         event.preventDefault();
-        videoRef.current?.paused ? safePlay() : videoRef.current?.pause();
+        videoRef.current?.paused ? safePlay() : pausePlayback();
       } else if (event.key === "ArrowLeft") {
         event.preventDefault();
         seek(currentTimeRef.current - 10);
@@ -1567,7 +1690,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [exitPlayer, fullscreenActive, revealControls, safePlay, seek, toggleFullscreen, togglePictureInPicture]);
+  }, [exitPlayer, fullscreenActive, pausePlayback, revealControls, safePlay, seek, toggleFullscreen, togglePictureInPicture]);
 
   const toggleMobileControls = useCallback(() => {
     if (showControlsRef.current) {
@@ -1698,58 +1821,44 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     pendingQualitySelectionRef.current = renditionId;
     setPlayerNotice(renditionId === "auto" ? "Enabling automatic quality…" : `Switching quality to ${selected.label}…`);
     if (renditionId === "auto") {
-      if (hlsRef.current) hlsRef.current.currentLevel = -1;
+      if (hlsRef.current) {
+        hlsRef.current.currentLevel = -1;
+        hlsRef.current.nextLevel = -1;
+      }
       setSelectedQualityId("auto");
       setPreferences((current) => ({ ...current, qualityHeight: "auto" }));
+      pendingQualitySelectionRef.current = null;
+      setPlayerNotice("Automatic quality active");
       return;
     }
-    if (selected.ready) {
-      if (hlsRef.current) {
-        hlsRef.current.currentLevel = selected.index;
-      } else if (runResponse?.manifestUrl) {
-        captureLastFrame(true);
-        resumePositionRef.current = currentTimeRef.current;
-        resumeAppliedRef.current = false;
-        transportResettingRef.current = true;
-        setStreamMode("hls");
-        setTransportRevision((value) => value + 1);
-      }
+    if (!selected.ready || selected.index < 0) {
+      pendingQualitySelectionRef.current = null;
+      setPlayerNotice(`${selected.label} is not available in the active HLS manifest yet.`);
       return;
     }
-    if (!runResponse) return;
-    if (selected.index < 0 && ["streamable", "ready"].includes(selected.status)) {
+    if (hlsRef.current) {
+      hlsRef.current.currentLevel = selected.index;
+      hlsRef.current.nextLevel = selected.index;
+      return;
+    }
+    if (runResponse?.manifestUrl) {
       captureLastFrame(true);
       resumePositionRef.current = currentTimeRef.current;
       resumeAppliedRef.current = false;
       transportResettingRef.current = true;
+      setStreamMode("hls");
       setTransportRevision((value) => value + 1);
       return;
     }
-    setAvailableQualities((current) => current.map((item) => item.id === renditionId ? { ...item, status: "preparing" } : item));
-    setRunResponse((current) => current ? {
-      ...current,
-      renditions: current.renditions.map((item) => item.id === renditionId ? { ...item, status: "preparing" } : item),
-    } : current);
-    void preparePlaybackRendition(runResponse.runId, renditionId).catch(() => {
-      pendingQualitySelectionRef.current = null;
-      setPlayerNotice(`${selected.label} quality could not be prepared.`);
-      setAvailableQualities((current) => current.map((item) => item.id === renditionId ? { ...item, status: "failed" } : item));
-      setRunResponse((current) => current ? {
-        ...current,
-        renditions: current.renditions.map((item) => item.id === renditionId ? { ...item, status: "failed" } : item),
-      } : current);
-    });
+    pendingQualitySelectionRef.current = null;
+    setPlayerNotice("Adaptive quality switching is unavailable for the current transport.");
   };
 
   const changeAudio = (trackId: string) => {
     const selected = availableAudioTracks.find((item) => item.id === trackId);
     if (!selected || selected.id === selectedAudioTrackId) return;
     pendingAudioSelectionRef.current = trackId;
-    setPlayerNotice(
-      selected.status === "preparing"
-        ? `Preparing ${selected.label} audio…`
-        : `Switching audio to ${selected.label}…`,
-    );
+    setPlayerNotice(`Switching audio to ${selected.label}…`);
     if (hlsRef.current && selected.index >= 0) {
       hlsRef.current.audioTrack = selected.index;
       return;
@@ -1778,21 +1887,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       setTransportRevision((value) => value + 1);
       return;
     }
-    if (!runResponse) return;
-    setAvailableAudioTracks((current) => current.map((item) => item.id === trackId ? { ...item, status: "preparing" } : item));
-    setRunResponse((current) => current ? {
-      ...current,
-      tracks: current.tracks.map((item) => item.id === trackId ? { ...item, status: "preparing" } : item),
-    } : current);
-    void preparePlaybackRendition(runResponse.runId, trackId).catch(() => {
-      pendingAudioSelectionRef.current = null;
-      setPlayerNotice(`${selected.label} audio could not be prepared.`);
-      setAvailableAudioTracks((current) => current.map((item) => item.id === trackId ? { ...item, status: "failed" } : item));
-      setRunResponse((current) => current ? {
-        ...current,
-        tracks: current.tracks.map((item) => item.id === trackId ? { ...item, status: "failed" } : item),
-      } : current);
-    });
+    pendingAudioSelectionRef.current = null;
+    setPlayerNotice(`${selected.label} is not available in the active HLS manifest.`);
   };
 
   const retryPlayback = () => {
@@ -1928,6 +2024,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           window.setTimeout(applySubtitlePreference, 0);
         }}
         onPlay={() => {
+          if (!playbackIntentRef.current) {
+            videoRef.current?.pause();
+            setPhase("paused");
+            return;
+          }
           if (!transportResettingRef.current) {
             setPhase("playing");
             lastAdvanceWallRef.current = performance.now();
@@ -1937,20 +2038,34 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         onPause={() => {
           captureWatchedTime();
           if (transportResettingRef.current) return;
+          playbackIntentRef.current = false;
           if (!completedRef.current) {
             setPhase("paused");
             reportProgress("pause");
           }
         }}
         onWaiting={() => {
+          if (!playbackIntentRef.current) {
+            setPhase("paused");
+            return;
+          }
           if (!hasLastFrameRef.current) captureLastFrame(true);
           setPhase("buffering");
         }}
         onStalled={() => {
+          if (!playbackIntentRef.current) {
+            setPhase("paused");
+            return;
+          }
           if (!hasLastFrameRef.current) captureLastFrame(true);
           setPhase("buffering");
         }}
         onPlaying={() => {
+          if (!playbackIntentRef.current) {
+            videoRef.current?.pause();
+            setPhase("paused");
+            return;
+          }
           const observedTime = videoRef.current?.currentTime ?? currentTimeRef.current;
           const accepted = shouldAcceptObservedPlaybackTime(
             observedTime,
@@ -1964,6 +2079,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             return;
           }
           transportResettingRef.current = false;
+          markPlaybackStartupReady();
           phaseRef.current = "playing";
           setPhase("playing");
           scheduleControlsHide();
@@ -1972,6 +2088,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         onCanPlay={() => {
           const video = videoRef.current;
           if (!video) return;
+          markPlaybackStartupReady();
+          if (!playbackIntentRef.current) {
+            video.pause();
+            transportResettingRef.current = false;
+            setPhase("paused");
+            return;
+          }
           const resumeReady = applyResume(video);
           if (transportResettingRef.current && !resumeReady) {
             setPhase("recovering");
@@ -2049,7 +2172,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             resumePositionRef.current = currentTimeRef.current;
             resumeAppliedRef.current = false;
             transportResettingRef.current = true;
-            resumePlaybackAfterResetRef.current = !videoRef.current?.paused && !completedRef.current;
             setPhase("recovering");
             setStreamMode("progressive");
             return;
@@ -2067,7 +2189,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             srcLang={normalizeLanguageTag(subtitle.language)}
             label={languageDisplayName(subtitle.language, subtitle.label)}
             data-subtitle-id={subtitle.id}
-            default={preferences.subtitleTrackId === subtitle.id}
             onLoad={applySubtitlePreference}
           />
         ))}
@@ -2230,7 +2351,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                 icon={phase === "playing" ? "pause" : "play"}
                 label={phase === "playing" ? "Pause" : "Play"}
                 className="mobile-player-transport__play"
-                onClick={() => phase === "playing" ? videoRef.current?.pause() : startMobilePlayback()}
+                onClick={() => phase === "playing" ? pausePlayback() : startMobilePlayback()}
               />
               <PlayerIconButton
                 icon="forward"
@@ -2332,7 +2453,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       </AnimatePresence>
 
       <AnimatePresence>
-        {!mobilePlayer && (showControls || phase === "paused") && phase !== "ended" && (
+        {!mobilePlayer && showControls && phase !== "ended" && (
           <motion.div
             className="player-controls absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black via-black/85 to-transparent px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-24 md:px-10 md:pb-7"
             initial={reduced ? { opacity: 0 } : { opacity: 0, y: 18 }}
@@ -2378,7 +2499,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
               </div>
 
               <div className="mt-3 flex flex-wrap items-center gap-2 md:gap-3">
-                <PlayerIconButton icon={phase === "playing" ? "pause" : "play"} label={phase === "playing" ? "Pause" : "Play"} onClick={() => phase === "playing" ? videoRef.current?.pause() : safePlay()} />
+                <PlayerIconButton icon={phase === "playing" ? "pause" : "play"} label={phase === "playing" ? "Pause" : "Play"} onClick={() => phase === "playing" ? pausePlayback() : safePlay()} />
                 <PlayerIconButton icon="rewind" label="Rewind 10 seconds" onClick={() => seek(currentTimeRef.current - 10)} />
                 <PlayerIconButton icon="forward" label="Forward 10 seconds" onClick={() => seek(currentTimeRef.current + 10)} />
                 <PlayerIconButton icon={muted ? "mute" : "volume"} label={muted ? "Unmute" : "Mute"} onClick={() => { if (videoRef.current) videoRef.current.muted = !videoRef.current.muted; }} />

@@ -105,6 +105,89 @@ class PlaybackPrepService:
         return Path(self.get_cache_path(media_id, fingerprint)).resolve()
 
     @staticmethod
+    def _link_or_copy(source: str, destination: str) -> str:
+        try:
+            os.link(source, destination)
+            return destination
+        except OSError:
+            return shutil.copy2(source, destination)
+
+    def _reuse_complete_renditions(
+        self,
+        media_id: str,
+        source_fingerprint: str,
+        target_fingerprint: str,
+        rendition_names: list[str],
+    ) -> list[str]:
+        if not source_fingerprint or source_fingerprint == target_fingerprint:
+            return []
+        source_root = self.cache_path(media_id, source_fingerprint)
+        target_root = self.cache_path(media_id, target_fingerprint)
+        if not source_root.is_dir():
+            return []
+        target_root.mkdir(parents=True, exist_ok=True)
+        reused: list[str] = []
+        for rendition_name in rendition_names:
+            source_dir = source_root / rendition_name
+            target_dir = target_root / rendition_name
+            if target_dir.exists() or not self.rendition_complete(media_id, source_fingerprint, rendition_name):
+                continue
+            temporary = target_root / f".{rendition_name}.reuse.tmp"
+            shutil.rmtree(temporary, ignore_errors=True)
+            try:
+                shutil.copytree(source_dir, temporary, copy_function=self._link_or_copy)
+                try:
+                    os.replace(temporary, target_dir)
+                except OSError:
+                    if not target_dir.exists():
+                        raise
+                reused.append(rendition_name)
+            except OSError as exc:
+                logger.warning(
+                    f"[Playback Prep] Could not reuse {media_id}/{rendition_name}: "
+                    f"{self.sanitize_diagnostics(str(exc), 300)}"
+                )
+            finally:
+                shutil.rmtree(temporary, ignore_errors=True)
+        return reused
+
+    def reuse_video_renditions(
+        self,
+        media_id: str,
+        source_fingerprint: str,
+        target_fingerprint: str,
+        media_obj: Any,
+    ) -> list[str]:
+        """Reuse immutable video-only HLS artifacts after an audio-sidecar change."""
+
+        return self._reuse_complete_renditions(
+            media_id,
+            source_fingerprint,
+            target_fingerprint,
+            [rendition.name for rendition in self.video_renditions(media_obj)],
+        )
+
+    def reuse_verified_playback_cache(
+        self,
+        media_id: str,
+        source_fingerprint: str,
+        target_fingerprint: str,
+        media_obj: Any,
+    ) -> list[str]:
+        """Migrate complete HLS renditions after a verified content-equivalent optimization."""
+
+        rendition_names = [
+            *(rendition.name for rendition in self.video_renditions(media_obj)),
+            *(rendition.name for rendition in self.audio_renditions(media_obj)),
+        ]
+        return self._reuse_complete_renditions(
+            media_id,
+            source_fingerprint,
+            target_fingerprint,
+            rendition_names,
+        )
+
+    @staticmethod
     def snapshot_media(media_obj: Any) -> PlaybackMediaSnapshot:
         if isinstance(media_obj, PlaybackMediaSnapshot):
             return media_obj
@@ -343,6 +426,17 @@ class PlaybackPrepService:
         cache_path = self.cache_path(media_id, fingerprint)
         cache_path.mkdir(parents=True, exist_ok=True)
         self.touch(media_id, fingerprint)
+        reused_video = self.reuse_video_renditions(
+            media_id,
+            source.video_fingerprint,
+            fingerprint,
+            media_obj,
+        )
+        if reused_video:
+            logger.info(
+                f"[Playback Prep] Reused {len(reused_video)} video rendition(s) for {media_id} "
+                "after an audio-sidecar identity change."
+            )
         if retry_errors:
             self.clear_preparation_error(media_id, fingerprint)
 

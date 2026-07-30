@@ -11,12 +11,12 @@ describe("dedicated mobile player presentation", () => {
     expect(playerPage).toContain('className="mobile-player-topbar"');
     expect(playerPage).toContain('className="mobile-player-transport"');
     expect(playerPage).toContain('className="mobile-player-bottom"');
-    expect(playerPage).toContain('!mobilePlayer && (showControls || phase === "paused")');
+    expect(playerPage).toContain('!mobilePlayer && showControls && phase !== "ended"');
   });
 
   it("omits phone volume controls and gates subtitles in both presentations", () => {
     const mobileStart = playerPage.indexOf('className="mobile-player-chrome"');
-    const desktopStart = playerPage.indexOf('!mobilePlayer && (showControls || phase === "paused")');
+    const desktopStart = playerPage.indexOf('!mobilePlayer && showControls && phase !== "ended"');
     const mobilePresentation = playerPage.slice(mobileStart, desktopStart);
 
     expect(mobilePresentation).not.toContain('className="player-volume"');

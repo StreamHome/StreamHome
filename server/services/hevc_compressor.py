@@ -100,6 +100,7 @@ class HEVCCompressorWorker:
             item = await db.get(model, item_id)
             if not item:
                 return
+            previous_fingerprint = str(item.source_fingerprint or "")
             item.hevc_compressed = True
             if probe:
                 item.codec = probe.get("codec") or item.codec
@@ -110,6 +111,22 @@ class HEVCCompressorWorker:
                 item.frame_rate = probe.get("frame_rate") or item.frame_rate
                 item.source_fingerprint = probe.get("source_fingerprint") or item.source_fingerprint
                 item.audio_metadata = probe.get("audio_metadata") or item.audio_metadata
+            next_fingerprint = str(item.source_fingerprint or "")
+            if previous_fingerprint and next_fingerprint and previous_fingerprint != next_fingerprint:
+                from services.playback_prep import playback_prep_service
+
+                reused = playback_prep_service.reuse_verified_playback_cache(
+                    item.id,
+                    previous_fingerprint,
+                    next_fingerprint,
+                    item,
+                )
+                if reused:
+                    await playback_prep_service.rebuild_master(item.id, next_fingerprint, item)
+                    logger.info(
+                        f"[HEVC Compressor] Preserved {len(reused)} verified HLS rendition(s) "
+                        f"for {item.id} across source optimization."
+                    )
             db.add(item)
             await db.commit()
 

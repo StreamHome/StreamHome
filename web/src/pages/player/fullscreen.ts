@@ -21,7 +21,7 @@ export interface PlayerFullscreenOptions {
   transitionTimeoutMs?: number;
 }
 
-const DEFAULT_TRANSITION_TIMEOUT_MS = 750;
+const DEFAULT_TRANSITION_TIMEOUT_MS = 2_500;
 
 export function fullscreenElement(documentObject: Document = document): Element | null {
   const webkitDocument = documentObject as WebKitFullscreenDocument;
@@ -43,6 +43,7 @@ function ownsFullscreenElement(
       activeElement === container
       || activeElement === video
       || container.contains(activeElement)
+      || (typeof activeElement.contains === "function" && activeElement.contains(container))
     ),
   );
 }
@@ -258,10 +259,18 @@ async function enterPlayerFullscreen(
   transitionTimeoutMs: number,
 ): Promise<void> {
   const webkitContainer = container as WebKitFullscreenElement;
+  const documentRoot = documentObject.documentElement as HTMLElement | undefined;
+  const webkitDocumentRoot = documentRoot as WebKitFullscreenElement | undefined;
   const webkitVideo = video as WebKitFullscreenVideo;
   const failures: string[] = [];
   const attempts: Array<{ label: string; request: () => Promise<void> | void }> = [];
 
+  if (documentRoot?.requestFullscreen) {
+    attempts.push({
+      label: "application root",
+      request: () => documentRoot.requestFullscreen(),
+    });
+  }
   if (container.requestFullscreen) {
     attempts.push({
       label: "player container",
@@ -278,6 +287,16 @@ async function enterPlayerFullscreen(
     attempts.push({
       label: "WebKit player container",
       request: () => webkitContainer.webkitRequestFullscreen?.(),
+    });
+  }
+  if (
+    webkitDocumentRoot
+    && webkitDocumentRoot !== webkitContainer
+    && webkitDocumentRoot.webkitRequestFullscreen
+  ) {
+    attempts.push({
+      label: "WebKit application root",
+      request: () => webkitDocumentRoot.webkitRequestFullscreen?.(),
     });
   }
   if (allowVideoFallback && webkitVideo.webkitEnterFullscreen) {

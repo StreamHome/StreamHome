@@ -49,6 +49,29 @@ function fullscreenVideo(properties: Partial<HTMLVideoElement> = {}): HTMLVideoE
 }
 
 describe("player fullscreen controller", () => {
+  it("uses the application root so the complete player can own fullscreen", async () => {
+    const harness = fullscreenDocument();
+    const container = fullscreenContainer();
+    let documentRoot: HTMLElement;
+    const rootRequest = vi.fn().mockImplementation(() => {
+      harness.setActiveElement(documentRoot);
+      harness.dispatch("fullscreenchange");
+      return Promise.resolve();
+    });
+    documentRoot = fullscreenContainer({ requestFullscreen: rootRequest }, [container]);
+    Object.assign(harness.documentObject, { documentElement: documentRoot });
+    const containerRequest = vi.fn();
+    Object.assign(container, { requestFullscreen: containerRequest });
+
+    await expect(togglePlayerFullscreen(
+      container,
+      fullscreenVideo(),
+      harness.documentObject,
+    )).resolves.toBe("entered");
+    expect(rootRequest).toHaveBeenCalledOnce();
+    expect(containerRequest).not.toHaveBeenCalled();
+  });
+
   it("enters container fullscreen only after the browser exposes the transition", async () => {
     const harness = fullscreenDocument();
     let container: HTMLElement;

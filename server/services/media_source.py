@@ -44,6 +44,26 @@ class ResolvedMediaSource:
             value = f"cloud:{self.cloud_identity or self.cloud_path or self.catalog_path}"
         return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
 
+    @property
+    def video_fingerprint(self) -> str:
+        """Identify the video bytes independently from replaceable audio sidecars."""
+
+        if self.local_exists:
+            value = local_video_identity(self.local_path)
+        else:
+            value = f"cloud:{self.cloud_identity or self.cloud_path or self.catalog_path}"
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
+def local_video_identity(media_path: Path) -> str:
+    stat = media_path.stat()
+    value = [{
+        "name": media_path.name,
+        "size": stat.st_size,
+        "modified": stat.st_mtime_ns,
+    }]
+    return f"local:{json.dumps(value, sort_keys=True, separators=(',', ':'))}"
+
 
 def local_media_identity(media_path: Path) -> str:
     """Fingerprint the playable file and application-owned audio sidecars."""

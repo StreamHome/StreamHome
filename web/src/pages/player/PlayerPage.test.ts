@@ -7,6 +7,7 @@ import {
   canUseProgressiveCompatibility,
   catalogDurationSeconds,
   clampPlaybackTime,
+  isMeaningfulPointerActivity,
   isPlaybackTimeSeekable,
   matchAudioTrackIndexes,
   mergePlaybackRunMetadata,
@@ -17,6 +18,8 @@ import {
   progressSequenceWasAccepted,
   shouldAutoHidePlayerControls,
   shouldAcceptObservedPlaybackTime,
+  shouldRetryPlaybackStartup,
+  shouldResumePlaybackAfterTransport,
 } from "./PlayerPage";
 
 describe("adaptive preparation status", () => {
@@ -198,13 +201,26 @@ describe("player interaction contracts", () => {
     expect(mergePlaybackRunMetadata(active, refreshed)).toEqual(refreshed);
   });
 
-  it("auto-hides only during uninterrupted playback", () => {
+  it("auto-hides after inactivity unless a menu or scrub interaction is active", () => {
     expect(shouldAutoHidePlayerControls("playing", false, false)).toBe(true);
-    expect(shouldAutoHidePlayerControls("paused", false, false)).toBe(false);
+    expect(shouldAutoHidePlayerControls("paused", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("buffering", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("recovering", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("playing", true, false)).toBe(false);
     expect(shouldAutoHidePlayerControls("playing", false, true)).toBe(false);
+  });
+
+  it("ignores stationary synthetic pointer events when deciding whether to reveal controls", () => {
+    expect(isMeaningfulPointerActivity(null, { x: 10, y: 10 }, 0, 0)).toBe(false);
+    expect(isMeaningfulPointerActivity({ x: 10, y: 10 }, { x: 10, y: 10 }, 0, 0)).toBe(false);
+    expect(isMeaningfulPointerActivity({ x: 10, y: 10 }, { x: 10, y: 10 }, 1, 0)).toBe(true);
+    expect(isMeaningfulPointerActivity({ x: 10, y: 10 }, { x: 11, y: 10 }, 0, 0)).toBe(true);
+  });
+
+  it("allows exactly one bounded playback-startup recovery attempt", () => {
+    expect(shouldRetryPlaybackStartup(0)).toBe(true);
+    expect(shouldRetryPlaybackStartup(1)).toBe(false);
+    expect(shouldRetryPlaybackStartup(2)).toBe(false);
   });
 
   it("keeps the complete runtime stable while an adaptive playlist grows", () => {
@@ -217,7 +233,7 @@ describe("player interaction contracts", () => {
     expect(authoritativePlaybackDuration(0, "", "progressive", 272)).toBe(272);
   });
 
-  it("shows the complete source-bounded ladder while marking unfinished levels", () => {
+  it("shows only manifest-backed quality levels that can switch immediately", () => {
     const options = playbackQualityOptions([
       { id: "video_original", label: "1080p", height: 800, width: 1920, original: true, ready: true, status: "ready" },
       { id: "video_720p", label: "720p", height: 720, width: 1728, original: false, ready: true, status: "streamable" },
@@ -230,11 +246,17 @@ describe("player interaction contracts", () => {
       { height: 612, url: "/api/playback/hls/movie/video_720p/playlist.m3u8" },
     ]);
 
-    expect(options.map((item) => item.height)).toEqual(["auto", 800, 720, 480, 360, 240, 144]);
+    expect(options.map((item) => item.height)).toEqual(["auto", 800, 720]);
     expect(options.find((item) => item.id === "video_original")?.label).toBe("1080p · Original");
     expect(options.find((item) => item.id === "video_720p")?.ready).toBe(true);
-    expect(options.find((item) => item.height === 144)?.ready).toBe(false);
+    expect(options.find((item) => item.height === 144)).toBeUndefined();
     expect(options.find((item) => item.height === 720)?.index).toBe(1);
+  });
+
+  it("never resumes a paused or completed player after transport replacement", () => {
+    expect(shouldResumePlaybackAfterTransport(true, false)).toBe(true);
+    expect(shouldResumePlaybackAfterTransport(false, false)).toBe(false);
+    expect(shouldResumePlaybackAfterTransport(true, true)).toBe(false);
   });
 
   it("enables exactly the selected subtitle element by stable track id", () => {
