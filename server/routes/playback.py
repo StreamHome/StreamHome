@@ -80,7 +80,7 @@ class PlaybackTrack(APIModel):
     source: Literal["embedded", "external"]
     stream_index: int
     ready: bool
-    status: Literal["preparing", "streamable", "ready", "failed"]
+    status: Literal["idle", "preparing", "streamable", "ready", "failed"]
 
 
 class PlaybackRendition(APIModel):
@@ -90,7 +90,7 @@ class PlaybackRendition(APIModel):
     width: int
     original: bool
     ready: bool
-    status: Literal["preparing", "streamable", "ready", "failed"]
+    status: Literal["idle", "preparing", "streamable", "ready", "failed"]
 
 
 class PlaybackPreparationFailure(APIModel):
@@ -408,6 +408,8 @@ async def next_playable_episode(db: AsyncSession, movie_id: str, current_id: str
     if current_index < 0:
         return None
     for episode in ordered[current_index + 1:]:
+        if episode.preview_task_id:
+            return episode.id
         if not episode.video_url:
             continue
         try:
@@ -750,7 +752,7 @@ async def create_playback_run(
             media_obj.id,
             media_obj,
             source,
-            include_remaining=True,
+            include_remaining=False,
             retry_errors=True,
         )
     return await build_run_response(db, request, user, run, media_obj, initial_resume_position=position)
@@ -766,10 +768,16 @@ async def get_playback_run(
 ) -> PlaybackRunResponse:
     run = await authorized_run(db, request, run_id)
     movie, media_obj = await resolve_run_media(db, run.movie_id, run.episode_id)
-    if run.source_kind != "ingest_preview":
+    if not retry and run.source_kind != "ingest_preview" and str(media_obj.video_url or "").startswith("/media/"):
+        source = await require_available_source(media_obj)
+        observed_fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
+        if observed_fingerprint != str(media_obj.source_fingerprint or ""):
+            await ensure_source_metadata(db, media_obj, source)
+            await synchronize_source_fingerprint(db, media_obj, source)
+    if retry and run.source_kind != "ingest_preview":
         fingerprint = str(media_obj.source_fingerprint or "")
         cached_failure = playback_prep_service.required_preparation_error(media_obj.id, fingerprint, media_obj) if fingerprint else None
-        if cached_failure and cached_failure["code"] in REPAIRABLE_PREPARATION_ERRORS and not retry:
+        if cached_failure and cached_failure["code"] in REPAIRABLE_PREPARATION_ERRORS:
             repair_task = await queue_media_repair(db, movie, media_obj, cached_failure["code"])
             if repair_task:
                 run.source_kind = "ingest_preview"
@@ -798,23 +806,14 @@ async def get_playback_run(
                 db.add(run)
                 await db.commit()
             if run.source_kind != "ingest_preview":
-                preparation_state = playback_prep_service.preparation_state(
-                    media_obj.id,
-                    str(media_obj.source_fingerprint or source.fingerprint),
-                    media_obj,
-                )
                 await playback_prep_service.prepare(
                     media_obj.id,
                     media_obj,
                     source,
-                    include_remaining=True,
-                    retry_errors=retry,
-                    foreground=retry or preparation_state != "ready",
+                    include_remaining=False,
+                    retry_errors=True,
+                    foreground=True,
                 )
-    run.last_seen_at = time.time()
-    run.updated_at = time.time()
-    db.add(run)
-    await db.commit()
     position = 0 if run.source_kind == "ingest_preview" else await run_resume_position(db, run, media_obj)
     return await build_run_response(db, request, user, run, media_obj, initial_resume_position=position)
 
@@ -1014,7 +1013,10 @@ def rewrite_ingest_preview_playlist(content: str, media_id: str, ticket: str, ba
 
 
 def safe_hls_file(cache_root: Path, relative_path: str) -> Path:
-    candidate = (cache_root / Path(*PurePosixPath(relative_path).parts)).resolve()
+    relative = PurePosixPath(relative_path)
+    if relative.suffix.lower() not in {".m3u8", ".m4s", ".mp4"} or any(part in {"", ".", ".."} for part in relative.parts):
+        raise playback_error(status.HTTP_403_FORBIDDEN, "HLS_ASSET_TYPE_FORBIDDEN", "Only HLS playlists and media fragments may be requested.")
+    candidate = (cache_root / Path(*relative.parts)).resolve()
     try:
         candidate.relative_to(cache_root.resolve())
     except ValueError as exc:
@@ -1193,14 +1195,19 @@ async def open_cloud_chunks(remote_path: str, start: int, length: int) -> AsyncI
 
     async def chunks() -> AsyncIterator[bytes]:
         delivered = 0
-        delivered += len(first)
-        yield first
-        async for chunk in iterator:
-            delivered += len(chunk)
-            yield chunk
-        if delivered != length:
-            logger.error(f"[Playback] Cloud stream ended early ({delivered}/{length} bytes).")
-            raise RuntimeError("Google Drive ended the protected media stream before the declared content length")
+        try:
+            delivered += len(first)
+            yield first
+            async for chunk in iterator:
+                delivered += len(chunk)
+                yield chunk
+            if delivered != length:
+                logger.error(f"[Playback] Cloud stream ended early ({delivered}/{length} bytes).")
+                raise RuntimeError("Google Drive ended the protected media stream before the declared content length")
+        finally:
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                await close()
 
     return chunks()
 
@@ -1241,11 +1248,6 @@ async def serve_playback_subtitles(
     if not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(track_id):
         raise playback_error(status.HTTP_400_BAD_REQUEST, "INVALID_SUBTITLE_LANGUAGE", "The subtitle language is invalid.")
     matched_track = next((item for item in media_obj.subtitles or [] if subtitle_track_id(item) == track_id), None)
-    if matched_track is None:
-        matched_track = next(
-            (item for item in media_obj.subtitles or [] if str(item.get("language") or "und").lower() == track_id),
-            None,
-        )
     if not matched_track:
         raise playback_error(status.HTTP_404_NOT_FOUND, "SUBTITLE_NOT_FOUND", "The requested subtitle track is unavailable.")
     file_name = subtitle_file_name(matched_track)

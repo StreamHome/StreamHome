@@ -499,7 +499,7 @@ export interface PlaybackSourceMetadata {
   sourceFormat: string;
 }
 
-export type PlaybackRenditionStatus = "preparing" | "streamable" | "ready" | "failed";
+export type PlaybackRenditionStatus = "idle" | "preparing" | "streamable" | "ready" | "failed";
 
 export interface PlaybackRendition {
   id: string;

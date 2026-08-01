@@ -233,7 +233,7 @@ describe("player interaction contracts", () => {
     expect(authoritativePlaybackDuration(0, "", "progressive", 272)).toBe(272);
   });
 
-  it("shows only manifest-backed quality levels that can switch immediately", () => {
+  it("shows manifest-backed and on-demand quality levels with truthful readiness", () => {
     const options = playbackQualityOptions([
       { id: "video_original", label: "1080p", height: 800, width: 1920, original: true, ready: true, status: "ready" },
       { id: "video_720p", label: "720p", height: 720, width: 1728, original: false, ready: true, status: "streamable" },
@@ -246,10 +246,11 @@ describe("player interaction contracts", () => {
       { height: 612, url: "/api/playback/hls/movie/video_720p/playlist.m3u8" },
     ]);
 
-    expect(options.map((item) => item.height)).toEqual(["auto", 800, 720]);
+    expect(options.map((item) => item.height)).toEqual(["auto", 800, 720, 480, 360, 240, 144]);
     expect(options.find((item) => item.id === "video_original")?.label).toBe("1080p · Original");
     expect(options.find((item) => item.id === "video_720p")?.ready).toBe(true);
-    expect(options.find((item) => item.height === 144)).toBeUndefined();
+    expect(options.find((item) => item.height === 144)?.ready).toBe(false);
+    expect(options.find((item) => item.height === 240)?.status).toBe("failed");
     expect(options.find((item) => item.height === 720)?.index).toBe(1);
   });
 

@@ -194,6 +194,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
         fingerprint = "a" * 32
         rendition_name = "video_480p"
         rendition_dir = playback_prep_service.cache_path(media_id, fingerprint) / rendition_name
+        self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "idle")
         rendition_dir.mkdir(parents=True)
         try:
             (rendition_dir / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
@@ -794,6 +795,9 @@ class PlaybackPipelineRegression(unittest.TestCase):
             content = master.read_text(encoding="utf-8")
             self.assertIn("TYPE=AUDIO", content)
             self.assertIn("video_original/playlist.m3u8", content)
+            self.assertNotIn("CODECS=", content)
+            self.assertRegex(content, r"BANDWIDTH=\d+")
+            self.assertRegex(content, r"AVERAGE-BANDWIDTH=\d+")
             rewritten = rewrite_hls_playlist(content, media.id, "ticket-value", Path("."))
             self.assertIn(f"/api/playback/hls/{media.id}/video_original/playlist.m3u8?ticket=ticket-value", rewritten)
 

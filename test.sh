@@ -145,7 +145,6 @@ run_server_checks() {
         scratch/test_auth_security.py
         scratch/test_auth_validation.py
         scratch/test_backup_security.py
-        scratch/test_cloud_streaming.py
         scratch/test_drive_setup.py
         scratch/test_ffmpeg_headers.py
         scratch/test_ingest_stream_script.py

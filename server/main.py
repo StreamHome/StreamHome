@@ -62,7 +62,6 @@ from services.update import automatic_update_worker
 import services.state as state
 from routes.queue import router as queue_router
 from routes.auth import router as auth_router, health_router, get_current_session, get_current_user, require_recent_reauth
-from routes.stream import router as stream_router
 from routes.backup import router as backup_router
 from routes.update import router as update_router
 from routes.setup import router as setup_router
@@ -431,7 +430,6 @@ app.add_middleware(
 app.include_router(queue_router)
 app.include_router(auth_router)
 app.include_router(health_router)
-app.include_router(stream_router)
 app.include_router(playback_router)
 app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
 app.include_router(update_router, prefix="/api/update", tags=["update"])
@@ -444,8 +442,8 @@ os.makedirs(os.path.join(settings.MEDIA_DIR, "Series"), exist_ok=True)
 
 from fastapi.responses import FileResponse, StreamingResponse
 import re
-from routes.stream import download_file_from_cloud_task, ACTIVE_CLOUD_DOWNLOADS
 from routes.playback import cloud_file_size, open_cloud_chunks
+from services.cloud_cache import ACTIVE_CLOUD_DOWNLOADS, download_file_from_cloud_task
 from services.rclone import rclone_service
 from services.media_source import is_safe_presentation_asset, local_path_for
 

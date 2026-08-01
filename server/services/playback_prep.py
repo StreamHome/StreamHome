@@ -7,9 +7,10 @@ import re
 import shutil
 import subprocess
 import time
+import weakref
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from config import settings
@@ -86,7 +87,7 @@ class PlaybackPrepService:
         concurrency = max(1, settings.PLAYBACK_TRANSCODE_CONCURRENCY)
         self.semaphore = asyncio.Semaphore(concurrency)
         self.background_semaphore = asyncio.Semaphore(max(1, concurrency - 1))
-        self._master_locks: dict[str, asyncio.Lock] = {}
+        self._master_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     @staticmethod
     def sanitize_diagnostics(value: str, limit: int = 2400) -> str:
@@ -322,7 +323,8 @@ class PlaybackPrepService:
             return "failed"
         if self.playlist_ready(media_id, fingerprint, rendition_name):
             return "streamable"
-        return "preparing"
+        key = f"{media_id}:{fingerprint}:{rendition_name}"
+        return "preparing" if key in self.active_jobs else "idle"
 
     def preparation_error(self, media_id: str, fingerprint: str) -> Optional[dict[str, str]]:
         error_path = self.cache_path(media_id, fingerprint) / "preparation-error.json"
@@ -506,7 +508,6 @@ class PlaybackPrepService:
             FOREGROUND_PRIORITY,
             retry_errors=True,
         )
-        self._schedule_remaining(media_id, fingerprint, source, media_obj)
         return "preparing"
 
     async def prioritize_audio_rendition(
@@ -541,7 +542,6 @@ class PlaybackPrepService:
             FOREGROUND_PRIORITY,
             retry_errors=True,
         )
-        self._schedule_remaining(media_id, fingerprint, source, media_obj)
         return "preparing"
 
     def _schedule_remaining(
@@ -759,13 +759,13 @@ class PlaybackPrepService:
         target_dir: Path,
     ) -> None:
         stall_seconds = max(1, int(settings.PLAYBACK_JOB_STALL_SECONDS))
-        last_signature = self._output_signature(target_dir)
+        last_signature = await asyncio.to_thread(self._output_signature, target_dir)
         last_activity = time.monotonic()
         wait_task = asyncio.create_task(process.wait())
         try:
             while not wait_task.done():
                 await asyncio.wait({wait_task}, timeout=1)
-                signature = self._output_signature(target_dir)
+                signature = await asyncio.to_thread(self._output_signature, target_dir)
                 if signature != last_signature:
                     last_signature = signature
                     last_activity = time.monotonic()
@@ -780,6 +780,20 @@ class PlaybackPrepService:
         finally:
             if not wait_task.done():
                 wait_task.cancel()
+
+    @staticmethod
+    async def _read_bounded_stream(
+        stream: asyncio.StreamReader,
+        limit: int = 2400,
+    ) -> bytes:
+        """Drain a child stream while retaining only its bounded diagnostic tail."""
+
+        tail = bytearray()
+        while chunk := await stream.read(64 * 1024):
+            tail.extend(chunk)
+            if len(tail) > limit:
+                del tail[:-limit]
+        return bytes(tail)
 
     async def _run_ffmpeg_job(
         self,
@@ -827,11 +841,11 @@ class PlaybackPrepService:
                     self._publish_when_streamable(media_id, fingerprint, rendition_name, media_obj, ffmpeg_process)
                 )
                 assert ffmpeg_process.stderr is not None
-                ffmpeg_stderr_task = asyncio.create_task(ffmpeg_process.stderr.read())
+                ffmpeg_stderr_task = asyncio.create_task(self._read_bounded_stream(ffmpeg_process.stderr))
                 if cloud_process:
                     pump_task = asyncio.create_task(self._pump_cloud_input(cloud_process, ffmpeg_process))
                     assert cloud_process.stderr is not None
-                    cloud_stderr_task = asyncio.create_task(cloud_process.stderr.read())
+                    cloud_stderr_task = asyncio.create_task(self._read_bounded_stream(cloud_process.stderr))
                 await self._wait_for_ffmpeg_progress(ffmpeg_process, target_dir)
                 stderr = await ffmpeg_stderr_task
                 if cloud_process:
@@ -872,7 +886,7 @@ class PlaybackPrepService:
                 self._clear_rendition_error(media_id, fingerprint, rendition_name)
                 self.touch(media_id, fingerprint)
                 await self.rebuild_master(media_id, fingerprint, media_obj)
-                self.enforce_lru_limits()
+                await asyncio.to_thread(self.enforce_lru_limits)
             except asyncio.CancelledError:
                 shutil.rmtree(target_dir, ignore_errors=True)
                 await self.rebuild_master(media_id, fingerprint, media_obj)
@@ -1035,6 +1049,35 @@ class PlaybackPrepService:
         ]
         await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, source, arguments, media_obj)
 
+    @staticmethod
+    def _measured_playlist_bandwidth(playlist: Path) -> Optional[tuple[int, int]]:
+        """Return peak and average bit rates from the fragments currently in a media playlist."""
+
+        try:
+            lines = playlist.read_text(encoding="utf-8").splitlines()
+            samples: list[tuple[int, float]] = []
+            pending_duration: Optional[float] = None
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("#EXTINF:"):
+                    pending_duration = float(stripped.split(":", 1)[1].split(",", 1)[0])
+                    continue
+                if not stripped or stripped.startswith("#") or pending_duration is None:
+                    continue
+                fragment = playlist.parent / Path(*PurePosixPath(stripped).parts)
+                if fragment.is_file() and pending_duration > 0:
+                    samples.append((fragment.stat().st_size, pending_duration))
+                pending_duration = None
+            if not samples:
+                return None
+            peak = max(round(size * 8 / duration) for size, duration in samples)
+            total_size = sum(size for size, _ in samples)
+            total_duration = sum(duration for _, duration in samples)
+            average = round(total_size * 8 / total_duration)
+            return max(1, peak), max(1, average)
+        except (OSError, ValueError, ZeroDivisionError):
+            return None
+
     async def rebuild_master(self, media_id: str, fingerprint: str, media_obj: Any) -> Optional[Path]:
         cache_path = self.cache_path(media_id, fingerprint)
         lock_key = f"{media_id}:{fingerprint}"
@@ -1046,6 +1089,16 @@ class PlaybackPrepService:
                 return None
 
             lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
+            measured_audio = [
+                measurement
+                for audio in audios
+                if (measurement := await asyncio.to_thread(
+                    self._measured_playlist_bandwidth,
+                    cache_path / audio.name / PLAYLIST_NAME,
+                )) is not None
+            ]
+            audio_peak = max((measurement[0] for measurement in measured_audio), default=0)
+            audio_average = max((measurement[1] for measurement in measured_audio), default=0)
             if audios:
                 for audio in audios:
                     attributes = [
@@ -1059,11 +1112,17 @@ class PlaybackPrepService:
                     ]
                     lines.append(f"#EXT-X-MEDIA:{','.join(attributes)}")
             for video in videos:
+                measured = await asyncio.to_thread(
+                    self._measured_playlist_bandwidth,
+                    cache_path / video.name / PLAYLIST_NAME,
+                )
+                video_peak, video_average = measured or (video.bandwidth, int(video.bandwidth * 0.82))
+                peak_bandwidth = video_peak + audio_peak
+                average_bandwidth = video_average + audio_average
                 attributes = [
-                    f"BANDWIDTH={video.bandwidth}",
-                    f"AVERAGE-BANDWIDTH={int(video.bandwidth * 0.82)}",
+                    f"BANDWIDTH={peak_bandwidth}",
+                    f"AVERAGE-BANDWIDTH={average_bandwidth}",
                     f"RESOLUTION={video.width}x{video.height}",
-                    'CODECS="avc1.640028,mp4a.40.2"' if audios else 'CODECS="avc1.640028"',
                     f'NAME="{video.label}"',
                 ]
                 if audios:

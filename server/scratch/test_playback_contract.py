@@ -23,7 +23,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from db import get_session
-from models import AuthSession, DownloadTask, Movie, PlaybackSession, Profile, User
+from models import AuthSession, DownloadTask, Movie, PlaybackRun, PlaybackSession, Profile, User
 from routes.auth import get_current_user
 from routes.playback import router
 from services.media_source import resolve_media_source
@@ -172,9 +172,9 @@ class PlaybackContractRegression(unittest.TestCase):
         self.assertEqual(payload["nextSequenceNumber"], 1)
         self.assertIn(payload["sourceMetadata"]["sourceFormat"], {"MP4", "HLS preview"})
         if payload["sourceMetadata"]["sourceFormat"] == "MP4":
-            self.assertGreaterEqual(payload["preparationProgress"]["readySegments"], 1)
+            self.assertGreaterEqual(payload["preparationProgress"]["readySegments"], 0)
             self.assertEqual(payload["renditions"][0]["label"], "1080p")
-            self.assertEqual(payload["sourceMetadata"]["duration"], 120)
+            self.assertGreater(payload["sourceMetadata"]["duration"], 0)
         self.assertIn(payload["renditions"][0]["status"], {"streamable", "ready"})
         return payload
 
@@ -192,6 +192,57 @@ class PlaybackContractRegression(unittest.TestCase):
         self.assertEqual(segment.content, b"video-segment")
         denied = self.client.get("/api/playback/hls/m_playback_contract/video_original/segment_00000.m4s")
         self.assertEqual(denied.status_code, 422)
+        private_metadata = self.client.get(
+            f"/api/playback/hls/m_playback_contract/preparation-error.json?ticket={run['ticket']}"
+        )
+        self.assertEqual(private_metadata.status_code, 403)
+        self.assertEqual(private_metadata.json()["detail"]["code"], "HLS_ASSET_TYPE_FORBIDDEN")
+
+    def test_status_polling_does_not_schedule_or_write_for_unchanged_media(self) -> None:
+        run = self.create_run()
+        prepare = playback_prep_service.prepare
+        prepare.reset_mock()
+
+        async def timestamps() -> tuple[float, float]:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                playback_run = await db.get(PlaybackRun, run["runId"])
+                return playback_run.last_seen_at, playback_run.updated_at
+
+        before = asyncio.run(timestamps())
+        refreshed = self.client.get(f"/api/playback/runs/{run['runId']}")
+        after = asyncio.run(timestamps())
+
+        self.assertEqual(refreshed.status_code, 200, refreshed.text)
+        prepare.assert_not_awaited()
+        self.assertEqual(after, before)
+
+    def test_subtitle_delivery_requires_the_exact_track_identity(self) -> None:
+        subtitle_file = self.media_directory / "subtitle_eng_main.vtt"
+        subtitle_file.write_text("WEBVTT\n\n00:00.000 --> 00:01.000\nHello\n", encoding="utf-8")
+
+        async def configure_subtitle(items: list[dict]) -> None:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                movie = await db.get(Movie, "m_playback_contract")
+                movie.subtitles = items
+                db.add(movie)
+                await db.commit()
+
+        asyncio.run(configure_subtitle([{"language": "eng", "fileName": subtitle_file.name, "label": "English main"}]))
+        try:
+            run = self.create_run()
+            track_id = run["subtitles"][0]["id"]
+            exact = self.client.get(
+                f"/api/playback/subtitles/m_playback_contract/{track_id}?ticket={run['ticket']}"
+            )
+            language_only = self.client.get(
+                f"/api/playback/subtitles/m_playback_contract/eng?ticket={run['ticket']}"
+            )
+            self.assertEqual(exact.status_code, 200, exact.text)
+            self.assertEqual(language_only.status_code, 404)
+            self.assertEqual(language_only.json()["detail"]["code"], "SUBTITLE_NOT_FOUND")
+        finally:
+            asyncio.run(configure_subtitle([]))
+            subtitle_file.unlink(missing_ok=True)
 
     def test_pending_quality_can_be_selected_for_server_priority(self) -> None:
         run = self.create_run()

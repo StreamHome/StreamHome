@@ -637,7 +637,7 @@ class DownloadQueueManager:
                 media_obj.source_fingerprint = fingerprint
                 db.add(media_obj)
                 await db.flush()
-            await playback_prep_service.prepare(media_obj.id, media_obj, source, include_remaining=True)
+            await playback_prep_service.prepare(media_obj.id, media_obj, source, include_remaining=False)
         except Exception as exc:
             logger.warning(
                 f"[Queue Manager] Playback baseline scheduling failed for "

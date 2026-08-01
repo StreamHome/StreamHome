@@ -9,7 +9,7 @@ Important route families:
 - `/api/profiles/*`: profile management and PIN verification;
 - `/api/admin/profiles/*`: recently reauthenticated cross-profile data inspection;
 - `/api/add-movie`: scoped ingestion;
-- `/api/playback/*` and `/api/stream/*`: playback preparation and delivery;
+- `/api/playback/*`: authenticated playback runs, preparation, and ticket-protected delivery;
 - `/api/system/*`: authenticated administration;
 - `/media/*`: range-capable physical media delivery.
 
