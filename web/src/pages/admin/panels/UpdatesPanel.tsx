@@ -16,7 +16,8 @@ import { SudoModal } from "../SudoModal";
 
 type ProtectedAction = "save" | "install-now" | "install-idle" | "retry" | "cancel" | null;
 
-const ACTIVE_PHASES = new Set(["queued", "preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back", "recovering"]);
+const ACTIVE_PHASES = new Set(["checking", "queued", "preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back", "recovering"]);
+const CANCELLABLE_PHASES = new Set(["queued", "preflight", "waiting_for_idle"]);
 
 function shortCommit(commit: string): string {
   return commit ? commit.slice(0, 12) : "Unknown";
@@ -47,7 +48,7 @@ export function UpdatesPanel() {
       applyStatus(await getUpdateStatus());
       setError("");
     } catch (requestError) {
-      if (!quiet) setError(requestError instanceof Error ? requestError.message : "Update status could not be loaded.");
+      setError(requestError instanceof Error ? requestError.message : "Update status could not be loaded.");
     } finally {
       if (!quiet) setLoading(false);
     }
@@ -56,8 +57,11 @@ export function UpdatesPanel() {
   useEffect(() => { void load(); }, [load]);
 
   useEffect(() => {
-    if (!status || !ACTIVE_PHASES.has(status.phase)) return;
-    const interval = window.setInterval(() => { void load(true); }, 5_000);
+    if (!status) return;
+    const interval = window.setInterval(
+      () => { void load(true); },
+      ACTIVE_PHASES.has(status.phase) || status.updateInProgress ? 5_000 : 30_000,
+    );
     return () => window.clearInterval(interval);
   }, [load, status]);
 
@@ -83,7 +87,7 @@ export function UpdatesPanel() {
     if (protectedAction === "install-now") await run(() => installUpdate("now"), "Immediate preflight started. StreamHome will restart after protected operations finish.");
     if (protectedAction === "install-idle") await run(() => installUpdate("when_idle"), "Update queued. Installation begins after all activity becomes idle.");
     if (protectedAction === "retry") await run(() => installUpdate("when_idle", true), "The failed target was explicitly queued for one retry.");
-    if (protectedAction === "cancel") await run(cancelPendingUpdate, "Pending update cancelled.");
+    if (protectedAction === "cancel") await run(cancelPendingUpdate, "Update cancellation requested.");
   };
 
   const header = (
@@ -108,7 +112,7 @@ export function UpdatesPanel() {
     );
   }
 
-  const busy = working || ACTIVE_PHASES.has(status.phase);
+  const busy = working || status.updateInProgress || ACTIVE_PHASES.has(status.phase);
   const failedTargetSuppressed = Boolean(status.failedTarget && status.failedTarget === status.targetCommit);
   const policyDirty = JSON.stringify(policy) !== JSON.stringify(status.policy);
 
@@ -143,7 +147,7 @@ export function UpdatesPanel() {
             {status.updateAvailable && status.phase !== "queued" && <Button type="button" disabled={busy} onClick={() => setConfirmImmediate(true)}>Update now</Button>}
             {status.updateAvailable && status.phase !== "queued" && <Button type="button" variant="secondary" disabled={busy} onClick={() => setProtectedAction("install-idle")}>Install when idle</Button>}
             {failedTargetSuppressed && <Button type="button" disabled={busy} onClick={() => setProtectedAction("retry")}>Retry failed target</Button>}
-            {status.phase === "queued" && <Button type="button" variant="ghost" disabled={working} onClick={() => setProtectedAction("cancel")}>Cancel pending update</Button>}
+            {CANCELLABLE_PHASES.has(status.phase) && <Button type="button" variant="ghost" disabled={working} onClick={() => setProtectedAction("cancel")}>Cancel update</Button>}
           </div>
         </GlassPane>
 

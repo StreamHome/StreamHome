@@ -133,6 +133,10 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("install.lock", install_sh)
         self.assertIn("--manual-execute", install_sh)
         self.assertIn("health-gated update", install_sh)
+        self.assertIn("verify_existing_update_trust", install_sh)
+        self.assertIn("UPDATE_TRUSTED_SIGNERS", install_sh)
+        self.assertIn('verify-commit "$commit"', install_sh)
+        self.assertIn("--no-start is not supported for existing-installation updates", install_sh)
         self.assertIn("already at the requested release", install_sh)
         self.assertNotIn('git -C "$INSTALL_DIR" checkout "$INSTALL_REF"', install_sh)
         self.assertIn("setup_args+=(--no-start)", install_sh)
@@ -199,6 +203,13 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("record_prepared_setup_state", update_sh)
         self.assertIn("/api/update/handoff", update_sh)
         self.assertIn("X-StreamHome-Update-Handoff", update_sh)
+        self.assertIn("X-StreamHome-Update-Commit", update_sh)
+        self.assertIn("STREAMHOME_UPDATE_TRANSACTION", update_sh)
+        self.assertIn("runtime_committed", update_sh)
+        self.assertIn("update-state.lock", update_sh)
+        self.assertIn("preserve_unexpected_worktree_changes", update_sh)
+        self.assertIn("cancellation_requested", update_sh)
+        self.assertIn("UPDATE_COMMAND_TIMEOUT_SECONDS", update_sh)
         self.assertIn("create_database_checkpoint", update_sh)
         self.assertIn("start_maintenance", update_sh)
         self.assertLess(update_sh.index("if ! start_maintenance; then"), update_sh.index("if ! create_database_checkpoint; then"))
@@ -387,7 +398,7 @@ class SetupScriptContracts(unittest.TestCase):
             )
             self.assertEqual(classify(web_dependencies, python_dependencies)["python_dependencies_changed"], "true")
 
-    def test_linux_bootstrap_is_atomic_forwards_options_and_refuses_dirty_update(self) -> None:
+    def test_linux_bootstrap_is_atomic_rejects_unverified_no_start_and_refuses_dirty_update(self) -> None:
         bash = bash_command()
         if not bash:
             self.skipTest("Bash is not installed")
@@ -436,11 +447,16 @@ class SetupScriptContracts(unittest.TestCase):
                 cwd=root,
                 env=environment,
             )
-            self.assertEqual(forwarded.returncode, 0, forwarded.stdout + forwarded.stderr)
-            self.assertEqual(
-                (install_directory / ".setup-args").read_text(encoding="utf-8").splitlines(),
-                ["--no-start", "--skip-system-packages"],
+            self.assertNotEqual(forwarded.returncode, 0, forwarded.stdout + forwarded.stderr)
+            self.assertIn("--no-start is not supported for existing-installation updates", forwarded.stdout + forwarded.stderr)
+            self.assertNotEqual(run(["git", "rev-parse", "HEAD"], cwd=install_directory).stdout.strip(), expected_commit)
+
+            forwarded = run(
+                [bash, "-lc", f"'{bash_path(installer)}' --skip-system-packages"],
+                cwd=root,
+                env=environment,
             )
+            self.assertEqual(forwarded.returncode, 0, forwarded.stdout + forwarded.stderr)
             installed_commit = run(["git", "rev-parse", "HEAD"], cwd=install_directory).stdout.strip()
             self.assertEqual(installed_commit, expected_commit)
             self.assertEqual((install_directory / "release.txt").read_text(encoding="utf-8"), "next release\n")

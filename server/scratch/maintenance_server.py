@@ -5,6 +5,7 @@ import html
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from http import HTTPStatus
@@ -49,13 +50,32 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def atomic_update_json(path: Path, **changes: Any) -> dict[str, Any]:
-    payload = read_json(path)
-    payload.update(changes)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
-    return payload
+    lock_path = path.with_name("update-state.lock")
+    with lock_path.open("a+b") as lock_file:
+        if sys.platform != "win32":
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            payload = read_json(path)
+            payload.update(changes)
+            temporary = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+            with temporary.open("w", encoding="utf-8", newline="\n") as state_file:
+                state_file.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                state_file.flush()
+                os.fsync(state_file.fileno())
+            os.replace(temporary, path)
+            if sys.platform != "win32":
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            return payload
+        finally:
+            if sys.platform != "win32":
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def linux_process_start_ticks(pid: int) -> str:

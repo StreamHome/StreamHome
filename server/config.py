@@ -136,6 +136,7 @@ class Settings:
     UPDATE_MAINTENANCE_END: str = os.getenv("UPDATE_MAINTENANCE_END", "").strip()
     UPDATE_BRANCH: str = os.getenv("UPDATE_BRANCH", "main").strip() or "main"
     UPDATE_REQUIRE_SIGNED_COMMITS: bool = os.getenv("UPDATE_REQUIRE_SIGNED_COMMITS", "false").lower() in ("true", "1", "yes")
+    UPDATE_TRUSTED_SIGNERS: str = os.getenv("UPDATE_TRUSTED_SIGNERS", "").strip()
 
     # Library Optimization System
     HEVC_COMPRESSION_MODE: str = os.getenv("HEVC_COMPRESSION_MODE", "auto")

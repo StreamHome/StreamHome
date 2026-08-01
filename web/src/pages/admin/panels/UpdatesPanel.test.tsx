@@ -103,4 +103,29 @@ describe("UpdatesPanel", () => {
       idleMinutes: 30,
     })));
   });
+
+  it("allows a preflight transaction to request cancellation", async () => {
+    vi.mocked(updates.getUpdateStatus).mockResolvedValue({
+      ...baseStatus,
+      phase: "preflight",
+      updateAvailable: false,
+      updateInProgress: true,
+      message: "Preparing candidate",
+    });
+    vi.mocked(updates.cancelPendingUpdate).mockResolvedValue({
+      ...baseStatus,
+      phase: "preflight",
+      updateAvailable: false,
+      updateInProgress: true,
+      message: "Cancellation requested",
+    });
+
+    render(<UpdatesPanel />);
+    await screen.findByText("Preparing candidate");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel update" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize cancel the pending update" }));
+
+    await waitFor(() => expect(updates.cancelPendingUpdate).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/Update cancellation requested/)).toBeTruthy();
+  });
 });

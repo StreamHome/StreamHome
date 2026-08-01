@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import re
+import time
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
@@ -15,6 +16,7 @@ from models import APIModel, AuthSession, User
 from routes.auth import add_event, get_current_session, get_current_user, require_recent_reauth
 from services import state
 from services.update import (
+    ACTIVE_PHASES,
     BUSY_PHASES,
     cancel_queued_update,
     check_for_update_details,
@@ -28,6 +30,7 @@ from services.update import (
     read_update_state,
     update_lock_active,
     update_handoff_blockers,
+    write_update_state,
 )
 
 
@@ -50,6 +53,11 @@ class UpdateInstallRequest(BaseModel):
 
 class BrowserPresenceRequest(BaseModel):
     visible: bool
+
+
+class UpdateCommitRequest(BaseModel):
+    transaction_id: str
+    target_commit: str
 
 
 class UpdatePolicyResponse(APIModel):
@@ -130,7 +138,7 @@ async def _status_response() -> UpdateStatusResponse:
         error=str(persisted.get("error") or ""),
         blockers=await protected_cutover_blockers() if active_immediate else await idle_blockers(),
         maintenance_window_open=maintenance_window_open(),
-        update_in_progress=bool(persisted.get("phase") in BUSY_PHASES or update_lock_active()),
+        update_in_progress=bool(persisted.get("phase") in ACTIVE_PHASES or update_lock_active()),
         log_tail=read_update_log(),
         policy=_policy_response(),
     )
@@ -143,6 +151,7 @@ def _runtime_error(exc: RuntimeError) -> HTTPException:
         "no_update_available": "No update is currently available.",
         "failed_target_suppressed": "This target previously failed. Use the explicit retry action after reviewing its log.",
         "update_not_queued": "There is no pending update to cancel.",
+        "update_not_cancellable": "The update has already entered protected cutover and cannot be cancelled safely.",
         "dirty_worktree": "Local source changes must be committed or moved before updating.",
         "untrusted_origin": "The installation does not use the official StreamHome repository.",
         "invalid_install_mode": "Choose either immediate installation or installation when idle.",
@@ -191,6 +200,37 @@ async def approve_update_handoff(
     return {"approved": True}
 
 
+@router.post("/commit", include_in_schema=False)
+async def commit_updated_runtime(
+    payload: UpdateCommitRequest,
+    request: Request,
+    token: str = Header(default="", alias="X-StreamHome-Update-Commit"),
+):
+    """Release transaction-scoped maintenance after exact-build verification."""
+    try:
+        peer = ipaddress.ip_address(request.client.host if request.client else "")
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail={"code": "commit_forbidden", "message": "Update commit is local only."}) from exc
+    persisted = read_update_state()
+    if (
+        not peer.is_loopback
+        or not state.UPDATE_COMMIT_TOKEN
+        or not hmac.compare_digest(token, state.UPDATE_COMMIT_TOKEN)
+        or not state.UPDATE_TRANSACTION_ID
+        or not hmac.compare_digest(payload.transaction_id, state.UPDATE_TRANSACTION_ID)
+        or str(persisted.get("transaction_id") or "") != payload.transaction_id
+        or str(persisted.get("target_commit") or "") != payload.target_commit
+        or settings.BUILD_ID != payload.target_commit[:12]
+    ):
+        raise HTTPException(status_code=403, detail={"code": "commit_forbidden", "message": "Update commit authorization failed."})
+    write_update_state(runtime_committed=True, runtime_committed_at=time.time())
+    state.MAINTENANCE_MODE = False
+    state.MAINTENANCE_REASON = ""
+    state.UPDATE_COMMIT_TOKEN = ""
+    state.UPDATE_TRANSACTION_ID = ""
+    return {"committed": True, "buildId": settings.BUILD_ID}
+
+
 @router.get("/status", response_model=UpdateStatusResponse)
 async def get_update_status(session: AuthSession = Depends(require_recent_reauth)):
     del session
@@ -205,7 +245,7 @@ async def check_for_updates(
     db: AsyncSession = Depends(get_session),
 ):
     existing = read_update_state()
-    if existing.get("phase") == "queued" or existing.get("phase") in BUSY_PHASES or update_lock_active():
+    if existing.get("phase") in ACTIVE_PHASES or update_lock_active():
         raise _runtime_error(RuntimeError("update_in_progress"))
     result = await check_for_update_details()
     await add_event(

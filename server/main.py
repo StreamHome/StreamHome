@@ -100,6 +100,9 @@ async def playback_run_reaper():
 async def lifespan(app: FastAPI):
     # Sunucu başlarken (Startup) yapılacaklar:
     await init_db()
+    if state.UPDATE_TRANSACTION_ID and state.UPDATE_COMMIT_TOKEN:
+        state.MAINTENANCE_MODE = True
+        state.MAINTENANCE_REASON = "StreamHome is verifying an updated release before reopening normal traffic."
     ingest_preview_service.cleanup_expired()
     background_tasks: list[asyncio.Task] = []
 
@@ -221,9 +224,14 @@ async def lifespan(app: FastAPI):
                 await db.commit()
     except Exception as seed_err:
         logger.error(f"[Lifespan Startup] Error seeding default profile: {seed_err}")
+
+    async def wait_for_update_commit() -> None:
+        while state.UPDATE_TRANSACTION_ID:
+            await asyncio.sleep(0.25)
             
     async def recover_catalog_and_playback() -> None:
         try:
+            await wait_for_update_commit()
             await queue_manager.sync_media_from_disk()
             from services.audio_extractor import repair_completed_ingestion_languages
             await repair_completed_ingestion_languages()
@@ -241,23 +249,29 @@ async def lifespan(app: FastAPI):
     except Exception as sync_err:
         logger.error(f"[Lifespan Startup] Error scheduling media sync from disk: {sync_err}")
 
-    try:
-        queue_manager.start()
-    except Exception as q_start_err:
-        logger.error(f"[Lifespan Startup] Error starting queue manager: {q_start_err}")
+    async def start_runtime_workers() -> None:
+        await wait_for_update_commit()
+        try:
+            queue_manager.start()
+        except Exception as q_start_err:
+            logger.error(f"[Lifespan Startup] Error starting queue manager: {q_start_err}")
+        try:
+            from services.tmdb import tmdb_client
+            await tmdb_client.start_cache_workers()
+        except Exception as cache_start_err:
+            logger.error(f"[Lifespan Startup] Error starting TMDB cache workers: {cache_start_err}")
+        try:
+            hevc_compressor.start()
+        except Exception as h_start_err:
+            logger.error(f"[Lifespan Startup] Error starting hevc compressor: {h_start_err}")
 
-    try:
-        from services.tmdb import tmdb_client
-        await tmdb_client.start_cache_workers()
-    except Exception as cache_start_err:
-        logger.error(f"[Lifespan Startup] Error starting TMDB cache workers: {cache_start_err}")
-
-    try:
-        hevc_compressor.start()
-    except Exception as h_start_err:
-        logger.error(f"[Lifespan Startup] Error starting hevc compressor: {h_start_err}")
+    if state.UPDATE_TRANSACTION_ID:
+        background_tasks.append(asyncio.create_task(start_runtime_workers(), name="runtime-workers-start"))
+    else:
+        await start_runtime_workers()
 
     async def daily_backup_worker():
+        await wait_for_update_commit()
         await asyncio.sleep(30)
         while True:
             try:
@@ -293,10 +307,18 @@ async def lifespan(app: FastAPI):
     background_tasks.append(asyncio.create_task(automatic_update_worker(update_stop), name="automatic-update"))
 
     recommendation_stop = asyncio.Event()
-    recommendation_task = asyncio.create_task(recommendation_worker(recommendation_stop))
+    async def guarded_recommendation_worker() -> None:
+        await wait_for_update_commit()
+        await recommendation_worker(recommendation_stop)
+
+    recommendation_task = asyncio.create_task(guarded_recommendation_worker())
     
     # Spawn background reaper task for expired playback runs
-    reaper_task = asyncio.create_task(playback_run_reaper())
+    async def guarded_playback_reaper() -> None:
+        await wait_for_update_commit()
+        await playback_run_reaper()
+
+    reaper_task = asyncio.create_task(guarded_playback_reaper())
 
     logger.info("[Server] Lifespan: Startup completed (with fallback checks).")
     
@@ -343,7 +365,11 @@ class ActivityTrackingMiddleware(BaseHTTPMiddleware):
         if (
             state.MAINTENANCE_MODE
             and request.url.path != "/api/health"
-            and not request.url.path.startswith("/api/backup/restore/")
+            and request.url.path != "/api/update/commit"
+            and (
+                bool(state.UPDATE_TRANSACTION_ID)
+                or not request.url.path.startswith("/api/backup/restore/")
+            )
         ):
             return JSONResponse(
                 status_code=503,
@@ -370,7 +396,7 @@ class ActivityTrackingMiddleware(BaseHTTPMiddleware):
 class SetupGateMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        allowed = request.method == "OPTIONS" or path.startswith("/api/setup") or path == "/api/health"
+        allowed = request.method == "OPTIONS" or path.startswith("/api/setup") or path in {"/api/health", "/api/update/commit"}
         if not settings.SETUP_COMPLETE and not allowed:
             return JSONResponse(
                 status_code=503,

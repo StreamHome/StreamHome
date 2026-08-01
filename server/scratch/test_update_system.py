@@ -7,6 +7,7 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from config import settings
@@ -20,10 +21,12 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.run_dir = Path(self.temporary.name) / ".run"
         self.status_path = self.run_dir / "update-state.json"
+        self.status_lock_path = self.run_dir / "update-state.lock"
         self.log_path = Path(self.temporary.name) / "update.log"
         self.patches = [
             patch.object(update, "RUN_DIR", self.run_dir),
             patch.object(update, "STATUS_PATH", self.status_path),
+            patch.object(update, "STATUS_LOCK_PATH", self.status_lock_path),
             patch.object(update, "LOG_PATH", self.log_path),
         ]
         for active_patch in self.patches:
@@ -34,6 +37,14 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
             settings.UPDATE_IDLE_MINUTES,
             settings.UPDATE_MAINTENANCE_START,
             settings.UPDATE_MAINTENANCE_END,
+            settings.UPDATE_REQUIRE_SIGNED_COMMITS,
+            settings.UPDATE_TRUSTED_SIGNERS,
+        )
+        self.original_update_guard = (
+            state.MAINTENANCE_MODE,
+            state.MAINTENANCE_REASON,
+            state.UPDATE_COMMIT_TOKEN,
+            state.UPDATE_TRANSACTION_ID,
         )
         state.ACTIVE_HTTP_REQUESTS = 0
         state.LAST_HTTP_ACTIVITY_TIMESTAMP = 0
@@ -50,7 +61,15 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
             settings.UPDATE_IDLE_MINUTES,
             settings.UPDATE_MAINTENANCE_START,
             settings.UPDATE_MAINTENANCE_END,
+            settings.UPDATE_REQUIRE_SIGNED_COMMITS,
+            settings.UPDATE_TRUSTED_SIGNERS,
         ) = self.original_settings
+        (
+            state.MAINTENANCE_MODE,
+            state.MAINTENANCE_REASON,
+            state.UPDATE_COMMIT_TOKEN,
+            state.UPDATE_TRANSACTION_ID,
+        ) = self.original_update_guard
         update.playback_prep_service.active_jobs.clear()
         for active_patch in reversed(self.patches):
             active_patch.stop()
@@ -72,6 +91,122 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         tail = update.read_update_log(80)
         self.assertEqual(len(tail), 80)
         self.assertEqual(tail[-1], "line-249")
+
+    async def test_checking_phase_blocks_installing_a_stale_target(self) -> None:
+        update.write_update_state(
+            phase="checking",
+            target_commit="b" * 40,
+            update_available=True,
+        )
+        with self.assertRaisesRegex(RuntimeError, "update_in_progress"):
+            await update.queue_update(automatic=False)
+
+    async def test_active_preflight_cancellation_creates_a_transaction_request(self) -> None:
+        transaction = "cancel-transaction-123"
+        update.write_update_state(
+            phase="preflight",
+            target_commit="b" * 40,
+            transaction_id=transaction,
+        )
+        result = await update.cancel_queued_update()
+        self.assertEqual(result["phase"], "preflight")
+        self.assertIn("Cancellation requested", result["message"])
+        self.assertTrue((self.run_dir / f"update-cancel.{transaction}.requested").is_file())
+
+    async def test_signed_policy_verifies_every_commit_against_the_allowlist(self) -> None:
+        current = "a" * 40
+        first = "b" * 40
+        target = "c" * 40
+        settings.UPDATE_REQUIRE_SIGNED_COMMITS = True
+        settings.UPDATE_TRUSTED_SIGNERS = "TRUSTED-FINGERPRINT"
+
+        async def fake_git(args: list[str], *unused_args, **unused_kwargs):
+            if args[:2] == ["rev-list", "--reverse"]:
+                return 0, f"{first}\n{target}", ""
+            if args[0] == "verify-commit":
+                return 0, "", ""
+            if args[:3] == ["show", "-s", "--format=%GF"]:
+                return 0, "TRUSTED-FINGERPRINT", ""
+            raise AssertionError(f"Unexpected Git command: {args}")
+
+        with patch.object(update, "run_git_cmd", AsyncMock(side_effect=fake_git)) as git:
+            valid, error = await update.verify_update_commit_range(current, target)
+        self.assertTrue(valid, error)
+        verified = [call.args[0][1] for call in git.await_args_list if call.args[0][0] == "verify-commit"]
+        self.assertEqual(verified, [first, target])
+
+    def test_local_runtime_probe_rejects_a_web_listener_with_the_wrong_build(self) -> None:
+        target = "b" * 40
+
+        class FakeResponse:
+            def __init__(self, body: bytes, headers: dict[str, str]) -> None:
+                self.status = 200
+                self.body = body
+                self.headers = headers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *unused_args):
+                return False
+
+            def read(self) -> bytes:
+                return self.body
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.responses = iter(
+                    [
+                        FakeResponse(
+                            json.dumps(
+                                {
+                                    "status": "ready",
+                                    "buildId": target[:12],
+                                    "updateTransaction": "tx-probe",
+                                }
+                            ).encode(),
+                            {},
+                        ),
+                        FakeResponse(b"<html></html>", {"X-StreamHome-Web-Build": "wrong-build"}),
+                    ]
+                )
+
+            def open(self, *unused_args, **unused_kwargs):
+                return next(self.responses)
+
+        with patch.object(update.urllib.request, "build_opener", return_value=FakeOpener()):
+            self.assertFalse(update._probe_local_runtime(target, "tx-probe"))
+
+    async def test_runtime_commit_is_durable_before_maintenance_is_released(self) -> None:
+        transaction = "commit-transaction"
+        target = "c" * 40
+        token = "commit-token"
+        state.MAINTENANCE_MODE = True
+        state.MAINTENANCE_REASON = "guarded"
+        state.UPDATE_COMMIT_TOKEN = token
+        state.UPDATE_TRANSACTION_ID = transaction
+
+        def persist_commit(**changes):
+            self.assertTrue(state.MAINTENANCE_MODE)
+            self.assertTrue(changes["runtime_committed"])
+            return changes
+
+        with (
+            patch.object(update_route, "read_update_state", return_value={"transaction_id": transaction, "target_commit": target}),
+            patch.object(update_route, "write_update_state", side_effect=persist_commit) as persisted,
+            patch.object(settings, "BUILD_ID", target[:12]),
+        ):
+            result = await update_route.commit_updated_runtime(
+                update_route.UpdateCommitRequest(transaction_id=transaction, target_commit=target),
+                SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")),
+                token,
+            )
+
+        self.assertTrue(result["committed"])
+        persisted.assert_called_once()
+        self.assertFalse(state.MAINTENANCE_MODE)
+        self.assertEqual(state.UPDATE_TRANSACTION_ID, "")
+        self.assertEqual(state.UPDATE_COMMIT_TOKEN, "")
 
     def test_maintenance_window_supports_daytime_and_overnight_ranges(self) -> None:
         settings.UPDATE_MAINTENANCE_START = ""
@@ -241,6 +376,8 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("STREAMHOME_INSTANCE_ROOT", detached_environment)
         self.assertNotIn("STREAMHOME_INSTANCE_TOKEN", detached_environment)
         self.assertNotIn("STREAMHOME_SERVICE", detached_environment)
+        self.assertNotIn("STREAMHOME_UPDATE_TRANSACTION", detached_environment)
+        self.assertNotIn("STREAMHOME_UPDATE_COMMIT_TOKEN", detached_environment)
         controller = Path(arguments[1])
         self.assertIn("target controller", controller.read_text(encoding="utf-8"))
 
@@ -260,7 +397,8 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
             patch.object(update, "update_lock_active", return_value=False),
             patch.object(update, "orphaned_controller_stale", return_value=True),
             patch.object(update, "current_commit", AsyncMock(return_value=target)),
-            patch.object(update, "local_web_ready", AsyncMock(return_value=True)),
+            patch.object(update, "local_runtime_ready", AsyncMock(return_value=True)),
+            patch.object(update, "commit_guarded_runtime", AsyncMock(return_value=True)),
             patch.object(update, "cleanup_reconciled_transaction") as cleanup,
         ):
             self.assertTrue(await update.reconcile_orphaned_update())
@@ -285,7 +423,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(update, "update_lock_active", return_value=False),
             patch.object(update, "current_commit", AsyncMock(return_value=target)),
-            patch.object(update, "local_web_ready", AsyncMock(return_value=False)),
+            patch.object(update, "local_runtime_ready", AsyncMock(return_value=False)),
             patch.object(update, "cleanup_reconciled_transaction") as cleanup,
         ):
             self.assertFalse(await update.reconcile_orphaned_update())
@@ -294,7 +432,8 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(update, "update_lock_active", return_value=False),
             patch.object(update, "current_commit", AsyncMock(return_value=target)),
-            patch.object(update, "local_web_ready", AsyncMock(return_value=True)),
+            patch.object(update, "local_runtime_ready", AsyncMock(return_value=True)),
+            patch.object(update, "commit_guarded_runtime", AsyncMock(return_value=True)),
             patch.object(update, "cleanup_reconciled_transaction") as cleanup,
         ):
             self.assertTrue(await update.reconcile_orphaned_update())
@@ -320,7 +459,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(update, "update_lock_active", return_value=False),
             patch.object(update, "current_commit", AsyncMock(return_value=target)),
-            patch.object(update, "local_web_ready", AsyncMock(return_value=True)) as ready,
+            patch.object(update, "local_runtime_ready", AsyncMock(return_value=True)) as ready,
         ):
             self.assertFalse(await update.reconcile_orphaned_update())
         ready.assert_not_awaited()
@@ -347,7 +486,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
             patch.object(update, "update_lock_active", return_value=False),
             patch.object(update, "orphaned_controller_stale", return_value=True),
             patch.object(update, "current_commit", AsyncMock(return_value=target)),
-            patch.object(update, "local_web_ready", AsyncMock(return_value=False)),
+            patch.object(update, "local_runtime_ready", AsyncMock(return_value=False)),
             patch.object(update.asyncio, "create_subprocess_exec", AsyncMock()) as launch,
         ):
             self.assertTrue(await update.reconcile_orphaned_update())

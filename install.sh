@@ -20,7 +20,7 @@ Usage:
   install.sh [--no-start] [--skip-system-packages] [--help]
 
 Options:
-  --no-start             Install and build without starting StreamHome.
+  --no-start             Leave a new/current release stopped; newer existing releases must pass startup health.
   --skip-system-packages Do not install missing operating-system packages.
   --help                 Show this help text.
 
@@ -96,6 +96,68 @@ valid_remote() {
     esac
 }
 
+read_env_value() {
+    local file="$1" key="$2" default_value="$3" value
+    value="$(awk -F= -v key="$key" '
+        {
+            line=$0
+            sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+            candidate=line
+            sub(/=.*/, "", candidate)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", candidate)
+            if (candidate == key) {
+                sub(/^[^=]*=/, "", line)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+                print line
+                exit
+            }
+        }
+    ' "$file" 2>/dev/null || true)"
+    value="${value%\"}"
+    value="${value#\"}"
+    value="${value%\'}"
+    value="${value#\'}"
+    printf '%s' "${value:-$default_value}"
+}
+
+verify_existing_update_trust() {
+    local old_commit="$1" target_commit="$2" require_signed raw_signers commit fingerprint trusted
+    local -a trusted_signers=() commits=()
+    require_signed="$(read_env_value "$INSTALL_DIR/.env" UPDATE_REQUIRE_SIGNED_COMMITS __unset__)"
+    if [[ "$require_signed" == "__unset__" ]]; then
+        require_signed="$(read_env_value "$INSTALL_DIR/server/.env" UPDATE_REQUIRE_SIGNED_COMMITS false)"
+    fi
+    require_signed="$(printf '%s' "$require_signed" | tr '[:upper:]' '[:lower:]')"
+    case "$require_signed" in
+        true|1|yes) ;;
+        *) return 0 ;;
+    esac
+    raw_signers="$(read_env_value "$INSTALL_DIR/.env" UPDATE_TRUSTED_SIGNERS __unset__)"
+    if [[ "$raw_signers" == "__unset__" ]]; then
+        raw_signers="$(read_env_value "$INSTALL_DIR/server/.env" UPDATE_TRUSTED_SIGNERS "")"
+    fi
+    IFS=',' read -r -a trusted_signers <<< "$raw_signers"
+    ((${#trusted_signers[@]} > 0)) \
+        || fail "Signed-update policy is enabled, but UPDATE_TRUSTED_SIGNERS is empty."
+    mapfile -t commits < <(git -C "$INSTALL_DIR" rev-list --reverse "$old_commit..$target_commit")
+    ((${#commits[@]} > 0)) || fail "The signed update range is empty."
+    for commit in "${commits[@]}"; do
+        git -C "$INSTALL_DIR" verify-commit "$commit" >/dev/null 2>&1 \
+            || fail "Commit $commit does not have a valid signature."
+        fingerprint="$(git -C "$INSTALL_DIR" show -s --format=%GF "$commit" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+        [[ -n "$fingerprint" ]] || fail "Commit $commit does not expose a signer fingerprint."
+        trusted=false
+        for signer in "${trusted_signers[@]}"; do
+            signer="$(printf '%s' "$signer" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+            if [[ -n "$signer" && "$signer" == "$fingerprint" ]]; then
+                trusted=true
+                break
+            fi
+        done
+        [[ "$trusted" == true ]] || fail "Commit $commit is not signed by an approved StreamHome release signer."
+    done
+}
+
 normalize_install_path() {
     local requested parent name
     requested="$INSTALL_DIR"
@@ -109,7 +171,7 @@ normalize_install_path() {
 }
 
 acquire_install_lock() {
-    local owner=""
+    local owner="" lock_age="0"
     INSTALL_LOCK="${INSTALL_DIR}.install.lock"
     if mkdir "$INSTALL_LOCK" 2>/dev/null; then
         printf '%s\n' "$$" > "$INSTALL_LOCK/owner.pid"
@@ -118,6 +180,20 @@ acquire_install_lock() {
     owner="$(cat "$INSTALL_LOCK/owner.pid" 2>/dev/null || true)"
     if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
         fail "Another StreamHome installation or update is already running for $INSTALL_DIR."
+    fi
+    lock_age="$(python3 - "$INSTALL_LOCK" <<'PY'
+import sys
+import time
+from pathlib import Path
+
+try:
+    print(max(0, int(time.time() - Path(sys.argv[1]).stat().st_mtime)))
+except OSError:
+    print(0)
+PY
+)"
+    if [[ ! "$lock_age" =~ ^[0-9]+$ ]] || (( lock_age < 30 )); then
+        fail "Another StreamHome installation is acquiring the install lock. Retry shortly."
     fi
     rm -f -- "$INSTALL_LOCK/owner.pid"
     rmdir -- "$INSTALL_LOCK" 2>/dev/null || fail "The installation lock is stale but could not be removed: $INSTALL_LOCK"
@@ -147,8 +223,11 @@ prepare_existing_checkout() {
         EXISTING_ALREADY_CURRENT=true
         return 0
     fi
+    [[ "$NO_START" == false ]] \
+        || fail "--no-start is not supported for existing-installation updates because the target must pass health checks before rollback artifacts are removed."
     git -C "$INSTALL_DIR" merge-base --is-ancestor "$head_commit" "$fetched_commit" \
         || fail "The requested update is not a safe fast-forward from the installed release."
+    verify_existing_update_trust "$head_commit" "$fetched_commit"
 
     STAGING_DIR="$(mktemp -d "$INSTALL_PARENT/.streamhome-install.XXXXXX")"
     controller="$STAGING_DIR/update-controller.sh"

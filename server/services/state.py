@@ -1,4 +1,5 @@
 import asyncio
+import os
 import subprocess
 import time
 from typing import Dict, Any, Union
@@ -20,9 +21,10 @@ MAINTENANCE_REASON: str = ""
 BROWSER_PRESENCE: Dict[str, float] = {}
 PRESENCE_TTL_SECONDS: int = 90
 UPDATE_HANDOFF_TOKEN: str = ""
+UPDATE_COMMIT_TOKEN: str = os.getenv("STREAMHOME_UPDATE_COMMIT_TOKEN", "")
+UPDATE_TRANSACTION_ID: str = os.getenv("STREAMHOME_UPDATE_TRANSACTION", "")
 
 import json
-import os
 
 from config import config_dir
 from services.logger import logger

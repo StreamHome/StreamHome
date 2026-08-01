@@ -20,6 +20,7 @@ from config import settings
 from db import engine, init_db
 from models import AuthChallenge, AuthSession, RecoveryCode, SecurityEvent, User
 from routes.auth import AUTH_COOKIE, get_current_user, health_router, router
+from services import state as service_state
 
 EMAIL = "streamhome_auth_regression@example.test"
 PASSWORD = "StreamHome-Regression-Password"
@@ -89,6 +90,18 @@ def run() -> None:
     try:
         health = client.get("/api/health")
         assert health.status_code == 200 and health.json()["status"] == "ready"
+
+        service_state.UPDATE_TRANSACTION_ID = "health-guard-transaction"
+        service_state.UPDATE_COMMIT_TOKEN = "health-guard-token"
+        service_state.MAINTENANCE_MODE = True
+        guarded_health = client.get("/api/health")
+        assert guarded_health.status_code == 200
+        assert guarded_health.json()["updateTransaction"] == "health-guard-transaction"
+        service_state.UPDATE_TRANSACTION_ID = ""
+        service_state.UPDATE_COMMIT_TOKEN = ""
+        blocked_health = client.get("/api/health")
+        assert blocked_health.status_code == 503
+        service_state.MAINTENANCE_MODE = False
 
         lock_connection = sqlite3.connect(settings.db_path, timeout=0)
         try:
@@ -174,6 +187,10 @@ def run() -> None:
         assert client.post("/api/auth/login", json={"email": UPDATED_EMAIL, "password": UPDATED_PASSWORD}, headers=headers).status_code == 200
         print("Authentication security regression checks passed.")
     finally:
+        service_state.UPDATE_TRANSACTION_ID = ""
+        service_state.UPDATE_COMMIT_TOKEN = ""
+        service_state.MAINTENANCE_MODE = False
+        service_state.MAINTENANCE_REASON = ""
         asyncio.run(cleanup_user(user_id))
 
 

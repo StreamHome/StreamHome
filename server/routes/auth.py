@@ -330,7 +330,9 @@ async def health():
     connection = None
     write_probe_started = False
     try:
-        if service_state.MAINTENANCE_MODE:
+        if service_state.MAINTENANCE_MODE and not (
+            service_state.UPDATE_TRANSACTION_ID and service_state.UPDATE_COMMIT_TOKEN
+        ):
             raise RuntimeError("Server restart required after database restore")
         connection = await engine.connect()
         await connection.exec_driver_sql("PRAGMA busy_timeout=500")
@@ -351,6 +353,7 @@ async def health():
             "version": settings.APP_VERSION,
             "buildId": settings.BUILD_ID,
             "serverTime": now(),
+            "updateTransaction": service_state.UPDATE_TRANSACTION_ID,
         }
     except Exception as exc:
         message = str(exc).lower()

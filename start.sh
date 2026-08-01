@@ -279,7 +279,7 @@ start_web() {
 }
 
 endpoint_ready() {
-    "$BACKEND_PYTHON" - "$1" "$2" <<'PY'
+    "$BACKEND_PYTHON" - "$1" "$2" "${3:-}" <<'PY'
 import json
 import sys
 import urllib.request
@@ -291,7 +291,13 @@ try:
             raise SystemExit(1)
         if sys.argv[2] == "api":
             payload = json.loads(response.read().decode("utf-8"))
-            raise SystemExit(0 if payload.get("status") == "ready" else 1)
+            raise SystemExit(
+                0
+                if payload.get("status") == "ready" and (not sys.argv[3] or payload.get("buildId") == sys.argv[3])
+                else 1
+            )
+        if sys.argv[2] == "web" and sys.argv[3]:
+            raise SystemExit(0 if str(response.headers.get("X-StreamHome-Web-Build") or "") == sys.argv[3] else 1)
 except Exception:
     raise SystemExit(1)
 PY
@@ -305,8 +311,8 @@ wait_for_services() {
     for ((attempt = 0; attempt < checks; attempt++)); do
         service_record_matches backend "$backend_pid" || return 1
         service_record_matches web "$web_pid" || return 1
-        if endpoint_ready "http://127.0.0.1:8000/api/health" api \
-            && endpoint_ready "http://127.0.0.1:${WEB_PORT}/" web; then
+        if endpoint_ready "http://127.0.0.1:8000/api/health" api "$STREAMHOME_BUILD_ID" \
+            && endpoint_ready "http://127.0.0.1:${WEB_PORT}/" web "$STREAMHOME_BUILD_ID"; then
             return 0
         fi
         sleep 0.5
@@ -383,12 +389,14 @@ wait_for_active_update() {
 }
 
 running_services_ready() {
-    local configured_port
+    local configured_port expected_build
     configured_port="$(read_env WEB_PORT 3000)"
     [[ "$configured_port" =~ ^[0-9]+$ ]] || return 1
     configured_port="$((10#$configured_port))"
-    endpoint_ready "http://127.0.0.1:8000/api/health" api \
-        && endpoint_ready "http://127.0.0.1:${configured_port}/" web
+    expected_build="$(git -C "$ROOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || true)"
+    [[ -n "$expected_build" ]] || return 1
+    endpoint_ready "http://127.0.0.1:8000/api/health" api "$expected_build" \
+        && endpoint_ready "http://127.0.0.1:${configured_port}/" web "$expected_build"
 }
 
 validate_runtime_dependencies() {

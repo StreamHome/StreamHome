@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import json
 import os
 import re
 import secrets
+import signal
 import shutil
 import subprocess
+import sys
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +28,7 @@ REPOSITORY_URL = "https://github.com/StreamHome/StreamHome.git"
 LEGACY_REPOSITORY_URL = "https://github.com/WaqSea/StreamHome.git"
 TERMINAL_PHASES = {"idle", "up_to_date", "update_available", "succeeded", "failed", "rolled_back", "rollback_failed"}
 BUSY_PHASES = {"preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back", "recovering"}
+ACTIVE_PHASES = BUSY_PHASES | {"checking", "queued"}
 RECOVERABLE_TARGET_ERRORS = {
     "shutdown_failed",
     "maintenance_start_failed",
@@ -37,11 +42,13 @@ RECOVERABLE_TARGET_ERRORS = {
 }
 INSTALL_MODES = {"automatic", "when_idle", "now"}
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 UPDATE_CHECK_LOCK = asyncio.Lock()
 UPDATE_QUEUE_LOCK = asyncio.Lock()
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 RUN_DIR = WORKSPACE_ROOT / ".run"
 STATUS_PATH = RUN_DIR / "update-state.json"
+STATUS_LOCK_PATH = RUN_DIR / "update-state.lock"
 LOG_PATH = WORKSPACE_ROOT / "update.log"
 START_SCRIPT = WORKSPACE_ROOT / "start.sh"
 ORPHANED_CONTROLLER_SECONDS = 30
@@ -49,6 +56,8 @@ RUNTIME_IDENTITY_ENV_KEYS = {
     "STREAMHOME_INSTANCE_ROOT",
     "STREAMHOME_INSTANCE_TOKEN",
     "STREAMHOME_SERVICE",
+    "STREAMHOME_UPDATE_TRANSACTION",
+    "STREAMHOME_UPDATE_COMMIT_TOKEN",
 }
 
 
@@ -77,6 +86,8 @@ def _default_status() -> dict[str, Any]:
         "recovery_requested_at": None,
         "transaction_id": "",
         "diagnostic_id": "",
+        "runtime_committed": False,
+        "runtime_committed_at": None,
         "failed_target": "",
         "error": "",
     }
@@ -94,15 +105,52 @@ def read_update_state() -> dict[str, Any]:
     return result
 
 
-def write_update_state(**changes: Any) -> dict[str, Any]:
+@contextmanager
+def _update_state_lock():
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    result = read_update_state()
-    result.update(changes)
-    result["updated_at"] = time.time()
-    temporary = STATUS_PATH.with_name(f"{STATUS_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, STATUS_PATH)
-    return result
+    with STATUS_LOCK_PATH.open("a+b") as lock_file:
+        if sys.platform == "win32":
+            import msvcrt
+
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def write_update_state(**changes: Any) -> dict[str, Any]:
+    with _update_state_lock():
+        result = read_update_state()
+        result.update(changes)
+        result["updated_at"] = time.time()
+        temporary = STATUS_PATH.with_name(f"{STATUS_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        with temporary.open("w", encoding="utf-8", newline="\n") as state_file:
+            state_file.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
+            state_file.flush()
+            os.fsync(state_file.fileno())
+        os.replace(temporary, STATUS_PATH)
+        if sys.platform != "win32":
+            directory_fd = os.open(RUN_DIR, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        return result
 
 
 def read_update_log(lines: int = 80) -> list[str]:
@@ -117,7 +165,12 @@ def get_git_path() -> str:
     return shutil.which("git") or "git"
 
 
-async def run_git_cmd(args: list[str], cwd: Path = WORKSPACE_ROOT) -> tuple[int, str, str]:
+async def run_git_cmd(
+    args: list[str],
+    cwd: Path = WORKSPACE_ROOT,
+    timeout_seconds: float = 120,
+) -> tuple[int, str, str]:
+    process: asyncio.subprocess.Process | None = None
     try:
         process = await asyncio.create_subprocess_exec(
             get_git_path(),
@@ -125,13 +178,26 @@ async def run_git_cmd(args: list[str], cwd: Path = WORKSPACE_ROOT) -> tuple[int,
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=sys.platform != "win32",
         )
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
         return (
             process.returncode,
             stdout.decode(errors="ignore").strip(),
             stderr.decode(errors="ignore").strip(),
         )
+    except asyncio.TimeoutError:
+        if process is not None and process.returncode is None:
+            try:
+                if sys.platform != "win32":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            await process.communicate()
+        logger.error(f"[Update Service] Git command timed out after {timeout_seconds:g} seconds: {' '.join(args)}")
+        return -1, "", "git_command_timeout"
     except Exception as exc:
         logger.error(f"[Update Service] Git command failed: {type(exc).__name__}: {exc}")
         return -1, "", str(exc)
@@ -176,6 +242,36 @@ async def current_commit() -> str:
     return output if code == 0 and COMMIT_RE.fullmatch(output) else ""
 
 
+async def verify_update_commit_range(current: str, target: str) -> tuple[bool, str]:
+    if not settings.UPDATE_REQUIRE_SIGNED_COMMITS:
+        return True, ""
+    trusted_signers = {
+        value.strip().replace(" ", "").upper()
+        for value in settings.UPDATE_TRUSTED_SIGNERS.split(",")
+        if value.strip()
+    }
+    if not trusted_signers:
+        return False, "trusted signer configuration is missing"
+    code, commit_list, error = await run_git_cmd(["rev-list", "--reverse", f"{current}..{target}"])
+    commits = [commit for commit in commit_list.splitlines() if COMMIT_RE.fullmatch(commit)]
+    if code != 0 or not commits:
+        return False, error or "signed commit range is empty"
+    for commit in commits:
+        verify_code, _, verify_error = await run_git_cmd(["verify-commit", commit])
+        fingerprint_code, fingerprint, fingerprint_error = await run_git_cmd(
+            ["show", "-s", "--format=%GF", commit]
+        )
+        normalized_fingerprint = fingerprint.strip().replace(" ", "").upper()
+        if (
+            verify_code != 0
+            or fingerprint_code != 0
+            or not normalized_fingerprint
+            or normalized_fingerprint not in trusted_signers
+        ):
+            return False, verify_error or fingerprint_error or f"untrusted signer for {commit}"
+    return True, ""
+
+
 async def check_for_update_details() -> dict[str, Any]:
     async with UPDATE_CHECK_LOCK:
         checked_at = time.time()
@@ -184,7 +280,10 @@ async def check_for_update_details() -> dict[str, Any]:
             phase="checking",
             message="Checking the official StreamHome repository.",
             current_commit=current,
+            update_available=False,
             error="",
+            runtime_committed=False,
+            runtime_committed_at=None,
         )
         if not current:
             return write_update_state(
@@ -214,6 +313,15 @@ async def check_for_update_details() -> dict[str, Any]:
                 last_checked_at=checked_at,
             )
         branch = settings.UPDATE_BRANCH
+        if not BRANCH_RE.fullmatch(branch) or ".." in branch:
+            return write_update_state(
+                phase="failed",
+                message="The configured update branch is invalid.",
+                current_commit=current,
+                update_available=False,
+                error="invalid_update_branch",
+                last_checked_at=checked_at,
+            )
         shallow_code, shallow_value, shallow_error = await run_git_cmd(["rev-parse", "--is-shallow-repository"])
         if shallow_code != 0:
             logger.error(f"[Update Service] Shallow-check failed: {shallow_error}")
@@ -252,19 +360,6 @@ async def check_for_update_details() -> dict[str, Any]:
                 error="target_unavailable",
                 last_checked_at=checked_at,
             )
-        if settings.UPDATE_REQUIRE_SIGNED_COMMITS:
-            code, _, error = await run_git_cmd(["verify-commit", target])
-            if code != 0:
-                logger.error(f"[Update Service] Signature verification failed: {error}")
-                return write_update_state(
-                    phase="failed",
-                    message="The available commit does not satisfy signed-update policy.",
-                    current_commit=current,
-                    target_commit=target,
-                    update_available=False,
-                    error="signature_verification_failed",
-                    last_checked_at=checked_at,
-                )
         if current == target:
             return write_update_state(
                 phase="up_to_date",
@@ -275,6 +370,19 @@ async def check_for_update_details() -> dict[str, Any]:
                 error="",
                 last_checked_at=checked_at,
             )
+        if settings.UPDATE_REQUIRE_SIGNED_COMMITS:
+            signatures_valid, signature_error = await verify_update_commit_range(current, target)
+            if not signatures_valid:
+                logger.error(f"[Update Service] Signature verification failed: {signature_error}")
+                return write_update_state(
+                    phase="failed",
+                    message="The available commit range does not satisfy signed-update policy.",
+                    current_commit=current,
+                    target_commit=target,
+                    update_available=False,
+                    error="signature_verification_failed",
+                    last_checked_at=checked_at,
+                )
         code, _, _ = await run_git_cmd(["merge-base", "--is-ancestor", current, target])
         if code != 0:
             return write_update_state(
@@ -456,27 +564,74 @@ def orphaned_controller_stale(status: dict[str, Any], current_time: float | None
         return True
 
 
-async def local_web_ready() -> bool:
-    writer: asyncio.StreamWriter | None = None
+def _probe_local_runtime(expected_commit: str, expected_transaction: str = "") -> bool:
+    expected_build = expected_commit[:12]
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection("127.0.0.1", settings.WEB_PORT),
-            timeout=2,
+        api_request = urllib.request.Request(
+            f"http://127.0.0.1:8000/api/health?update_probe={time.time_ns()}",
+            headers={"Accept": "application/json", "Cache-Control": "no-cache"},
         )
-        writer.write(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        await writer.drain()
-        status_line = await asyncio.wait_for(reader.readline(), timeout=2)
-    except (OSError, asyncio.TimeoutError):
+        with opener.open(api_request, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            if (
+                response.status >= 400
+                or payload.get("status") != "ready"
+                or str(payload.get("buildId") or "") != expected_build
+                or (
+                    expected_transaction
+                    and str(payload.get("updateTransaction") or "") != expected_transaction
+                )
+            ):
+                return False
+        web_request = urllib.request.Request(
+            f"http://127.0.0.1:{settings.WEB_PORT}/?update_probe={time.time_ns()}",
+            headers={"Cache-Control": "no-cache"},
+        )
+        with opener.open(web_request, timeout=2) as response:
+            return (
+                200 <= response.status < 400
+                and str(response.headers.get("X-StreamHome-Web-Build") or "") == expected_build
+            )
+    except Exception:
         return False
-    finally:
-        if writer is not None:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
-    parts = status_line.decode("ascii", errors="ignore").split()
-    return len(parts) >= 2 and parts[1].isdigit() and 200 <= int(parts[1]) < 400
+
+
+async def local_runtime_ready(expected_commit: str, expected_transaction: str = "") -> bool:
+    if not COMMIT_RE.fullmatch(expected_commit):
+        return False
+    return await asyncio.to_thread(_probe_local_runtime, expected_commit, expected_transaction)
+
+
+def _commit_guarded_runtime(transaction: str, target: str) -> bool:
+    token_path = RUN_DIR / f"update-commit.{transaction}.token"
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not token:
+        return False
+    request = urllib.request.Request(
+        "http://127.0.0.1:8000/api/update/commit",
+        method="POST",
+        data=json.dumps({"transaction_id": transaction, "target_commit": target}).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-StreamHome-Update-Commit": token,
+        },
+    )
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=2) as response:
+            committed = 200 <= response.status < 300
+    except Exception:
+        return False
+    if committed:
+        token_path.unlink(missing_ok=True)
+    return committed
+
+
+async def commit_guarded_runtime(transaction: str, target: str) -> bool:
+    return await asyncio.to_thread(_commit_guarded_runtime, transaction, target)
 
 
 def cleanup_reconciled_transaction(status: dict[str, Any]) -> None:
@@ -499,6 +654,8 @@ def cleanup_reconciled_transaction(status: dict[str, Any]) -> None:
         RUN_DIR / "maintenance.start",
         RUN_DIR / f"update-recovery.{transaction}.requested",
         RUN_DIR / f"update-recovery.{transaction[:12]}.requested",
+        RUN_DIR / f"update-cancel.{transaction}.requested",
+        RUN_DIR / f"update-commit.{transaction}.token",
     ):
         try:
             path.unlink()
@@ -531,7 +688,15 @@ async def reconcile_orphaned_update() -> bool:
     previous = str(status.get("previous_commit") or "")
     error = str(status.get("error") or "")
     if phase in TERMINAL_PHASES and error in RECOVERABLE_TARGET_ERRORS:
-        if not target or installed != target or not await local_web_ready():
+        transaction = str(status.get("transaction_id") or "")
+        runtime_committed = bool(status.get("runtime_committed"))
+        if (
+            not target
+            or installed != target
+            or not await local_runtime_ready(target, "" if runtime_committed else transaction)
+        ):
+            return False
+        if transaction and not runtime_committed and not await commit_guarded_runtime(transaction, target):
             return False
         completed_at = time.time()
         write_update_state(
@@ -550,8 +715,17 @@ async def reconcile_orphaned_update() -> bool:
         return True
     if phase not in BUSY_PHASES or not orphaned_controller_stale(status):
         return False
-    web_ready = await local_web_ready()
-    if web_ready and installed == target:
+    transaction = str(status.get("transaction_id") or "")
+    runtime_committed = bool(status.get("runtime_committed"))
+    target_ready = installed == target and await local_runtime_ready(
+        target,
+        "" if runtime_committed else transaction,
+    )
+    previous_ready = installed == previous and await local_runtime_ready(previous)
+    if target_ready:
+        if transaction and not runtime_committed and not await commit_guarded_runtime(transaction, target):
+            target_ready = False
+    if target_ready:
         write_update_state(
             phase="succeeded",
             message="The updated release is healthy; interrupted controller bookkeeping was reconciled.",
@@ -566,7 +740,7 @@ async def reconcile_orphaned_update() -> bool:
         )
         cleanup_reconciled_transaction(status)
         return True
-    if web_ready and installed == previous:
+    if previous_ready:
         write_update_state(
             phase="rolled_back",
             message="The previous release is healthy; interrupted controller bookkeeping was reconciled.",
@@ -633,7 +807,7 @@ async def queue_update(
         if resolved_mode not in INSTALL_MODES or (not automatic and resolved_mode == "automatic"):
             raise RuntimeError("invalid_install_mode")
         status = read_update_state()
-        if status.get("phase") == "queued" or status.get("phase") in BUSY_PHASES or update_lock_active():
+        if status.get("phase") in ACTIVE_PHASES or update_lock_active():
             raise RuntimeError("update_in_progress")
         target = str(status.get("target_commit") or "")
         if target and target == status.get("failed_target") and not allow_failed_target:
@@ -668,20 +842,33 @@ async def queue_update(
             started_at=None,
             finished_at=None,
             error="",
+            runtime_committed=False,
+            runtime_committed_at=None,
         )
 
 
 async def cancel_queued_update() -> dict[str, Any]:
     async with UPDATE_QUEUE_LOCK:
         status = read_update_state()
-        if status.get("phase") != "queued":
+        phase = str(status.get("phase") or "")
+        if phase == "queued":
+            return write_update_state(
+                phase="update_available",
+                message="The pending update was cancelled.",
+                automatic=False,
+                queued_at=None,
+                error="",
+            )
+        if phase not in {"preflight", "waiting_for_idle"}:
             raise RuntimeError("update_not_queued")
+        transaction = str(status.get("transaction_id") or "")
+        if not transaction or not transaction.replace("-", "").isalnum():
+            raise RuntimeError("update_not_cancellable")
+        request_path = RUN_DIR / f"update-cancel.{transaction}.requested"
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        request_path.touch(exist_ok=True)
         return write_update_state(
-            phase="update_available",
-            message="The pending update was cancelled.",
-            automatic=False,
-            queued_at=None,
-            error="",
+            message="Cancellation requested. The updater will stop before protected cutover.",
         )
 
 
@@ -714,12 +901,25 @@ async def launch_queued_update_if_ready() -> bool:
                 finished_at=time.time(),
             )
             return False
+        signatures_valid, signature_error = await verify_update_commit_range(current, target)
+        if not signatures_valid:
+            logger.error(f"[Update Service] Launch signature verification failed: {signature_error}")
+            write_update_state(
+                phase="failed",
+                message="The queued target no longer satisfies signed-update policy.",
+                error="signature_verification_failed",
+                failed_target=target,
+                finished_at=time.time(),
+            )
+            return False
         token = secrets.token_urlsafe(32)
         RUN_DIR.mkdir(parents=True, exist_ok=True)
         token_path = RUN_DIR / f"update-handoff.{secrets.token_hex(8)}.token"
-        token_path.write_text(token, encoding="utf-8")
-        if os.name != "nt":
-            os.chmod(token_path, 0o600)
+        token_descriptor = os.open(token_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(token_descriptor, "w", encoding="utf-8") as token_file:
+            token_file.write(token)
+            token_file.flush()
+            os.fsync(token_file.fileno())
         controller_path = RUN_DIR / f"update-controller.{secrets.token_hex(8)}.sh"
         code, controller_source, controller_error = await run_git_cmd(["show", f"{target}:update.sh"])
         if code != 0 or not controller_source.startswith("#!/usr/bin/env bash"):
@@ -810,13 +1010,13 @@ async def automatic_update_worker(stop_event: asyncio.Event, initial_delay_secon
                     pass
                 continue
             status = read_update_state()
-            if state.MAINTENANCE_MODE and status.get("phase") in TERMINAL_PHASES:
+            if state.MAINTENANCE_MODE and not state.UPDATE_TRANSACTION_ID and status.get("phase") in TERMINAL_PHASES:
                 state.MAINTENANCE_MODE = False
                 state.MAINTENANCE_REASON = ""
                 state.UPDATE_HANDOFF_TOKEN = ""
             if status.get("phase") == "queued":
                 await launch_queued_update_if_ready()
-            elif settings.SETUP_COMPLETE and settings.AUTO_UPDATE_ENABLED and status.get("phase") not in BUSY_PHASES:
+            elif settings.SETUP_COMPLETE and settings.AUTO_UPDATE_ENABLED and status.get("phase") not in ACTIVE_PHASES:
                 last_checked = float(status.get("last_checked_at") or 0)
                 interval = settings.UPDATE_CHECK_INTERVAL_HOURS * 60 * 60
                 if time.time() - last_checked >= interval:

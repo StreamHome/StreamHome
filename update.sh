@@ -37,6 +37,11 @@ MANUAL_CUTOVER=false
 START_AFTER_UPDATE=true
 PUBLIC_URL=""
 PUBLIC_ORIGIN_WAS_READY=false
+COMMIT_TOKEN=""
+COMMIT_FILE=""
+CANCEL_FILE=""
+UPDATE_HANDOFF_TIMEOUT_SECONDS="${STREAMHOME_UPDATE_HANDOFF_TIMEOUT_SECONDS:-21600}"
+UPDATE_COMMAND_TIMEOUT_SECONDS="${STREAMHOME_UPDATE_COMMAND_TIMEOUT_SECONDS:-1800}"
 
 usage() {
     cat <<'EOF'
@@ -50,7 +55,7 @@ The public command fetches the configured official branch and runs the same
 isolated, preflighted, health-gated update path as the bootstrap installer.
 
 Options:
-  --no-start  Install and prepare the update, but leave StreamHome stopped.
+  --no-start  Repair the current release without starting; newer releases must pass guarded startup health.
   --help      Show this help text.
 EOF
 }
@@ -111,6 +116,46 @@ new_transaction_id() {
 import uuid
 print(uuid.uuid4().hex)
 PY
+}
+
+new_secret_token() {
+    python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(32))
+PY
+}
+
+run_bounded() {
+    local seconds="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --signal=TERM --kill-after=30 "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
+cancellation_requested() {
+    [[ -n "$CANCEL_FILE" && -f "$CANCEL_FILE" ]]
+}
+
+record_cancelled_update() {
+    rm -f -- "$CANCEL_FILE"
+    write_state "update_available" "The update was cancelled before protected cutover." "" "" "$OLD_COMMIT"
+}
+
+preserve_unexpected_worktree_changes() {
+    local patch_path="$RUN_DIR/update-preserved-changes.${TRANSACTION_ID}.patch"
+    if git -C "$ROOT_DIR" diff --quiet HEAD --; then
+        return 0
+    fi
+    if git -C "$ROOT_DIR" diff --binary HEAD -- > "$patch_path"; then
+        chmod 600 "$patch_path" 2>/dev/null || true
+        log "Unexpected tracked changes were preserved at $patch_path before rollback."
+        return 0
+    fi
+    log "Unexpected tracked changes could not be preserved; refusing destructive rollback."
+    return 1
 }
 
 write_update_lease() {
@@ -212,10 +257,26 @@ destination.parent.mkdir(parents=True, exist_ok=True)
 temporary = destination.with_name(f"{destination.name}.{os.getpid()}.tmp")
 temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 os.replace(temporary, destination)
-state["diagnostic_id"] = diagnostic_id
-state_temporary = state_path.with_name(f"{state_path.name}.{os.getpid()}.diagnostic.tmp")
-state_temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-os.replace(state_temporary, state_path)
+lock_path = state_path.with_name("update-state.lock")
+with lock_path.open("a+b") as lock_file:
+    if os.name == "posix":
+        import fcntl
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    try:
+        try:
+            latest_state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            latest_state = state
+        latest_state["diagnostic_id"] = diagnostic_id
+        state_temporary = state_path.with_name(f"{state_path.name}.{os.getpid()}.diagnostic.tmp")
+        with state_temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(latest_state, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(state_temporary, state_path)
+    finally:
+        if os.name == "posix":
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 PY
 }
 
@@ -289,10 +350,7 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 path.parent.mkdir(parents=True, exist_ok=True)
-try:
-    payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-except (OSError, ValueError, TypeError):
-    payload = {}
+lock_path = path.with_name("update-state.lock")
 (
     phase,
     message,
@@ -311,49 +369,72 @@ except (OSError, ValueError, TypeError):
     controller_pid,
     controller_start_ticks,
 ) = sys.argv[2:]
-now = time.time()
-previous_transaction = str(payload.get("transaction_id") or "")
-if transaction_id and transaction_id != previous_transaction:
-    payload.update({
-        "started_at": now,
-        "finished_at": None,
-        "recovery_requested_at": None,
-        "diagnostic_id": "",
-    })
-payload.update({
-    "phase": phase,
-    "message": message,
-    "error": error,
-    "failed_target": failed_target,
-    "current_commit": current,
-    "target_commit": target,
-    "automatic": automatic == "true",
-    "previous_commit": current if transaction_id and transaction_id != previous_transaction else (payload.get("previous_commit") or current),
-    "update_available": phase in {"update_available", "queued"} and not failed_target,
-    "updated_at": now,
-})
-if transaction_id:
-    payload.update({
-        "transaction_id": transaction_id,
-        "staging_dir": staging_dir,
-        "web_artifacts_swapped": web_artifacts_swapped == "true",
-        "web_dependencies_swapped": web_dependencies_swapped == "true",
-        "python_dependencies_changed": python_dependencies_changed == "true",
-        "web_dependencies_changed": web_dependencies_changed == "true",
-        "web_build_required": web_build_required == "true",
-        "controller_pid": int(controller_pid),
-        "controller_start_ticks": controller_start_ticks,
-    })
-if phase in {"preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back", "recovering"}:
-    payload["started_at"] = payload.get("started_at") or now
-if phase in {"succeeded", "failed", "rolled_back", "rollback_failed"}:
-    payload["finished_at"] = now
-if phase == "succeeded":
-    payload["last_success_at"] = now
-    payload["queued_at"] = None
-path_tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-path_tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-os.replace(path_tmp, path)
+with lock_path.open("a+b") as lock_file:
+    if os.name == "posix":
+        import fcntl
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    try:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except (OSError, ValueError, TypeError):
+            payload = {}
+        now = time.time()
+        previous_transaction = str(payload.get("transaction_id") or "")
+        if transaction_id and transaction_id != previous_transaction:
+            payload.update({
+                "started_at": now,
+                "finished_at": None,
+                "recovery_requested_at": None,
+                "diagnostic_id": "",
+                "runtime_committed": False,
+                "runtime_committed_at": None,
+            })
+        payload.update({
+            "phase": phase,
+            "message": message,
+            "error": error,
+            "failed_target": failed_target,
+            "current_commit": current,
+            "target_commit": target,
+            "automatic": automatic == "true",
+            "previous_commit": current if transaction_id and transaction_id != previous_transaction else (payload.get("previous_commit") or current),
+            "update_available": phase in {"update_available", "queued"} and not failed_target,
+            "updated_at": now,
+        })
+        if transaction_id:
+            payload.update({
+                "transaction_id": transaction_id,
+                "staging_dir": staging_dir,
+                "web_artifacts_swapped": web_artifacts_swapped == "true",
+                "web_dependencies_swapped": web_dependencies_swapped == "true",
+                "python_dependencies_changed": python_dependencies_changed == "true",
+                "web_dependencies_changed": web_dependencies_changed == "true",
+                "web_build_required": web_build_required == "true",
+                "controller_pid": int(controller_pid),
+                "controller_start_ticks": controller_start_ticks,
+            })
+        if phase in {"preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back", "recovering"}:
+            payload["started_at"] = payload.get("started_at") or now
+        if phase in {"succeeded", "failed", "rolled_back", "rollback_failed"}:
+            payload["finished_at"] = now
+        if phase == "succeeded":
+            payload["last_success_at"] = now
+            payload["queued_at"] = None
+        path_tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        with path_tmp.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(path_tmp, path)
+        if os.name == "posix":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if os.name == "posix":
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 PY
     if [[ -n "$error" && ( "$phase" == "failed" || "$phase" == "rolled_back" || "$phase" == "rollback_failed" ) ]]; then
         record_diagnostics "$phase" "$error" || true
@@ -452,6 +533,12 @@ cleanup() {
     if [[ -n "$HANDOFF_FILE" && "$HANDOFF_FILE" == "$RUN_DIR"/update-handoff.*.token ]]; then
         rm -f -- "$HANDOFF_FILE"
     fi
+    if [[ -n "$CANCEL_FILE" && "$CANCEL_FILE" == "$RUN_DIR"/update-cancel.*.requested ]]; then
+        rm -f -- "$CANCEL_FILE"
+    fi
+    if [[ "$PRESERVE_RECOVERY_ARTIFACTS" == false && -n "$COMMIT_FILE" && "$COMMIT_FILE" == "$RUN_DIR"/update-commit.*.token ]]; then
+        rm -f -- "$COMMIT_FILE"
+    fi
     if [[ "$PRESERVE_RECOVERY_ARTIFACTS" == false && -n "$STAGING_DIR" && -d "$STAGING_DIR" ]]; then
         rm -rf -- "$STAGING_DIR"
     fi
@@ -463,7 +550,7 @@ cleanup() {
 }
 
 acquire_update_lock() {
-    local owner=""
+    local owner="" lock_age="0"
     mkdir -p "$RUN_DIR"
     chmod 700 "$RUN_DIR" 2>/dev/null || true
     if mkdir "$UPDATE_LOCK" 2>/dev/null; then
@@ -476,6 +563,20 @@ acquire_update_lock() {
     fi
     owner="$(cat "$UPDATE_LOCK/owner.pid" 2>/dev/null || true)"
     if [[ "$owner" =~ ^[0-9]+$ ]] && update_process_is_controller "$owner"; then
+        return 1
+    fi
+    lock_age="$(python3 - "$UPDATE_LOCK" <<'PY'
+import sys
+import time
+from pathlib import Path
+
+try:
+    print(max(0, int(time.time() - Path(sys.argv[1]).stat().st_mtime)))
+except OSError:
+    print(0)
+PY
+)"
+    if [[ ! "$lock_age" =~ ^[0-9]+$ ]] || (( lock_age < 30 )); then
         return 1
     fi
     rm -f -- "$UPDATE_LOCK/owner.pid"
@@ -593,7 +694,7 @@ PY
 prepare_python_wheelhouse() {
     local source_root="$1" destination="$2" builder_python="$3"
     mkdir -p "$destination"
-    "$builder_python" -m pip wheel \
+    run_bounded "$UPDATE_COMMAND_TIMEOUT_SECONDS" "$builder_python" -m pip wheel \
         --wheel-dir "$destination" \
         -c "$source_root/server/requirements.lock" \
         -r "$source_root/server/requirements.txt"
@@ -603,18 +704,18 @@ install_python_wheelhouse() {
     local source_root="$1" wheelhouse="$2" target_python="${3:-$ROOT_DIR/venv/bin/python}"
     [[ -x "$target_python" ]] || return 1
     [[ -d "$wheelhouse" ]] || return 1
-    "$target_python" -m pip install \
+    run_bounded "$UPDATE_COMMAND_TIMEOUT_SECONDS" "$target_python" -m pip install \
         --no-index \
         --find-links "$wheelhouse" \
         -c "$source_root/server/requirements.lock" \
         -r "$source_root/server/requirements.txt" \
         || return 1
-    "$target_python" -m pip check
+    run_bounded "$UPDATE_COMMAND_TIMEOUT_SECONDS" "$target_python" -m pip check
 }
 
 validate_current_python_environment() {
     [[ -x "$ROOT_DIR/venv/bin/python" ]] || return 1
-    "$ROOT_DIR/venv/bin/python" -m pip check
+    run_bounded "$UPDATE_COMMAND_TIMEOUT_SECONDS" "$ROOT_DIR/venv/bin/python" -m pip check
 }
 
 installed_web_build_matches() {
@@ -663,7 +764,7 @@ prepare_candidate_python() {
         return 0
     fi
 
-    python3 -m venv "$staged_checkout/venv" || return 1
+    run_bounded "$UPDATE_COMMAND_TIMEOUT_SECONDS" python3 -m venv "$staged_checkout/venv" || return 1
     builder_python="$staged_checkout/venv/bin/python"
     "$builder_python" -m pip --version >/dev/null || "$builder_python" -m ensurepip --upgrade || return 1
     log "Python dependency manifests changed; preparing candidate and rollback packages."
@@ -683,7 +784,7 @@ prepare_candidate_web() {
 
     if [[ "$WEB_DEPENDENCIES_CHANGED" == true ]]; then
         log "Web dependency manifests changed; installing the candidate dependency tree once."
-        (cd "$candidate_web" && npm ci --prefer-offline --no-audit --no-fund) || return 1
+        (cd "$candidate_web" && run_bounded "$UPDATE_COMMAND_TIMEOUT_SECONDS" npm ci --prefer-offline --no-audit --no-fund) || return 1
     else
         [[ -d "$ROOT_DIR/web/node_modules" ]] || return 1
         ln -s "$ROOT_DIR/web/node_modules" "$candidate_web/node_modules" || return 1
@@ -691,7 +792,7 @@ prepare_candidate_web() {
     fi
 
     if ! (cd "$candidate_web" \
-        && env VITE_BUILD_ID="$candidate_build" STREAMHOME_BUILD_ID="$candidate_build" npm run build); then
+        && run_bounded "$UPDATE_COMMAND_TIMEOUT_SECONDS" env VITE_BUILD_ID="$candidate_build" STREAMHOME_BUILD_ID="$candidate_build" npm run build); then
         [[ "$WEB_DEPENDENCIES_CHANGED" == false ]] && rm -f -- "$candidate_web/node_modules"
         return 1
     fi
@@ -755,7 +856,7 @@ preflight_target() {
     git -C "$ROOT_DIR" cat-file -e "${TARGET_COMMIT}^{commit}" || return 1
     git -C "$ROOT_DIR" merge-base --is-ancestor "$OLD_COMMIT" "$TARGET_COMMIT" || return 1
     log "Creating an isolated checkout from the already-fetched exact target commit."
-    git clone --shared --no-checkout "$ROOT_DIR" "$staged_checkout" || return 1
+    run_bounded "$UPDATE_COMMAND_TIMEOUT_SECONDS" git clone --shared --no-checkout "$ROOT_DIR" "$staged_checkout" || return 1
     git -C "$staged_checkout" checkout --detach "$TARGET_COMMIT" || return 1
     staged_head="$(git -C "$staged_checkout" rev-parse HEAD 2>/dev/null || true)"
     [[ "$staged_head" == "$TARGET_COMMIT" ]] || {
@@ -772,9 +873,9 @@ preflight_target() {
     prepare_candidate_web "$staged_checkout" || return 1
     (
         cd "$staged_checkout"
-        ./test.sh --syntax-only
-        ./venv/bin/python -m compileall -q server
-        PYTHONPATH=server ./venv/bin/python server/scratch/test_update_system.py
+        run_bounded "$UPDATE_COMMAND_TIMEOUT_SECONDS" ./test.sh --syntax-only
+        run_bounded "$UPDATE_COMMAND_TIMEOUT_SECONDS" ./venv/bin/python -m compileall -q server
+        run_bounded "$UPDATE_COMMAND_TIMEOUT_SECONDS" env PYTHONPATH=server ./venv/bin/python server/scratch/test_update_system.py
     ) || return 1
     log "Candidate scripts, code, required dependencies, rollback artifacts, and production assets are ready."
 }
@@ -819,7 +920,7 @@ stop_installed_runtime_with_target_lifecycle() {
 }
 
 wait_for_idle_handoff() {
-    local code handoff_token install_mode
+    local code handoff_token install_mode wait_started
     handoff_token="$(cat "$HANDOFF_FILE" 2>/dev/null || true)"
     [[ -n "$handoff_token" ]] || return 1
     install_mode="$(python3 - "$STATUS_FILE" <<'PY'
@@ -838,7 +939,16 @@ PY
     else
         write_state "waiting_for_idle" "Preflight passed. Waiting for the server to become idle again."
     fi
+    wait_started="$(date +%s)"
     while true; do
+        if cancellation_requested; then
+            log "Cancellation was requested before protected cutover."
+            return 2
+        fi
+        if (( $(date +%s) - wait_started >= UPDATE_HANDOFF_TIMEOUT_SECONDS )); then
+            log "The protected cutover handoff timed out after ${UPDATE_HANDOFF_TIMEOUT_SECONDS} seconds."
+            return 1
+        fi
         code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
             -H "X-StreamHome-Update-Handoff: $handoff_token" \
             -X POST "http://127.0.0.1:8000/api/update/handoff" 2>/dev/null || true)"
@@ -931,6 +1041,7 @@ rollback_release() {
         return 1
     fi
     start_maintenance || true
+    preserve_unexpected_worktree_changes || return 1
     git -C "$ROOT_DIR" reset --hard "$OLD_COMMIT" || return 1
     if [[ -f "$RUN_DIR/pre-update-database.db" ]]; then
         restore_database_checkpoint || return 1
@@ -961,6 +1072,7 @@ recover_unchanged_release() {
         CUTOVER_STARTED=false
         ACTIVATION_STARTED=false
         write_state "failed" "$message The existing release remains installed and healthy." "$error" "$TARGET_COMMIT" "$OLD_COMMIT"
+        rm -f -- "$RUN_DIR/pre-update-database.db"
         return 0
     fi
     RUNTIME_HEALTHY=false
@@ -982,25 +1094,50 @@ record_rollback_failure() {
 }
 
 runtime_endpoints_ready() {
-    local configured_port
+    local configured_port expected_commit="${1:-}" expected_transaction="${2:-}"
     configured_port="$(read_env "$ROOT_DIR/.env" WEB_PORT 3000)"
-    [[ "$configured_port" =~ ^[0-9]+$ ]] || return 1
-    python3 - "$configured_port" <<'PY'
+    [[ "$configured_port" =~ ^[0-9]+$ && "$expected_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+    python3 - "$configured_port" "${expected_commit:0:12}" "$expected_transaction" <<'PY'
 import json
 import sys
+import time
 import urllib.request
 
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 try:
-    with opener.open("http://127.0.0.1:8000/api/health", timeout=1.5) as response:
+    with opener.open(f"http://127.0.0.1:8000/api/health?update_probe={time.time_ns()}", timeout=1.5) as response:
         payload = json.loads(response.read().decode("utf-8"))
-        if response.status >= 400 or payload.get("status") != "ready":
+        if (
+            response.status >= 400
+            or payload.get("status") != "ready"
+            or str(payload.get("buildId") or "") != sys.argv[2]
+            or (sys.argv[3] and str(payload.get("updateTransaction") or "") != sys.argv[3])
+        ):
             raise SystemExit(1)
-    with opener.open(f"http://127.0.0.1:{int(sys.argv[1])}/", timeout=1.5) as response:
-        raise SystemExit(0 if 200 <= response.status < 400 else 1)
+    with opener.open(f"http://127.0.0.1:{int(sys.argv[1])}/?update_probe={time.time_ns()}", timeout=1.5) as response:
+        web_build = str(response.headers.get("X-StreamHome-Web-Build") or "")
+        raise SystemExit(0 if 200 <= response.status < 400 and web_build == sys.argv[2] else 1)
 except Exception:
     raise SystemExit(1)
 PY
+}
+
+commit_updated_runtime() {
+    local code
+    if [[ -z "$COMMIT_TOKEN" && -n "$COMMIT_FILE" ]]; then
+        COMMIT_TOKEN="$(cat "$COMMIT_FILE" 2>/dev/null || true)"
+    fi
+    [[ -n "$COMMIT_TOKEN" && -n "$TRANSACTION_ID" ]] || return 1
+    code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+        -H "Content-Type: application/json" \
+        -H "X-StreamHome-Update-Commit: $COMMIT_TOKEN" \
+        --data "{\"transaction_id\":\"$TRANSACTION_ID\",\"target_commit\":\"$TARGET_COMMIT\"}" \
+        -X POST "http://127.0.0.1:8000/api/update/commit" 2>/dev/null || true)"
+    if [[ "$code" == "200" ]]; then
+        rm -f -- "$COMMIT_FILE"
+        return 0
+    fi
+    return 1
 }
 
 recovery_staging_is_safe() {
@@ -1014,7 +1151,7 @@ recovery_staging_is_safe() {
 }
 
 recover_interrupted_release() {
-    local phase current_head recovered_staging web_swapped
+    local phase current_head recovered_staging web_swapped runtime_committed
     RUN_DIR="$ROOT_DIR/.run"
     STATUS_FILE="$RUN_DIR/update-state.json"
     UPDATE_LOG="$ROOT_DIR/update.log"
@@ -1045,6 +1182,7 @@ print("true" if web_dependencies_swapped else "false")
 print("true" if payload.get("python_dependencies_changed", True) else "false")
 print("true" if payload.get("web_dependencies_changed", True) else "false")
 print("true" if payload.get("web_build_required", True) else "false")
+print("true" if payload.get("runtime_committed", False) else "false")
 PY
     )
     phase="${recovery_state[0]:-}"
@@ -1057,7 +1195,9 @@ PY
     PYTHON_DEPENDENCIES_CHANGED="${recovery_state[7]:-true}"
     WEB_DEPENDENCIES_CHANGED="${recovery_state[8]:-true}"
     WEB_BUILD_REQUIRED="${recovery_state[9]:-true}"
+    runtime_committed="${recovery_state[10]:-false}"
     [[ -n "$TRANSACTION_ID" ]] || TRANSACTION_ID="$(new_transaction_id)"
+    COMMIT_FILE="$RUN_DIR/update-commit.${TRANSACTION_ID}.token"
     STAGING_DIR="$recovered_staging"
     WEB_ARTIFACTS_SWAPPED="$web_swapped"
     if [[ -n "$STAGING_DIR" ]] && ! recovery_staging_is_safe; then
@@ -1076,21 +1216,27 @@ PY
     fi
     trap cleanup EXIT
     current_head="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
-    if runtime_endpoints_ready; then
+    if [[ "$current_head" == "$TARGET_COMMIT" ]] \
+        && { { [[ "$runtime_committed" == true ]] && runtime_endpoints_ready "$TARGET_COMMIT"; } \
+            || { [[ "$runtime_committed" != true ]] && runtime_endpoints_ready "$TARGET_COMMIT" "$TRANSACTION_ID"; }; }; then
+        if [[ "$runtime_committed" != true ]]; then
+            COMMIT_TOKEN="$(cat "$COMMIT_FILE" 2>/dev/null || true)"
+            commit_updated_runtime || return 1
+        fi
         stop_maintenance
         rm -f -- "$RUN_DIR/pre-update-database.db"
-        if [[ "$current_head" == "$TARGET_COMMIT" ]]; then
-            RUNTIME_HEALTHY=true
-            CUTOVER_STARTED=false
-            write_state "succeeded" "The updated release was already healthy; interrupted bookkeeping was reconciled." "" "" "$TARGET_COMMIT"
-            return 12
-        fi
-        if [[ "$current_head" == "$OLD_COMMIT" ]]; then
-            RUNTIME_HEALTHY=true
-            CUTOVER_STARTED=false
-            write_state "rolled_back" "The previous release was already healthy; interrupted bookkeeping was reconciled." "update_interrupted_rolled_back" "$TARGET_COMMIT" "$OLD_COMMIT"
-            return 12
-        fi
+        RUNTIME_HEALTHY=true
+        CUTOVER_STARTED=false
+        write_state "succeeded" "The updated release was already healthy; interrupted bookkeeping was reconciled." "" "" "$TARGET_COMMIT"
+        return 12
+    fi
+    if [[ "$current_head" == "$OLD_COMMIT" ]] && runtime_endpoints_ready "$OLD_COMMIT"; then
+        stop_maintenance
+        rm -f -- "$RUN_DIR/pre-update-database.db"
+        RUNTIME_HEALTHY=true
+        CUTOVER_STARTED=false
+        write_state "rolled_back" "The previous release was already healthy; interrupted bookkeeping was reconciled." "update_interrupted_rolled_back" "$TARGET_COMMIT" "$OLD_COMMIT"
+        return 12
     fi
     if [[ "$current_head" == "$OLD_COMMIT" && ! -f "$RUN_DIR/pre-update-database.db" ]]; then
         stop_maintenance
@@ -1104,6 +1250,10 @@ PY
         record_rollback_failure
         return 1
     fi
+    preserve_unexpected_worktree_changes || {
+        record_rollback_failure
+        return 1
+    }
     git -C "$ROOT_DIR" reset --hard "$OLD_COMMIT" || {
         record_rollback_failure
         return 1
@@ -1199,7 +1349,7 @@ PY
     trap cleanup EXIT
     current_head="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
     [[ "$current_head" == "$OLD_COMMIT" ]] || return 1
-    runtime_endpoints_ready || return 1
+    runtime_endpoints_ready "$OLD_COMMIT" || return 1
     stop_maintenance
     rm -f -- "$RUN_DIR/pre-update-database.db"
     rm -f -- "$RUN_DIR/update-recovery.${TRANSACTION_ID}.requested"
@@ -1223,6 +1373,8 @@ execute_update() {
     MAINTENANCE_PID_FILE="$RUN_DIR/maintenance.pid"
     MAINTENANCE_START_FILE="$RUN_DIR/maintenance.start"
     TRANSACTION_ID="$(new_transaction_id)"
+    COMMIT_FILE="$RUN_DIR/update-commit.${TRANSACTION_ID}.token"
+    CANCEL_FILE="$RUN_DIR/update-cancel.${TRANSACTION_ID}.requested"
     if [[ "$MANUAL_CUTOVER" == false ]]; then
         UPDATE_BRANCH="$(read_env "$ROOT_DIR/server/.env" UPDATE_BRANCH main)"
     fi
@@ -1230,6 +1382,24 @@ execute_update() {
     PUBLIC_URL="$(read_env "$ROOT_DIR/.env" PUBLIC_URL "")"
     trap cleanup EXIT
     trap 'exit 130' INT TERM HUP
+
+    [[ "$UPDATE_HANDOFF_TIMEOUT_SECONDS" =~ ^[0-9]+$ \
+        && "$UPDATE_COMMAND_TIMEOUT_SECONDS" =~ ^[0-9]+$ \
+        && "$UPDATE_HANDOFF_TIMEOUT_SECONDS" -ge 60 \
+        && "$UPDATE_HANDOFF_TIMEOUT_SECONDS" -le 86400 \
+        && "$UPDATE_COMMAND_TIMEOUT_SECONDS" -ge 60 \
+        && "$UPDATE_COMMAND_TIMEOUT_SECONDS" -le 7200 ]] || {
+        write_state "failed" "Update timeout configuration is invalid." "invalid_update_timeout" "$TARGET_COMMIT"
+        return 1
+    }
+    if [[ "$START_AFTER_UPDATE" == false ]]; then
+        write_state "failed" "Existing installations cannot be updated with --no-start because health-gated rollback would be unavailable." "no_start_update_unsupported" "$TARGET_COMMIT"
+        return 1
+    fi
+    if ! command -v timeout >/dev/null 2>&1; then
+        write_state "failed" "The timeout command is required for bounded update operations." "timeout_command_unavailable" "$TARGET_COMMIT"
+        return 1
+    fi
 
     if ! acquire_update_lock; then
         write_state "failed" "Another update controller already owns the update lock." "update_in_progress" "$TARGET_COMMIT"
@@ -1244,11 +1414,25 @@ execute_update() {
         write_state "failed" "The candidate failed isolated preflight. The running installation was not changed." "preflight_failed" "$TARGET_COMMIT"
         return 1
     fi
+    if cancellation_requested; then
+        record_cancelled_update
+        return 0
+    fi
+    if git -C "$ROOT_DIR" status --porcelain --untracked-files=normal | grep -q .; then
+        write_state "failed" "The checkout changed during preflight. The running installation was not modified." "dirty_worktree" "$TARGET_COMMIT"
+        return 1
+    fi
     if [[ "$MANUAL_CUTOVER" == true ]]; then
         write_state "waiting_for_idle" "Manual terminal update approved. Beginning protected cutover."
         log "Manual terminal update approved; active sessions will be disconnected."
     else
-        if ! wait_for_idle_handoff; then
+        wait_for_idle_handoff
+        handoff_result=$?
+        if [[ "$handoff_result" -eq 2 ]]; then
+            record_cancelled_update
+            return 0
+        fi
+        if [[ "$handoff_result" -ne 0 ]]; then
             write_state "failed" "The updater could not reserve a verified-idle cutover." "idle_handoff_failed" "$TARGET_COMMIT"
             return 1
         fi
@@ -1263,6 +1447,12 @@ execute_update() {
     write_state "stopping" "Prepared release is ready. Stopping StreamHome for a short protected activation."
     CUTOVER_STARTED=true
     RUNTIME_HEALTHY=false
+    if git -C "$ROOT_DIR" status --porcelain --untracked-files=normal | grep -q .; then
+        recover_unchanged_release \
+            "The checkout changed before shutdown, so the update was not applied." \
+            "dirty_worktree" || true
+        return 1
+    fi
     if ! stop_installed_runtime_with_target_lifecycle; then
         recover_unchanged_release \
             "StreamHome did not stop cleanly, so the update was not applied." \
@@ -1283,18 +1473,25 @@ execute_update() {
     fi
 
     write_state "installing" "Activating the exact preflighted commit and prepared runtime assets."
-    ACTIVATION_STARTED=true
     if ! git -C "$ROOT_DIR" status --porcelain --untracked-files=normal | grep -q .; then
         :
     else
         log "The checkout became dirty before cutover."
-        rollback_release || record_rollback_failure
+        recover_unchanged_release \
+            "The checkout changed during shutdown, so the update was not applied." \
+            "dirty_worktree" || true
         return 1
     fi
     if ! git -C "$ROOT_DIR" merge --ff-only "$TARGET_COMMIT"; then
-        rollback_release || record_rollback_failure
+        if [[ "$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)" == "$OLD_COMMIT" ]]; then
+            recover_unchanged_release "The target commit could not be activated." "activation_failed" || true
+        else
+            ACTIVATION_STARTED=true
+            rollback_release || record_rollback_failure
+        fi
         return 1
     fi
+    ACTIVATION_STARTED=true
     if [[ "$PYTHON_DEPENDENCIES_CHANGED" == true ]]; then
         write_state "installing" "Installing the changed preflighted Python dependency set offline."
         if ! install_python_wheelhouse "$ROOT_DIR" "$STAGING_DIR/candidate-wheels"; then
@@ -1315,18 +1512,23 @@ execute_update() {
     fi
     write_state "starting" "Starting and health-checking the updated API and web client." "" "" "$TARGET_COMMIT"
     stop_maintenance
-    if [[ "$START_AFTER_UPDATE" == false ]]; then
-        record_prepared_setup_state
-        rm -f -- "$RUN_DIR/pre-update-database.db"
-        RUNTIME_HEALTHY=true
-        CUTOVER_STARTED=false
-        ACTIVATION_STARTED=false
-        write_state "succeeded" "Update installed successfully. StreamHome was left stopped by explicit --no-start request." "" "" "$TARGET_COMMIT"
-        log "Update completed successfully at ${TARGET_COMMIT:0:12}; startup was skipped by request."
-        return 0
-    fi
-    if ! "$ROOT_DIR/start.sh" --update-recovery-complete; then
+    COMMIT_TOKEN="$(new_secret_token)"
+    [[ -n "$COMMIT_TOKEN" ]] || {
         start_maintenance || true
+        rollback_release || record_rollback_failure
+        return 1
+    }
+    (umask 077; printf '%s' "$COMMIT_TOKEN" > "$COMMIT_FILE")
+    if ! env \
+        STREAMHOME_UPDATE_TRANSACTION="$TRANSACTION_ID" \
+        STREAMHOME_UPDATE_COMMIT_TOKEN="$COMMIT_TOKEN" \
+        "$ROOT_DIR/start.sh" --update-recovery-complete; then
+        start_maintenance || true
+        rollback_release || record_rollback_failure
+        return 1
+    fi
+    if ! runtime_endpoints_ready "$TARGET_COMMIT" "$TRANSACTION_ID"; then
+        log "The local runtime did not expose the exact guarded target build; rolling back."
         rollback_release || record_rollback_failure
         return 1
     fi
@@ -1337,6 +1539,11 @@ execute_update() {
             rollback_release || record_rollback_failure
             return 1
         fi
+    fi
+    if ! commit_updated_runtime; then
+        log "The exact target build could not commit its guarded update transaction; rolling back."
+        rollback_release || record_rollback_failure
+        return 1
     fi
     record_prepared_setup_state
     RUNTIME_HEALTHY=true
