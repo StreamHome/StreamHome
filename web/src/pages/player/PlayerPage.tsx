@@ -131,6 +131,7 @@ const NETWORK_RETRY_LIMIT = 3;
 const MEDIA_RECOVERY_LIMIT = 2;
 export const PLAYER_CONTROLS_IDLE_MS = 3_000;
 export const PLAYBACK_STARTUP_TIMEOUT_MS = 12_000;
+export const PLAYBACK_STARTUP_MAX_PROGRESS_WAIT_MS = 30_000;
 
 
 function episodeTmdbId(mediaId: string): number | null {
@@ -335,10 +336,27 @@ export function isPlaybackTimeSeekable(ranges: Pick<TimeRanges, "length" | "star
   return false;
 }
 
-export function canUseProgressiveCompatibility(metadata: PlaybackRunResponse["sourceMetadata"]): boolean {
+export function canUseProgressiveCompatibility(
+  metadata: PlaybackRunResponse["sourceMetadata"],
+  mediaElement?: Pick<HTMLMediaElement, "canPlayType"> | null,
+): boolean {
   const codec = metadata.codec.trim().toLowerCase();
   const formats = `${metadata.container},${metadata.sourceFormat}`.toLowerCase().split(",").map((item) => item.trim());
-  return ["h264", "avc", "avc1"].includes(codec) && formats.some((item) => ["mp4", "mov", "mov,mp4", "m4v"].includes(item));
+  const mp4 = formats.some((item) => ["mp4", "mov", "mov,mp4", "m4v"].includes(item));
+  const webm = formats.some((item) => item === "webm");
+  if (["h264", "avc", "avc1"].includes(codec) && mp4) return true;
+  if (!mediaElement) return false;
+  const candidates: string[] = [];
+  if (["hevc", "h265", "hvc1", "hev1"].includes(codec) && mp4) {
+    candidates.push('video/mp4; codecs="hvc1"', 'video/mp4; codecs="hev1"');
+  }
+  if (["av1", "av01"].includes(codec)) {
+    if (mp4) candidates.push('video/mp4; codecs="av01.0.05M.08"');
+    if (webm) candidates.push('video/webm; codecs="av01"');
+  }
+  if (["vp9", "vp09"].includes(codec) && webm) candidates.push('video/webm; codecs="vp9"');
+  if (["vp8", "vp08"].includes(codec) && webm) candidates.push('video/webm; codecs="vp8"');
+  return candidates.some((candidate) => mediaElement.canPlayType(candidate) !== "");
 }
 
 export function progressiveAudioTrack(
@@ -354,6 +372,30 @@ export function progressiveAudioTrack(
   return preferred && preferred.source === "embedded"
     ? preferred
     : embedded.find((track) => track.default) ?? embedded[0];
+}
+
+export function canUseProgressivePlayback(
+  response: PlaybackRunResponse,
+  preferredTrackId: string,
+  preferredLanguage: string,
+  mediaElement?: Pick<HTMLMediaElement, "canPlayType"> | null,
+): boolean {
+  if (!response.progressiveUrl || !canUseProgressiveCompatibility(response.sourceMetadata, mediaElement)) return false;
+  return response.tracks.length === 0
+    || progressiveAudioTrack(response.tracks, preferredTrackId, preferredLanguage) !== null;
+}
+
+export function adaptiveTransportIsGrowing(response: PlaybackRunResponse): boolean {
+  return [...response.renditions, ...response.tracks].some((item) => item.status === "streamable");
+}
+
+export function shouldExtendPlaybackStartup(
+  now: number,
+  startedAt: number,
+  lastProgressAt: number,
+): boolean {
+  return now - startedAt < PLAYBACK_STARTUP_MAX_PROGRESS_WAIT_MS
+    && now - lastProgressAt < PLAYBACK_STARTUP_TIMEOUT_MS;
 }
 
 export function progressSequenceWasAccepted(requestSequence: number, nextSequence: number): boolean {
@@ -466,9 +508,12 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const controlsTimerRef = useRef<number | null>(null);
   const playbackStartupTimerRef = useRef<number | null>(null);
   const playbackStartupRetriesRef = useRef(0);
+  const playbackStartupStartedAtRef = useRef(0);
+  const playbackStartupProgressAtRef = useRef(0);
   const desktopClickTimerRef = useRef<number | null>(null);
   const hlsRetryTimerRef = useRef<number | null>(null);
   const resumePositionRef = useRef(0);
+  const deferredResumeTargetRef = useRef<number | null>(null);
   const currentTimeRef = useRef(0);
   const pendingSeekTargetRef = useRef<number | null>(null);
   const transportResettingRef = useRef(false);
@@ -690,6 +735,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (hlsRetryTimerRef.current !== null) window.clearTimeout(hlsRetryTimerRef.current);
     hlsRetryTimerRef.current = null;
     playbackStartupRetriesRef.current = 0;
+    playbackStartupStartedAtRef.current = 0;
+    playbackStartupProgressAtRef.current = 0;
+    deferredResumeTargetRef.current = null;
     pendingQualitySelectionRef.current = null;
     pendingAudioSelectionRef.current = null;
     lastFrameCaptureAtRef.current = 0;
@@ -741,9 +789,12 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       );
       if (
         response.preparationState === "preparing"
-        && response.progressiveUrl
-        && canUseProgressiveCompatibility(response.sourceMetadata)
-        && immediateProgressiveTrack
+        && canUseProgressivePlayback(
+          response,
+          immediateProgressiveTrack?.id ?? preferences.audioTrackId,
+          immediateProgressiveTrack?.language ?? preferences.audioLanguage,
+          typeof document === "undefined" ? null : document.createElement("video"),
+        )
       ) {
         setStreamMode("progressive");
         return { asset: resolvedAsset, episodeSequence: sequence, runResponse: response };
@@ -848,7 +899,27 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const markPlaybackStartupReady = useCallback(() => {
     clearPlaybackStartupWatchdog();
     playbackStartupRetriesRef.current = 0;
+    playbackStartupStartedAtRef.current = 0;
+    playbackStartupProgressAtRef.current = 0;
   }, [clearPlaybackStartupWatchdog]);
+
+  const markPlaybackStartupProgress = useCallback(() => {
+    playbackStartupProgressAtRef.current = performance.now();
+  }, []);
+
+  const applyDeferredResume = useCallback((video: HTMLVideoElement) => {
+    const target = deferredResumeTargetRef.current;
+    if (target === null || !isPlaybackTimeSeekable(video.seekable, target)) return false;
+    video.currentTime = target;
+    currentTimeRef.current = target;
+    resumePositionRef.current = target;
+    pendingSeekTargetRef.current = target;
+    resumeAppliedRef.current = true;
+    deferredResumeTargetRef.current = null;
+    setCurrentTime(target);
+    setPlayerNotice("Resume position reached.");
+    return true;
+  }, []);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -865,41 +936,81 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     networkRetriesRef.current = 0;
     mediaRecoveriesRef.current = 0;
     clearPlaybackStartupWatchdog();
-    playbackStartupTimerRef.current = window.setTimeout(() => {
-      playbackStartupTimerRef.current = null;
-      if (shouldRetryPlaybackStartup(playbackStartupRetriesRef.current)) {
-        playbackStartupRetriesRef.current += 1;
-        captureLastFrame(true);
-        resumePositionRef.current = currentTimeRef.current;
-        resumeAppliedRef.current = false;
-        transportResettingRef.current = true;
-        setPhase("recovering");
-        setPlayerNotice("Playback startup stalled. Refreshing the stream once…");
-        void getPlaybackRun(runResponse.runId, { retry: true })
-          .then((refreshed) => {
-            sequenceNumberRef.current = refreshed.nextSequenceNumber;
-            setRunResponse((current) => current ? mergePlaybackRunMetadata(current, refreshed) : refreshed);
-            setTransportRevision((value) => value + 1);
-          })
-          .catch((error: unknown) => {
-            setFatal({
-              title: "Playback did not start",
-              message: error instanceof Error
-                ? error.message
-                : "The stream could not be refreshed. Retry this title.",
-              retryable: true,
+    const startupStartedAt = performance.now();
+    playbackStartupStartedAtRef.current = startupStartedAt;
+    playbackStartupProgressAtRef.current = startupStartedAt;
+    const armStartupWatchdog = () => {
+      clearPlaybackStartupWatchdog();
+      playbackStartupTimerRef.current = window.setTimeout(() => {
+        playbackStartupTimerRef.current = null;
+        const now = performance.now();
+        if (
+          streamMode !== "progressive"
+          && canUseProgressivePlayback(
+            runResponse,
+            preferences.audioTrackId,
+            preferences.audioLanguage,
+            video,
+          )
+        ) {
+          captureLastFrame(true);
+          resumePositionRef.current = currentTimeRef.current;
+          resumeAppliedRef.current = false;
+          transportResettingRef.current = true;
+          setPlayerNotice("Adaptive startup stalled. Switching to the protected source stream…");
+          setPhase("recovering");
+          setStreamMode("progressive");
+          return;
+        }
+        if (
+          streamMode !== "progressive"
+          && shouldExtendPlaybackStartup(
+            now,
+            playbackStartupStartedAtRef.current,
+            playbackStartupProgressAtRef.current,
+          )
+        ) {
+          setPlayerNotice("The adaptive stream is still loading…");
+          armStartupWatchdog();
+          return;
+        }
+        if (shouldRetryPlaybackStartup(playbackStartupRetriesRef.current)) {
+          playbackStartupRetriesRef.current += 1;
+          captureLastFrame(true);
+          resumePositionRef.current = currentTimeRef.current;
+          resumeAppliedRef.current = false;
+          transportResettingRef.current = true;
+          setPhase("recovering");
+          setPlayerNotice("Playback startup stalled. Refreshing the stream once…");
+          void getPlaybackRun(runResponse.runId, { retry: true })
+            .then((refreshed) => {
+              sequenceNumberRef.current = refreshed.nextSequenceNumber;
+              setRunResponse((current) => current ? mergePlaybackRunMetadata(current, refreshed) : refreshed);
+              setTransportRevision((value) => value + 1);
+            })
+            .catch((error: unknown) => {
+              setFatal({
+                title: "Playback did not start",
+                message: error instanceof Error
+                  ? error.message
+                  : "The stream could not be refreshed. Retry this title.",
+                retryable: true,
+              });
+              setPhase("fatal");
             });
-            setPhase("fatal");
-          });
-        return;
-      }
-      setFatal({
-        title: "Playback did not start",
-        message: "The server prepared the stream, but the browser did not reach a playable state. Retry this title.",
-        retryable: true,
-      });
-      setPhase("fatal");
-    }, PLAYBACK_STARTUP_TIMEOUT_MS);
+          return;
+        }
+        setFatal({
+          title: "Playback did not start",
+          message: streamMode === "progressive"
+            ? "The browser could not decode the protected source stream. Retry this title or choose another browser."
+            : "The adaptive stream stopped making startup progress. Retry this title.",
+          retryable: true,
+        });
+        setPhase("fatal");
+      }, PLAYBACK_STARTUP_TIMEOUT_MS);
+    };
+    armStartupWatchdog();
 
     hlsRef.current?.destroy();
     hlsRef.current = null;
@@ -931,18 +1042,23 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (serverPreferredAudio && serverPreferredAudio.id !== selectedAudioTrackIdRef.current) {
       pendingAudioSelectionRef.current = serverPreferredAudio.id;
     }
+    const growingAdaptiveTransport = streamMode !== "progressive" && adaptiveTransportIsGrowing(runResponse);
 
     const beginPlayback = () => {
-      const resumeReady = applyResume(video);
       video.playbackRate = preferences.playbackRate;
-      if (!resumeReady) {
-        setPhase("recovering");
-        const activeTrack = runResponse.tracks.find((track) => track.id === selectedAudioTrackIdRef.current);
-        const progressiveSafe = !activeTrack || (activeTrack.source === "embedded" && activeTrack.default);
-        if (streamMode !== "progressive" && progressiveSafe && canUseProgressiveCompatibility(runResponse.sourceMetadata)) {
-          setStreamMode("progressive");
+      if (streamMode === "progressive") {
+        if (!applyResume(video)) {
+          setPhase("recovering");
+          return;
         }
-        return;
+      } else if (growingAdaptiveTransport && resumePositionRef.current > 0) {
+        deferredResumeTargetRef.current = resumePositionRef.current;
+        resumePositionRef.current = 0;
+        currentTimeRef.current = 0;
+        pendingSeekTargetRef.current = null;
+        resumeAppliedRef.current = true;
+        setCurrentTime(0);
+        setPlayerNotice("The resume point is still preparing; playback is starting from the available stream.");
       }
       const shouldResumePlayback = shouldResumePlaybackAfterTransport(
         playbackIntentRef.current,
@@ -974,7 +1090,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         enableWorker: true,
         capLevelToPlayerSize: true,
         startLevel: -1,
-        startPosition: Math.max(0, resumePositionRef.current),
+        startPosition: growingAdaptiveTransport ? 0 : Math.max(0, resumePositionRef.current),
         maxBufferLength: 30,
         maxMaxBufferLength: 90,
         backBufferLength: 30,
@@ -984,8 +1100,12 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       });
       hlsRef.current = hls;
       hls.attachMedia(video);
-      hls.on(HlsRuntime.Events.MEDIA_ATTACHED, () => hls.loadSource(runResponse.manifestUrl!));
+      hls.on(HlsRuntime.Events.MEDIA_ATTACHED, () => {
+        markPlaybackStartupProgress();
+        hls.loadSource(runResponse.manifestUrl!);
+      });
       hls.on(HlsRuntime.Events.MANIFEST_PARSED, (_, data) => {
+        markPlaybackStartupProgress();
         const options = playbackQualityOptions(runResponse.renditions, data.levels);
         hlsQualityOptionsRef.current = options;
         setAvailableQualities(options);
@@ -1015,6 +1135,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         setPlayerNotice(automatic ? "Automatic quality active" : selected ? `${selected.label} quality active` : "Automatic quality active");
       });
       hls.on(HlsRuntime.Events.LEVEL_UPDATED, () => {
+        markPlaybackStartupProgress();
+        if (applyDeferredResume(video)) return;
         if (resumeAppliedRef.current || !applyResume(video)) return;
         transportResettingRef.current = false;
         if (playbackIntentRef.current) {
@@ -1024,6 +1146,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }
       });
       hls.on(HlsRuntime.Events.AUDIO_TRACKS_UPDATED, (_, data) => {
+        markPlaybackStartupProgress();
         const matchedIndexes = matchAudioTrackIndexes(runResponse.tracks, data.audioTracks);
         const tracks = runResponse.tracks
           .map((serverTrack, serverIndex) => {
@@ -1057,6 +1180,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         if (selected) setPlayerNotice(`Switching audio to ${selected.label}…`);
       });
       hls.on(HlsRuntime.Events.AUDIO_TRACK_SWITCHED, (_, data) => {
+        markPlaybackStartupProgress();
         const selected = hlsAudioOptionsRef.current.find((track) => track.index === data.id);
         if (!selected) return;
         selectedAudioTrackIdRef.current = selected.id;
@@ -1069,6 +1193,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }));
         setPlayerNotice(`${selected.label} audio active`);
       });
+      hls.on(HlsRuntime.Events.LEVEL_LOADED, markPlaybackStartupProgress);
+      hls.on(HlsRuntime.Events.FRAG_LOADED, markPlaybackStartupProgress);
+      hls.on(HlsRuntime.Events.FRAG_BUFFERED, markPlaybackStartupProgress);
       hls.on(HlsRuntime.Events.ERROR, (_, data) => {
         if (!data.fatal) return;
         if (data.type === HlsRuntime.ErrorTypes.NETWORK_ERROR && networkRetriesRef.current < NETWORK_RETRY_LIMIT) {
@@ -1100,9 +1227,23 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           setPhase("fatal");
           return;
         }
-        setPhase("recovering");
-        setPlayerNotice("Adaptive playback failed; using the compatible source audio.");
-        setStreamMode("progressive");
+        if (canUseProgressivePlayback(
+          runResponse,
+          preferences.audioTrackId,
+          preferences.audioLanguage,
+          video,
+        )) {
+          setPhase("recovering");
+          setPlayerNotice("Adaptive playback failed; using the protected source stream.");
+          setStreamMode("progressive");
+          return;
+        }
+        setFatal({
+          title: "Adaptive playback failed",
+          message: `The browser could not load the prepared stream (${String(data.details || "unknown HLS error")}). Retry this title.`,
+          retryable: true,
+        });
+        setPhase("fatal");
       });
       return () => {
         clearPlaybackStartupWatchdog();
@@ -1156,6 +1297,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       };
       video.src = runResponse.manifestUrl;
       const onLoadedMetadata = () => {
+        markPlaybackStartupProgress();
         syncNativeAudioTracks();
         beginPlayback();
       };
@@ -1170,17 +1312,22 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     }
 
     if (runResponse.manifestUrl && !hlsEngine) return;
-    const selectedTrack = runResponse.tracks.find((track) => track.id === selectedAudioTrackIdRef.current);
-    const progressiveSafe = !selectedTrack || (selectedTrack.source === "embedded" && selectedTrack.default);
-    if (progressiveSafe && canUseProgressiveCompatibility(runResponse.sourceMetadata)) {
+    if (canUseProgressivePlayback(
+      runResponse,
+      preferences.audioTrackId,
+      preferences.audioLanguage,
+      video,
+    )) {
       setStreamMode("progressive");
     }
     return clearPlaybackStartupWatchdog;
   }, [
+    applyDeferredResume,
     applyResume,
     captureLastFrame,
     clearPlaybackStartupWatchdog,
     hlsEngine,
+    markPlaybackStartupProgress,
     runResponse?.manifestUrl,
     runResponse?.progressiveUrl,
     runResponse?.runId,
@@ -2115,6 +2262,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         onLoadedMetadata={() => {
           const video = videoRef.current;
           if (!video) return;
+          markPlaybackStartupProgress();
           const authoritativeDuration = authoritativePlaybackDuration(
             runResponse.sourceMetadata.duration,
             asset.durationLabel,
@@ -2249,7 +2397,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }}
         onProgress={() => {
           const video = videoRef.current;
-          if (!video || video.buffered.length === 0) {
+          if (!video) return;
+          markPlaybackStartupProgress();
+          applyDeferredResume(video);
+          if (video.buffered.length === 0) {
             return;
           }
           let nextBufferedEnd = 0;

@@ -259,70 +259,52 @@ async function enterPlayerFullscreen(
   transitionTimeoutMs: number,
 ): Promise<void> {
   const webkitContainer = container as WebKitFullscreenElement;
-  const documentRoot = documentObject.documentElement as HTMLElement | undefined;
-  const webkitDocumentRoot = documentRoot as WebKitFullscreenElement | undefined;
   const webkitVideo = video as WebKitFullscreenVideo;
-  const failures: string[] = [];
-  const attempts: Array<{ label: string; request: () => Promise<void> | void }> = [];
+  let attempt: { label: string; request: () => Promise<void> | void } | null = null;
 
-  if (documentRoot?.requestFullscreen) {
-    attempts.push({
-      label: "application root",
-      request: () => documentRoot.requestFullscreen(),
-    });
-  }
+  // Fullscreen requests must remain inside the original user-activation turn.
+  // Choose one target up front instead of awaiting a rejected request and then
+  // attempting fallbacks after the browser has consumed transient activation.
   if (container.requestFullscreen) {
-    attempts.push({
+    attempt = {
       label: "player container",
       request: () => container.requestFullscreen(),
-    });
-  }
-  if (allowVideoFallback && video.requestFullscreen) {
-    attempts.push({
-      label: "video element",
-      request: () => video.requestFullscreen(),
-    });
-  }
-  if (webkitContainer.webkitRequestFullscreen) {
-    attempts.push({
+    };
+  } else if (webkitContainer.webkitRequestFullscreen) {
+    attempt = {
       label: "WebKit player container",
       request: () => webkitContainer.webkitRequestFullscreen?.(),
-    });
-  }
-  if (
-    webkitDocumentRoot
-    && webkitDocumentRoot !== webkitContainer
-    && webkitDocumentRoot.webkitRequestFullscreen
-  ) {
-    attempts.push({
-      label: "WebKit application root",
-      request: () => webkitDocumentRoot.webkitRequestFullscreen?.(),
-    });
-  }
-  if (allowVideoFallback && webkitVideo.webkitEnterFullscreen) {
-    attempts.push({
+    };
+  } else if (allowVideoFallback && video.requestFullscreen) {
+    attempt = {
+      label: "video element",
+      request: () => video.requestFullscreen(),
+    };
+  } else if (allowVideoFallback && webkitVideo.webkitEnterFullscreen) {
+    attempt = {
       label: "native video",
       request: () => webkitVideo.webkitEnterFullscreen?.(),
-    });
+    };
   }
 
-  for (const attempt of attempts) {
-    try {
-      if (await requestVerifiedFullscreenTransition(
-        attempt.request,
-        container,
-        video,
-        documentObject,
-        true,
-        transitionTimeoutMs,
-      )) return;
-      failures.push(`${attempt.label}: the browser accepted the request but did not enter fullscreen.`);
-    } catch (error) {
-      failures.push(`${attempt.label}: ${errorMessage(error)}`);
-    }
-  }
+  if (!attempt) throw fullscreenEntryError([]);
 
-  throw fullscreenEntryError(failures);
+  try {
+    if (await requestVerifiedFullscreenTransition(
+      attempt.request,
+      container,
+      video,
+      documentObject,
+      true,
+      transitionTimeoutMs,
+    )) return;
+    throw fullscreenEntryError([
+      `${attempt.label}: the browser accepted the request but did not enter fullscreen.`,
+    ]);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Fullscreen could not be opened.")) throw error;
+    throw fullscreenEntryError([`${attempt.label}: ${errorMessage(error)}`]);
+  }
 }
 
 export async function togglePlayerFullscreen(

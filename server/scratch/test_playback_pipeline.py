@@ -197,8 +197,13 @@ class PlaybackPipelineRegression(unittest.TestCase):
         self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "idle")
         rendition_dir.mkdir(parents=True)
         try:
-            (rendition_dir / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+            (rendition_dir / "playlist.m3u8").write_text(
+                "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_00000.m4s\n",
+                encoding="utf-8",
+            )
             (rendition_dir / "segment_00000.m4s").write_bytes(b"segment")
+            self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "idle")
+            (rendition_dir / "init.mp4").write_bytes(b"init")
             self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "streamable")
             key = f"{media_id}:{fingerprint}:{rendition_name}"
             playback_prep_service.active_jobs[key] = SimpleNamespace()  # type: ignore[assignment]
@@ -222,12 +227,16 @@ class PlaybackPipelineRegression(unittest.TestCase):
     def test_optional_rendition_failure_does_not_interrupt_ready_baseline(self) -> None:
         media_id = f"m_optional_failure_{uuid.uuid4().hex}"
         fingerprint = "b" * 32
-        media = SimpleNamespace(width=1280, height=720, quality="720p", audio_metadata=[])
+        media = SimpleNamespace(width=1280, height=720, quality="720p", codec="h264", audio_metadata=[])
         cache_path = playback_prep_service.cache_path(media_id, fingerprint)
         baseline_dir = cache_path / "video_original"
         baseline_dir.mkdir(parents=True)
         try:
-            (baseline_dir / "playlist.m3u8").write_text("#EXTM3U\n#EXT-X-ENDLIST\n", encoding="utf-8")
+            (baseline_dir / "playlist.m3u8").write_text(
+                "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_00000.m4s\n#EXT-X-ENDLIST\n",
+                encoding="utf-8",
+            )
+            (baseline_dir / "init.mp4").write_bytes(b"init")
             (baseline_dir / "segment_00000.m4s").write_bytes(b"segment")
             (cache_path / "master.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
             playback_prep_service._write_rendition_error(media_id, fingerprint, "video_480p", "TEST_FAILURE", "failed")
@@ -326,7 +335,11 @@ class PlaybackPipelineRegression(unittest.TestCase):
             for name in ("video_original", "video_480p"):
                 rendition_dir = cache_path / name
                 rendition_dir.mkdir(parents=True)
-                (rendition_dir / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+                (rendition_dir / "playlist.m3u8").write_text(
+                    "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_00000.m4s\n",
+                    encoding="utf-8",
+                )
+                (rendition_dir / "init.mp4").write_bytes(b"init")
                 (rendition_dir / "segment_00000.m4s").write_bytes(b"segment")
             (cache_path / "video_original" / ".complete").write_text("done", encoding="utf-8")
             key = f"{media_id}:{fingerprint}:video_480p"
@@ -391,7 +404,11 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 first_source.video_fingerprint,
             ) / "video_original"
             original.mkdir(parents=True)
-            (original / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+            (original / "playlist.m3u8").write_text(
+                "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_00000.m4s\n",
+                encoding="utf-8",
+            )
+            (original / "init.mp4").write_bytes(b"init")
             (original / "segment_00000.m4s").write_bytes(b"unchanged-video")
             (original / ".complete").write_text("done", encoding="utf-8")
 
@@ -719,7 +736,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 self.assertNotIn("160k", audio_arguments)
 
             hevc = SimpleNamespace(codec="hevc", width=1920, height=1080, quality="1080p")
-            self.assertEqual(service.baseline_video(hevc).height, 720)
+            self.assertEqual(service.baseline_video(hevc).height, 480)
 
         with tempfile.TemporaryDirectory() as directory:
             service = PlaybackPrepService()

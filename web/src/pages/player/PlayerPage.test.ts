@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { Episode, PlaybackRunResponse } from "../../types/api";
 import {
   advancingPlaybackDelta,
+  adaptiveTransportIsGrowing,
   applySubtitleTrackSelection,
   authoritativePlaybackDuration,
   canUseProgressiveCompatibility,
+  canUseProgressivePlayback,
   catalogDurationSeconds,
   clampPlaybackTime,
   isMeaningfulPointerActivity,
@@ -18,6 +20,7 @@ import {
   progressSequenceWasAccepted,
   shouldAutoHidePlayerControls,
   shouldAcceptObservedPlaybackTime,
+  shouldExtendPlaybackStartup,
   shouldRetryPlaybackStartup,
   shouldResumePlaybackAfterTransport,
 } from "./PlayerPage";
@@ -104,6 +107,10 @@ describe("player interaction contracts", () => {
     const metadata = { duration: 6_000, container: "mov,mp4,m4a", codec: "h264", width: 1920, height: 1080, frameRate: 24, sourceFormat: "MP4" };
     expect(canUseProgressiveCompatibility(metadata)).toBe(true);
     expect(canUseProgressiveCompatibility({ ...metadata, codec: "hevc" })).toBe(false);
+    expect(canUseProgressiveCompatibility(
+      { ...metadata, codec: "hevc" },
+      { canPlayType: (type: string) => type.includes("hvc1") ? "probably" : "" },
+    )).toBe(true);
     expect(canUseProgressiveCompatibility({ ...metadata, container: "matroska", sourceFormat: "MKV" })).toBe(false);
   });
 
@@ -115,6 +122,30 @@ describe("player interaction contracts", () => {
     expect(progressiveAudioTrack([...tracks], "", "")?.id).toBe("audio_0_en");
     expect(progressiveAudioTrack([...tracks], "audio_0_en", "en")?.id).toBe("audio_0_en");
     expect(progressiveAudioTrack([...tracks], "audio_0_tr", "tr")).toBeNull();
+  });
+
+  it("allows progressive startup without audio metadata but preserves external dubbing preferences", () => {
+    const base = {
+      progressiveUrl: "/api/playback/progressive/m_media?ticket=value",
+      sourceMetadata: { duration: 120, container: "mov,mp4", codec: "h264", width: 1280, height: 720, frameRate: 24, sourceFormat: "MP4" },
+      tracks: [],
+    } as unknown as PlaybackRunResponse;
+    expect(canUseProgressivePlayback(base, "", "")).toBe(true);
+    expect(canUseProgressivePlayback({
+      ...base,
+      tracks: [{ id: "audio_0_tr", label: "Turkish", language: "tr", channels: 2, default: true, source: "external", streamIndex: 0, ready: true, status: "ready" }],
+    }, "audio_0_tr", "tr")).toBe(false);
+  });
+
+  it("recognizes growing HLS and extends startup only while bounded progress continues", () => {
+    const response = {
+      renditions: [{ id: "video_480p", status: "streamable" }],
+      tracks: [],
+    } as unknown as PlaybackRunResponse;
+    expect(adaptiveTransportIsGrowing(response)).toBe(true);
+    expect(shouldExtendPlaybackStartup(15_000, 0, 10_000)).toBe(true);
+    expect(shouldExtendPlaybackStartup(31_000, 0, 30_000)).toBe(false);
+    expect(shouldExtendPlaybackStartup(20_000, 0, 1_000)).toBe(false);
   });
 
   it("maps same-language audio tracks by stable rendition identity without reusing an index", () => {

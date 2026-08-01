@@ -21,6 +21,7 @@ from services.rclone import rclone_service
 
 
 STANDARD_HEIGHTS = (1080, 720, 480, 360, 240, 144)
+BOOTSTRAP_HLS_HEIGHT = 480
 PLAYLIST_NAME = "playlist.m3u8"
 MASTER_NAME = "master.m3u8"
 COMPLETE_MARKER = ".complete"
@@ -284,11 +285,38 @@ class PlaybackPrepService:
         codec = str(getattr(media_obj, "codec", "") or "").lower()
         if codec in FAST_HLS_VIDEO_CODECS:
             return renditions[0]
-        return next((item for item in renditions if item.height == 720), renditions[0])
+        return next(
+            (item for item in renditions if item.height <= BOOTSTRAP_HLS_HEIGHT),
+            renditions[-1],
+        )
 
     def playlist_ready(self, media_id: str, fingerprint: str, rendition_name: str) -> bool:
         rendition_dir = self.cache_path(media_id, fingerprint) / rendition_name
-        return (rendition_dir / PLAYLIST_NAME).is_file() and any(rendition_dir.glob("*.m4s"))
+        playlist = rendition_dir / PLAYLIST_NAME
+        try:
+            content = playlist.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        init_match = re.search(r'#EXT-X-MAP:URI="([^"?#]+)"', content)
+        segment_references = [
+            line.strip().split("?", 1)[0]
+            for line in content.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if not init_match or not segment_references or "#EXTINF:" not in content:
+            return False
+        references = [init_match.group(1), *segment_references]
+        for reference in references:
+            relative = PurePosixPath(reference)
+            if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+                return False
+            asset = rendition_dir / Path(*relative.parts)
+            try:
+                if not asset.is_file() or asset.stat().st_size <= 0:
+                    return False
+            except OSError:
+                return False
+        return True
 
     def rendition_complete(self, media_id: str, fingerprint: str, rendition_name: str) -> bool:
         rendition_dir = self.cache_path(media_id, fingerprint) / rendition_name
