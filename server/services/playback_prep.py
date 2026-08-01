@@ -88,6 +88,7 @@ class PlaybackPrepService:
         self.semaphore = asyncio.Semaphore(concurrency)
         self.background_semaphore = asyncio.Semaphore(max(1, concurrency - 1))
         self._master_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._last_touch_at: dict[str, float] = {}
 
     @staticmethod
     def sanitize_diagnostics(value: str, limit: int = 2400) -> str:
@@ -1164,8 +1165,20 @@ class PlaybackPrepService:
     def touch(self, media_id: str, fingerprint: str) -> None:
         path = self.cache_path(media_id, fingerprint)
         path.mkdir(parents=True, exist_ok=True)
+        key = str(path)
+        now = time.monotonic()
+        if now - self._last_touch_at.get(key, 0) < 30:
+            return
         try:
             os.utime(path, None)
+            self._last_touch_at[key] = now
+            if len(self._last_touch_at) > 4096:
+                cutoff = now - 24 * 60 * 60
+                self._last_touch_at = {
+                    cached_path: touched_at
+                    for cached_path, touched_at in self._last_touch_at.items()
+                    if touched_at >= cutoff
+                }
         except OSError:
             pass
 

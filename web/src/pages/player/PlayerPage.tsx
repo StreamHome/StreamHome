@@ -184,7 +184,7 @@ export function applySubtitleTrackSelection(video: HTMLVideoElement, selectedTra
 }
 
 export function shouldAutoHidePlayerControls(phase: PlayerPhase, menuOpen: boolean, scrubbing: boolean): boolean {
-  return ["playing", "paused", "buffering", "recovering"].includes(phase) && !menuOpen && !scrubbing;
+  return ["playing", "buffering", "recovering"].includes(phase) && !menuOpen && !scrubbing;
 }
 
 export function shouldResumePlaybackAfterTransport(playRequested: boolean, completed: boolean): boolean {
@@ -1522,6 +1522,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (!shouldAutoHidePlayerControls(phase, controlMenuOpenRef.current, scrubbingRef.current)) {
       if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
       controlsTimerRef.current = null;
+      if (phase === "paused") {
+        showControlsRef.current = true;
+        setShowControls(true);
+      }
       return;
     }
     if (showControlsRef.current && controlsTimerRef.current === null) {

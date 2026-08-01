@@ -203,7 +203,7 @@ describe("player interaction contracts", () => {
 
   it("auto-hides after inactivity unless a menu or scrub interaction is active", () => {
     expect(shouldAutoHidePlayerControls("playing", false, false)).toBe(true);
-    expect(shouldAutoHidePlayerControls("paused", false, false)).toBe(true);
+    expect(shouldAutoHidePlayerControls("paused", false, false)).toBe(false);
     expect(shouldAutoHidePlayerControls("buffering", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("recovering", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("playing", true, false)).toBe(false);

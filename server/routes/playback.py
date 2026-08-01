@@ -371,8 +371,8 @@ async def ensure_source_metadata(
     if not source.local_exists:
         last_probe = _cloud_audio_probe_times.get(str(media_obj.id), 0)
         if source.cloud_path and (refresh_sidecars or time.monotonic() - last_probe >= CLOUD_AUDIO_PROBE_TTL_SECONDS):
-            _cloud_audio_probe_times[str(media_obj.id)] = time.monotonic()
             audio_metadata = await probe_cloud_external_audio(source.cloud_path, list(media_obj.audio_metadata or []))
+            _cloud_audio_probe_times[str(media_obj.id)] = time.monotonic()
             if audio_metadata != list(media_obj.audio_metadata or []):
                 media_obj.audio_metadata = audio_metadata
                 db.add(media_obj)
