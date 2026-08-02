@@ -235,8 +235,8 @@ async def lifespan(app: FastAPI):
             await queue_manager.sync_media_from_disk()
             from services.audio_extractor import repair_completed_ingestion_languages
             await repair_completed_ingestion_languages()
-            await playback_prep_service.reconcile_catalog_cache_identities()
             await vibe_analysis_manager.start()
+            await playback_prep_service.schedule_catalog_baselines()
         except asyncio.CancelledError:
             raise
         except Exception as exc:

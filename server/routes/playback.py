@@ -124,6 +124,10 @@ class PlaybackRunResponse(APIModel):
     preparation_state: Literal["preparing", "ready", "error"]
     preparation_error: Optional[PlaybackPreparationFailure] = None
     preparation_progress: PlaybackPreparationProgress
+    seekable_until: float = 0
+    resume_ready: bool = False
+    switching_ready: bool = False
+    fully_prepared: bool = False
     next_sequence_number: int
 
 
@@ -227,6 +231,23 @@ async def require_available_source(media_obj: Any) -> ResolvedMediaSource:
     if not source.available:
         raise playback_error(status.HTTP_409_CONFLICT, "MEDIA_SOURCE_MISSING", "The media file is not currently available on this server.")
     return source
+
+
+async def complete_cloud_cache_fast_path(media_obj: Any) -> bool:
+    """Avoid remote Drive probes only when a complete cache has no local source to validate."""
+
+    fingerprint = str(media_obj.source_fingerprint or "")
+    if settings.STORAGE_ENGINE != "CLOUD" or not fingerprint:
+        return False
+    try:
+        local_source = await resolve_media_source(media_obj.video_url, check_cloud=False)
+    except MediaSourceError:
+        return False
+    return not local_source.local_exists and playback_prep_service.fully_prepared(
+        media_obj.id,
+        fingerprint,
+        media_obj,
+    )
 
 
 async def active_preview_task(db: AsyncSession, movie: Movie, media_obj: Any) -> Optional[DownloadTask]:
@@ -640,12 +661,23 @@ async def build_run_response(
                 ready_segments=max(0, int(preview_status.get("segment_count") or 0)),
                 active_workers=1 if preview_status["phase"] == "preparing" else 0,
             ),
+            seekable_until=max(0, int(preview_status.get("segment_count") or 0)) * 4,
+            resume_ready=True,
+            switching_ready=preview_status["phase"] == "ready",
+            fully_prepared=preview_status["phase"] == "ready",
             next_sequence_number=run.sequence_number,
         )
 
     fingerprint = str(media_obj.source_fingerprint or "")
     state = playback_prep_service.preparation_state(media_obj.id, fingerprint, media_obj)
+    baseline = playback_prep_service.baseline_video(media_obj)
+    seekable_until = playback_prep_service.rendition_seekable_until(media_obj.id, fingerprint, baseline.name)
+    fully_prepared = playback_prep_service.fully_prepared(media_obj.id, fingerprint, media_obj)
     failure_payload = playback_prep_service.required_preparation_error(media_obj.id, fingerprint, media_obj)
+    if not fully_prepared and not failure_payload:
+        failure_payload = playback_prep_service.full_preparation_error(media_obj.id, fingerprint, media_obj)
+    if failure_payload:
+        state = "error"
     failure = PlaybackPreparationFailure(**failure_payload) if failure_payload else None
     ticket, expires_at = issue_playback_ticket(user, auth_session, run.profile_id, run.id, media_obj.id, fingerprint)
     encoded_ticket = quote(ticket, safe="")
@@ -671,6 +703,10 @@ async def build_run_response(
         preparation_progress=PlaybackPreparationProgress(
             **playback_prep_service.preparation_progress(media_obj.id, fingerprint, media_obj)
         ),
+        seekable_until=seekable_until,
+        resume_ready=initial_resume_position <= 0 or seekable_until >= initial_resume_position + 1,
+        switching_ready=playback_prep_service.switching_ready(media_obj.id, fingerprint, media_obj),
+        fully_prepared=fully_prepared,
         next_sequence_number=run.sequence_number,
     )
 
@@ -694,6 +730,7 @@ async def create_playback_run(
     db: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> PlaybackRunResponse:
+    run_started_at = time.monotonic()
     auth_session = current_auth_session(request)
     await require_profile_access(db, auth_session, req.profile_id)
     movie, media_obj = await resolve_run_media(db, req.movie_id, req.episode_id)
@@ -703,25 +740,31 @@ async def create_playback_run(
         source_kind = "ingest_preview"
         source_fingerprint = ingest_preview_service.fingerprint(preview_task.id)
     else:
-        try:
-            source = await require_available_source(media_obj)
-            await ensure_source_metadata(db, media_obj, source)
-            await synchronize_source_fingerprint(db, media_obj, source)
-        except HTTPException as source_error:
-            detail = source_error.detail if isinstance(source_error.detail, dict) else {}
-            error_code = str(detail.get("code") or "")
-            if error_code not in {"MEDIA_SOURCE_MISSING", "MEDIA_PROBE_FAILED", "INVALID_MEDIA_PATH"}:
-                raise
-            preview_task = await queue_media_repair(db, movie, media_obj, error_code)
-            if not preview_task:
-                raise
-            source = None
-        if preview_task:
-            source_kind = "ingest_preview"
-            source_fingerprint = ingest_preview_service.fingerprint(preview_task.id)
-        else:
+        cached_fingerprint = str(media_obj.source_fingerprint or "")
+        if cached_fingerprint and await complete_cloud_cache_fast_path(media_obj):
+            await playback_prep_service.rebuild_master(media_obj.id, cached_fingerprint, media_obj)
             source_kind = "catalog"
-            source_fingerprint = str(media_obj.source_fingerprint or source.fingerprint)
+            source_fingerprint = cached_fingerprint
+        else:
+            try:
+                source = await require_available_source(media_obj)
+                await ensure_source_metadata(db, media_obj, source)
+                await synchronize_source_fingerprint(db, media_obj, source)
+            except HTTPException as source_error:
+                detail = source_error.detail if isinstance(source_error.detail, dict) else {}
+                error_code = str(detail.get("code") or "")
+                if error_code not in {"MEDIA_SOURCE_MISSING", "MEDIA_PROBE_FAILED", "INVALID_MEDIA_PATH"}:
+                    raise
+                preview_task = await queue_media_repair(db, movie, media_obj, error_code)
+                if not preview_task:
+                    raise
+                source = None
+            if preview_task:
+                source_kind = "ingest_preview"
+                source_fingerprint = ingest_preview_service.fingerprint(preview_task.id)
+            else:
+                source_kind = "catalog"
+                source_fingerprint = str(media_obj.source_fingerprint or source.fingerprint)
 
     filters = [PlaybackSession.profile_id == req.profile_id, PlaybackSession.movie_id == req.movie_id]
     filters.append(PlaybackSession.episode_id == req.episode_id if req.episode_id else PlaybackSession.episode_id.is_(None))
@@ -752,10 +795,15 @@ async def create_playback_run(
             media_obj.id,
             media_obj,
             source,
-            include_remaining=False,
+            include_remaining=True,
             retry_errors=True,
         )
-    return await build_run_response(db, request, user, run, media_obj, initial_resume_position=position)
+    response = await build_run_response(db, request, user, run, media_obj, initial_resume_position=position)
+    logger.info(
+        f"[Playback Run] Created {run.id} for {media_obj.id} in {time.monotonic() - run_started_at:.3f}s; "
+        f"cache_complete={response.fully_prepared} resume_ready={response.resume_ready}."
+    )
+    return response
 
 
 @router.get("/runs/{run_id}", response_model=PlaybackRunResponse)
@@ -768,7 +816,9 @@ async def get_playback_run(
 ) -> PlaybackRunResponse:
     run = await authorized_run(db, request, run_id)
     movie, media_obj = await resolve_run_media(db, run.movie_id, run.episode_id)
-    if not retry and run.source_kind != "ingest_preview" and str(media_obj.video_url or "").startswith("/media/"):
+    fingerprint = str(media_obj.source_fingerprint or "")
+    cache_complete = bool(fingerprint) and await complete_cloud_cache_fast_path(media_obj)
+    if not retry and not cache_complete and run.source_kind != "ingest_preview" and str(media_obj.video_url or "").startswith("/media/"):
         source = await require_available_source(media_obj)
         observed_fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
         if observed_fingerprint != str(media_obj.source_fingerprint or ""):
@@ -810,7 +860,7 @@ async def get_playback_run(
                     media_obj.id,
                     media_obj,
                     source,
-                    include_remaining=False,
+                    include_remaining=True,
                     retry_errors=True,
                     foreground=True,
                 )

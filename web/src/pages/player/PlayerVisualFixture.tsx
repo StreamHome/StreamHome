@@ -60,6 +60,10 @@ const fixturePlayback: ResolvedPlayback = {
     preparationState: "ready",
     preparationError: null,
     preparationProgress: { stage: "streamable", queuePosition: 0, readySegments: 4, activeWorkers: 0 },
+    seekableUntil: 120,
+    resumeReady: true,
+    switchingReady: true,
+    fullyPrepared: true,
     nextSequenceNumber: 1,
   },
 };
@@ -78,6 +82,10 @@ export function PlayerVisualFixture() {
           ...fixturePlayback.runResponse,
           preparationState: "preparing" as const,
           preparationProgress: { stage: "packaging" as const, queuePosition: 0, readySegments: 2, activeWorkers: 2 },
+          seekableUntil: 8,
+          resumeReady: false,
+          switchingReady: false,
+          fullyPrepared: false,
         },
       }
     : fixturePlayback;

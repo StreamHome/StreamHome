@@ -355,6 +355,66 @@ class PlaybackPrepService:
         key = f"{media_id}:{fingerprint}:{rendition_name}"
         return "preparing" if key in self.active_jobs else "idle"
 
+    def rendition_seekable_until(self, media_id: str, fingerprint: str, rendition_name: str) -> float:
+        playlist = self.cache_path(media_id, fingerprint) / rendition_name / PLAYLIST_NAME
+        try:
+            durations = re.findall(r"^#EXTINF:([0-9]+(?:\.[0-9]+)?)", playlist.read_text(encoding="utf-8"), re.MULTILINE)
+            return sum(float(value) for value in durations)
+        except (OSError, ValueError):
+            return 0.0
+
+    def fully_prepared(self, media_id: str, fingerprint: str, media_obj: Any) -> bool:
+        names = [
+            *(rendition.name for rendition in self.video_renditions(media_obj)),
+            *(rendition.name for rendition in self.audio_renditions(media_obj)),
+        ]
+        return bool(names) and all(self.rendition_complete(media_id, fingerprint, name) for name in names)
+
+    def switching_ready(self, media_id: str, fingerprint: str, media_obj: Any) -> bool:
+        names = [
+            *(rendition.name for rendition in self.video_renditions(media_obj)),
+            *(rendition.name for rendition in self.audio_renditions(media_obj)),
+        ]
+        return bool(names) and all(self.playlist_ready(media_id, fingerprint, name) for name in names)
+
+    def full_preparation_error(self, media_id: str, fingerprint: str, media_obj: Any) -> Optional[dict[str, str]]:
+        names = [
+            *(rendition.name for rendition in self.video_renditions(media_obj)),
+            *(rendition.name for rendition in self.audio_renditions(media_obj)),
+        ]
+        for name in names:
+            failure = self.rendition_error(media_id, fingerprint, name)
+            if failure:
+                return failure
+        return self.preparation_error(media_id, fingerprint)
+
+    async def wait_until_fully_prepared(
+        self,
+        media_id: str,
+        fingerprint: str,
+        media_obj: Any,
+    ) -> bool:
+        """Wait for every scheduled rendition without polling the filesystem aggressively."""
+
+        media_obj = self.snapshot_media(media_obj)
+        prefix = f"{media_id}:{fingerprint}:"
+        while not self.fully_prepared(media_id, fingerprint, media_obj):
+            expected_names = [
+                *(rendition.name for rendition in self.video_renditions(media_obj)),
+                *(rendition.name for rendition in self.audio_renditions(media_obj)),
+            ]
+            if any(self.rendition_error(media_id, fingerprint, name) for name in expected_names):
+                return False
+            relevant_tasks = [
+                task
+                for key, task in self.active_jobs.items()
+                if key.startswith(prefix) and not task.done()
+            ]
+            if not relevant_tasks:
+                return False
+            await asyncio.wait(relevant_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+        return True
+
     def preparation_error(self, media_id: str, fingerprint: str) -> Optional[dict[str, str]]:
         error_path = self.cache_path(media_id, fingerprint) / "preparation-error.json"
         if not error_path.is_file():
@@ -916,6 +976,11 @@ class PlaybackPrepService:
                 self.touch(media_id, fingerprint)
                 await self.rebuild_master(media_id, fingerprint, media_obj)
                 await asyncio.to_thread(self.enforce_lru_limits)
+                elapsed = max(0.0, time.monotonic() - self.job_started_at.get(job_key, time.monotonic()))
+                logger.info(
+                    f"[Playback Prep] Prepared {media_id}/{rendition_name} in {elapsed:.2f}s; "
+                    f"seekable={self.rendition_seekable_until(media_id, fingerprint, rendition_name):.2f}s."
+                )
             except asyncio.CancelledError:
                 shutil.rmtree(target_dir, ignore_errors=True)
                 await self.rebuild_master(media_id, fingerprint, media_obj)
@@ -1278,9 +1343,51 @@ class PlaybackPrepService:
             await db.commit()
 
     async def schedule_catalog_baselines(self) -> None:
-        """Compatibility entry point; startup reconciles cache identity without queuing FFmpeg work."""
+        """Prepare the complete rendition set for existing catalog media in bounded order."""
+
+        from db import engine
+        from models import Episode, Movie, PlaybackSession
+        from sqlmodel import select
+        from sqlmodel.ext.asyncio.session import AsyncSession
 
         await self.reconcile_catalog_cache_identities()
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            sessions = (await db.exec(select(PlaybackSession).order_by(PlaybackSession.updated_at.desc()))).all()
+            recent_ids = [str(item.episode_id or item.movie_id) for item in sessions]
+            movies = (await db.exec(select(Movie).where(Movie.video_url != ""))).all()
+            episodes = (await db.exec(select(Episode).where(Episode.video_url != ""))).all()
+            media_items = [*movies, *episodes]
+
+        recent_order = {media_id: index for index, media_id in enumerate(dict.fromkeys(recent_ids))}
+        media_items.sort(key=lambda item: (recent_order.get(str(item.id), len(recent_order)), str(item.id)))
+        for media_obj in media_items:
+            try:
+                source = await resolve_media_source(media_obj.video_url)
+                if not source.available:
+                    continue
+                fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
+                media_obj.source_fingerprint = fingerprint
+                if self.fully_prepared(media_obj.id, fingerprint, media_obj):
+                    await self.rebuild_master(media_obj.id, fingerprint, media_obj)
+                    continue
+                await self.prepare(
+                    media_obj.id,
+                    media_obj,
+                    source,
+                    include_remaining=True,
+                    retry_errors=True,
+                    foreground=False,
+                )
+                prepared = await self.wait_until_fully_prepared(media_obj.id, fingerprint, media_obj)
+                if not prepared:
+                    logger.warning(f"[Playback Prep] Catalog warming did not complete for {media_obj.id}.")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"[Playback Prep] Catalog warming skipped {getattr(media_obj, 'id', 'unknown')}: "
+                    f"{self.sanitize_diagnostics(str(exc), 400)}"
+                )
 
     def enforce_lru_limits(self) -> None:
         limit_bytes = int(settings.PLAYBACK_CACHE_GB * 1024 * 1024 * 1024)
@@ -1288,7 +1395,7 @@ class PlaybackPrepService:
             return
         active_roots = {
             str(self.cache_path(parts[0], parts[1]))
-            for key in self.active_jobs
+            for key in list(self.active_jobs)
             if len(parts := key.split(":")) >= 3
         }
         entries: list[tuple[float, int, Path]] = []

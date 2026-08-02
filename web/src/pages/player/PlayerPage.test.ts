@@ -12,6 +12,7 @@ import {
   isMeaningfulPointerActivity,
   isPlaybackTimeSeekable,
   matchAudioTrackIndexes,
+  playbackTransportIsReady,
   mergePlaybackRunMetadata,
   nextPlayableEpisode,
   preparationStatusMessage,
@@ -146,6 +147,18 @@ describe("player interaction contracts", () => {
     expect(shouldExtendPlaybackStartup(15_000, 0, 10_000)).toBe(true);
     expect(shouldExtendPlaybackStartup(31_000, 0, 30_000)).toBe(false);
     expect(shouldExtendPlaybackStartup(20_000, 0, 1_000)).toBe(false);
+  });
+
+  it("does not mount playback transport until every rendition is complete", () => {
+    const incomplete = {
+      fullyPrepared: false,
+      preparationState: "ready",
+      progressiveUrl: "/api/playback/progressive/m_media?ticket=value",
+    } as const;
+    expect(playbackTransportIsReady(incomplete, "hls")).toBe(false);
+    expect(playbackTransportIsReady(incomplete, "progressive")).toBe(false);
+    expect(playbackTransportIsReady({ ...incomplete, fullyPrepared: true }, "hls")).toBe(true);
+    expect(playbackTransportIsReady({ ...incomplete, fullyPrepared: true }, "progressive")).toBe(true);
   });
 
   it("maps same-language audio tracks by stable rendition identity without reusing an index", () => {

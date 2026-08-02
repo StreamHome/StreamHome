@@ -224,6 +224,37 @@ class PlaybackPipelineRegression(unittest.TestCase):
             playback_prep_service.job_priorities.pop(f"{media_id}:{fingerprint}:{rendition_name}", None)
             shutil.rmtree(playback_prep_service.cache_path(media_id, fingerprint).parent, ignore_errors=True)
 
+    def test_complete_readiness_requires_every_rendition_and_reports_seekable_duration(self) -> None:
+        media_id = f"m_readiness_{uuid.uuid4().hex}"
+        fingerprint = "c" * 32
+        media = SimpleNamespace(width=1280, height=720, quality="720p", codec="h264", audio_metadata=[])
+        cache_path = playback_prep_service.cache_path(media_id, fingerprint)
+        rendition_names = [item.name for item in playback_prep_service.video_renditions(media)]
+        try:
+            for index, rendition_name in enumerate(rendition_names):
+                rendition_dir = cache_path / rendition_name
+                rendition_dir.mkdir(parents=True)
+                (rendition_dir / "playlist.m3u8").write_text(
+                    "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4.0,\nsegment_00000.m4s\n#EXTINF:3.5,\nsegment_00001.m4s\n",
+                    encoding="utf-8",
+                )
+                (rendition_dir / "init.mp4").write_bytes(b"init")
+                (rendition_dir / "segment_00000.m4s").write_bytes(b"segment")
+                (rendition_dir / "segment_00001.m4s").write_bytes(b"segment")
+                if index == 0:
+                    self.assertEqual(
+                        playback_prep_service.rendition_seekable_until(media_id, fingerprint, rendition_name),
+                        7.5,
+                    )
+                    self.assertFalse(playback_prep_service.switching_ready(media_id, fingerprint, media))
+            self.assertTrue(playback_prep_service.switching_ready(media_id, fingerprint, media))
+            self.assertFalse(playback_prep_service.fully_prepared(media_id, fingerprint, media))
+            for rendition_name in rendition_names:
+                (cache_path / rendition_name / ".complete").write_text("done", encoding="utf-8")
+            self.assertTrue(playback_prep_service.fully_prepared(media_id, fingerprint, media))
+        finally:
+            shutil.rmtree(cache_path.parent, ignore_errors=True)
+
     def test_optional_rendition_failure_does_not_interrupt_ready_baseline(self) -> None:
         media_id = f"m_optional_failure_{uuid.uuid4().hex}"
         fingerprint = "b" * 32

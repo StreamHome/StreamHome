@@ -151,6 +151,9 @@ class PlaybackContractRegression(unittest.TestCase):
             patch.object(playback_prep_service, "preparation_state", return_value="ready"),
             patch.object(playback_prep_service, "preparation_error", return_value=None),
             patch.object(playback_prep_service, "playlist_ready", return_value=True),
+            patch.object(playback_prep_service, "fully_prepared", side_effect=lambda *_: self.media_file.is_file()),
+            patch.object(playback_prep_service, "switching_ready", side_effect=lambda *_: self.media_file.is_file()),
+            patch.object(playback_prep_service, "rendition_seekable_until", return_value=120.0),
             patch("routes.playback.record_playback_progress", new=AsyncMock(return_value="viewing-attempt-contract")),
         ]
         for patcher in self.patchers:
@@ -168,10 +171,18 @@ class PlaybackContractRegression(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
         self.assertEqual(payload["preparationState"], "ready")
+        self.assertIn("fullyPrepared", payload)
+        self.assertIn("switchingReady", payload)
+        self.assertIn("resumeReady", payload)
+        self.assertIn("seekableUntil", payload)
         self.assertEqual(payload["preparationProgress"]["stage"], "streamable")
         self.assertEqual(payload["nextSequenceNumber"], 1)
         self.assertIn(payload["sourceMetadata"]["sourceFormat"], {"MP4", "HLS preview"})
         if payload["sourceMetadata"]["sourceFormat"] == "MP4":
+            self.assertTrue(payload["fullyPrepared"])
+            self.assertTrue(payload["switchingReady"])
+            self.assertTrue(payload["resumeReady"])
+            self.assertEqual(payload["seekableUntil"], 120.0)
             self.assertGreaterEqual(payload["preparationProgress"]["readySegments"], 0)
             self.assertEqual(payload["renditions"][0]["label"], "1080p")
             self.assertGreater(payload["sourceMetadata"]["duration"], 0)

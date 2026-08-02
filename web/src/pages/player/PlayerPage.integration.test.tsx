@@ -82,6 +82,10 @@ const playback: ResolvedPlayback = {
       readySegments: 1,
       activeWorkers: 0,
     },
+    seekableUntil: 120,
+    resumeReady: true,
+    switchingReady: true,
+    fullyPrepared: true,
     nextSequenceNumber: 1,
   },
 };
@@ -125,7 +129,7 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
-  it("requests an idle quality only when the viewer selects it", async () => {
+  it("keeps an unfinished quality disabled instead of preparing it on demand", async () => {
     const prepare = vi.spyOn(playbackApi, "preparePlaybackRendition").mockResolvedValue({ status: "preparing" });
     const onDemandPlayback: ResolvedPlayback = {
       ...playback,
@@ -161,14 +165,15 @@ describe("mounted player lifecycle", () => {
 
     const qualityMenu = await screen.findByRole("button", { name: "Quality: Auto" });
     fireEvent.click(qualityMenu);
-    fireEvent.click(screen.getByRole("option", { name: /240p/ }));
+    const unfinishedQuality = screen.getByRole("option", { name: /240p/ });
+    expect(unfinishedQuality.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(unfinishedQuality);
 
-    expect(prepare).toHaveBeenCalledOnce();
-    expect(prepare).toHaveBeenCalledWith("mounted-player-run", "video_240p");
+    expect(prepare).not.toHaveBeenCalled();
     view.unmount();
   });
 
-  it("keeps the first open mounted while progressive playback fails and HLS becomes ready", async () => {
+  it("keeps the first open mounted while complete HLS preparation becomes ready", async () => {
     const preparingRun = {
       ...playback.runResponse,
       runId: "first-open-run",
@@ -182,6 +187,10 @@ describe("mounted player lifecycle", () => {
         readySegments: 0,
         activeWorkers: 1,
       },
+      seekableUntil: 4,
+      resumeReady: false,
+      switchingReady: false,
+      fullyPrepared: false,
     };
     const readyRun = {
       ...preparingRun,
@@ -193,6 +202,10 @@ describe("mounted player lifecycle", () => {
         readySegments: 2,
         activeWorkers: 0,
       },
+      seekableUntil: 120,
+      resumeReady: true,
+      switchingReady: true,
+      fullyPrepared: true,
     };
     vi.spyOn(moviesApi, "getMovie").mockResolvedValue({
       id: "m_first-open",

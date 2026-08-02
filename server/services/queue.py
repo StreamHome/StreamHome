@@ -7,6 +7,7 @@ import traceback
 import httpx
 import aiofiles
 import re
+from pathlib import Path
 from typing import Dict, Any, List, Optional
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -21,7 +22,7 @@ from services.ingestion_errors import IngestionFailure, IngestionTaskError, prun
 from services.ingest_preview import ingest_preview_service
 from services.rclone import rclone_service
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
-from services.media_source import MediaSourceError, catalog_path_from_storage, playback_source_fingerprint, resolve_media_source
+from services.media_source import MediaSourceError, ResolvedMediaSource, catalog_path_from_storage, playback_source_fingerprint, resolve_media_source
 from services.vibe_analysis import VIBE_ANALYSIS_VERSION, compute_trope_vectors, vibe_analysis_manager
 from services.audio_extractor import apply_primary_audio_language, extract_audio_and_strip_video, normalize_language_code
 
@@ -464,7 +465,7 @@ class DownloadQueueManager:
                         subtitles_list,
                         quality,
                         task.skip_markers,
-                        finalize=not cloud_ingestion,
+                        finalize=False,
                         preview_task_id=task_id,
                     )
                     await db.commit()
@@ -480,12 +481,20 @@ class DownloadQueueManager:
                         )
                     ) from cat_err
 
+            from services.state import update_task_metrics
+            update_task_metrics(task_id, 99.0, speed="Preparing playback", eta="00:00:00", force_write=True)
+            prepared_fingerprint = await self._prepare_ingested_media(
+                tmdb_id,
+                media_type,
+                season,
+                episode,
+                output_abs_path,
+            )
+
             if cloud_ingestion:
                 # Rclone can take minutes or hours. It must never run while an SQLite
                 # write transaction is open, otherwise login and telemetry writes are
                 # blocked for the entire upload.
-                from services.state import update_task_metrics
-
                 update_task_metrics(task_id, 99.9, speed="Uploading", eta="00:00:00", force_write=True)
                 if media_type == "movie":
                     remote_subpath = os.path.join("Movies", folder_name)
@@ -518,6 +527,16 @@ class DownloadQueueManager:
                             )
                         ) from fallback_err
 
+            final_fingerprint = prepared_fingerprint
+            if cloud_ingestion and uploaded_to_cloud:
+                final_fingerprint = await self._migrate_ingested_cache_to_cloud(
+                    tmdb_id,
+                    media_type,
+                    season,
+                    episode,
+                    prepared_fingerprint,
+                )
+
             async with AsyncSession(engine) as db:
                 task = await db.get(DownloadTask, task_id)
                 if not task:
@@ -525,16 +544,16 @@ class DownloadQueueManager:
                     from services.state import remove_task_metrics
                     remove_task_metrics(task_id)
                     return
-                if cloud_ingestion:
-                    await self._finalize_catalog_media(
-                        db,
-                        tmdb_id,
-                        media_type,
-                        season,
-                        episode,
-                        task_id,
-                        uploaded_to_cloud=uploaded_to_cloud,
-                    )
+                await self._finalize_catalog_media(
+                    db,
+                    tmdb_id,
+                    media_type,
+                    season,
+                    episode,
+                    task_id,
+                    uploaded_to_cloud=uploaded_to_cloud,
+                    source_fingerprint=final_fingerprint,
+                )
                 task.status = "COMPLETED"
                 task.error_message = None
                 db.add(task)
@@ -637,12 +656,120 @@ class DownloadQueueManager:
                 media_obj.source_fingerprint = fingerprint
                 db.add(media_obj)
                 await db.flush()
-            await playback_prep_service.prepare(media_obj.id, media_obj, source, include_remaining=False)
+            await playback_prep_service.prepare(
+                media_obj.id,
+                media_obj,
+                source,
+                include_remaining=True,
+                foreground=False,
+            )
         except Exception as exc:
             logger.warning(
                 f"[Queue Manager] Playback baseline scheduling failed for "
                 f"{getattr(media_obj, 'id', 'unknown')}: {type(exc).__name__}"
             )
+
+    async def _prepare_ingested_media(
+        self,
+        tmdb_id: int,
+        media_type: str,
+        season: Optional[int],
+        episode: Optional[int],
+        output_abs_path: str,
+    ) -> str:
+        """Finish every playback rendition while the verified local source is retained."""
+
+        from services.playback_prep import playback_prep_service
+
+        preparation_started_at = time.monotonic()
+        media_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            model = Movie if media_type == "movie" else Episode
+            media_obj = await db.get(model, media_id)
+            if not media_obj:
+                raise IngestionTaskError(
+                    IngestionFailure("PLAYBACK_PREPARATION_FAILED", "The prepared catalog entry is missing.")
+                )
+            catalog_path = str(media_obj.video_url)
+            source = ResolvedMediaSource(
+                catalog_path=catalog_path,
+                relative_path=catalog_path.removeprefix("/media/"),
+                local_path=Path(output_abs_path).resolve(),
+                cloud_path=None,
+                local_exists=True,
+                cloud_exists=False,
+            )
+            fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
+            media_obj.source_fingerprint = fingerprint
+            db.add(media_obj)
+            await db.commit()
+
+        await playback_prep_service.prepare(
+            media_id,
+            media_obj,
+            source,
+            include_remaining=True,
+            retry_errors=True,
+            foreground=False,
+        )
+        if not await playback_prep_service.wait_until_fully_prepared(media_id, fingerprint, media_obj):
+            failure = playback_prep_service.preparation_error(media_id, fingerprint) or {}
+            raise IngestionTaskError(
+                IngestionFailure(
+                    str(failure.get("code") or "PLAYBACK_PREPARATION_FAILED"),
+                    str(failure.get("message") or "The browser-ready quality and dubbing renditions could not be prepared."),
+                )
+            )
+        logger.info(
+            f"[Queue Manager] Browser-ready playback preparation completed for {media_id} "
+            f"in {time.monotonic() - preparation_started_at:.2f}s."
+        )
+        return fingerprint
+
+    async def _migrate_ingested_cache_to_cloud(
+        self,
+        tmdb_id: int,
+        media_type: str,
+        season: Optional[int],
+        episode: Optional[int],
+        local_fingerprint: str,
+    ) -> str:
+        """Bind verified local preparation artifacts to the uploaded cloud identity."""
+
+        from services.playback_prep import playback_prep_service
+
+        media_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            model = Movie if media_type == "movie" else Episode
+            media_obj = await db.get(model, media_id)
+            if not media_obj:
+                raise IngestionTaskError(
+                    IngestionFailure("PLAYBACK_PREPARATION_FAILED", "The uploaded catalog entry is missing.")
+                )
+            source = await resolve_media_source(media_obj.video_url)
+            if not source.cloud_exists:
+                raise IngestionTaskError(
+                    IngestionFailure("CLOUD_MOVE_FAILED", "The uploaded media could not be resolved from cloud storage.")
+                )
+            cloud_fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
+            playback_prep_service.reuse_verified_playback_cache(
+                media_id,
+                local_fingerprint,
+                cloud_fingerprint,
+                media_obj,
+            )
+            if not playback_prep_service.fully_prepared(media_id, cloud_fingerprint, media_obj):
+                raise IngestionTaskError(
+                    IngestionFailure(
+                        "PLAYBACK_CACHE_MIGRATION_FAILED",
+                        "The prepared playback cache could not be bound to the uploaded cloud source.",
+                    )
+                )
+            media_obj.source_fingerprint = cloud_fingerprint
+            db.add(media_obj)
+            await db.commit()
+        await playback_prep_service.rebuild_master(media_id, cloud_fingerprint, media_obj)
+        return cloud_fingerprint
 
     async def _catalog_media(
         self, db: AsyncSession, tmdb_id: int, media_type: str, season: Optional[int], 
@@ -1085,8 +1212,9 @@ class DownloadQueueManager:
         preview_task_id: str,
         *,
         uploaded_to_cloud: bool,
+        source_fingerprint: str,
     ) -> None:
-        """Publish a prepared cloud catalog row in one short SQLite transaction."""
+        """Publish a fully prepared local or cloud catalog row in one short transaction."""
 
         if media_type == "movie":
             media_obj = await db.get(Movie, f"m_{tmdb_id}")
@@ -1103,8 +1231,7 @@ class DownloadQueueManager:
                 db.add(show)
         if media_obj.preview_task_id == preview_task_id:
             media_obj.preview_task_id = None
-        if uploaded_to_cloud:
-            media_obj.source_fingerprint = None
+        media_obj.source_fingerprint = source_fingerprint
         db.add(media_obj)
 
     def _parse_duration_to_seconds(self, duration_str: str) -> float:

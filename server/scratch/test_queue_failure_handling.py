@@ -153,9 +153,16 @@ def test_queue_contracts() -> None:
     process_source = queue_source[queue_source.index("    async def _process_task"):queue_source.index("    async def _record_task_failure")]
     catalog_position = process_source.index("await self._catalog_media")
     preparation_commit_position = process_source.index("await db.commit()", catalog_position)
-    cloud_upload_position = process_source.index("await self.run_rclone_move_dir", preparation_commit_position)
+    playback_preparation_position = process_source.index("await self._prepare_ingested_media", preparation_commit_position)
+    cloud_upload_position = process_source.index("await self.run_rclone_move_dir", playback_preparation_position)
+    publication_position = process_source.index("await self._finalize_catalog_media", cloud_upload_position)
     completion_position = process_source.index('task.status = "COMPLETED"', cloud_upload_position)
-    assert catalog_position < preparation_commit_position < cloud_upload_position < completion_position
+    assert catalog_position < preparation_commit_position < playback_preparation_position < cloud_upload_position
+    assert cloud_upload_position < publication_position < completion_position
+    assert "finalize=False" in process_source
+    assert "include_remaining=True" in queue_source
+    assert "wait_until_fully_prepared" in queue_source
+    assert "PLAYBACK_CACHE_MIGRATION_FAILED" in queue_source
     assert "Rclone can take minutes or hours" in process_source
     assert "CATALOG_UPDATE_FAILED" in queue_source
     vibe_source = Path(__file__).parents[1].joinpath("services", "vibe_analysis.py").read_text(encoding="utf-8")

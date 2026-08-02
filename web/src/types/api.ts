@@ -563,5 +563,9 @@ export interface PlaybackRunResponse {
   preparationState: PlaybackPreparationState;
   preparationError: { code: string; message: string } | null;
   preparationProgress: PlaybackPreparationProgress;
+  seekableUntil: number;
+  resumeReady: boolean;
+  switchingReady: boolean;
+  fullyPrepared: boolean;
   nextSequenceNumber: number;
 }
