@@ -8,6 +8,20 @@ import type { DiscoverMovie, MediaPreference, Movie, PlaybackSession, Profile, R
 
 const FEED_PAGE_SIZE = 48;
 
+interface CatalogBootstrapState {
+  movies: Movie[];
+  sessions: PlaybackSession[];
+  watchlist: string[];
+  preferences: Record<string, Exclude<MediaPreference, null>>;
+}
+
+const catalogBootstrapCache = new Map<string, CatalogBootstrapState>();
+
+function updateCatalogBootstrap(profileId: string, update: Partial<CatalogBootstrapState>): void {
+  const current = catalogBootstrapCache.get(profileId) ?? { movies: [], sessions: [], watchlist: [], preferences: {} };
+  catalogBootstrapCache.set(profileId, { ...current, ...update });
+}
+
 export interface CatalogController {
   movies: Movie[];
   movieItems: Movie[];
@@ -80,15 +94,16 @@ function appendUnique(current: RecommendationFeed, page: RecommendationFeed): Re
 }
 
 export function useCatalogController(profile: Profile, query: AppQueryState): CatalogController {
-  const [baseMovies, setBaseMovies] = useState<Movie[]>([]);
-  const [sessions, setSessions] = useState<PlaybackSession[]>([]);
-  const [watchlist, setWatchlist] = useState<string[]>([]);
-  const [preferences, setPreferences] = useState<Record<string, Exclude<MediaPreference, null>>>({});
+  const initialBootstrap = catalogBootstrapCache.get(profile.id);
+  const [baseMovies, setBaseMovies] = useState<Movie[]>(() => initialBootstrap?.movies ?? []);
+  const [sessions, setSessions] = useState<PlaybackSession[]>(() => initialBootstrap?.sessions ?? []);
+  const [watchlist, setWatchlist] = useState<string[]>(() => initialBootstrap?.watchlist ?? []);
+  const [preferences, setPreferences] = useState<Record<string, Exclude<MediaPreference, null>>>(() => initialBootstrap?.preferences ?? {});
   const [results, setResults] = useState<DiscoverMovie[]>([]);
   const [retainedMovies, setRetainedMovies] = useState<Record<string, Movie>>({});
   const [recommendation, setRecommendation] = useState<RecommendationFeed | null>(null);
   const [recommendationKey, setRecommendationKey] = useState("");
-  const [catalogLoading, setCatalogLoading] = useState(true);
+  const [catalogLoading, setCatalogLoading] = useState(!initialBootstrap);
   const [recommendationLoading, setRecommendationLoading] = useState(false);
   const [recommendationLoadingMore, setRecommendationLoadingMore] = useState(false);
   const [searching, setSearching] = useState(false);
@@ -107,17 +122,50 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
 
   useEffect(() => {
     const abort = new AbortController();
-    setCatalogLoading(true);
+    const cached = catalogBootstrapCache.get(profile.id);
+    if (cached) {
+      setBaseMovies(cached.movies);
+      setSessions(cached.sessions);
+      setWatchlist(cached.watchlist);
+      setPreferences(cached.preferences);
+      setCatalogLoading(false);
+    } else {
+      setBaseMovies([]);
+      setSessions([]);
+      setWatchlist([]);
+      setPreferences({});
+      setCatalogLoading(true);
+    }
     setError("");
-    Promise.all([getMovies(profile.id, abort.signal), getPlaybackSessions(profile.id, abort.signal), getWatchlist(profile.id, abort.signal), getMediaPreferences(profile.id, abort.signal)])
-      .then(([catalog, playback, saved, preferenceMap]) => {
+    void getMovies(profile.id, abort.signal)
+      .then((catalog) => {
         if (abort.signal.aborted) return;
-        setBaseMovies(catalog); setSessions(playback); setWatchlist(saved); setPreferences(preferenceMap);
+        setBaseMovies(catalog);
+        updateCatalogBootstrap(profile.id, { movies: catalog });
       })
       .catch((requestError: unknown) => {
         if (!abort.signal.aborted) setError(requestError instanceof Error ? requestError.message : "The catalog could not be loaded.");
       })
       .finally(() => { if (!abort.signal.aborted) setCatalogLoading(false); });
+    void Promise.allSettled([
+      getPlaybackSessions(profile.id, abort.signal),
+      getWatchlist(profile.id, abort.signal),
+      getMediaPreferences(profile.id, abort.signal),
+    ]).then(([playback, saved, preferenceMap]) => {
+      if (abort.signal.aborted) return;
+      if (playback.status === "fulfilled") {
+        setSessions(playback.value);
+        updateCatalogBootstrap(profile.id, { sessions: playback.value });
+      }
+      if (saved.status === "fulfilled") {
+        setWatchlist(saved.value);
+        updateCatalogBootstrap(profile.id, { watchlist: saved.value });
+      }
+      if (preferenceMap.status === "fulfilled") {
+        setPreferences(preferenceMap.value);
+        updateCatalogBootstrap(profile.id, { preferences: preferenceMap.value });
+      }
+    });
     return () => abort.abort();
   }, [profile.id]);
 
@@ -299,7 +347,7 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
     }
   }, [category, profile.id, recommendation, recommendationLoadingMore, requestedKey, scope]);
 
-  const loading = catalogLoading || Boolean(scope && recommendationLoading && !recommendation);
+  const loading = catalogLoading;
   return {
     movies, movieItems, seriesItems, continueWatching, sessions, watchlist, watchlistItems, setWatchlist,
     categories, genres, results, recommendation, recommendationLoading, recommendationRefreshing,

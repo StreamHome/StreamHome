@@ -82,7 +82,14 @@ function FeedStatus({ controller }: { controller: CatalogController }) {
 function CatalogDiscoveryView({ query, controller, theme, variant, onOpen, onPlay, onResume, onCategory }: { query: AppQueryState; controller: CatalogController; theme: string; variant: string; onOpen: (movie: Movie) => void; onPlay: (movie: Movie) => void; onResume: (movie: Movie, session: PlaybackSession) => void; onCategory: (category: string) => void }) {
   const view = query.view as CatalogView;
   const model = useMemo(() => controller.recommendation ? buildCatalogPresentation({ feed: controller.recommendation, fallbackMovies: controller.movies, continueWatching: controller.continueWatching, view }) : null, [controller.continueWatching, controller.movies, controller.recommendation, view]);
-  if (!model) return <div className="catalog-feed-failure"><EmptyState title="Recommendations unavailable" body={controller.recommendationError || "The server did not return a recommendation feed."} /><button className="catalog-retry" onClick={controller.retryRecommendations}>Retry recommendations</button></div>;
+  if (!model && controller.movies.length > 0) {
+    const fallbackItems = view === "movies" ? controller.movieItems : view === "series" ? controller.seriesItems : controller.movies;
+    return <div className={`${view === "home" ? "home-view" : "browse-discovery"} category-discovery`} data-category-mode="catalog-fallback">
+      <FeedStatus controller={controller} />
+      <CatalogGrid title={view === "home" ? "Server Catalog" : view === "movies" ? "Movies" : "Series"} label="AVAILABLE NOW" items={fallbackItems} total={fallbackItems.length} sessions={controller.sessions} theme={theme} showReasons={false} onOpen={onOpen} />
+    </div>;
+  }
+  if (!model) return <div className="catalog-feed-failure"><EmptyState title="Catalog unavailable" body={controller.error || controller.recommendationError || "The server did not return catalog records."} /><button className="catalog-retry" onClick={controller.retryRecommendations}>Retry</button></div>;
   const context = view as "home" | "movies" | "series";
   const collectionsClass = view === "home" ? "home-collections" : "browse-genre-collections";
   const hasResults = model.gridItems.length > 0 || model.sections.length > 0;

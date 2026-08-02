@@ -22,7 +22,7 @@ from routes.playback import (
 )
 from services.languages import normalize_language_tag
 from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
-from services.media_source import MediaSourceError, ResolvedMediaSource, canonicalize_catalog_path, is_safe_presentation_asset, resolve_media_source
+from services.media_source import MediaSourceError, ResolvedMediaSource, canonicalize_catalog_path, clear_cloud_object_cache, is_safe_presentation_asset, resolve_media_source
 from services.playback_prep import PlaybackMediaSnapshot, PlaybackPrepService, PlaybackPreparationError, playback_prep_service
 from services.rclone import rclone_service
 from services.queue import srt_to_vtt
@@ -541,6 +541,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
         catalog_path = f"/media/Movies/Cloud_{uuid.uuid4().hex}/movie.mp4"
 
         async def resolve_with(modified: str):
+            clear_cloud_object_cache()
             response = SimpleNamespace(
                 ok=True,
                 stdout=f'{{"Path":"movie.mp4","Size":2048,"ModTime":"{modified}","Hashes":{{"md5":"abc"}},"IsDir":false}}',
@@ -554,6 +555,32 @@ class PlaybackPipelineRegression(unittest.TestCase):
             self.assertTrue(first.cloud_exists)
             self.assertNotEqual(first.fingerprint, second.fingerprint)
         finally:
+            clear_cloud_object_cache()
+            settings.STORAGE_ENGINE = old_engine
+
+    def test_cloud_source_metadata_is_reused_across_range_resolution(self) -> None:
+        old_engine = settings.STORAGE_ENGINE
+        settings.STORAGE_ENGINE = "CLOUD"
+        catalog_path = f"/media/Movies/CloudCache_{uuid.uuid4().hex}/movie.mp4"
+        response = SimpleNamespace(
+            ok=True,
+            stdout='{"Path":"movie.mp4","Size":4096,"ModTime":"2026-08-02T10:00:00Z","Hashes":{},"IsDir":false}',
+        )
+        clear_cloud_object_cache()
+        try:
+            with patch.object(rclone_service, "executable", return_value="rclone"), patch.object(
+                rclone_service,
+                "run",
+                new=AsyncMock(return_value=response),
+            ) as run:
+                first = asyncio.run(resolve_media_source(catalog_path))
+                second = asyncio.run(resolve_media_source(catalog_path))
+            self.assertEqual(first.cloud_size, 4096)
+            self.assertEqual(second.cloud_size, 4096)
+            self.assertEqual(first.cloud_identity, second.cloud_identity)
+            run.assert_awaited_once()
+        finally:
+            clear_cloud_object_cache()
             settings.STORAGE_ENGINE = old_engine
 
     def test_strict_open_suffix_and_invalid_ranges(self) -> None:

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Optional
@@ -16,6 +17,16 @@ from services.rclone import rclone_service
 CANONICAL_MEDIA_PREFIX = "/media/"
 WINDOWS_DRIVE_RE = re.compile(r"^[a-zA-Z]:")
 EXTERNAL_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"}
+CLOUD_OBJECT_CACHE_TTL_SECONDS = 15.0
+
+
+@dataclass(frozen=True, slots=True)
+class CloudObjectInfo:
+    identity: str
+    size: int
+
+
+_cloud_object_cache: dict[str, tuple[float, CloudObjectInfo]] = {}
 
 
 class MediaSourceError(ValueError):
@@ -31,6 +42,7 @@ class ResolvedMediaSource:
     local_exists: bool
     cloud_exists: bool
     cloud_identity: Optional[str] = None
+    cloud_size: Optional[int] = None
 
     @property
     def available(self) -> bool:
@@ -171,9 +183,21 @@ def cloud_path_for(catalog_path: str) -> str:
     return f"{settings.RCLONE_REMOTE_PATH.rstrip('/')}/{relative}"
 
 
-async def cloud_object_identity(remote_path: str) -> Optional[str]:
+def clear_cloud_object_cache() -> None:
+    _cloud_object_cache.clear()
+
+
+async def cloud_object_info(remote_path: str) -> Optional[CloudObjectInfo]:
     if settings.STORAGE_ENGINE != "CLOUD" or not rclone_service.executable():
         return None
+    now = time.monotonic()
+    if len(_cloud_object_cache) > 1024:
+        expired_paths = [path for path, (expires_at, _) in _cloud_object_cache.items() if expires_at <= now]
+        for expired_path in expired_paths:
+            _cloud_object_cache.pop(expired_path, None)
+    cached = _cloud_object_cache.get(remote_path)
+    if cached and cached[0] > now:
+        return cached[1]
     result = await rclone_service.run("lsjson", remote_path, "--stat", timeout=30)
     if not result.ok or not result.stdout.strip():
         return None
@@ -181,34 +205,37 @@ async def cloud_object_identity(remote_path: str) -> Optional[str]:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError:
         return None
+    item: Optional[dict] = None
     if isinstance(payload, dict):
-        if payload.get("IsDir"):
-            return None
-        return json.dumps(
-            {
-                "path": remote_path,
-                "size": payload.get("Size"),
-                "modTime": payload.get("ModTime"),
-                "hashes": payload.get("Hashes") or {},
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        item = payload
     if isinstance(payload, list) and payload:
         item = payload[0]
-        if item.get("IsDir"):
-            return None
-        return json.dumps(
-            {
-                "path": remote_path,
-                "size": item.get("Size"),
-                "modTime": item.get("ModTime"),
-                "hashes": item.get("Hashes") or {},
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    return None
+    if not item or item.get("IsDir"):
+        return None
+    try:
+        size = int(item.get("Size", 0))
+    except (TypeError, ValueError):
+        return None
+    if size <= 0:
+        return None
+    identity = json.dumps(
+        {
+            "path": remote_path,
+            "size": size,
+            "modTime": item.get("ModTime"),
+            "hashes": item.get("Hashes") or {},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    info = CloudObjectInfo(identity=identity, size=size)
+    _cloud_object_cache[remote_path] = (time.monotonic() + CLOUD_OBJECT_CACHE_TTL_SECONDS, info)
+    return info
+
+
+async def cloud_object_identity(remote_path: str) -> Optional[str]:
+    info = await cloud_object_info(remote_path)
+    return info.identity if info else None
 
 
 async def resolve_media_source(catalog_path: str, *, check_cloud: bool = True) -> ResolvedMediaSource:
@@ -218,8 +245,11 @@ async def resolve_media_source(catalog_path: str, *, check_cloud: bool = True) -
     local_exists = local_path.is_file()
     remote = cloud_path_for(canonical) if settings.STORAGE_ENGINE == "CLOUD" else None
     cloud_identity: Optional[str] = None
+    cloud_size: Optional[int] = None
     if check_cloud and not local_exists and remote:
-        cloud_identity = await cloud_object_identity(remote)
+        cloud_info = await cloud_object_info(remote)
+        cloud_identity = cloud_info.identity if cloud_info else None
+        cloud_size = cloud_info.size if cloud_info else None
     return ResolvedMediaSource(
         catalog_path=canonical,
         relative_path=relative,
@@ -228,6 +258,7 @@ async def resolve_media_source(catalog_path: str, *, check_cloud: bool = True) -
         local_exists=local_exists,
         cloud_exists=cloud_identity is not None,
         cloud_identity=cloud_identity,
+        cloud_size=cloud_size,
     )
 
 

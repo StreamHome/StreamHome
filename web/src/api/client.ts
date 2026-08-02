@@ -5,19 +5,47 @@ export class ApiError extends Error {
   }
 }
 
-export async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const headers = new Headers(options.headers || {});
+export interface ApiRequestInit extends RequestInit {
+  timeoutMs?: number;
+}
+
+const DEFAULT_API_TIMEOUT_MS = 45_000;
+
+export async function apiFetch<T>(path: string, options: ApiRequestInit = {}): Promise<T> {
+  const { timeoutMs = DEFAULT_API_TIMEOUT_MS, ...requestOptions } = options;
+  const headers = new Headers(requestOptions.headers || {});
   
-  if (!headers.has("Content-Type") && options.body && typeof options.body === "string") {
+  if (!headers.has("Content-Type") && requestOptions.body && typeof requestOptions.body === "string") {
     headers.set("Content-Type", "application/json");
   }
 
+  const requestController = new AbortController();
+  let timedOut = false;
+  const abortFromCaller = () => requestController.abort(requestOptions.signal?.reason);
+  if (requestOptions.signal?.aborted) abortFromCaller();
+  else requestOptions.signal?.addEventListener("abort", abortFromCaller, { once: true });
+  const timeout = window.setTimeout(() => {
+    timedOut = true;
+    requestController.abort();
+  }, timeoutMs);
+
   let response: Response;
   try {
-    response = await fetch(path, { ...options, headers, credentials: options.credentials ?? "same-origin" });
+    response = await fetch(path, {
+      ...requestOptions,
+      headers,
+      signal: requestController.signal,
+      credentials: requestOptions.credentials ?? "same-origin",
+    });
   } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") throw new ApiError("The server took too long to respond.", 0, "request_timeout");
+    if (error instanceof DOMException && error.name === "AbortError") {
+      if (timedOut) throw new ApiError("The server took too long to respond.", 0, "request_timeout");
+      throw new ApiError("The request was cancelled.", 0, "request_cancelled");
+    }
     throw new ApiError(navigator.onLine ? "StreamHome could not reach the server." : "This device is offline.", 0, navigator.onLine ? "server_unreachable" : "offline");
+  } finally {
+    window.clearTimeout(timeout);
+    requestOptions.signal?.removeEventListener("abort", abortFromCaller);
   }
   
   if (!response.ok) {
@@ -56,11 +84,11 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
   return JSON.parse(text) as T;
 }
 
-export function apiGet<T>(path: string, options?: RequestInit): Promise<T> {
+export function apiGet<T>(path: string, options?: ApiRequestInit): Promise<T> {
   return apiFetch<T>(path, { ...options, method: "GET" });
 }
 
-export function apiPost<T>(path: string, body?: unknown, options?: RequestInit): Promise<T> {
+export function apiPost<T>(path: string, body?: unknown, options?: ApiRequestInit): Promise<T> {
   return apiFetch<T>(path, {
     ...options,
     method: "POST",
@@ -68,7 +96,7 @@ export function apiPost<T>(path: string, body?: unknown, options?: RequestInit):
   });
 }
 
-export function apiPut<T>(path: string, body?: unknown, options?: RequestInit): Promise<T> {
+export function apiPut<T>(path: string, body?: unknown, options?: ApiRequestInit): Promise<T> {
   return apiFetch<T>(path, {
     ...options,
     method: "PUT",
@@ -76,6 +104,6 @@ export function apiPut<T>(path: string, body?: unknown, options?: RequestInit): 
   });
 }
 
-export function apiDelete<T>(path: string, options?: RequestInit): Promise<T> {
+export function apiDelete<T>(path: string, options?: ApiRequestInit): Promise<T> {
   return apiFetch<T>(path, { ...options, method: "DELETE" });
 }

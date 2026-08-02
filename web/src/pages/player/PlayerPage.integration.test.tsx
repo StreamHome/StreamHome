@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useProfileStore } from "../../stores/profileStore";
 import type { Profile } from "../../types/api";
+import * as moviesApi from "../../api/movies";
 import * as playbackApi from "../../api/playback";
 import { PlayerPage, type ResolvedPlayback } from "./PlayerPage";
 
@@ -144,6 +145,13 @@ describe("mounted player lifecycle", () => {
         ],
       },
     };
+    vi.spyOn(playbackApi, "getPlaybackRun").mockResolvedValue({
+      ...onDemandPlayback.runResponse,
+      manifestUrl: "/api/playback/manifest/mounted-player-media?ticket=mounted-player-ticket",
+      renditions: onDemandPlayback.runResponse.renditions.map((item) => item.id === "video_240p"
+        ? { ...item, ready: true, status: "ready" as const }
+        : item),
+    });
 
     const view = render(
       <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
@@ -157,6 +165,81 @@ describe("mounted player lifecycle", () => {
 
     expect(prepare).toHaveBeenCalledOnce();
     expect(prepare).toHaveBeenCalledWith("mounted-player-run", "video_240p");
+    view.unmount();
+  });
+
+  it("keeps the first open mounted while progressive playback fails and HLS becomes ready", async () => {
+    const preparingRun = {
+      ...playback.runResponse,
+      runId: "first-open-run",
+      mediaId: "m_first-open",
+      movieId: "m_first-open",
+      manifestUrl: null,
+      preparationState: "preparing" as const,
+      preparationProgress: {
+        stage: "packaging" as const,
+        queuePosition: 0,
+        readySegments: 0,
+        activeWorkers: 1,
+      },
+    };
+    const readyRun = {
+      ...preparingRun,
+      manifestUrl: "/api/playback/manifest/m_first-open?ticket=mounted-player-ticket",
+      preparationState: "ready" as const,
+      preparationProgress: {
+        stage: "streamable" as const,
+        queuePosition: 0,
+        readySegments: 2,
+        activeWorkers: 0,
+      },
+    };
+    vi.spyOn(moviesApi, "getMovie").mockResolvedValue({
+      id: "m_first-open",
+      title: "First open recovery",
+      description: "",
+      thumbnailUrl: "",
+      bannerUrl: null,
+      videoUrl: "/media/first-open.mp4",
+      genres: [],
+      duration: "2m",
+      releaseYear: 2026,
+      rating: null,
+      cast: [],
+      director: null,
+      type: "movie",
+      quality: "360p",
+      languages: ["en"],
+      subtitles: [],
+      voteAverage: 0,
+      voteCount: 0,
+      skipMarkers: {},
+    });
+    vi.spyOn(playbackApi, "createPlaybackRun").mockResolvedValue(preparingRun);
+    const poll = vi.spyOn(playbackApi, "getPlaybackRun").mockResolvedValue(readyRun);
+    const close = vi.spyOn(playbackApi, "closePlaybackRun").mockResolvedValue({
+      status: "abandoned",
+      acceptedSeconds: 0,
+      nextSequenceNumber: 2,
+    });
+
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=m_first-open"]}>
+        <PlayerPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("First open recovery")).toBeTruthy();
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    fireEvent.error(video);
+
+    await waitFor(() => expect(poll).toHaveBeenCalled(), { timeout: 2_000 });
+    await waitFor(() => expect(view.container.querySelector("video")).toBeTruthy(), { timeout: 2_000 });
+    expect(screen.queryByText("Recovery required")).toBeNull();
+    fireEvent(window, new Event("pagehide"));
+    fireEvent(window, new Event("pagehide"));
+    expect(close).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledWith("first-open-run", expect.objectContaining({ timestamp: 12, event: "exit" }));
     view.unmount();
   });
 
@@ -191,7 +274,9 @@ describe("mounted player lifecycle", () => {
     fireEvent(document, new Event("fullscreenerror"));
     expect(screen.queryByText("The browser rejected the fullscreen request. Check the fullscreen permission for this site.")).toBeNull();
 
-    fireEvent.keyDown(window, { key: "Escape" });
+    const focusedFullscreenButton = screen.getByRole("button", { name: "Exit fullscreen" });
+    focusedFullscreenButton.focus();
+    fireEvent.keyDown(focusedFullscreenButton, { key: "Escape" });
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Fullscreen" })).toBeTruthy());
     expect(player.getAttribute("data-player-viewport-fullscreen")).toBeNull();

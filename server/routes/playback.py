@@ -682,8 +682,8 @@ async def authorized_run(db: AsyncSession, request: Request, run_id: str) -> Pla
         raise playback_error(status.HTTP_404_NOT_FOUND, "PLAYBACK_RUN_NOT_FOUND", "The playback run does not exist.")
     if run.auth_session_id != auth_session.id:
         raise playback_error(status.HTTP_403_FORBIDDEN, "PLAYBACK_RUN_FORBIDDEN", "This playback run belongs to another session.")
-    if run.lifecycle_state == "expired":
-        raise playback_error(status.HTTP_410_GONE, "PLAYBACK_RUN_EXPIRED", "The playback run has expired.")
+    if run.lifecycle_state in {"expired", "abandoned"}:
+        raise playback_error(status.HTTP_410_GONE, "PLAYBACK_RUN_EXPIRED", "The playback run is no longer active.")
     return run
 
 
@@ -895,6 +895,30 @@ async def update_playback_progress(
         "acceptedSeconds": accepted_watched,
         "nextSequenceNumber": run.sequence_number,
     }
+
+
+@router.post("/runs/{run_id}/close")
+async def close_playback_run(
+    run_id: str,
+    req: PlaybackProgressRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    run = await authorized_run(db, request, run_id)
+    if run.lifecycle_state == "finished":
+        return {"status": "sticky_finished", "nextSequenceNumber": run.sequence_number}
+    close_request = req.model_copy(update={"sequence_number": run.sequence_number, "event": "exit"})
+    response = await update_playback_progress(run_id, close_request, request, db, user)
+    refreshed_run = await db.get(PlaybackRun, run_id)
+    if refreshed_run and refreshed_run.lifecycle_state != "finished":
+        refreshed_run.lifecycle_state = "abandoned"
+        refreshed_run.last_seen_at = time.time()
+        refreshed_run.updated_at = refreshed_run.last_seen_at
+        db.add(refreshed_run)
+        await db.commit()
+        response["status"] = "abandoned"
+    return response
 
 
 @router.post("/runs/{run_id}/start-over")
@@ -1221,7 +1245,7 @@ async def progressive_playback(
 ):
     _, _, media_obj = await validate_playback_ticket(ticket, media_id, db)
     source = await require_available_source(media_obj)
-    file_size = source.local_path.stat().st_size if source.local_exists else await cloud_file_size(str(source.cloud_path))
+    file_size = source.local_path.stat().st_size if source.local_exists else source.cloud_size or await cloud_file_size(str(source.cloud_path))
     start, end, partial = parse_byte_range(request.headers.get("range"), file_size)
     length = end - start + 1
     content_type = mimetypes.guess_type(source.catalog_path)[0] or "application/octet-stream"

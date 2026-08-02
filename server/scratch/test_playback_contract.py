@@ -451,6 +451,34 @@ class PlaybackContractRegression(unittest.TestCase):
         self.assertEqual(session.timestamp, 0)
         self.assertFalse(session.is_finished)
 
+    def test_close_persists_confirmed_position_and_abandons_run_immediately(self) -> None:
+        run = self.create_run()
+        closed = self.client.post(
+            f"/api/playback/runs/{run['runId']}/close",
+            json={"timestamp": 37, "durationWatched": 2, "sequenceNumber": 99, "event": "exit"},
+        )
+        self.assertEqual(closed.status_code, 200, closed.text)
+        self.assertEqual(closed.json()["status"], "abandoned")
+
+        async def read_state() -> tuple[PlaybackRun, PlaybackSession]:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                playback_run = await db.get(PlaybackRun, run["runId"])
+                session = (await db.exec(select(PlaybackSession).where(
+                    PlaybackSession.profile_id == "contract-profile",
+                    PlaybackSession.movie_id == "m_playback_contract",
+                ))).one()
+                return playback_run, session
+
+        playback_run, session = asyncio.run(read_state())
+        self.assertEqual(playback_run.lifecycle_state, "abandoned")
+        self.assertEqual(session.timestamp, 37)
+
+        late_progress = self.client.post(
+            f"/api/playback/runs/{run['runId']}/progress",
+            json={"timestamp": 40, "durationWatched": 0, "sequenceNumber": closed.json()["nextSequenceNumber"], "event": "heartbeat"},
+        )
+        self.assertEqual(late_progress.status_code, 410, late_progress.text)
+
     def test_resume_position_survives_preparation_polling(self) -> None:
         async def seed_resume() -> None:
             async with AsyncSession(self.engine, expire_on_commit=False) as db:

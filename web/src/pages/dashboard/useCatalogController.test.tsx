@@ -44,6 +44,27 @@ beforeEach(() => {
 });
 
 describe("useCatalogController recommendations", () => {
+  it("unlocks the media catalog before recommendations and restores it immediately after remount", async () => {
+    const cacheProfile = { ...profile, id: "catalog-bootstrap-profile" };
+    let resolveRecommendation!: (value: RecommendationFeed) => void;
+    mocks.getMovies.mockResolvedValue([movie("available-now")]);
+    mocks.getRecommendations.mockImplementation(() => new Promise<RecommendationFeed>((resolve) => { resolveRecommendation = resolve; }));
+    const query: AppQueryState = { profile: cacheProfile.id, view: "movies" };
+    const first = renderHook(() => useCatalogController(cacheProfile, query));
+
+    await waitFor(() => expect(first.result.current.loading).toBe(false));
+    expect(first.result.current.movieItems.map((item) => item.id)).toEqual(["available-now"]);
+    expect(first.result.current.recommendation).toBeNull();
+    first.unmount();
+
+    mocks.getMovies.mockImplementation(() => new Promise<Movie[]>(() => undefined));
+    const second = renderHook(() => useCatalogController(cacheProfile, query));
+    expect(second.result.current.loading).toBe(false);
+    expect(second.result.current.movieItems.map((item) => item.id)).toEqual(["available-now"]);
+    second.unmount();
+    void resolveRecommendation;
+  });
+
   it("requests the active scope/category and keeps Watch Again in server order", async () => {
     mocks.getRecommendations.mockResolvedValue(feed("Drama", ["ranked"], 1, ["recent", "older"]));
     const query: AppQueryState = { profile: profile.id, view: "movies", genre: "Drama" };

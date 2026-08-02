@@ -27,6 +27,15 @@ export const updatePlaybackProgress = (runId: string, progress: PlaybackProgress
     event: progress.event,
   }, { keepalive });
 
+export const closePlaybackRun = (runId: string, progress: PlaybackProgressRequest) =>
+  apiPost<PlaybackProgressResponse>(`/api/playback/runs/${runId}/close`, {
+    timestamp: progress.timestamp,
+    duration_watched: progress.durationWatched,
+    is_finished: progress.isFinished,
+    sequence_number: progress.sequenceNumber,
+    event: "exit",
+  }, { keepalive: true });
+
 export const startOverPlaybackRun = (runId: string) =>
   apiPost<{ status: string }>(`/api/playback/runs/${runId}/start-over`);
 

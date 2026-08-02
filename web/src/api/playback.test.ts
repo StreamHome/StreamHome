@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createPlaybackRun, updatePlaybackProgress } from "./playback";
+import { closePlaybackRun, createPlaybackRun, updatePlaybackProgress } from "./playback";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -34,6 +34,28 @@ describe("playback tracking", () => {
       is_finished: false,
       sequence_number: 7,
       event: "visibility",
+    });
+  });
+
+  it("closes unfinished runs with confirmed progress and keepalive delivery", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ status: "abandoned", nextSequenceNumber: 4 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await closePlaybackRun("run-1", {
+      timestamp: 42,
+      durationWatched: 3,
+      isFinished: false,
+      sequenceNumber: 3,
+      event: "exit",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/playback/runs/run-1/close");
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(request.keepalive).toBe(true);
+    expect(JSON.parse(String(request.body))).toEqual({
+      timestamp: 42,
+      duration_watched: 3,
+      is_finished: false,
+      sequence_number: 3,
+      event: "exit",
     });
   });
 });

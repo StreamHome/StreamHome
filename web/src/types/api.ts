@@ -538,7 +538,7 @@ export interface PlaybackProgressRequest {
 }
 
 export interface PlaybackProgressResponse {
-  status: "ok" | "finished" | "sticky_finished";
+  status: "ok" | "finished" | "sticky_finished" | "abandoned";
   viewingSessionId?: string;
   acceptedSeconds?: number;
   nextSequenceNumber: number;

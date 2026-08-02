@@ -27,7 +27,8 @@ describe("recommendation API", () => {
     vi.stubGlobal("fetch", fetchMock);
     const result = await getRecommendations({ profileId: "profile one", scope: "movies", category: "Science Fiction", signal });
     expect(fetchMock.mock.calls[0][0]).toBe("/api/recommendations/profile%20one?scope=movies&category=Science+Fiction&limit=48&offset=0");
-    expect(fetchMock.mock.calls[0][1].signal).toBe(signal);
+    expect(fetchMock.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+    expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(false);
     expect(result.items.map((entry) => entry.media.id)).toEqual(["first", "second"]);
     expect(result.watchAgain.map((entry) => entry.media.id)).toEqual(["recent", "older"]);
     expect(result.algorithmVersion).toBe("v2.1");

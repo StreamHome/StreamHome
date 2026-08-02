@@ -71,7 +71,14 @@ function EmberFeedStatus({ controller }: { controller: ThemeApplicationProps["co
 function EmberCatalogView({ query, controller, onOpen, onPlay, onResume, onCategory }: { query: AppQueryState; controller: ThemeApplicationProps["controller"]; onOpen: (movie: Movie) => void; onPlay: (movie: Movie) => void; onResume: (movie: Movie, session: PlaybackSession) => void; onCategory: (category: string) => void }) {
   const view = query.view as CatalogView;
   const model = useMemo(() => controller.recommendation ? buildCatalogPresentation({ feed: controller.recommendation, fallbackMovies: controller.movies, continueWatching: controller.continueWatching, view }) : null, [controller.continueWatching, controller.movies, controller.recommendation, view]);
-  if (!model) return <EmberStatePanel code="RECOMMENDATION SIGNAL LOST" title="Recommendations unavailable" body={controller.recommendationError || "The server returned no personalized catalog feed."} action={<button className="ember-retry" onClick={controller.retryRecommendations}>Retry signal</button>} />;
+  if (!model && controller.movies.length > 0) {
+    const fallbackItems = view === "movies" ? controller.movieItems : view === "series" ? controller.seriesItems : controller.movies;
+    return <div className={`${view === "home" ? "ember-home" : "ember-discovery"} ember-category-discovery`} data-category-mode="catalog-fallback">
+      <EmberFeedStatus controller={controller} />
+      <EmberGrid title={view === "home" ? "Server Catalog" : view === "movies" ? "Movies" : "Series"} label="AVAILABLE NOW" items={fallbackItems} total={fallbackItems.length} sessions={controller.sessions} showReasons={false} onOpen={onOpen} />
+    </div>;
+  }
+  if (!model) return <EmberStatePanel code="CATALOG SIGNAL LOST" title="Catalog unavailable" body={controller.error || controller.recommendationError || "The server returned no catalog records."} action={<button className="ember-retry" onClick={controller.retryRecommendations}>Retry</button>} />;
   const context = view as "home" | "movies" | "series";
   const collectionsClass = view === "home" ? "ember-collections" : "ember-genre-collections";
   const hasResults = model.gridItems.length > 0 || model.sections.length > 0;
