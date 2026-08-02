@@ -30,8 +30,10 @@ import { formatDuration } from "../../utils/format";
 import { hasSubtitleOptions, PlayerControlMenu, PlayerIcon, PlayerIconButton } from "./PlayerControls";
 import { languageDisplayName, normalizeLanguageTag } from "./language";
 import {
-  isPlayerFullscreen,
+  playerFullscreenMode,
+  releaseViewportPlayerFullscreen,
   togglePlayerFullscreen,
+  type PlayerFullscreenMode,
 } from "./fullscreen";
 import {
   isForcedLandscape,
@@ -572,6 +574,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [nextCancelled, setNextCancelled] = useState(false);
   const [timelinePreview, setTimelinePreview] = useState<{ x: number; time: number } | null>(null);
   const [fullscreenActive, setFullscreenActive] = useState(false);
+  const [fullscreenMode, setFullscreenMode] = useState<PlayerFullscreenMode>(null);
   const [fullscreenError, setFullscreenError] = useState("");
   const [playerNotice, setPlayerNotice] = useState("");
   const [hasLastFrame, setHasLastFrame] = useState(false);
@@ -1700,12 +1703,24 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     };
   }, [duration, phase]);
 
+  const resolvePlayerContainer = useCallback((interactionTarget?: HTMLElement | null) => {
+    const interactionContainer = interactionTarget?.matches("[data-player-root='true']")
+      ? interactionTarget
+      : interactionTarget?.closest<HTMLElement>("[data-player-root='true']");
+    return containerRef.current
+      ?? interactionContainer
+      ?? document.querySelector<HTMLElement>("[data-player-root='true']");
+  }, []);
+
   useEffect(() => {
-    const container = containerRef.current;
+    const container = resolvePlayerContainer();
     const video = videoRef.current;
     const updateFullscreenState = () => {
-      const active = isPlayerFullscreen(container, video);
+      const nextMode = playerFullscreenMode(container, video);
+      const active = nextMode !== null;
+      setFullscreenMode(nextMode);
       setFullscreenActive(active);
+      if (active) setFullscreenError("");
       if (mobilePlayer) {
         if (active) void lockPlayerLandscape();
         else {
@@ -1715,7 +1730,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       }
     };
     const reportFullscreenError = () => {
-      setFullscreenActive(isPlayerFullscreen(container, video));
+      const nextMode = playerFullscreenMode(container, video);
+      setFullscreenMode(nextMode);
+      setFullscreenActive(nextMode !== null);
+      if (nextMode !== null) {
+        setFullscreenError("");
+        return;
+      }
       setFullscreenError("The browser rejected the fullscreen request. Check the fullscreen permission for this site.");
       setShowControls(true);
     };
@@ -1734,32 +1755,40 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       document.removeEventListener("webkitfullscreenerror", reportFullscreenError);
       video?.removeEventListener("webkitbeginfullscreen", updateFullscreenState);
       video?.removeEventListener("webkitendfullscreen", updateFullscreenState);
+      releaseViewportPlayerFullscreen(container);
     };
-  }, [mobilePlayer, runResponse?.runId]);
+  }, [mobilePlayer, resolvePlayerContainer, runResponse?.runId]);
 
-  const toggleFullscreen = useCallback(() => {
-    const container = containerRef.current;
+  const toggleFullscreen = useCallback((interactionTarget?: HTMLElement | null) => {
+    const container = resolvePlayerContainer(interactionTarget);
     const video = videoRef.current;
     if (!container || !video) return;
 
     setFullscreenError("");
     void togglePlayerFullscreen(container, video, document, { allowVideoFallback: true })
       .then((result) => {
-        const active = result === "entered";
+        const nextMode = playerFullscreenMode(container, video);
+        const active = result === "entered" && nextMode !== null;
+        setFullscreenMode(nextMode);
         setFullscreenActive(active);
         setFullscreenError("");
+        if (active && nextMode === "viewport") {
+          setPlayerNotice("This browser uses app fullscreen because native fullscreen is unavailable.");
+        }
         if (mobilePlayer && active) void lockPlayerLandscape();
         if (mobilePlayer && !active) unlockPlayerLandscape();
         revealControls();
       })
       .catch((error: unknown) => {
-        setFullscreenActive(isPlayerFullscreen(container, video));
+        const nextMode = playerFullscreenMode(container, video);
+        setFullscreenMode(nextMode);
+        setFullscreenActive(nextMode !== null);
         setFullscreenError(error instanceof Error
           ? error.message
           : "Fullscreen could not be opened. Check this browser's fullscreen permission.");
         setShowControls(true);
       });
-  }, [mobilePlayer, revealControls]);
+  }, [mobilePlayer, resolvePlayerContainer, revealControls]);
 
   const ensureMobileLandscape = useCallback(() => {
     if (!mobilePlayer) return;
@@ -1767,7 +1796,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       void lockPlayerLandscape();
       return;
     }
-    const container = containerRef.current;
+    const container = resolvePlayerContainer();
     const video = videoRef.current;
     if (!container || !video) return;
     const now = performance.now();
@@ -1775,7 +1804,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     mobileFullscreenAttemptedAtRef.current = now;
     void togglePlayerFullscreen(container, video, document, { allowVideoFallback: true })
       .then(async (result) => {
-        const active = result === "entered";
+        const nextMode = playerFullscreenMode(container, video);
+        const active = result === "entered" && nextMode !== null;
+        setFullscreenMode(nextMode);
         setFullscreenActive(active);
         if (active) await lockPlayerLandscape();
       })
@@ -1783,7 +1814,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         mobileFullscreenAttemptedAtRef.current = 0;
         // The CSS-rotated landscape presentation remains active when browser policy rejects fullscreen.
       });
-  }, [fullscreenActive, mobilePlayer]);
+  }, [fullscreenActive, mobilePlayer, resolvePlayerContainer]);
 
   const startMobilePlayback = useCallback(() => {
     ensureMobileLandscape();
@@ -1809,7 +1840,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     event.preventDefault();
     if (desktopClickTimerRef.current !== null) window.clearTimeout(desktopClickTimerRef.current);
     desktopClickTimerRef.current = null;
-    toggleFullscreen();
+    toggleFullscreen(event.currentTarget);
     revealControls();
   }, [mobilePlayer, revealControls, toggleFullscreen]);
 
@@ -1903,14 +1934,19 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         videoRef.current.muted = !videoRef.current.muted;
       } else if (event.key.toLowerCase() === "p") {
         togglePictureInPicture();
-      } else if (event.key === "Escape" && !fullscreenActive) {
-        exitPlayer();
+      } else if (event.key === "Escape") {
+        if (fullscreenMode === "viewport") {
+          event.preventDefault();
+          toggleFullscreen();
+        } else if (!fullscreenActive) {
+          exitPlayer();
+        }
       }
       revealControls();
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [exitPlayer, fullscreenActive, pausePlayback, revealControls, safePlay, seek, toggleFullscreen, togglePictureInPicture]);
+  }, [exitPlayer, fullscreenActive, fullscreenMode, pausePlayback, revealControls, safePlay, seek, toggleFullscreen, togglePictureInPicture]);
 
   const toggleMobileControls = useCallback(() => {
     if (showControlsRef.current) {
@@ -2236,10 +2272,12 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       data-interaction={definition.interaction.id}
       data-player-theme={definition.playerVariant}
       data-player-phase={phase}
+      data-player-root="true"
       data-frame-hold={holdLastFrame ? "true" : "false"}
       data-controls-visible={showControls || phase === "paused" ? "true" : "false"}
       data-mobile-player={mobilePlayer ? "true" : "false"}
       data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
+      data-player-viewport-fullscreen={fullscreenMode === "viewport" ? "true" : undefined}
       style={{ "--caption-scale": preferences.captionScale } as React.CSSProperties}
       onMouseMove={mobilePlayer ? undefined : handleDesktopPointerActivity}
       onClick={mobilePlayer ? undefined : handleDesktopSurfaceClick}
@@ -2692,7 +2730,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                     icon={fullscreenActive ? "fullscreen-exit" : "fullscreen"}
                     label={fullscreenActive ? "Exit fullscreen" : "Fullscreen"}
                     aria-pressed={fullscreenActive}
-                    onClick={toggleFullscreen}
+                    onClick={(event) => toggleFullscreen(event.currentTarget)}
                   />
                 </div>
               </div>
@@ -2819,7 +2857,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                     icon={fullscreenActive ? "fullscreen-exit" : "fullscreen"}
                     label={fullscreenActive ? "Exit fullscreen" : "Fullscreen"}
                     aria-pressed={fullscreenActive}
-                    onClick={toggleFullscreen}
+                    onClick={(event) => toggleFullscreen(event.currentTarget)}
                   />
                 </div>
               </div>

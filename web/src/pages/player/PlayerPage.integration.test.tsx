@@ -1,5 +1,5 @@
 import React from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -97,6 +97,10 @@ describe("mounted player lifecycle", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     useProfileStore.setState({ profiles: [], activeProfile: null, isAdmin: false });
+    document.documentElement.removeAttribute("data-player-viewport-fullscreen");
+    document.body.removeAttribute("data-player-viewport-fullscreen");
+    Reflect.deleteProperty(document, "fullscreenEnabled");
+    Reflect.deleteProperty(document, "webkitFullscreenEnabled");
   });
 
   it("mounts the real page and commits one desktop seek when dragging ends", () => {
@@ -153,6 +157,46 @@ describe("mounted player lifecycle", () => {
 
     expect(prepare).toHaveBeenCalledOnce();
     expect(prepare).toHaveBeenCalledWith("mounted-player-run", "video_240p");
+    view.unmount();
+  });
+
+  it("enters and exits viewport fullscreen from the real player controls", async () => {
+    Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: false });
+    Object.defineProperty(document, "webkitFullscreenEnabled", { configurable: true, value: false });
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={playback} />
+      </MemoryRouter>,
+    );
+
+    const player = view.container.querySelector(".player-view") as HTMLElement;
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    Object.defineProperties(player, {
+      requestFullscreen: { configurable: true, value: undefined },
+      webkitRequestFullscreen: { configurable: true, value: undefined },
+    });
+    Object.defineProperties(video, {
+      requestFullscreen: { configurable: true, value: undefined },
+      webkitEnterFullscreen: { configurable: true, value: undefined },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Fullscreen" }));
+
+    await waitFor(
+      () => expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeTruthy(),
+      { timeout: 4_000 },
+    );
+    expect(player.getAttribute("data-player-viewport-fullscreen")).toBe("true");
+    expect(document.documentElement.getAttribute("data-player-viewport-fullscreen")).toBe("true");
+    expect(document.body.getAttribute("data-player-viewport-fullscreen")).toBe("true");
+    fireEvent(document, new Event("fullscreenerror"));
+    expect(screen.queryByText("The browser rejected the fullscreen request. Check the fullscreen permission for this site.")).toBeNull();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Fullscreen" })).toBeTruthy());
+    expect(player.getAttribute("data-player-viewport-fullscreen")).toBeNull();
+    expect(document.documentElement.getAttribute("data-player-viewport-fullscreen")).toBeNull();
+    expect(document.body.getAttribute("data-player-viewport-fullscreen")).toBeNull();
     view.unmount();
   });
 });

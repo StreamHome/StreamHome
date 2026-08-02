@@ -18,10 +18,14 @@ export type PlayerFullscreenResult = "entered" | "exited";
 
 export interface PlayerFullscreenOptions {
   allowVideoFallback?: boolean;
+  allowViewportFallback?: boolean;
   transitionTimeoutMs?: number;
 }
 
 const DEFAULT_TRANSITION_TIMEOUT_MS = 2_500;
+const VIEWPORT_FULLSCREEN_ATTRIBUTE = "data-player-viewport-fullscreen";
+
+export type PlayerFullscreenMode = "native" | "viewport" | null;
 
 export function fullscreenElement(documentObject: Document = document): Element | null {
   const webkitDocument = documentObject as WebKitFullscreenDocument;
@@ -30,6 +34,10 @@ export function fullscreenElement(documentObject: Document = document): Element 
 
 export function isVideoFullscreen(video: HTMLVideoElement | null): boolean {
   return Boolean((video as WebKitFullscreenVideo | null)?.webkitDisplayingFullscreen);
+}
+
+export function isViewportPlayerFullscreen(container: HTMLElement | null): boolean {
+  return container?.getAttribute?.(VIEWPORT_FULLSCREEN_ATTRIBUTE) === "true";
 }
 
 function ownsFullscreenElement(
@@ -55,22 +63,64 @@ export function isPlayerFullscreen(
 ): boolean {
   if (!container || !video) return false;
   return ownsFullscreenElement(container, video, fullscreenElement(documentObject))
-    || isVideoFullscreen(video);
+    || isVideoFullscreen(video)
+    || isViewportPlayerFullscreen(container);
+}
+
+export function playerFullscreenMode(
+  container: HTMLElement | null,
+  video: HTMLVideoElement | null,
+  documentObject: Document = document,
+): PlayerFullscreenMode {
+  if (!container || !video) return null;
+  if (
+    ownsFullscreenElement(container, video, fullscreenElement(documentObject))
+    || isVideoFullscreen(video)
+  ) return "native";
+  return isViewportPlayerFullscreen(container) ? "viewport" : null;
 }
 
 export function canUsePlayerFullscreen(
   container: HTMLElement | null,
   video: HTMLVideoElement | null,
+  documentObject: Document = document,
 ): boolean {
   if (!container || !video) return false;
+  const webkitDocument = documentObject as WebKitFullscreenDocument;
   const webkitContainer = container as WebKitFullscreenElement;
   const webkitVideo = video as WebKitFullscreenVideo;
   return Boolean(
-    container.requestFullscreen
-    || video.requestFullscreen
-    || webkitContainer.webkitRequestFullscreen
+    (documentObject.fullscreenEnabled !== false && (container.requestFullscreen || video.requestFullscreen))
+    || (webkitDocument.webkitFullscreenEnabled !== false && webkitContainer.webkitRequestFullscreen)
     || webkitVideo.webkitEnterFullscreen,
   );
+}
+
+function setViewportPlayerFullscreen(
+  container: HTMLElement,
+  documentObject: Document,
+  active: boolean,
+): void {
+  if (active) container.setAttribute?.(VIEWPORT_FULLSCREEN_ATTRIBUTE, "true");
+  else container.removeAttribute?.(VIEWPORT_FULLSCREEN_ATTRIBUTE);
+  const documentElement = documentObject.documentElement;
+  const body = documentObject.body;
+  if (active) {
+    documentElement?.setAttribute?.(VIEWPORT_FULLSCREEN_ATTRIBUTE, "true");
+    body?.setAttribute?.(VIEWPORT_FULLSCREEN_ATTRIBUTE, "true");
+  } else {
+    documentElement?.removeAttribute?.(VIEWPORT_FULLSCREEN_ATTRIBUTE);
+    body?.removeAttribute?.(VIEWPORT_FULLSCREEN_ATTRIBUTE);
+  }
+}
+
+export function releaseViewportPlayerFullscreen(
+  container: HTMLElement | null,
+  documentObject: Document = document,
+): void {
+  container?.removeAttribute?.(VIEWPORT_FULLSCREEN_ATTRIBUTE);
+  documentObject.documentElement?.removeAttribute?.(VIEWPORT_FULLSCREEN_ATTRIBUTE);
+  documentObject.body?.removeAttribute?.(VIEWPORT_FULLSCREEN_ATTRIBUTE);
 }
 
 function transitionTargets(
@@ -219,6 +269,11 @@ async function exitPlayerFullscreen(
   const webkitVideo = video as WebKitFullscreenVideo;
   const activeElement = fullscreenElement(documentObject);
 
+  if (isViewportPlayerFullscreen(container)) {
+    setViewportPlayerFullscreen(container, documentObject, false);
+    return;
+  }
+
   if (ownsFullscreenElement(container, video, activeElement)) {
     const exit = documentObject.exitFullscreen
       ? () => documentObject.exitFullscreen()
@@ -256,26 +311,31 @@ async function enterPlayerFullscreen(
   video: HTMLVideoElement,
   documentObject: Document,
   allowVideoFallback: boolean,
+  allowViewportFallback: boolean,
   transitionTimeoutMs: number,
 ): Promise<void> {
+  const webkitDocument = documentObject as WebKitFullscreenDocument;
   const webkitContainer = container as WebKitFullscreenElement;
   const webkitVideo = video as WebKitFullscreenVideo;
   let attempt: { label: string; request: () => Promise<void> | void } | null = null;
+  let failure: string | null = null;
+  const standardElementFullscreenEnabled = documentObject.fullscreenEnabled !== false;
+  const webkitElementFullscreenEnabled = webkitDocument.webkitFullscreenEnabled !== false;
 
   // Fullscreen requests must remain inside the original user-activation turn.
-  // Choose one target up front instead of awaiting a rejected request and then
-  // attempting fallbacks after the browser has consumed transient activation.
-  if (container.requestFullscreen) {
+  // Choose the best enabled native target up front. The viewport fallback does
+  // not require transient activation and remains safe after native rejection.
+  if (standardElementFullscreenEnabled && container.requestFullscreen) {
     attempt = {
       label: "player container",
       request: () => container.requestFullscreen(),
     };
-  } else if (webkitContainer.webkitRequestFullscreen) {
+  } else if (webkitElementFullscreenEnabled && webkitContainer.webkitRequestFullscreen) {
     attempt = {
       label: "WebKit player container",
       request: () => webkitContainer.webkitRequestFullscreen?.(),
     };
-  } else if (allowVideoFallback && video.requestFullscreen) {
+  } else if (allowVideoFallback && standardElementFullscreenEnabled && video.requestFullscreen) {
     attempt = {
       label: "video element",
       request: () => video.requestFullscreen(),
@@ -287,24 +347,28 @@ async function enterPlayerFullscreen(
     };
   }
 
-  if (!attempt) throw fullscreenEntryError([]);
-
-  try {
-    if (await requestVerifiedFullscreenTransition(
-      attempt.request,
-      container,
-      video,
-      documentObject,
-      true,
-      transitionTimeoutMs,
-    )) return;
-    throw fullscreenEntryError([
-      `${attempt.label}: the browser accepted the request but did not enter fullscreen.`,
-    ]);
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith("Fullscreen could not be opened.")) throw error;
-    throw fullscreenEntryError([`${attempt.label}: ${errorMessage(error)}`]);
+  if (attempt) {
+    try {
+      if (await requestVerifiedFullscreenTransition(
+        attempt.request,
+        container,
+        video,
+        documentObject,
+        true,
+        transitionTimeoutMs,
+      )) return;
+      failure = `${attempt.label}: the browser accepted the request but did not enter fullscreen.`;
+    } catch (error) {
+      failure = `${attempt.label}: ${errorMessage(error)}`;
+    }
   }
+
+  if (allowViewportFallback) {
+    setViewportPlayerFullscreen(container, documentObject, true);
+    return;
+  }
+
+  throw fullscreenEntryError(failure ? [failure] : []);
 }
 
 export async function togglePlayerFullscreen(
@@ -324,6 +388,7 @@ export async function togglePlayerFullscreen(
     video,
     documentObject,
     options.allowVideoFallback ?? true,
+    options.allowViewportFallback ?? true,
     transitionTimeoutMs,
   );
   return "entered";
