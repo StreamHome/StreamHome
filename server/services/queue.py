@@ -482,7 +482,7 @@ class DownloadQueueManager:
                     ) from cat_err
 
             from services.state import update_task_metrics
-            update_task_metrics(task_id, 99.0, speed="Preparing playback", eta="00:00:00", force_write=True)
+            update_task_metrics(task_id, 99.0, speed="Indexing playback", eta="00:00:00", force_write=True)
             prepared_fingerprint = await self._prepare_ingested_media(
                 tmdb_id,
                 media_type,
@@ -643,11 +643,10 @@ class DownloadQueueManager:
             current = os.path.dirname(current)
 
     async def _schedule_playback_baseline(self, db: AsyncSession, media_obj: Any) -> None:
+        """Refresh source identity; adaptive delivery itself is request-driven."""
         if not getattr(media_obj, "video_url", ""):
             return
         try:
-            from services.playback_prep import playback_prep_service
-
             source = await resolve_media_source(media_obj.video_url)
             if not source.available:
                 return
@@ -656,13 +655,6 @@ class DownloadQueueManager:
                 media_obj.source_fingerprint = fingerprint
                 db.add(media_obj)
                 await db.flush()
-            await playback_prep_service.prepare(
-                media_obj.id,
-                media_obj,
-                source,
-                include_remaining=True,
-                foreground=False,
-            )
         except Exception as exc:
             logger.warning(
                 f"[Queue Manager] Playback baseline scheduling failed for "
@@ -677,11 +669,8 @@ class DownloadQueueManager:
         episode: Optional[int],
         output_abs_path: str,
     ) -> str:
-        """Finish every playback rendition while the verified local source is retained."""
+        """Bind the verified source identity without blocking publication on transcoding."""
 
-        from services.playback_prep import playback_prep_service
-
-        preparation_started_at = time.monotonic()
         media_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"
         async with AsyncSession(engine, expire_on_commit=False) as db:
             model = Movie if media_type == "movie" else Episode
@@ -703,26 +692,9 @@ class DownloadQueueManager:
             media_obj.source_fingerprint = fingerprint
             db.add(media_obj)
             await db.commit()
-
-        await playback_prep_service.prepare(
-            media_id,
-            media_obj,
-            source,
-            include_remaining=True,
-            retry_errors=True,
-            foreground=False,
-        )
-        if not await playback_prep_service.wait_until_fully_prepared(media_id, fingerprint, media_obj):
-            failure = playback_prep_service.preparation_error(media_id, fingerprint) or {}
-            raise IngestionTaskError(
-                IngestionFailure(
-                    str(failure.get("code") or "PLAYBACK_PREPARATION_FAILED"),
-                    str(failure.get("message") or "The browser-ready quality and dubbing renditions could not be prepared."),
-                )
-            )
         logger.info(
-            f"[Queue Manager] Browser-ready playback preparation completed for {media_id} "
-            f"in {time.monotonic() - preparation_started_at:.2f}s."
+            f"[Queue Manager] Seekable playback source indexed for {media_id}; "
+            "adaptive segments will be generated at the requested timestamp."
         )
         return fingerprint
 
@@ -734,9 +706,9 @@ class DownloadQueueManager:
         episode: Optional[int],
         local_fingerprint: str,
     ) -> str:
-        """Bind verified local preparation artifacts to the uploaded cloud identity."""
+        """Replace the staging identity with the verified uploaded object identity."""
 
-        from services.playback_prep import playback_prep_service
+        del local_fingerprint
 
         media_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"
         async with AsyncSession(engine, expire_on_commit=False) as db:
@@ -752,23 +724,9 @@ class DownloadQueueManager:
                     IngestionFailure("CLOUD_MOVE_FAILED", "The uploaded media could not be resolved from cloud storage.")
                 )
             cloud_fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
-            playback_prep_service.reuse_verified_playback_cache(
-                media_id,
-                local_fingerprint,
-                cloud_fingerprint,
-                media_obj,
-            )
-            if not playback_prep_service.fully_prepared(media_id, cloud_fingerprint, media_obj):
-                raise IngestionTaskError(
-                    IngestionFailure(
-                        "PLAYBACK_CACHE_MIGRATION_FAILED",
-                        "The prepared playback cache could not be bound to the uploaded cloud source.",
-                    )
-                )
             media_obj.source_fingerprint = cloud_fingerprint
             db.add(media_obj)
             await db.commit()
-        await playback_prep_service.rebuild_master(media_id, cloud_fingerprint, media_obj)
         return cloud_fingerprint
 
     async def _catalog_media(
@@ -1214,7 +1172,7 @@ class DownloadQueueManager:
         uploaded_to_cloud: bool,
         source_fingerprint: str,
     ) -> None:
-        """Publish a fully prepared local or cloud catalog row in one short transaction."""
+        """Publish a verified seekable local or cloud catalog row in one short transaction."""
 
         if media_type == "movie":
             media_obj = await db.get(Movie, f"m_{tmdb_id}")

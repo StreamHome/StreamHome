@@ -110,9 +110,9 @@ Artwork and portable recovery metadata are stored alongside the relevant media d
 
 ### 🌊 Adaptive HLS Streaming
 
-A secure, demand-prioritized fMP4 HLS pipeline publishes compatible sources without re-encoding when possible, then prepares a source-resolution-aware quality ladder down to 144p in preemptible background jobs.
+Browser-compatible media starts through a low-latency byte-range video path. Other codecs, quality changes, and dubbing use time-indexed just-in-time HLS that generates only the requested playback window instead of transcoding the complete title.
 
-Playback supports local and Google Drive media sources through the same unified experience.
+Playback supports local files, Google Drive objects, and validated HTTP source URLs through the same seekable source layer.
 
 ### 🔌 Source-Agnostic Ingestion API
 

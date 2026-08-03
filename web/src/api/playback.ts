@@ -38,6 +38,3 @@ export const closePlaybackRun = (runId: string, progress: PlaybackProgressReques
 
 export const startOverPlaybackRun = (runId: string) =>
   apiPost<{ status: string }>(`/api/playback/runs/${runId}/start-over`);
-
-export const preparePlaybackRendition = (runId: string, renditionId: string) =>
-  apiPost<{ status: string }>(`/api/playback/runs/${runId}/renditions/${encodeURIComponent(renditionId)}/prepare`);

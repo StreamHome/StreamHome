@@ -28,6 +28,7 @@ from routes.auth import get_current_user
 from routes.playback import router
 from services.media_source import resolve_media_source
 from services.ingest_preview import ingest_preview_service
+from services.playback_jit import playback_jit_service
 from services.playback_prep import playback_prep_service
 
 
@@ -144,16 +145,10 @@ class PlaybackContractRegression(unittest.TestCase):
         shutil.rmtree(cls.temp_directory, ignore_errors=True)
         shutil.rmtree(cls.media_directory, ignore_errors=True)
         shutil.rmtree(cls.cache_root.parent, ignore_errors=True)
+        shutil.rmtree(playback_jit_service.cache_path("m_playback_contract", cls.fingerprint).parent, ignore_errors=True)
 
     def setUp(self) -> None:
         self.patchers = [
-            patch.object(playback_prep_service, "prepare", new=AsyncMock(return_value="ready")),
-            patch.object(playback_prep_service, "preparation_state", return_value="ready"),
-            patch.object(playback_prep_service, "preparation_error", return_value=None),
-            patch.object(playback_prep_service, "playlist_ready", return_value=True),
-            patch.object(playback_prep_service, "fully_prepared", side_effect=lambda *_: self.media_file.is_file()),
-            patch.object(playback_prep_service, "switching_ready", side_effect=lambda *_: self.media_file.is_file()),
-            patch.object(playback_prep_service, "rendition_seekable_until", return_value=120.0),
             patch("routes.playback.record_playback_progress", new=AsyncMock(return_value="viewing-attempt-contract")),
         ]
         for patcher in self.patchers:
@@ -182,38 +177,53 @@ class PlaybackContractRegression(unittest.TestCase):
             self.assertTrue(payload["fullyPrepared"])
             self.assertTrue(payload["switchingReady"])
             self.assertTrue(payload["resumeReady"])
-            self.assertEqual(payload["seekableUntil"], 120.0)
+            self.assertEqual(payload["seekableUntil"], payload["sourceMetadata"]["duration"])
             self.assertGreaterEqual(payload["preparationProgress"]["readySegments"], 0)
             self.assertEqual(payload["renditions"][0]["label"], "1080p")
             self.assertGreater(payload["sourceMetadata"]["duration"], 0)
         self.assertIn(payload["renditions"][0]["status"], {"streamable", "ready"})
         return payload
 
-    def test_manifest_children_and_fragments_remain_ticket_protected(self) -> None:
+    def test_jit_manifest_exposes_and_generates_ticket_protected_timeline_segments(self) -> None:
         run = self.create_run()
+        self.assertIn("/api/playback/jit/", run["manifestUrl"])
         master = self.client.get(run["manifestUrl"])
         self.assertEqual(master.status_code, 200, master.text)
-        self.assertIn("/api/playback/hls/m_playback_contract/video_original/playlist.m3u8?ticket=", master.text)
+        self.assertIn("/api/playback/jit/m_playback_contract/video_original/playlist.m3u8?ticket=", master.text)
         child_url = next(line for line in master.text.splitlines() if "video_original/playlist.m3u8" in line)
         child = self.client.get(child_url)
         self.assertEqual(child.status_code, 200, child.text)
-        segment_url = next(line for line in child.text.splitlines() if "segment_00000.m4s" in line)
+        self.assertIn("#EXT-X-ENDLIST", child.text)
+        segment_url = next(line for line in child.text.splitlines() if "segment_00000.ts" in line)
         segment = self.client.get(segment_url)
         self.assertEqual(segment.status_code, 200)
-        self.assertEqual(segment.content, b"video-segment")
-        denied = self.client.get("/api/playback/hls/m_playback_contract/video_original/segment_00000.m4s")
+        self.assertGreater(len(segment.content), 0)
+        self.assertIn("jit;dur=", segment.headers["server-timing"])
+        cached_segment = self.client.get(segment_url)
+        self.assertEqual(cached_segment.status_code, 200)
+        self.assertEqual(cached_segment.headers["x-streamhome-playback-cache"], "hit")
+        denied = self.client.get("/api/playback/jit/m_playback_contract/video_original/segment_00000.ts")
         self.assertEqual(denied.status_code, 422)
-        private_metadata = self.client.get(
-            f"/api/playback/hls/m_playback_contract/preparation-error.json?ticket={run['ticket']}"
-        )
-        self.assertEqual(private_metadata.status_code, 403)
-        self.assertEqual(private_metadata.json()["detail"]["code"], "HLS_ASSET_TYPE_FORBIDDEN")
+
+    def test_direct_and_ffmpeg_bridge_sources_are_true_byte_range_streams(self) -> None:
+        run = self.create_run()
+        expected = self.media_file.read_bytes()[32:160]
+        ranged = self.client.get(run["progressiveUrl"], headers={"Range": "bytes=32-159"})
+        self.assertEqual(ranged.status_code, 206, ranged.text)
+        self.assertEqual(ranged.content, expected)
+        self.assertEqual(ranged.headers["accept-ranges"], "bytes")
+        self.assertEqual(ranged.headers["content-range"], f"bytes 32-159/{self.media_file.stat().st_size}")
+
+        bridge_url = f"/api/playback/source/m_playback_contract?ticket={run['ticket']}&source_id=main"
+        bridge_head = self.client.head(bridge_url)
+        self.assertEqual(bridge_head.status_code, 200, bridge_head.text)
+        self.assertEqual(int(bridge_head.headers["content-length"]), self.media_file.stat().st_size)
+        bridge_range = self.client.get(bridge_url, headers={"Range": "bytes=32-159"})
+        self.assertEqual(bridge_range.status_code, 206, bridge_range.text)
+        self.assertEqual(bridge_range.content, expected)
 
     def test_status_polling_does_not_schedule_or_write_for_unchanged_media(self) -> None:
         run = self.create_run()
-        prepare = playback_prep_service.prepare
-        prepare.reset_mock()
-
         async def timestamps() -> tuple[float, float]:
             async with AsyncSession(self.engine, expire_on_commit=False) as db:
                 playback_run = await db.get(PlaybackRun, run["runId"])
@@ -224,7 +234,6 @@ class PlaybackContractRegression(unittest.TestCase):
         after = asyncio.run(timestamps())
 
         self.assertEqual(refreshed.status_code, 200, refreshed.text)
-        prepare.assert_not_awaited()
         self.assertEqual(after, before)
 
     def test_subtitle_delivery_requires_the_exact_track_identity(self) -> None:
@@ -255,13 +264,12 @@ class PlaybackContractRegression(unittest.TestCase):
             asyncio.run(configure_subtitle([]))
             subtitle_file.unlink(missing_ok=True)
 
-    def test_pending_quality_can_be_selected_for_server_priority(self) -> None:
+    def test_quality_capability_is_immediately_actionable_without_whole_title_preparation(self) -> None:
         run = self.create_run()
-        with patch.object(playback_prep_service, "prioritize_video_rendition", new=AsyncMock(return_value="preparing")) as prioritize:
-            response = self.client.post(f"/api/playback/runs/{run['runId']}/renditions/video_original/prepare")
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["status"], "preparing")
-        prioritize.assert_awaited_once()
+        self.assertTrue(all(item["ready"] for item in run["renditions"]))
+        master = self.client.get(run["manifestUrl"])
+        self.assertEqual(master.status_code, 200, master.text)
+        self.assertIn("video_original/playlist.m3u8", master.text)
 
     def test_ingest_preview_is_protected_and_survives_local_catalog_handoff(self) -> None:
         task_id = f"preview-{uuid.uuid4().hex}"
@@ -535,7 +543,7 @@ class PlaybackContractRegression(unittest.TestCase):
         payload = jwt.decode(run["ticket"], settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
         payload["exp"] = int(time.time()) - 1
         expired = jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
-        response = self.client.get(f"/api/playback/manifest/m_playback_contract?ticket={expired}")
+        response = self.client.get(f"/api/playback/jit/m_playback_contract/master.m3u8?ticket={expired}")
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json()["detail"]["code"], "PLAYBACK_TICKET_EXPIRED")
 

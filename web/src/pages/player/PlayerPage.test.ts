@@ -123,6 +123,17 @@ describe("player interaction contracts", () => {
     expect(progressiveAudioTrack([...tracks], "", "")?.id).toBe("audio_0_en");
     expect(progressiveAudioTrack([...tracks], "audio_0_en", "en")?.id).toBe("audio_0_en");
     expect(progressiveAudioTrack([...tracks], "audio_0_tr", "tr")).toBeNull();
+    const multipleEmbedded = [
+      tracks[0],
+      { ...tracks[0], id: "audio_1_es", label: "Spanish", language: "es", streamIndex: 1, default: false },
+    ];
+    const response = {
+      progressiveUrl: "/api/playback/progressive/m_media?ticket=value",
+      sourceMetadata: { duration: 120, container: "mov,mp4", codec: "h264", width: 1280, height: 720, frameRate: 24, sourceFormat: "MP4" },
+      tracks: multipleEmbedded,
+    } as unknown as PlaybackRunResponse;
+    expect(canUseProgressivePlayback(response, "audio_1_es", "es")).toBe(false);
+    expect(canUseProgressivePlayback(response, "audio_0_en", "en")).toBe(true);
   });
 
   it("allows progressive startup without audio metadata but preserves external dubbing preferences", () => {
@@ -149,16 +160,16 @@ describe("player interaction contracts", () => {
     expect(shouldExtendPlaybackStartup(20_000, 0, 1_000)).toBe(false);
   });
 
-  it("does not mount playback transport until every rendition is complete", () => {
-    const incomplete = {
-      fullyPrepared: false,
+  it("mounts direct playback immediately and adaptive playback as soon as its manifest exists", () => {
+    const available = {
       preparationState: "ready",
       progressiveUrl: "/api/playback/progressive/m_media?ticket=value",
+      manifestUrl: "/api/playback/jit/m_media/master.m3u8?ticket=value",
     } as const;
-    expect(playbackTransportIsReady(incomplete, "hls")).toBe(false);
-    expect(playbackTransportIsReady(incomplete, "progressive")).toBe(false);
-    expect(playbackTransportIsReady({ ...incomplete, fullyPrepared: true }, "hls")).toBe(true);
-    expect(playbackTransportIsReady({ ...incomplete, fullyPrepared: true }, "progressive")).toBe(true);
+    expect(playbackTransportIsReady(available, "hls")).toBe(true);
+    expect(playbackTransportIsReady(available, "progressive")).toBe(true);
+    expect(playbackTransportIsReady({ ...available, manifestUrl: null }, "hls")).toBe(false);
+    expect(playbackTransportIsReady({ ...available, preparationState: "preparing" }, "progressive")).toBe(true);
   });
 
   it("maps same-language audio tracks by stable rendition identity without reusing an index", () => {
@@ -277,7 +288,7 @@ describe("player interaction contracts", () => {
     expect(authoritativePlaybackDuration(0, "", "progressive", 272)).toBe(272);
   });
 
-  it("shows manifest-backed and on-demand quality levels with truthful readiness", () => {
+  it("shows every source capability while transport indexes are attached independently", () => {
     const options = playbackQualityOptions([
       { id: "video_original", label: "1080p", height: 800, width: 1920, original: true, ready: true, status: "ready" },
       { id: "video_720p", label: "720p", height: 720, width: 1728, original: false, ready: true, status: "streamable" },

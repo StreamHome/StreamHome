@@ -129,12 +129,12 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
-  it("keeps an unfinished quality disabled instead of preparing it on demand", async () => {
-    const prepare = vi.spyOn(playbackApi, "preparePlaybackRendition").mockResolvedValue({ status: "preparing" });
+  it("keeps an uncached quality actionable without a preparation request", async () => {
     const onDemandPlayback: ResolvedPlayback = {
       ...playback,
       runResponse: {
         ...playback.runResponse,
+        manifestUrl: "/api/playback/jit/mounted-player-media/master.m3u8?ticket=mounted-player-ticket",
         renditions: [
           ...playback.runResponse.renditions,
           {
@@ -143,20 +143,12 @@ describe("mounted player lifecycle", () => {
             height: 240,
             width: 426,
             original: false,
-            ready: false,
-            status: "idle",
+            ready: true,
+            status: "ready",
           },
         ],
       },
     };
-    vi.spyOn(playbackApi, "getPlaybackRun").mockResolvedValue({
-      ...onDemandPlayback.runResponse,
-      manifestUrl: "/api/playback/manifest/mounted-player-media?ticket=mounted-player-ticket",
-      renditions: onDemandPlayback.runResponse.renditions.map((item) => item.id === "video_240p"
-        ? { ...item, ready: true, status: "ready" as const }
-        : item),
-    });
-
     const view = render(
       <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
         <PlayerPage visualFixture={onDemandPlayback} />
@@ -165,11 +157,47 @@ describe("mounted player lifecycle", () => {
 
     const qualityMenu = await screen.findByRole("button", { name: "Quality: Auto" });
     fireEvent.click(qualityMenu);
-    const unfinishedQuality = screen.getByRole("option", { name: /240p/ });
-    expect(unfinishedQuality.getAttribute("aria-disabled")).toBe("true");
-    fireEvent.click(unfinishedQuality);
+    const uncachedQuality = screen.getByRole("option", { name: /240p/ });
+    expect(uncachedQuality.getAttribute("aria-disabled")).not.toBe("true");
+    fireEvent.click(uncachedQuality);
 
-    expect(prepare).not.toHaveBeenCalled();
+    view.unmount();
+  });
+
+  it("keeps external dubbing actionable before adaptive indexes are attached", async () => {
+    const dualAudioPlayback: ResolvedPlayback = {
+      ...playback,
+      runResponse: {
+        ...playback.runResponse,
+        manifestUrl: "/api/playback/jit/mounted-player-media/master.m3u8?ticket=mounted-player-ticket",
+        tracks: [
+          ...playback.runResponse.tracks,
+          {
+            id: "audio_0_tr",
+            label: "Turkish",
+            language: "tr",
+            channels: 2,
+            default: false,
+            source: "external",
+            streamIndex: 0,
+            ready: true,
+            status: "ready",
+          },
+        ],
+      },
+    };
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={dualAudioPlayback} />
+      </MemoryRouter>,
+    );
+
+    const audioMenu = await screen.findByRole("button", { name: /Audio language/ });
+    fireEvent.click(audioMenu);
+    const turkish = screen.getByRole("option", { name: /Turkish/ });
+    expect(turkish.getAttribute("aria-disabled")).not.toBe("true");
+    fireEvent.click(turkish);
+
     view.unmount();
   });
 

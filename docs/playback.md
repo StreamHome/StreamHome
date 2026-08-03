@@ -1,43 +1,95 @@
 # Playback
 
-StreamHome uses protected adaptive fMP4 HLS as its primary playback transport for completed local and Google Drive media.
+StreamHome uses a direct-first playback engine with time-indexed just-in-time HLS fallback. Completed media becomes playable as soon as its source is verified and probed. Publication and player startup never wait for a complete set of transcoded qualities or audio tracks.
 
-Playback behavior includes:
+## Delivery selection
 
-- playback-run-scoped HLS manifests and segments;
-- ingestion-time and startup playback pre-generation;
-- adaptive video variants;
-- multiple audio tracks and subtitles;
-- profile-specific resume state;
-- cleanup of expired playback runs and cache artifacts.
+The browser receives two authenticated transports for completed catalog media:
 
-## Complete adaptive preparation
+- a progressive endpoint that supports `HEAD`, `Range`, `206`, and `Content-Range`; and
+- a JIT HLS master whose variant and audio playlists describe the complete media timeline immediately.
 
-Ingestion keeps a movie or episode in `processing` state until every source-bounded video quality and every embedded/external audio rendition is complete. Local ingestion prepares directly from the retained catalog source. Cloud ingestion prepares from verified local staging, uploads the media, migrates the complete cache to the verified remote fingerprint, and only then removes staging and publishes the catalog entry as available.
+The player starts browser-compatible source media through the progressive endpoint. This is the normal low-latency HTML video path and requires no FFmpeg work. If the source codec/container is incompatible, the saved audio preference requires adaptive delivery, or the viewer selects a quality or dubbing track, the player attaches hls.js at the current stable timestamp.
 
-Server startup reconciles source identities and warms older catalog entries one at a time, prioritizing recently watched media. Complete markers make this work restart-safe: already finished renditions are reused, and only missing renditions are scheduled. Cold playback and explicit retry paths also schedule the complete set, so legacy items converge to the same prepared state.
+The existing player presentation remains unchanged. Direct and adaptive transports share one play/pause intent, stable playback clock, resume position, last-frame overlay, retry budget, progress session, subtitles, and fullscreen controller.
 
-Compatible H.264 video and AAC audio are packaged into fMP4 HLS without re-encoding. Sources that are not browser-compatible receive browser-compatible H.264/AAC renditions. A growing protected master may be published for status inspection, but completed-media playback does not begin until every rendition has an end-to-end complete marker. This guarantees the saved position and arbitrary timeline seeks are valid before the first frame.
+## Seekable sources
 
-The playback-run contract reports `seekableUntil`, `resumeReady`, `switchingReady`, and `fullyPrepared`. The player polls through both preparing and partially streamable states, preserves the saved position without temporarily resetting to zero, and mounts its transport only when `fullyPrepared` is true. Unfinished quality/audio options are disabled as `Preparing`; ready hls.js levels and audio tracks switch in the active transport without an API preparation request or full player reload.
+`services/playback_source.py` provides one random-access source contract:
 
-FFmpeg jobs that stop producing output are terminated with a specific preparation failure instead of leaving an indefinite spinner. Secondary-rendition failures are surfaced as preparation errors because complete readiness cannot otherwise be reached. Backend logs record per-rendition preparation/seekable timing, total ingestion preparation time, and playback-run cache readiness.
+- `LocalPlaybackSource` performs bounded asynchronous file reads.
+- `DrivePlaybackSource` performs rclone offset/count reads for browser delivery. FFmpeg receives a loopback-only authenticated range URL, allowing its demuxer to issue byte ranges instead of consuming `rclone cat` from byte zero.
+- `HttpPlaybackSource` validates source URLs and approved headers, revalidates every redirect, probes range support, and streams only the requested origin bytes.
 
-For cloud-only media, a fully prepared application cache is a playback-run fast path and avoids repeated Google Drive metadata probes. Local sources are still fingerprint-validated so replacement bytes invalidate old playback tickets and caches.
+Raw source URLs, Drive paths, request headers, and filesystem paths are never included in the browser playback contract.
+
+## Time-indexed adaptive delivery
+
+JIT media playlists are VOD playlists that cover the complete server-owned duration before any segment exists. Each segment number maps directly to a timestamp:
+
+```text
+start time = segment number × PLAYBACK_SEGMENT_SECONDS
+```
+
+A request for a segment around one hour starts FFmpeg around one hour. It does not generate the preceding hour. The server generates a bounded forward window, publishes the requested MPEG-TS segment as soon as that individual file is complete, and continues producing nearby reusable segments in the background.
+
+Video renditions use H.264 High Profile output with aligned forced keyframes. Audio renditions use aligned AAC stereo output. Every video quality and embedded/external audio rendition shares the same segment grid, so hls.js can switch at a nearby boundary without rebuilding the playback run.
+
+Generation jobs are deduplicated by media fingerprint, rendition, and window number. The segment cache is bounded by the existing playback cache size and evicted by least-recently-used media fingerprint. Active cache roots are not removed. Segment responses expose `Server-Timing` and an `X-StreamHome-Playback-Cache` hit/miss header for measurement.
+
+Default controls are:
+
+- `PLAYBACK_SEGMENT_SECONDS=4`
+- `PLAYBACK_WINDOW_SEGMENTS=6`
+- `PLAYBACK_SEGMENT_WAIT_SECONDS=30`
+- `PLAYBACK_TRANSCODE_CONCURRENCY=2`
+- `PLAYBACK_CACHE_GB=20`
+- `PLAYBACK_LOOPBACK_URL=http://127.0.0.1:8000`
+
+## Resume and seeking
+
+The saved profile position is returned with the playback run. Direct playback applies it after metadata is available and before playback begins. Adaptive playback supplies it to hls.js as `startPosition`, causing hls.js to request the containing JIT segment immediately.
+
+For later seeks, the application clock moves to the requested value immediately. Direct playback assigns `video.currentTime`, allowing the browser to issue new byte ranges. Adaptive playback asks hls.js to start loading at the requested position. When the target range becomes seekable, the video element commits that exact target. The last decoded frame remains visible during the bounded transition.
+
+Movie duration is always server-owned. A partially buffered source or generated segment window cannot redefine the full runtime.
+
+## Quality and audio switching
+
+Playback-run quality and audio lists describe source capabilities, not cache contents. A valid capability is actionable immediately and is never disabled as `Preparing`.
+
+When adaptive playback is active, quality selection sets the hls.js level and audio selection sets its audio-track index. When direct playback is active, selecting a derived quality, non-default embedded track, or external dubbing track moves to the JIT master at the current timestamp and applies the requested selection as soon as hls.js attaches.
+
+Auto quality remains hls.js adaptive bitrate selection. The source rendition is labeled Original, and derived levels never upscale beyond the source dimensions.
+
+## Ingestion and startup
+
+Ingestion now publishes after the output is verified, probed, cataloged, and assigned a source fingerprint. Cloud publication waits for the verified upload identity, but it does not generate playback renditions. Server startup repairs catalog metadata and source identities without warming the entire library.
+
+The legacy pre-generated fMP4 cache can still serve an already issued legacy URL during migration, but no new completed-media run, ingestion task, startup job, quality selection, or audio selection depends on it.
+
+## Authentication
+
+Playback remains restricted to a signed-in session and selected profile. Playback tickets are scoped to the authentication session, playback run, media identity, and source fingerprint. Manifests, segments, progressive ranges, source bridges, and subtitles validate the ticket. This is an access-control boundary, not DRM; the delivery architecture does not sacrifice startup or seeking performance to obscure media bytes.
 
 ## Play While Downloading
 
-When a MediaSender ingestion is active, a processing movie or episode can become playable before the final file reaches local or Google Drive storage. StreamHome reads the submitted source once with FFmpeg and simultaneously creates:
+Active MediaSender ingestion continues to use an application-owned growing HLS preview. The submitted source URL and headers remain server-only. Existing preview runs survive final catalog handoff, while new runs use direct/JIT completed-media delivery.
 
-- the lossless final media file used by the catalog; and
-- an application-owned, growing H.264/AAC fMP4 HLS preview capped at 720p.
+A downloading preview can only seek through bytes already processed by ingestion. Once publication completes, the full timeline becomes immediately seekable through the completed source.
 
-The preview publisher still waits for a safe buffer of at least 12 seconds and grows that target when ingestion is slower than real-time. The completed-media readiness policy prevents a partial preview from replacing the deterministic fully seekable catalog transport.
+## Validation
 
-The browser never receives the submitted source URL or its authorization headers. It receives only renewable, playback-run-scoped StreamHome tickets and protected `/api/playback/preview/...` playlist and segment URLs.
+Playback regression coverage verifies:
 
-When ingestion finishes, new playback runs use the completed catalog source. A preview run that is already playing continues through its completed application-owned preview cache, so the handoff does not reload the player or reveal a source change. Preview caches expire after 24 hours without use.
-
-If preview transcoding is unsupported for a particular source, StreamHome records a preview error and retries normal ingestion without the preview branch. The media download can still complete even when early playback is unavailable. Cancelling a download or restarting the server ends the associated preview cleanly.
-
-If playback fails, inspect the browser console, `backend.log`, FFmpeg availability, source metadata, and free space in the playback cache. Do not expose API port 8000 directly to clients.
+- exact local and HTTP origin byte ranges;
+- authenticated progressive and FFmpeg source-bridge ranges;
+- full-timeline virtual manifests before segment generation;
+- generation at a nonzero requested window without earlier segments;
+- aligned video and audio segment production;
+- cached segment reuse and timing headers;
+- resume preservation across playback-run refresh;
+- immediate quality and external-audio capability selection;
+- source-fingerprint ticket invalidation;
+- real mounted `PlayerPage` seeking and transport transitions; and
+- bounded recovery, fullscreen, progress, subtitle, and ingestion-preview behavior.
