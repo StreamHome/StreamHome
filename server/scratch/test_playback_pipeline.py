@@ -25,7 +25,6 @@ from routes.playback import (
 from services.languages import normalize_language_tag
 from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
 from services.media_source import MediaSourceError, ResolvedMediaSource, canonicalize_catalog_path, clear_cloud_object_cache, is_safe_presentation_asset, resolve_media_source
-from services.playback_jit import PlaybackJITService
 from services.playback_prep import PlaybackMediaSnapshot, PlaybackPrepService, PlaybackPreparationError, playback_prep_service
 from services.playback_source import HttpPlaybackSource, LocalPlaybackSource
 from services.rclone import rclone_service
@@ -161,92 +160,6 @@ class PlaybackPipelineRegression(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
-
-    def test_jit_manifest_exposes_the_full_timeline_before_segments_exist(self) -> None:
-        service = PlaybackJITService()
-        service.segment_seconds = 4
-        service.window_segments = 1
-        media = SimpleNamespace(
-            probed_duration=5.0,
-            duration="5s",
-            width=640,
-            height=360,
-            quality="360p",
-            codec="h264",
-            audio_metadata=[],
-            languages=[],
-        )
-        manifest = service.media_manifest("m_jit", "video_original", "ticket", media)
-        self.assertIn("segment_00000.ts", manifest)
-        self.assertIn("segment_00001.ts", manifest)
-        self.assertIn("#EXT-X-ENDLIST", manifest)
-
-    def test_jit_segment_generation_seeks_to_the_requested_window(self) -> None:
-        async def exercise(cache_dir: Path) -> tuple[Path, Path]:
-            source = await resolve_media_source(self.catalog_path, check_cloud=False)
-            probe = await probe_completed_media(str(self.media_file))
-            media = SimpleNamespace(
-                id="m_jit_fixture",
-                source_fingerprint=source.fingerprint,
-                probed_duration=probe["probed_duration"],
-                duration="5s",
-                container=probe["container"],
-                codec=probe["codec"],
-                width=probe["width"],
-                height=probe["height"],
-                frame_rate=probe["frame_rate"],
-                quality="360p",
-                audio_metadata=probe["audio_metadata"],
-                languages=["eng", "tur"],
-            )
-            service = PlaybackJITService()
-            service.cache_dir = cache_dir
-            service.segment_seconds = 4
-            service.window_segments = 1
-            generated = await service.segment(
-                media.id,
-                source.fingerprint,
-                "video_original",
-                1,
-                "unused-local-ticket",
-                source,
-                media,
-            )
-            self.assertFalse((generated.path.parent / "segment_00000.ts").exists())
-            audio_rendition = service.rendition(media, playback_prep_service.audio_renditions(media)[0].name)[1]
-            self.assertIsNotNone(audio_rendition)
-            generated_audio = await service.segment(
-                media.id,
-                source.fingerprint,
-                str(audio_rendition.name),
-                1,
-                "unused-local-ticket",
-                source,
-                media,
-            )
-            return generated.path, generated_audio.path
-
-        with tempfile.TemporaryDirectory() as directory:
-            generated, generated_audio = asyncio.run(exercise(Path(directory)))
-            self.assertTrue(generated.is_file())
-            self.assertGreater(generated.stat().st_size, 0)
-            self.assertTrue(generated_audio.is_file())
-            self.assertGreater(generated_audio.stat().st_size, 0)
-            ffprobe = shutil.which("ffprobe")
-            self.assertIsNotNone(ffprobe)
-            result = subprocess.run(
-                [
-                    str(ffprobe), "-v", "error", "-select_streams", "v:0",
-                    "-show_entries", "packet=pts_time", "-of", "csv=p=0",
-                    "-read_intervals", "%+#1", str(generated),
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            first_pts = float(result.stdout.splitlines()[0].strip().rstrip(","))
-            self.assertGreaterEqual(first_pts, 3.5)
 
     def test_background_preparation_uses_a_session_independent_snapshot(self) -> None:
         service = PlaybackPrepService()

@@ -110,7 +110,7 @@ Artwork and portable recovery metadata are stored alongside the relevant media d
 
 ### 🌊 Adaptive HLS Streaming
 
-Browser-compatible media starts through a low-latency byte-range video path. Other codecs, quality changes, and dubbing use time-indexed just-in-time HLS that generates only the requested playback window instead of transcoding the complete title.
+Browser-compatible media starts through a low-latency byte-range video path. Existing `audio/` dubbing files play directly beside the video, while quality controls use only already-ready HLS variants. Pressing Play, seeking, or changing a track never starts completed-title transcoding.
 
 Playback supports local files, Google Drive objects, and validated HTTP source URLs through the same seekable source layer.
 

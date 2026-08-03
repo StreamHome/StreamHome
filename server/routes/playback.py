@@ -28,7 +28,6 @@ from services.logger import logger
 from services.languages import language_label, normalize_language_tag
 from services.media_source import MediaSourceError, ResolvedMediaSource, playback_source_fingerprint, resolve_media_source
 from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
-from services.playback_jit import AdaptiveDeliveryFailure, playback_jit_service
 from services.playback_prep import playback_prep_service
 from services.playback_source import PlaybackSourceFailure, source_reader
 from services.ingest_preview import IngestPreviewError, ingest_preview_service
@@ -80,6 +79,7 @@ class PlaybackTrack(APIModel):
     default: bool
     source: Literal["embedded", "external"]
     stream_index: int
+    direct_url: Optional[str] = None
     ready: bool
     status: Literal["idle", "preparing", "streamable", "ready", "failed"]
 
@@ -488,11 +488,19 @@ def source_metadata(media_obj: Any) -> PlaybackSourceMetadata:
     )
 
 
-def track_contract(media_obj: Any, media_id: str, fingerprint: str) -> list[PlaybackTrack]:
+def track_contract(media_obj: Any, media_id: str, fingerprint: str, encoded_ticket: str) -> list[PlaybackTrack]:
     channel_by_index = {int(item.get("index", index)): int(item.get("channels", 2)) for index, item in enumerate(media_obj.audio_metadata or [])}
     result: list[PlaybackTrack] = []
     for item in playback_prep_service.audio_renditions(media_obj):
         rendition_status = playback_prep_service.rendition_status(media_id, fingerprint, item.name)
+        direct_url = (
+            f"/api/playback/source/{quote(media_id, safe='')}?ticket={encoded_ticket}&source_id={quote(item.name, safe='')}"
+            if item.source == "external"
+            else None
+        )
+        actionable = bool(direct_url) or item.default or rendition_status in {"streamable", "ready"}
+        if not actionable:
+            continue
         result.append(PlaybackTrack(
             id=item.name,
             label=item.label,
@@ -501,8 +509,9 @@ def track_contract(media_obj: Any, media_id: str, fingerprint: str) -> list[Play
             default=item.default,
             source="external" if item.source == "external" else "embedded",
             stream_index=item.stream_index,
-            ready=rendition_status in {"streamable", "ready"},
-            status=rendition_status,
+            direct_url=direct_url,
+            ready=True,
+            status="ready",
         ))
     return result
 
@@ -511,6 +520,8 @@ def rendition_contract(media_obj: Any, media_id: str, fingerprint: str) -> list[
     result: list[PlaybackRendition] = []
     for item in playback_prep_service.video_renditions(media_obj):
         rendition_status = playback_prep_service.rendition_status(media_id, fingerprint, item.name)
+        if rendition_status not in {"streamable", "ready"}:
+            continue
         result.append(PlaybackRendition(
             id=item.name,
             label=item.label,
@@ -521,6 +532,12 @@ def rendition_contract(media_obj: Any, media_id: str, fingerprint: str) -> list[
             status=rendition_status,
         ))
     return result
+
+
+def ready_hls_manifest_url(media_obj: Any, fingerprint: str, encoded_ticket: str, renditions: list[PlaybackRendition]) -> Optional[str]:
+    if not renditions or playback_prep_service.preparation_state(media_obj.id, fingerprint, media_obj) != "ready":
+        return None
+    return f"/api/playback/manifest/{quote(media_obj.id, safe='')}?ticket={encoded_ticket}"
 
 
 def subtitle_track_id(item: dict[str, Any]) -> Optional[str]:
@@ -656,14 +673,11 @@ async def build_run_response(
     ticket, expires_at = issue_playback_ticket(user, auth_session, run.profile_id, run.id, media_obj.id, fingerprint)
     encoded_ticket = quote(ticket, safe="")
     next_episode_id = await next_playable_episode(db, run.movie_id, run.episode_id) if run.episode_id else None
-    tracks = track_contract(media_obj, media_obj.id, fingerprint)
+    tracks = track_contract(media_obj, media_obj.id, fingerprint, encoded_ticket)
     renditions = rendition_contract(media_obj, media_obj.id, fingerprint)
-    for track in tracks:
-        track.ready = True
-        track.status = "ready"
-    for rendition in renditions:
-        rendition.ready = True
-        rendition.status = "ready"
+    manifest_url = ready_hls_manifest_url(media_obj, fingerprint, encoded_ticket, renditions)
+    if not manifest_url:
+        renditions = []
     duration = media_duration_seconds(media_obj)
     return PlaybackRunResponse(
         run_id=run.id,
@@ -678,7 +692,7 @@ async def build_run_response(
         subtitles=subtitle_contract(media_obj),
         ticket=ticket,
         ticket_expires_at=expires_at,
-        manifest_url=f"/api/playback/jit/{quote(media_obj.id, safe='')}/master.m3u8?ticket={encoded_ticket}",
+        manifest_url=manifest_url,
         progressive_url=f"/api/playback/progressive/{quote(media_obj.id, safe='')}?ticket={encoded_ticket}",
         next_episode_id=next_episode_id,
         preparation_state="ready",
@@ -772,7 +786,7 @@ async def create_playback_run(
     response = await build_run_response(db, request, user, run, media_obj, initial_resume_position=position)
     logger.info(
         f"[Playback Run] Created {run.id} for {media_obj.id} in {time.monotonic() - run_started_at:.3f}s; "
-        f"delivery=direct+jit resume={position:.1f}s."
+        f"delivery=direct+ready-hls resume={position:.1f}s."
     )
     return response
 
@@ -1008,80 +1022,6 @@ def safe_hls_file(cache_root: Path, relative_path: str) -> Path:
     except ValueError as exc:
         raise playback_error(status.HTTP_403_FORBIDDEN, "HLS_PATH_INVALID", "The HLS path is outside the playback cache.") from exc
     return candidate
-
-
-@router.get("/jit/{media_id}/master.m3u8")
-async def serve_jit_master_manifest(
-    media_id: str,
-    ticket: str = Query(...),
-    db: AsyncSession = Depends(get_session),
-):
-    _, _, media_obj = await validate_playback_ticket(ticket, media_id, db)
-    content = playback_jit_service.master_manifest(media_id, ticket, media_obj)
-    return PlainTextResponse(
-        content,
-        media_type="application/vnd.apple.mpegurl",
-        headers={"Cache-Control": "private, no-store"},
-    )
-
-
-@router.get("/jit/{media_id}/{rendition_id}/playlist.m3u8")
-async def serve_jit_media_manifest(
-    media_id: str,
-    rendition_id: str,
-    ticket: str = Query(...),
-    db: AsyncSession = Depends(get_session),
-):
-    _, _, media_obj = await validate_playback_ticket(ticket, media_id, db)
-    playback_jit_service.rendition(media_obj, rendition_id)
-    try:
-        content = playback_jit_service.media_manifest(media_id, rendition_id, ticket, media_obj)
-    except AdaptiveDeliveryFailure as exc:
-        raise playback_error(status.HTTP_409_CONFLICT, exc.code, str(exc)) from exc
-    return PlainTextResponse(
-        content,
-        media_type="application/vnd.apple.mpegurl",
-        headers={"Cache-Control": "private, no-store"},
-    )
-
-
-@router.get("/jit/{media_id}/{rendition_id}/segment_{segment_index}.ts")
-async def serve_jit_segment(
-    media_id: str,
-    rendition_id: str,
-    segment_index: int,
-    ticket: str = Query(...),
-    db: AsyncSession = Depends(get_session),
-):
-    segment_started_at = time.monotonic()
-    _, _, media_obj = await validate_playback_ticket(ticket, media_id, db)
-    source = await require_available_source(media_obj)
-    try:
-        segment = await playback_jit_service.segment(
-            media_id,
-            str(media_obj.source_fingerprint or source.fingerprint),
-            rendition_id,
-            segment_index,
-            ticket,
-            source,
-            media_obj,
-        )
-    except AdaptiveDeliveryFailure as exc:
-        http_status = (
-            status.HTTP_404_NOT_FOUND
-            if exc.code in {"SEGMENT_NOT_FOUND", "RENDITION_NOT_FOUND"}
-            else status.HTTP_503_SERVICE_UNAVAILABLE
-        )
-        raise playback_error(http_status, exc.code, str(exc)) from exc
-    return FileResponse(
-        segment.path,
-        media_type=segment.content_type,
-        headers={
-            "Cache-Control": "private, max-age=31536000, immutable",
-            "Server-Timing": f"jit;dur={(time.monotonic() - segment_started_at) * 1000:.1f}",
-            "X-StreamHome-Playback-Cache": "hit" if segment.cache_hit else "miss",
-        },
-    )
 
 
 async def preview_run_from_ticket(

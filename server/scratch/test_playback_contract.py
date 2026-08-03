@@ -28,7 +28,6 @@ from routes.auth import get_current_user
 from routes.playback import router
 from services.media_source import resolve_media_source
 from services.ingest_preview import ingest_preview_service
-from services.playback_jit import playback_jit_service
 from services.playback_prep import playback_prep_service
 
 
@@ -122,7 +121,7 @@ class PlaybackContractRegression(unittest.TestCase):
 
         cls.cache_root = playback_prep_service.cache_path("m_playback_contract", cls.fingerprint)
         video_dir = cls.cache_root / "video_original"
-        audio_dir = cls.cache_root / "audio_0_eng"
+        audio_dir = cls.cache_root / "audio_0_en"
         video_dir.mkdir(parents=True, exist_ok=True)
         audio_dir.mkdir(parents=True, exist_ok=True)
         (video_dir / "playlist.m3u8").write_text("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_00000.m4s\n#EXT-X-ENDLIST\n", encoding="utf-8")
@@ -133,7 +132,7 @@ class PlaybackContractRegression(unittest.TestCase):
         (audio_dir / "segment_00000.m4s").write_bytes(b"audio-segment")
         (cls.cache_root / "master.m3u8").write_text(
             "#EXTM3U\n"
-            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",DEFAULT=YES,URI=\"audio_0_eng/playlist.m3u8\"\n"
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",DEFAULT=YES,URI=\"audio_0_en/playlist.m3u8\"\n"
             "#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,AUDIO=\"audio\"\n"
             "video_original/playlist.m3u8\n",
             encoding="utf-8",
@@ -145,7 +144,6 @@ class PlaybackContractRegression(unittest.TestCase):
         shutil.rmtree(cls.temp_directory, ignore_errors=True)
         shutil.rmtree(cls.media_directory, ignore_errors=True)
         shutil.rmtree(cls.cache_root.parent, ignore_errors=True)
-        shutil.rmtree(playback_jit_service.cache_path("m_playback_contract", cls.fingerprint).parent, ignore_errors=True)
 
     def setUp(self) -> None:
         self.patchers = [
@@ -179,31 +177,32 @@ class PlaybackContractRegression(unittest.TestCase):
             self.assertTrue(payload["resumeReady"])
             self.assertEqual(payload["seekableUntil"], payload["sourceMetadata"]["duration"])
             self.assertGreaterEqual(payload["preparationProgress"]["readySegments"], 0)
-            self.assertEqual(payload["renditions"][0]["label"], "1080p")
             self.assertGreater(payload["sourceMetadata"]["duration"], 0)
-        self.assertIn(payload["renditions"][0]["status"], {"streamable", "ready"})
+            if payload["manifestUrl"]:
+                self.assertEqual(payload["renditions"][0]["label"], "1080p")
+                self.assertIn(payload["renditions"][0]["status"], {"streamable", "ready"})
+            else:
+                self.assertEqual(payload["renditions"], [])
         return payload
 
-    def test_jit_manifest_exposes_and_generates_ticket_protected_timeline_segments(self) -> None:
+    def test_ready_hls_manifest_serves_only_existing_ticket_protected_assets(self) -> None:
         run = self.create_run()
-        self.assertIn("/api/playback/jit/", run["manifestUrl"])
+        self.assertIn("/api/playback/manifest/", run["manifestUrl"])
         master = self.client.get(run["manifestUrl"])
         self.assertEqual(master.status_code, 200, master.text)
-        self.assertIn("/api/playback/jit/m_playback_contract/video_original/playlist.m3u8?ticket=", master.text)
+        self.assertIn("/api/playback/hls/m_playback_contract/video_original/playlist.m3u8?ticket=", master.text)
         child_url = next(line for line in master.text.splitlines() if "video_original/playlist.m3u8" in line)
         child = self.client.get(child_url)
         self.assertEqual(child.status_code, 200, child.text)
         self.assertIn("#EXT-X-ENDLIST", child.text)
-        segment_url = next(line for line in child.text.splitlines() if "segment_00000.ts" in line)
+        segment_url = next(line for line in child.text.splitlines() if "segment_00000.m4s" in line)
         segment = self.client.get(segment_url)
         self.assertEqual(segment.status_code, 200)
-        self.assertGreater(len(segment.content), 0)
-        self.assertIn("jit;dur=", segment.headers["server-timing"])
-        cached_segment = self.client.get(segment_url)
-        self.assertEqual(cached_segment.status_code, 200)
-        self.assertEqual(cached_segment.headers["x-streamhome-playback-cache"], "hit")
-        denied = self.client.get("/api/playback/jit/m_playback_contract/video_original/segment_00000.ts")
+        self.assertEqual(segment.content, b"video-segment")
+        denied = self.client.get("/api/playback/manifest/m_playback_contract")
         self.assertEqual(denied.status_code, 422)
+        obsolete_jit = self.client.get(f"/api/playback/jit/m_playback_contract/master.m3u8?ticket={run['ticket']}")
+        self.assertEqual(obsolete_jit.status_code, 404)
 
     def test_direct_and_ffmpeg_bridge_sources_are_true_byte_range_streams(self) -> None:
         run = self.create_run()
@@ -221,6 +220,39 @@ class PlaybackContractRegression(unittest.TestCase):
         bridge_range = self.client.get(bridge_url, headers={"Range": "bytes=32-159"})
         self.assertEqual(bridge_range.status_code, 206, bridge_range.text)
         self.assertEqual(bridge_range.content, expected)
+
+    def test_external_dubbing_sidecar_is_returned_as_an_immediate_range_url(self) -> None:
+        audio_directory = self.media_directory / "audio"
+        audio_directory.mkdir(exist_ok=True)
+        dubbing_file = audio_directory / "tur.m4a"
+        dubbing_file.write_bytes(b"streamhome-direct-dubbing-bytes")
+
+        async def restore_source() -> None:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                movie = await db.get(Movie, "m_playback_contract")
+                movie.audio_metadata = [{"index": 0, "streamIndex": 1, "language": "eng", "label": "English", "channels": 2, "default": True}]
+                movie.source_fingerprint = self.fingerprint
+                db.add(movie)
+                await db.commit()
+
+        try:
+            response = self.client.post(
+                "/api/playback/runs",
+                json={"movieId": "m_playback_contract", "profileId": "contract-profile"},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            run = response.json()
+            turkish = next(track for track in run["tracks"] if track["source"] == "external")
+            self.assertEqual(turkish["language"], "tr")
+            self.assertTrue(turkish["ready"])
+            self.assertIn("source_id=audio_1_tr", turkish["directUrl"])
+            ranged = self.client.get(turkish["directUrl"], headers={"Range": "bytes=4-14"})
+            self.assertEqual(ranged.status_code, 206, ranged.text)
+            self.assertEqual(ranged.content, dubbing_file.read_bytes()[4:15])
+        finally:
+            dubbing_file.unlink(missing_ok=True)
+            audio_directory.rmdir()
+            asyncio.run(restore_source())
 
     def test_status_polling_does_not_schedule_or_write_for_unchanged_media(self) -> None:
         run = self.create_run()
@@ -543,7 +575,7 @@ class PlaybackContractRegression(unittest.TestCase):
         payload = jwt.decode(run["ticket"], settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
         payload["exp"] = int(time.time()) - 1
         expired = jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
-        response = self.client.get(f"/api/playback/jit/m_playback_contract/master.m3u8?ticket={expired}")
+        response = self.client.get(f"/api/playback/manifest/m_playback_contract?ticket={expired}")
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json()["detail"]["code"], "PLAYBACK_TICKET_EXPIRED")
 

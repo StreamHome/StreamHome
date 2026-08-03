@@ -129,12 +129,12 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
-  it("keeps an uncached quality actionable without a preparation request", async () => {
+  it("keeps an already-ready HLS quality actionable without a preparation request", async () => {
     const onDemandPlayback: ResolvedPlayback = {
       ...playback,
       runResponse: {
         ...playback.runResponse,
-        manifestUrl: "/api/playback/jit/mounted-player-media/master.m3u8?ticket=mounted-player-ticket",
+        manifestUrl: "/api/playback/manifest/mounted-player-media?ticket=mounted-player-ticket",
         renditions: [
           ...playback.runResponse.renditions,
           {
@@ -164,12 +164,12 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
-  it("keeps external dubbing actionable before adaptive indexes are attached", async () => {
+  it("activates a direct external dubbing file without replacing the video transport", async () => {
     const dualAudioPlayback: ResolvedPlayback = {
       ...playback,
       runResponse: {
         ...playback.runResponse,
-        manifestUrl: "/api/playback/jit/mounted-player-media/master.m3u8?ticket=mounted-player-ticket",
+        manifestUrl: null,
         tracks: [
           ...playback.runResponse.tracks,
           {
@@ -180,6 +180,7 @@ describe("mounted player lifecycle", () => {
             default: false,
             source: "external",
             streamIndex: 0,
+            directUrl: "/api/playback/source/mounted-player-media?ticket=mounted-player-ticket&source_id=audio_0_tr",
             ready: true,
             status: "ready",
           },
@@ -197,6 +198,12 @@ describe("mounted player lifecycle", () => {
     const turkish = screen.getByRole("option", { name: /Turkish/ });
     expect(turkish.getAttribute("aria-disabled")).not.toBe("true");
     fireEvent.click(turkish);
+
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    const audio = view.container.querySelector("audio") as HTMLAudioElement;
+    expect(audio.getAttribute("src")).toContain("source_id=audio_0_tr");
+    expect(video.getAttribute("src")).toBe(playback.runResponse.progressiveUrl);
+    expect(video.muted).toBe(true);
 
     view.unmount();
   });

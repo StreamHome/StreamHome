@@ -10,6 +10,7 @@ import {
   catalogDurationSeconds,
   clampPlaybackTime,
   isMeaningfulPointerActivity,
+  initialPlaybackMode,
   isPlaybackTimeSeekable,
   matchAudioTrackIndexes,
   playbackTransportIsReady,
@@ -22,6 +23,7 @@ import {
   shouldAutoHidePlayerControls,
   shouldAcceptObservedPlaybackTime,
   shouldExtendPlaybackStartup,
+  shouldRetryPlaybackStall,
   shouldRetryPlaybackStartup,
   shouldResumePlaybackAfterTransport,
 } from "./PlayerPage";
@@ -115,14 +117,14 @@ describe("player interaction contracts", () => {
     expect(canUseProgressiveCompatibility({ ...metadata, container: "matroska", sourceFormat: "MKV" })).toBe(false);
   });
 
-  it("uses progressive playback only when the preferred audio is embedded", () => {
+  it("uses progressive playback for embedded audio and direct external dubbing", () => {
     const tracks = [
       { id: "audio_0_en", label: "English", language: "en", channels: 2, default: true, source: "embedded", streamIndex: 0, ready: true, status: "ready" },
-      { id: "audio_0_tr", label: "Turkish", language: "tr", channels: 2, default: false, source: "external", streamIndex: 0, ready: true, status: "ready" },
+      { id: "audio_0_tr", label: "Turkish", language: "tr", channels: 2, default: false, source: "external", streamIndex: 0, directUrl: "/api/playback/source/m_media?ticket=value&source_id=audio_0_tr", ready: true, status: "ready" },
     ] as const;
     expect(progressiveAudioTrack([...tracks], "", "")?.id).toBe("audio_0_en");
     expect(progressiveAudioTrack([...tracks], "audio_0_en", "en")?.id).toBe("audio_0_en");
-    expect(progressiveAudioTrack([...tracks], "audio_0_tr", "tr")).toBeNull();
+    expect(progressiveAudioTrack([...tracks], "audio_0_tr", "tr")?.id).toBe("audio_0_tr");
     const multipleEmbedded = [
       tracks[0],
       { ...tracks[0], id: "audio_1_es", label: "Spanish", language: "es", streamIndex: 1, default: false },
@@ -145,8 +147,8 @@ describe("player interaction contracts", () => {
     expect(canUseProgressivePlayback(base, "", "")).toBe(true);
     expect(canUseProgressivePlayback({
       ...base,
-      tracks: [{ id: "audio_0_tr", label: "Turkish", language: "tr", channels: 2, default: true, source: "external", streamIndex: 0, ready: true, status: "ready" }],
-    }, "audio_0_tr", "tr")).toBe(false);
+      tracks: [{ id: "audio_0_tr", label: "Turkish", language: "tr", channels: 2, default: true, source: "external", streamIndex: 0, directUrl: "/api/playback/source/m_media?ticket=value&source_id=audio_0_tr", ready: true, status: "ready" }],
+    }, "audio_0_tr", "tr")).toBe(true);
   });
 
   it("recognizes growing HLS and extends startup only while bounded progress continues", () => {
@@ -164,12 +166,23 @@ describe("player interaction contracts", () => {
     const available = {
       preparationState: "ready",
       progressiveUrl: "/api/playback/progressive/m_media?ticket=value",
-      manifestUrl: "/api/playback/jit/m_media/master.m3u8?ticket=value",
+      manifestUrl: "/api/playback/manifest/m_media?ticket=value",
     } as const;
     expect(playbackTransportIsReady(available, "hls")).toBe(true);
     expect(playbackTransportIsReady(available, "progressive")).toBe(true);
     expect(playbackTransportIsReady({ ...available, manifestUrl: null }, "hls")).toBe(false);
     expect(playbackTransportIsReady({ ...available, preparationState: "preparing" }, "progressive")).toBe(true);
+  });
+
+  it("tries the protected source instead of waiting forever when no ready HLS exists", () => {
+    const response = {
+      progressiveUrl: "/api/playback/progressive/m_media?ticket=value",
+      manifestUrl: null,
+      sourceMetadata: { duration: 120, container: "matroska", codec: "hevc", width: 1280, height: 720, frameRate: 24, sourceFormat: "MKV" },
+      tracks: [],
+    } as unknown as PlaybackRunResponse;
+    expect(initialPlaybackMode(response, "", "")).toBe("progressive");
+    expect(initialPlaybackMode({ ...response, manifestUrl: "/api/playback/manifest/m_media?ticket=value" }, "", "")).toBe("hls");
   });
 
   it("maps same-language audio tracks by stable rendition identity without reusing an index", () => {
@@ -276,6 +289,14 @@ describe("player interaction contracts", () => {
     expect(shouldRetryPlaybackStartup(0)).toBe(true);
     expect(shouldRetryPlaybackStartup(1)).toBe(false);
     expect(shouldRetryPlaybackStartup(2)).toBe(false);
+  });
+
+  it("keeps forward-buffer stall recovery bounded and requires active play intent", () => {
+    expect(shouldRetryPlaybackStall(true, HTMLMediaElement.HAVE_CURRENT_DATA, 0)).toBe(true);
+    expect(shouldRetryPlaybackStall(true, HTMLMediaElement.HAVE_CURRENT_DATA, 1)).toBe(true);
+    expect(shouldRetryPlaybackStall(true, HTMLMediaElement.HAVE_CURRENT_DATA, 2)).toBe(false);
+    expect(shouldRetryPlaybackStall(false, HTMLMediaElement.HAVE_CURRENT_DATA, 0)).toBe(false);
+    expect(shouldRetryPlaybackStall(true, HTMLMediaElement.HAVE_FUTURE_DATA, 0)).toBe(false);
   });
 
   it("keeps the complete runtime stable while an adaptive playlist grows", () => {

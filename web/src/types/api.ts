@@ -485,6 +485,7 @@ export interface PlaybackAudioTrack {
   default: boolean;
   source: "embedded" | "external";
   streamIndex: number;
+  directUrl?: string | null;
   ready: boolean;
   status: PlaybackRenditionStatus;
 }

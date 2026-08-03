@@ -56,7 +56,6 @@ from services.logger import logger
 from services.queue import queue_manager
 from services.hevc_compressor import hevc_compressor
 from services.playback_prep import playback_prep_service
-from services.playback_jit import playback_jit_service
 from services.ingest_preview import ingest_preview_service
 from services.vibe_analysis import vibe_analysis_manager
 from services.update import automatic_update_worker
@@ -332,7 +331,6 @@ async def lifespan(app: FastAPI):
     if background_tasks:
         await asyncio.gather(*background_tasks, return_exceptions=True)
     await playback_prep_service.shutdown()
-    await playback_jit_service.shutdown()
     
     try:
         await queue_manager.stop()
