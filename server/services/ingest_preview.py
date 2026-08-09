@@ -108,10 +108,7 @@ class IngestPreviewService:
         complete = "#EXT-X-ENDLIST" in content
         duration = max(0.0, float(state.get("duration_seconds") or 0))
         speed = max(0.0, float(state.get("speed_multiplier") or 0))
-        effective_speed = speed * 0.9
         required_buffer = MINIMUM_START_BUFFER_SECONDS
-        if duration > 0 and effective_speed < 1:
-            required_buffer = max(required_buffer, duration * (1 - effective_speed))
         if duration > 0:
             required_buffer = min(duration, required_buffer)
         has_segments = bool(re.search(r"^[^#\s].+\.m4s(?:\?.*)?$", content, re.MULTILINE))

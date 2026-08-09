@@ -9,6 +9,7 @@ import {
   canUseProgressiveCompatibility,
   canUseProgressivePlayback,
   catalogDurationSeconds,
+  clampGrowingPlaybackTime,
   clampPlaybackTime,
   isMeaningfulPointerActivity,
   initialPlaybackMode,
@@ -144,6 +145,16 @@ describe("player interaction contracts", () => {
     expect(isPlaybackTimeSeekable(ranges, 20)).toBe(true);
     expect(isPlaybackTimeSeekable(ranges, 90)).toBe(false);
     expect(isPlaybackTimeSeekable(ranges, 150)).toBe(true);
+  });
+
+  it("keeps rapid seeks behind the published edge of a growing stream", () => {
+    const ranges = {
+      length: 1,
+      end: () => 92,
+    };
+    expect(clampGrowingPlaybackTime(50, ranges, 96)).toBe(50);
+    expect(clampGrowingPlaybackTime(100, ranges, 96)).toBe(91.5);
+    expect(clampGrowingPlaybackTime(100, { length: 1, end: () => 110 }, 96)).toBe(95.5);
   });
 
   it("uses progressive seeking only for browser-compatible source media", () => {

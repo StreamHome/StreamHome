@@ -129,6 +129,59 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
+  it("clamps rapid seeks to a growing preview edge and pauses synchronized audio", () => {
+    const growingPlayback: ResolvedPlayback = {
+      ...playback,
+      runResponse: {
+        ...playback.runResponse,
+        resumePosition: 80,
+        sourceMetadata: {
+          ...playback.runResponse.sourceMetadata,
+          container: "hls",
+          codec: "h264",
+          sourceFormat: "HLS preview",
+        },
+        manifestUrl: "/api/playback/preview/mounted-player-media/playlist.m3u8?ticket=mounted-player-ticket",
+        progressiveUrl: "",
+        preparationState: "ready",
+        preparationProgress: {
+          stage: "streamable",
+          queuePosition: 0,
+          readySegments: 24,
+          activeWorkers: 1,
+        },
+        seekableUntil: 96,
+        resumeReady: true,
+        switchingReady: true,
+        fullyPrepared: false,
+      },
+    };
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={growingPlayback} />
+      </MemoryRouter>,
+    );
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    Object.defineProperty(video, "seekable", {
+      configurable: true,
+      value: {
+        length: 1,
+        start: () => 0,
+        end: () => 92,
+      },
+    });
+    const pause = vi.mocked(HTMLMediaElement.prototype.pause);
+    pause.mockClear();
+
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+
+    expect(video.currentTime).toBe(91.5);
+    expect(screen.getByText("The download is still expanding. Jumped to the latest available point.")).toBeTruthy();
+    expect(pause).toHaveBeenCalled();
+    view.unmount();
+  });
+
   it("keeps an already-ready HLS quality actionable without a preparation request", async () => {
     const onDemandPlayback: ResolvedPlayback = {
       ...playback,

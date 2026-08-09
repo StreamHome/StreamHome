@@ -395,6 +395,36 @@ class PlaybackContractRegression(unittest.TestCase):
             asyncio.run(restore())
             ingest_preview_service.remove(task_id)
 
+    def test_ingest_preview_cannot_regress_after_becoming_ready(self) -> None:
+        task_id = f"preview-readiness-{uuid.uuid4().hex}"
+        preview_root = ingest_preview_service.prepare(task_id, 7_200)
+        (preview_root / "playlist.m3u8").write_text(
+            "#EXTM3U\n"
+            "#EXT-X-VERSION:7\n"
+            "#EXT-X-MAP:URI=\"init.mp4\"\n"
+            "#EXTINF:4,\nsegment_00000.m4s\n"
+            "#EXTINF:4,\nsegment_00001.m4s\n"
+            "#EXTINF:4,\nsegment_00002.m4s\n",
+            encoding="utf-8",
+        )
+        ingest_preview_service.update_progress(
+            task_id,
+            processed_seconds=12,
+            speed_multiplier=2,
+            duration_seconds=7_200,
+        )
+        self.assertEqual(ingest_preview_service.status(task_id)["phase"], "ready")
+        ingest_preview_service.update_progress(
+            task_id,
+            processed_seconds=16,
+            speed_multiplier=0.05,
+            duration_seconds=7_200,
+        )
+        slowed = ingest_preview_service.status(task_id)
+        self.assertEqual(slowed["phase"], "ready")
+        self.assertEqual(slowed["required_buffer_seconds"], 12)
+        ingest_preview_service.remove(task_id)
+
     def test_available_local_source_wins_over_stale_completed_preview_reference(self) -> None:
         task_id = f"completed-preview-{uuid.uuid4().hex}"
 

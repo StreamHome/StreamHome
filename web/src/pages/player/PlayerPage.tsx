@@ -377,6 +377,24 @@ export function isPlaybackTimeSeekable(ranges: Pick<TimeRanges, "length" | "star
   return false;
 }
 
+export function clampGrowingPlaybackTime(
+  requestedTime: number,
+  ranges: Pick<TimeRanges, "length" | "end">,
+  seekableUntil: number,
+  edgeMargin = 0.5,
+): number {
+  let browserEdge = 0;
+  for (let index = 0; index < ranges.length; index += 1) {
+    browserEdge = Math.max(browserEdge, ranges.end(index));
+  }
+  const publishedEdge = Number.isFinite(seekableUntil) && seekableUntil > 0 ? seekableUntil : browserEdge;
+  const commonEdge = browserEdge > 0 && publishedEdge > 0
+    ? Math.min(browserEdge, publishedEdge)
+    : Math.max(browserEdge, publishedEdge);
+  const safeEdge = Math.max(0, commonEdge - Math.max(0, edgeMargin));
+  return Math.min(Math.max(0, requestedTime), safeEdge);
+}
+
 export function bufferedEndForTime(ranges: Pick<TimeRanges, "length" | "start" | "end">, position: number): number {
   let end = position;
   for (let index = 0; index < ranges.length; index += 1) {
@@ -1974,7 +1992,15 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     const video = videoRef.current;
     if (!video) return;
     captureWatchedTime();
-    const bounded = clampPlaybackTime(nextTime, video.duration, duration);
+    externalAudioRef.current?.pause();
+    const requested = clampPlaybackTime(nextTime, video.duration, duration);
+    const growingAdaptive = streamMode !== "progressive" && Boolean(runResponse && !runResponse.fullyPrepared);
+    const bounded = growingAdaptive && runResponse
+      ? clampGrowingPlaybackTime(requested, video.seekable, runResponse.seekableUntil)
+      : requested;
+    if (bounded + 0.1 < requested) {
+      setPlayerNotice("The download is still expanding. Jumped to the latest available point.");
+    }
     pendingSeekTargetRef.current = bounded;
     currentTimeRef.current = bounded;
     pendingSeekReportRef.current = pendingSeekReportRef.current || report;
@@ -1989,6 +2015,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     } else {
       captureLastFrame(true);
       transportResettingRef.current = true;
+      video.pause();
       setPhase("recovering");
       if (runResponse && !progressiveFailedRef.current && canUseProgressivePlayback(
         runResponse,

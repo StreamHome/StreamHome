@@ -180,6 +180,13 @@ def local_path_for(catalog_path: str) -> Path:
     return (Path(settings.MEDIA_DIR).resolve() / Path(*parts)).resolve()
 
 
+def local_catalog_source_exists(catalog_path: str) -> bool:
+    try:
+        return local_path_for(catalog_path).is_file()
+    except MediaSourceError:
+        return False
+
+
 def catalog_path_from_storage(file_path: str) -> str:
     """Convert an absolute media/temp file into its canonical ``/media`` URL."""
 

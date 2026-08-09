@@ -1593,6 +1593,12 @@ class DownloadQueueManager:
                                         existing.vibe_analysis_status = data.get("vibe_analysis_status", existing.vibe_analysis_status)
                                         existing.vibe_analysis_version = int(data.get("vibe_analysis_version", existing.vibe_analysis_version) or 0)
                                         existing.vibe_analyzed_at = data.get("vibe_analyzed_at", existing.vibe_analyzed_at)
+                                        if file_path:
+                                            existing.video_url = catalog_path_from_storage(abs_video_path)
+                                            existing.catalog_source = "server"
+                                            existing.availability = "available"
+                                            existing.preview_task_id = None
+                                            db.add(existing)
                                         if file_path and probe_info:
                                             existing.probed_duration = probe_info.get("probed_duration")
                                             existing.container = probe_info.get("container")
@@ -1620,6 +1626,15 @@ class DownloadQueueManager:
                                             existing.vibe_analysis_status = data.get("vibe_analysis_status", existing.vibe_analysis_status)
                                             existing.vibe_analysis_version = int(data.get("vibe_analysis_version", existing.vibe_analysis_version) or 0)
                                             existing.vibe_analyzed_at = data.get("vibe_analyzed_at", existing.vibe_analyzed_at)
+                                            if file_path:
+                                                existing.video_url = catalog_path_from_storage(abs_video_path)
+                                                existing.preview_task_id = None
+                                                show = await db.get(Movie, existing.movie_id)
+                                                if show:
+                                                    show.catalog_source = "server"
+                                                    show.availability = "available"
+                                                    db.add(show)
+                                                db.add(existing)
                                             if file_path and probe_info:
                                                 existing.probed_duration = probe_info.get("probed_duration")
                                                 existing.container = probe_info.get("container")

@@ -15,6 +15,7 @@ from services.ffmpeg_input import ffmpeg_network_input_options, is_hls_media_sou
 from services.media_source import (
     MediaSourceError,
     catalog_path_from_storage,
+    local_catalog_source_exists,
     local_playback_fingerprint,
     local_video_fingerprint,
 )
@@ -87,6 +88,11 @@ def test_storage_paths_become_canonical_media_urls() -> None:
 
             assert catalog_path_from_storage(str(movie_file)) == "/media/Movies/Movie_TMDB_1/movie.mp4"
             assert catalog_path_from_storage(str(episode_file)) == "/media/Series/Show_TMDB_2/Season_1/Episode_1/episode.mp4"
+            assert not local_catalog_source_exists("/media/Movies/Movie_TMDB_1/movie.mp4")
+            movie_file.parent.mkdir(parents=True)
+            movie_file.write_bytes(b"completed-local-media")
+            assert local_catalog_source_exists("/media/Movies/Movie_TMDB_1/movie.mp4")
+            assert not local_catalog_source_exists("https://media.example.test/movie.mp4")
             try:
                 catalog_path_from_storage(str(root / "outside" / "video.mp4"))
             except MediaSourceError:
@@ -238,6 +244,9 @@ def test_catalog_recovery_releases_sqlite_writes_between_media_entries() -> None
         existing_movie,
     )
     assert "await db.commit()" in recovery_source[existing_movie:restore_movie]
+    assert "existing.video_url = catalog_path_from_storage(abs_video_path)" in recovery_source[existing_movie:restore_movie]
+    assert "existing.preview_task_id = None" in recovery_source[existing_movie:restore_movie]
+    assert 'existing.availability = "available"' in recovery_source[existing_movie:restore_movie]
 
     existing_episode = recovery_source.index(
         'if existing and not (existing.title.startswith("Episode ")'
@@ -247,6 +256,8 @@ def test_catalog_recovery_releases_sqlite_writes_between_media_entries() -> None
         existing_episode,
     )
     assert "await db.commit()" in recovery_source[existing_episode:restore_episode]
+    assert "existing.video_url = catalog_path_from_storage(abs_video_path)" in recovery_source[existing_episode:restore_episode]
+    assert "existing.preview_task_id = None" in recovery_source[existing_episode:restore_episode]
 
     existing_series = recovery_source.index(
         'if existing and not (existing.title.startswith("Captured ")',

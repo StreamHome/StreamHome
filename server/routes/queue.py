@@ -28,6 +28,7 @@ from services.integration_auth import (
     integration_token_hash,
     require_integration_scope,
 )
+from services.media_source import local_catalog_source_exists
 from services.request_security import address_is_loopback, client_ip
 
 router = APIRouter()
@@ -178,11 +179,18 @@ async def add_movie(
                 movie.skip_markers = payload.skip_markers or {}
                 db.add(movie)
             else:
-                preserve_local_media = movie.availability == "available" and is_local_playable_url(movie.video_url)
+                physical_local_media = local_catalog_source_exists(movie.video_url)
+                preserve_local_media = is_local_playable_url(movie.video_url) and (
+                    movie.availability == "available" or physical_local_media
+                )
                 if not preserve_local_media:
                     movie.video_url = payload.video_url
                     movie.availability = "processing"
                     movie.preview_task_id = task_id
+                else:
+                    movie.preview_task_id = None
+                    if physical_local_media:
+                        movie.availability = "available"
                 movie.tmdb_id = payload.tmdb_id
                 movie.catalog_source = "server"
                 if payload.skip_markers:
