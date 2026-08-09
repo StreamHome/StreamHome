@@ -188,6 +188,8 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertNotIn("--queue", update_sh)
         self.assertIn('bash "$ORIGINAL_ROOT/install.sh"', update_sh)
         self.assertIn('STREAMHOME_INSTALL_DIR="$ORIGINAL_ROOT"', update_sh)
+        self.assertIn('read_env "$root/.env" UPDATE_BRANCH __unset__', update_sh)
+        self.assertIn('read_env "$root/server/.env" UPDATE_BRANCH main', update_sh)
         self.assertNotIn("Use the StreamHome admin center to manage updates.", update_sh)
         self.assertIn("--manual-execute", update_sh)
         self.assertIn("--classify-changes", update_sh)

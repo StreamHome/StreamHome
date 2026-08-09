@@ -424,9 +424,33 @@ def _minutes_since_http_activity() -> float:
 
 
 def active_media_work_count() -> int:
-    """Count registered subprocesses and scheduled adaptive preparation work."""
+    """Count non-cancellable media subprocesses that must finish before cutover."""
 
-    return len(state.ACTIVE_PROCESSES) + len(playback_prep_service.active_jobs)
+    return len(state.ACTIVE_PROCESSES)
+
+
+def playback_cache_work_count() -> int:
+    """Count cache-only playback jobs that managed cutover may safely quiesce."""
+
+    return len(playback_prep_service.active_jobs)
+
+
+async def quiesce_cancellable_update_work() -> int:
+    """Pause and cancel cache-only playback work before process shutdown."""
+
+    pending = await playback_prep_service.quiesce_for_update(timeout=8.0)
+    if pending:
+        logger.warning(
+            f"[Update Service] {pending} playback preparation task(s) are still stopping; "
+            "the lifecycle controller will finish process-group cleanup."
+        )
+    return pending
+
+
+def resume_cancellable_update_work() -> None:
+    """Resume cache preparation when managed cutover does not proceed."""
+
+    playback_prep_service.resume_after_update_quiesce()
 
 
 async def idle_blockers() -> list[str]:
@@ -543,6 +567,47 @@ def update_lock_active() -> bool:
         for script in ("update.sh", "update-controller")
         for mode in ("--execute", "--manual-execute", "--recover-interrupted", "--finalize-recovery")
     )
+
+
+def install_lock_active() -> bool:
+    """Report whether the public installer currently owns this installation."""
+
+    lock_path = WORKSPACE_ROOT.with_name(f"{WORKSPACE_ROOT.name}.install.lock")
+    owner_path = lock_path / "owner.pid"
+    try:
+        owner = int(owner_path.read_text(encoding="utf-8").strip())
+        os.kill(owner, 0)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def persisted_update_handoff_token_matches(token: str, handoff_file: str) -> bool:
+    """Validate a handoff token from its private single-use controller file."""
+
+    if not token or len(token) > 256 or not handoff_file:
+        return False
+    try:
+        candidate = Path(handoff_file)
+        if candidate.is_symlink():
+            return False
+        path = candidate.resolve()
+        run_dir = RUN_DIR.resolve()
+    except OSError:
+        return False
+    if (
+        path.parent != run_dir
+        or not path.name.startswith("update-handoff.")
+        or not path.name.endswith(".token")
+    ):
+        return False
+    try:
+        if not path.is_file() or path.stat().st_size > 512:
+            return False
+        persisted = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return secrets.compare_digest(token, persisted)
 
 
 def orphaned_controller_stale(status: dict[str, Any], current_time: float | None = None) -> bool:
@@ -807,7 +872,7 @@ async def queue_update(
         if resolved_mode not in INSTALL_MODES or (not automatic and resolved_mode == "automatic"):
             raise RuntimeError("invalid_install_mode")
         status = read_update_state()
-        if status.get("phase") in ACTIVE_PHASES or update_lock_active():
+        if status.get("phase") in ACTIVE_PHASES or update_lock_active() or install_lock_active():
             raise RuntimeError("update_in_progress")
         target = str(status.get("target_commit") or "")
         if target and target == status.get("failed_target") and not allow_failed_target:
@@ -877,6 +942,9 @@ async def launch_queued_update_if_ready() -> bool:
         status = read_update_state()
         if status.get("phase") != "queued":
             return False
+        if install_lock_active():
+            write_update_state(message="Waiting for the active public installer to finish.")
+            return False
         if status.get("automatic") and not maintenance_window_open():
             return False
         blockers = await queued_launch_blockers(status)
@@ -945,6 +1013,7 @@ async def launch_queued_update_if_ready() -> bool:
             ),
             started_at=time.time(),
             error="",
+            handoff_file=str(token_path),
         )
         try:
             with LOG_PATH.open("ab", buffering=0) as log_handle:
@@ -1014,6 +1083,7 @@ async def automatic_update_worker(stop_event: asyncio.Event, initial_delay_secon
                 state.MAINTENANCE_MODE = False
                 state.MAINTENANCE_REASON = ""
                 state.UPDATE_HANDOFF_TOKEN = ""
+                resume_cancellable_update_work()
             if status.get("phase") == "queued":
                 await launch_queued_update_if_ready()
             elif settings.SETUP_COMPLETE and settings.AUTO_UPDATE_ENABLED and status.get("phase") not in ACTIVE_PHASES:

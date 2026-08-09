@@ -8,8 +8,8 @@ Administrators can manage updates from **Admin center → Updates**. The page re
 2. Review the available commit and current activity blockers.
 3. Choose an installation mode and reauthenticate:
    - **Update now** starts isolated preflight immediately and, after confirmation, bypasses browser presence, playback, the maintenance window, and the configured idle grace period. Viewers may be disconnected during the protected cutover.
-   - **Install when idle** waits for the configured idle grace period and for playback, ingestion, downloads, media processing, backup/restore work, browser presence, and conflicting lifecycle work to stop.
-4. For **Update now**, active ingestion, downloads, FFmpeg/media processing, backup/restore work, and unrelated API mutations must still finish or be cancelled. StreamHome reports these protected blockers instead of interrupting a potentially destructive write.
+   - **Install when idle** waits for the configured idle grace period and for playback, ingestion, downloads, non-cancellable media processing, backup/restore work, browser presence, and conflicting lifecycle work to stop.
+4. For **Update now**, active ingestion, downloads, source-changing FFmpeg/Rclone work, backup/restore work, and unrelated API mutations must still finish or be cancelled. Cache-only adaptive playback warming is paused and cancelled through its bounded shutdown contract instead of blocking the update.
 
 Both modes first build and validate the candidate in an isolated temporary checkout. A failed preflight does not stop or modify the running installation.
 
@@ -27,7 +27,7 @@ The update channel is the official `StreamHome/StreamHome` `main` branch. Update
 
 ## Cutover and recovery
 
-After preflight, the detached Linux update controller asks the running backend to reserve a protected cutover. Idle and automatic requests re-confirm full idle state. Immediate requests ignore viewers, playback, the maintenance window, and idle grace, but still refuse active transfers, media processing, backups/restores, or unrelated API mutations. Once approved, the controller:
+After preflight, the detached Linux update controller asks the running backend to reserve a protected cutover. Idle and automatic requests re-confirm full idle state. Immediate requests ignore viewers, playback, the maintenance window, and idle grace, but still refuse active transfers, source-changing media work, backups/restores, or unrelated API mutations. Cache-only playback preparation is quiesced before approval, so catalog warming cannot indefinitely block either managed mode. Once approved, the controller:
 
 1. stop the owned StreamHome processes;
 2. create and integrity-check a recovery copy of `server/database.db`;
@@ -40,7 +40,7 @@ The expensive network fetches, dependency resolution, `npm ci`, and frontend bui
 
 Lifecycle output is stored in `update.log`. While cutover is active, Cloudflare or another reverse proxy receives a maintenance response rather than an unresponsive origin whenever the temporary responder can bind the configured port.
 
-Each cutover has a durable transaction identifier, controller lease, process-start identity, heartbeat, prepared-artifact location, and recovery state. The maintenance responder checks that lease independently. If the controller is terminated, killed by the kernel, loses its shell, or stops heartbeating, the responder changes from the active phase to recovery, queues the detached restart/recovery handoff once, and releases the public port. `start.sh` then restores the recorded previous commit, verified database checkpoint, Python wheelhouse, Node runtime, and production assets before applying the normal API and web health gates.
+Each cutover has a durable transaction identifier, controller lease, process-start identity, heartbeat, prepared-artifact location, and recovery state. The private handoff credential is also persisted in its single-use controller file, allowing a restarted backend to authenticate the same in-progress preflight without weakening loopback or phase checks. The maintenance responder checks the controller lease independently. If the controller is terminated, killed by the kernel, loses its shell, or stops heartbeating, the responder changes from the active phase to recovery, queues the detached restart/recovery handoff once, and releases the public port. `start.sh` then restores the recorded previous commit, verified database checkpoint, Python wheelhouse, Node runtime, and production assets before applying the normal API and web health gates.
 
 The maintenance response is never a cacheable static success claim. It reports the current safe lifecycle phase, elapsed time, transaction and target identifiers, rollback progress, and a diagnostic reference for terminal failures. Responses include browser, CDN, and surrogate no-store controls plus cache-busted polling. A stale or reused PID cannot retain update or maintenance ownership because PID records are bound to process start identity.
 

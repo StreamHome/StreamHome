@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -43,6 +44,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.original_update_guard = (
             state.MAINTENANCE_MODE,
             state.MAINTENANCE_REASON,
+            state.UPDATE_HANDOFF_TOKEN,
             state.UPDATE_COMMIT_TOKEN,
             state.UPDATE_TRANSACTION_ID,
         )
@@ -52,6 +54,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         state.BROWSER_PRESENCE.clear()
         update.queue_manager.active_tasks.clear()
         update.playback_prep_service.active_jobs.clear()
+        update.playback_prep_service.resume_after_update_quiesce()
         settings.SETUP_COMPLETE = True
 
     def tearDown(self) -> None:
@@ -67,10 +70,12 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         (
             state.MAINTENANCE_MODE,
             state.MAINTENANCE_REASON,
+            state.UPDATE_HANDOFF_TOKEN,
             state.UPDATE_COMMIT_TOKEN,
             state.UPDATE_TRANSACTION_ID,
         ) = self.original_update_guard
         update.playback_prep_service.active_jobs.clear()
+        update.playback_prep_service.resume_after_update_quiesce()
         for active_patch in reversed(self.patches):
             active_patch.stop()
         self.temporary.cleanup()
@@ -247,15 +252,58 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(update, "is_database_idle", AsyncMock(return_value=True)):
             self.assertEqual(await update.idle_blockers(), [])
 
-    async def test_playback_preparation_blocks_idle_and_protected_cutover(self) -> None:
-        update.playback_prep_service.active_jobs["movie:fingerprint:video_720"] = object()  # type: ignore[assignment]
+    async def test_playback_cache_warming_is_quiesced_instead_of_blocking_cutover(self) -> None:
+        task = asyncio.create_task(asyncio.sleep(60))
+        update.playback_prep_service.active_jobs["movie:fingerprint:video_720"] = task
 
         with patch.object(update, "is_database_idle", AsyncMock(return_value=True)):
             idle = await update.idle_blockers()
         protected = await update.protected_cutover_blockers()
 
-        self.assertTrue(any("1 active media operation" in blocker for blocker in idle))
-        self.assertTrue(any("1 active media operation" in blocker for blocker in protected))
+        self.assertFalse(any("active media operation" in blocker for blocker in idle))
+        self.assertFalse(any("active media operation" in blocker for blocker in protected))
+        self.assertEqual(update.playback_cache_work_count(), 1)
+        self.assertEqual(await update.quiesce_cancellable_update_work(), 0)
+        self.assertTrue(task.cancelled())
+        self.assertTrue(update.playback_prep_service.update_quiesced)
+
+    async def test_persisted_handoff_survives_backend_memory_loss_and_quiesces_cache_work(self) -> None:
+        token = "persisted-handoff-token"
+        token_path = self.run_dir / "update-handoff.test.token"
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(token, encoding="utf-8")
+        update.write_update_state(
+            phase="waiting_for_idle",
+            message="Waiting",
+            current_commit="a" * 40,
+            target_commit="b" * 40,
+            update_available=False,
+            install_mode="now",
+            handoff_file=str(token_path),
+        )
+        state.UPDATE_HANDOFF_TOKEN = ""
+        request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
+
+        with (
+            patch.object(update_route, "update_handoff_blockers", AsyncMock(return_value=[])),
+            patch.object(update_route, "quiesce_cancellable_update_work", AsyncMock(return_value=0)) as quiesce,
+        ):
+            response = await update_route.approve_update_handoff(request, token)
+
+        self.assertEqual(response, {"approved": True})
+        self.assertTrue(state.MAINTENANCE_MODE)
+        self.assertEqual(state.UPDATE_HANDOFF_TOKEN, "")
+        quiesce.assert_awaited_once()
+
+    def test_managed_updates_refuse_a_concurrent_public_installer(self) -> None:
+        workspace = Path(self.temporary.name) / "StreamHome"
+        workspace.mkdir()
+        lock_path = workspace.with_name(f"{workspace.name}.install.lock")
+        lock_path.mkdir()
+        (lock_path / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+        with patch.object(update, "WORKSPACE_ROOT", workspace):
+            self.assertTrue(update.install_lock_active())
 
     async def test_status_reports_the_checked_out_commit_over_stale_persisted_state(self) -> None:
         actual = "c" * 40
@@ -363,6 +411,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted["phase"], "preflight")
         launch.assert_awaited_once()
         arguments = launch.await_args.args
+        self.assertEqual(Path(persisted["handoff_file"]), Path(arguments[6]))
         self.assertEqual(arguments[0], "bash")
         self.assertEqual(arguments[2], "--execute")
         self.assertEqual(arguments[3], target)

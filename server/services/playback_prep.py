@@ -91,6 +91,30 @@ class PlaybackPrepService:
         self.background_semaphore = asyncio.Semaphore(max(1, concurrency - 1))
         self._master_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._last_touch_at: dict[str, float] = {}
+        self._update_quiesced = False
+
+    @property
+    def update_quiesced(self) -> bool:
+        """Report whether managed update handoff has paused cache preparation."""
+
+        return self._update_quiesced
+
+    def resume_after_update_quiesce(self) -> None:
+        """Allow cache preparation again when a pre-cutover update is cancelled."""
+
+        self._update_quiesced = False
+
+    async def quiesce_for_update(self, timeout: float = 8.0) -> int:
+        """Stop cancellable cache warming before a managed update cutover."""
+
+        self._update_quiesced = True
+        tasks = [task for task in self.active_jobs.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return 0
+        _, pending = await asyncio.wait(tasks, timeout=max(0.1, timeout))
+        return len(pending)
 
     @staticmethod
     def sanitize_diagnostics(value: str, limit: int = 2400) -> str:
@@ -561,6 +585,8 @@ class PlaybackPrepService:
     ) -> str:
         media_obj = self.snapshot_media(media_obj)
         fingerprint = getattr(media_obj, "source_fingerprint", None) or source.fingerprint
+        if self._update_quiesced:
+            return self.preparation_state(media_id, fingerprint, media_obj)
         cache_path = self.cache_path(media_id, fingerprint)
         cache_path.mkdir(parents=True, exist_ok=True)
         self.touch(media_id, fingerprint)
@@ -689,6 +715,8 @@ class PlaybackPrepService:
         *,
         retry_errors: bool = False,
     ) -> None:
+        if self._update_quiesced:
+            return
         key = f"{media_id}:{fingerprint}:remaining"
         if key in self.active_jobs:
             return
@@ -811,6 +839,10 @@ class PlaybackPrepService:
         retry_errors: bool = False,
     ) -> None:
         key = f"{media_id}:{fingerprint}:{rendition_name}"
+        if self._update_quiesced:
+            if hasattr(coroutine, "close"):
+                coroutine.close()
+            return
         if self.rendition_complete(media_id, fingerprint, rendition_name) or key in self.active_jobs:
             if key in self.active_jobs:
                 self.job_priorities[key] = min(priority, self.job_priorities.get(key, priority))
@@ -1334,6 +1366,7 @@ class PlaybackPrepService:
     async def shutdown(self, timeout: float = 8.0) -> None:
         """Cancel adaptive preparation and wait a bounded time for child cleanup."""
 
+        self._update_quiesced = True
         tasks = list(self.active_jobs.values())
         for task in tasks:
             task.cancel()
@@ -1399,6 +1432,8 @@ class PlaybackPrepService:
         from sqlmodel import select
         from sqlmodel.ext.asyncio.session import AsyncSession
 
+        if self._update_quiesced:
+            return
         await self.reconcile_catalog_cache_identities()
         async with AsyncSession(engine, expire_on_commit=False) as db:
             sessions = (await db.exec(select(PlaybackSession).order_by(PlaybackSession.updated_at.desc()))).all()
@@ -1410,6 +1445,8 @@ class PlaybackPrepService:
         recent_order = {media_id: index for index, media_id in enumerate(dict.fromkeys(recent_ids))}
         media_items.sort(key=lambda item: (recent_order.get(str(item.id), len(recent_order)), str(item.id)))
         for media_obj in media_items:
+            if self._update_quiesced:
+                return
             try:
                 source = await resolve_media_source(media_obj.video_url)
                 if not source.available:
@@ -1428,6 +1465,8 @@ class PlaybackPrepService:
                     foreground=False,
                 )
                 prepared = await self.wait_until_fully_prepared(media_obj.id, fingerprint, media_obj)
+                if self._update_quiesced:
+                    return
                 if not prepared:
                     logger.warning(f"[Playback Prep] Catalog warming did not complete for {media_obj.id}.")
             except asyncio.CancelledError:

@@ -22,9 +22,12 @@ from services.update import (
     check_for_update_details,
     current_commit,
     idle_blockers,
+    install_lock_active,
     launch_queued_update_if_ready,
     maintenance_window_open,
+    persisted_update_handoff_token_matches,
     protected_cutover_blockers,
+    quiesce_cancellable_update_work,
     queue_update,
     read_update_log,
     read_update_state,
@@ -138,7 +141,11 @@ async def _status_response() -> UpdateStatusResponse:
         error=str(persisted.get("error") or ""),
         blockers=await protected_cutover_blockers() if active_immediate else await idle_blockers(),
         maintenance_window_open=maintenance_window_open(),
-        update_in_progress=bool(persisted.get("phase") in ACTIVE_PHASES or update_lock_active()),
+        update_in_progress=bool(
+            persisted.get("phase") in ACTIVE_PHASES
+            or update_lock_active()
+            or install_lock_active()
+        ),
         log_tail=read_update_log(),
         policy=_policy_response(),
     )
@@ -180,9 +187,18 @@ async def approve_update_handoff(
         peer = ipaddress.ip_address(request.client.host if request.client else "")
     except ValueError as exc:
         raise HTTPException(status_code=403, detail={"code": "handoff_forbidden", "message": "Update handoff is local only."}) from exc
-    if not peer.is_loopback or not state.UPDATE_HANDOFF_TOKEN or not hmac.compare_digest(token, state.UPDATE_HANDOFF_TOKEN):
-        raise HTTPException(status_code=403, detail={"code": "handoff_forbidden", "message": "Update handoff authorization failed."})
     update_state = read_update_state()
+    memory_token_matches = bool(state.UPDATE_HANDOFF_TOKEN) and hmac.compare_digest(token, state.UPDATE_HANDOFF_TOKEN)
+    persisted_token_matches = persisted_update_handoff_token_matches(
+        token,
+        str(update_state.get("handoff_file") or ""),
+    )
+    if (
+        not peer.is_loopback
+        or update_state.get("phase") != "waiting_for_idle"
+        or not (memory_token_matches or persisted_token_matches)
+    ):
+        raise HTTPException(status_code=403, detail={"code": "handoff_forbidden", "message": "Update handoff authorization failed."})
     install_mode = str(update_state.get("install_mode") or "when_idle")
     blockers = await update_handoff_blockers(install_mode)
     if blockers:
@@ -196,6 +212,7 @@ async def approve_update_handoff(
         if install_mode == "now"
         else "StreamHome is installing a validated update and will return automatically."
     )
+    await quiesce_cancellable_update_work()
     state.UPDATE_HANDOFF_TOKEN = ""
     return {"approved": True}
 
@@ -245,7 +262,7 @@ async def check_for_updates(
     db: AsyncSession = Depends(get_session),
 ):
     existing = read_update_state()
-    if existing.get("phase") in ACTIVE_PHASES or update_lock_active():
+    if existing.get("phase") in ACTIVE_PHASES or update_lock_active() or install_lock_active():
         raise _runtime_error(RuntimeError("update_in_progress"))
     result = await check_for_update_details()
     await add_event(

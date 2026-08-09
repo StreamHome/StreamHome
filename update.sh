@@ -304,6 +304,15 @@ read_env() {
     printf '%s' "${value:-$default_value}"
 }
 
+read_update_branch() {
+    local root="$1" value
+    value="$(read_env "$root/.env" UPDATE_BRANCH __unset__)"
+    if [[ "$value" == "__unset__" ]]; then
+        value="$(read_env "$root/server/.env" UPDATE_BRANCH main)"
+    fi
+    printf '%s' "$value"
+}
+
 public_origin_matches() {
     local expected_commit="$1" attempts="${2:-1}"
     [[ "$PUBLIC_URL" == http://* || "$PUBLIC_URL" == https://* ]] || return 1
@@ -1376,7 +1385,7 @@ execute_update() {
     COMMIT_FILE="$RUN_DIR/update-commit.${TRANSACTION_ID}.token"
     CANCEL_FILE="$RUN_DIR/update-cancel.${TRANSACTION_ID}.requested"
     if [[ "$MANUAL_CUTOVER" == false ]]; then
-        UPDATE_BRANCH="$(read_env "$ROOT_DIR/server/.env" UPDATE_BRANCH main)"
+        UPDATE_BRANCH="$(read_update_branch "$ROOT_DIR")"
     fi
     WEB_PORT="$(read_env "$ROOT_DIR/.env" WEB_PORT 3000)"
     PUBLIC_URL="$(read_env "$ROOT_DIR/.env" PUBLIC_URL "")"
@@ -1556,7 +1565,7 @@ execute_update() {
 
 case "${1:-}" in
     "")
-        update_branch="$(read_env "$ORIGINAL_ROOT/server/.env" UPDATE_BRANCH main)"
+        update_branch="$(read_update_branch "$ORIGINAL_ROOT")"
         exec env \
             STREAMHOME_INSTALL_DIR="$ORIGINAL_ROOT" \
             STREAMHOME_REF="${STREAMHOME_REF:-$update_branch}" \
@@ -1564,7 +1573,7 @@ case "${1:-}" in
         ;;
     --no-start)
         [[ $# -eq 1 ]] || exit 2
-        update_branch="$(read_env "$ORIGINAL_ROOT/server/.env" UPDATE_BRANCH main)"
+        update_branch="$(read_update_branch "$ORIGINAL_ROOT")"
         exec env \
             STREAMHOME_INSTALL_DIR="$ORIGINAL_ROOT" \
             STREAMHOME_REF="${STREAMHOME_REF:-$update_branch}" \
