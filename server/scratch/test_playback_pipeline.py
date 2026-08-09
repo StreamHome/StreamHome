@@ -28,7 +28,7 @@ from services.media_source import MediaSourceError, ResolvedMediaSource, canonic
 from services.playback_prep import PlaybackMediaSnapshot, PlaybackPrepService, PlaybackPreparationError, playback_prep_service
 from services.playback_source import HttpPlaybackSource, LocalPlaybackSource
 from services.rclone import rclone_service
-from services.queue import srt_to_vtt
+from services.queue import DownloadQueueManager, srt_to_vtt
 
 
 class PlaybackPipelineRegression(unittest.TestCase):
@@ -201,6 +201,43 @@ class PlaybackPipelineRegression(unittest.TestCase):
         media.width = 1
         self.assertTrue(all(item.width == 640 for item in scheduled))
 
+    def test_completed_ingestion_schedules_verified_adaptive_warming(self) -> None:
+        manager = DownloadQueueManager()
+        source = ResolvedMediaSource(
+            catalog_path=self.catalog_path,
+            relative_path=self.catalog_path.removeprefix("/media/"),
+            local_path=self.media_file,
+            cloud_path=None,
+            local_exists=True,
+            cloud_exists=False,
+        )
+        media = SimpleNamespace(
+            id="m_completed_ingestion",
+            video_url=self.catalog_path,
+            source_fingerprint=None,
+            audio_metadata=[],
+        )
+        database = SimpleNamespace(add=lambda _item: None, flush=AsyncMock(return_value=None))
+
+        async def run() -> None:
+            with (
+                patch("services.queue.resolve_media_source", new=AsyncMock(return_value=source)),
+                patch.object(playback_prep_service, "prepare", new=AsyncMock(return_value="preparing")) as prepare,
+            ):
+                await manager._schedule_playback_baseline(database, media)
+                prepare.assert_awaited_once_with(
+                    media.id,
+                    media,
+                    source,
+                    include_remaining=True,
+                    retry_errors=True,
+                    foreground=False,
+                )
+
+        asyncio.run(run())
+        self.assertEqual(media.source_fingerprint, source.fingerprint)
+        database.flush.assert_awaited_once()
+
     def test_quality_ladder_reaches_144p_without_upscaling(self) -> None:
         source_720p = SimpleNamespace(width=1280, height=720)
         renditions = playback_prep_service.video_renditions(source_720p)
@@ -280,8 +317,10 @@ class PlaybackPipelineRegression(unittest.TestCase):
             playback_prep_service.active_jobs.pop(key, None)
             playback_prep_service.job_priorities.pop(key, None)
             (rendition_dir / ".complete").write_text("done", encoding="utf-8")
+            (rendition_dir / ".verified-v1").write_text("1", encoding="utf-8")
             self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "ready")
             (rendition_dir / ".complete").unlink()
+            (rendition_dir / ".verified-v1").unlink()
             shutil.rmtree(rendition_dir)
             playback_prep_service._write_rendition_error(media_id, fingerprint, rendition_name, "TEST_FAILURE", "failed")
             self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "failed")
@@ -317,6 +356,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             self.assertFalse(playback_prep_service.fully_prepared(media_id, fingerprint, media))
             for rendition_name in rendition_names:
                 (cache_path / rendition_name / ".complete").write_text("done", encoding="utf-8")
+                (cache_path / rendition_name / ".verified-v1").write_text("1", encoding="utf-8")
             self.assertTrue(playback_prep_service.fully_prepared(media_id, fingerprint, media))
         finally:
             shutil.rmtree(cache_path.parent, ignore_errors=True)
@@ -423,7 +463,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             finally:
                 service.running_jobs.discard(audio_key)
 
-    def test_streamable_background_rendition_remains_advertised_during_preemption(self) -> None:
+    def test_unverified_background_rendition_is_not_advertised_during_preemption(self) -> None:
         async def exercise(service: PlaybackPrepService) -> None:
             media_id = "m_background_manifest"
             fingerprint = "c" * 32
@@ -439,13 +479,14 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 (rendition_dir / "init.mp4").write_bytes(b"init")
                 (rendition_dir / "segment_00000.m4s").write_bytes(b"segment")
             (cache_path / "video_original" / ".complete").write_text("done", encoding="utf-8")
+            (cache_path / "video_original" / ".verified-v1").write_text("1", encoding="utf-8")
             key = f"{media_id}:{fingerprint}:video_480p"
             service.active_jobs[key] = SimpleNamespace()  # type: ignore[assignment]
             service.job_priorities[key] = 100
             await service.rebuild_master(media_id, fingerprint, media)
             master = (cache_path / "master.m3u8").read_text(encoding="utf-8")
             self.assertIn("video_original/playlist.m3u8", master)
-            self.assertIn("video_480p/playlist.m3u8", master)
+            self.assertNotIn("video_480p/playlist.m3u8", master)
             await service._preempt_background_jobs(set())
             self.assertIn(key, service.active_jobs)
             self.assertEqual(service.rendition_status(media_id, fingerprint, "video_480p"), "streamable")
@@ -508,6 +549,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             (original / "init.mp4").write_bytes(b"init")
             (original / "segment_00000.m4s").write_bytes(b"unchanged-video")
             (original / ".complete").write_text("done", encoding="utf-8")
+            (original / ".verified-v1").write_text("1", encoding="utf-8")
 
             reused = service.reuse_video_renditions(
                 "m_sidecar_reuse",
@@ -522,6 +564,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             self.assertEqual(reused, ["video_original"])
             self.assertEqual((target / "segment_00000.m4s").read_bytes(), b"unchanged-video")
             self.assertTrue((target / ".complete").is_file())
+            self.assertTrue((target / ".verified-v1").is_file())
 
     def test_verified_source_optimization_preserves_complete_video_and_audio_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -559,6 +602,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 (rendition / "init.mp4").write_bytes(b"init")
                 (rendition / "segment_00000.m4s").write_bytes(rendition_name.encode("utf-8"))
                 (rendition / ".complete").write_text("done", encoding="utf-8")
+                (rendition / ".verified-v1").write_text("1", encoding="utf-8")
 
             reused = service.reuse_verified_playback_cache(
                 "m_verified_optimization",

@@ -1,6 +1,6 @@
 # Playback
 
-StreamHome uses a direct-media, ready-asset playback model. Pressing Play never starts completed-title transcoding. The server creates one authenticated playback run, returns every currently playable URL and track, and lets the browser begin from the protected source immediately.
+StreamHome uses a direct-media, verified-asset playback model. Pressing Play never starts completed-title transcoding. Completed ingestion schedules adaptive preparation after its catalog transaction commits, and startup recovery warms existing titles in bounded order with recently watched media first. The server creates one authenticated playback run, returns every currently playable URL and track, and lets the browser begin from the protected source or a verified adaptive stream immediately.
 
 ## Playback descriptor
 
@@ -24,11 +24,17 @@ The video element uses eager browser preloading. Local media is read directly fr
 
 ## Ready HLS quality switching
 
-If a protected HLS cache already contains a valid master, initialization fragments, playlists, and media fragments, the descriptor includes `/api/playback/manifest/{mediaId}`. The player uses hls.js or native HLS to select only those ready variants.
+If a protected HLS cache already contains a valid master, initialization fragments, playlists, and media fragments, the descriptor includes `/api/playback/manifest/{mediaId}`. A rendition becomes ready only after FFprobe opens its completed playlist and confirms the expected video or audio stream; interrupted and legacy unverified output is rebuilt in the background. The player uses hls.js or native HLS to select only those verified variants.
 
 Quality clicks change the active ready HLS level. They never call a preparation endpoint and never start FFmpeg. If no ready HLS master exists, the source plays directly and unavailable qualities are not displayed.
 
-The adaptive forward-buffer target is 30 seconds with a bounded 60-second ceiling. Automatic mode remains hls.js bandwidth selection across the ready variants.
+The adaptive forward-buffer target is 30 seconds with a bounded 60-second ceiling. Startup begins in automatic quality with a conservative bandwidth estimate. A saved manual level is restored only after at least eight seconds are buffered and measured bandwidth has 35 percent headroom; a viewer's explicit quality click still switches immediately.
+
+## Startup path and diagnostics
+
+The browser requests catalog metadata and the authenticated playback run concurrently. It also begins loading hls.js as soon as the player route mounts, so API and player-engine work do not form a serial startup waterfall.
+
+Adaptive startup records transport initialization, media attachment, manifest, level/audio playlist, fragment load/buffer, `canplay`, and `playing` stages. If the bounded retry cannot start playback, the client posts the exact last stage, sanitized hls.js error token, HTTP status, media element state, position, buffer edge, and elapsed time to `/api/playback/runs/{runId}/diagnostics`. The server writes this ticket-free diagnostic to `backend.log`, allowing an operator to distinguish a manifest failure, fragment HTTP failure, decode failure, or genuine no-progress timeout.
 
 ## External dubbing
 
@@ -67,7 +73,10 @@ Playback coverage verifies:
 - exact local and validated HTTP source byte ranges;
 - authenticated direct video and external dubbing byte ranges;
 - ready-HLS manifest and static fragment allowlisting;
+- FFprobe-verified rendition publication and interrupted-cache recovery;
 - absence of JIT routes and Play-triggered FFmpeg work;
+- startup catalog warming and completed-ingestion scheduling;
+- concurrent startup requests, transport-stage diagnostics, and bandwidth-safe initial quality;
 - resume and source-fingerprint ticket invalidation;
 - direct external dubbing selection without video replacement;
 - bounded forward buffering and stall recovery;

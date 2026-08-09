@@ -2,6 +2,7 @@ import { apiGet, apiPost } from "./client";
 import type {
   PlaybackProgressRequest,
   PlaybackProgressResponse,
+  PlaybackStartupDiagnosticRequest,
   PlaybackSession,
   PlaybackRunResponse,
 } from "../types/api";
@@ -38,3 +39,17 @@ export const closePlaybackRun = (runId: string, progress: PlaybackProgressReques
 
 export const startOverPlaybackRun = (runId: string) =>
   apiPost<{ status: string }>(`/api/playback/runs/${runId}/start-over`);
+
+export const reportPlaybackStartupDiagnostic = (runId: string, diagnostic: PlaybackStartupDiagnosticRequest) =>
+  apiPost<void>(`/api/playback/runs/${runId}/diagnostics`, {
+    transport: diagnostic.transport,
+    stage: diagnostic.stage,
+    error_type: diagnostic.errorType,
+    error_detail: diagnostic.errorDetail,
+    http_status: diagnostic.httpStatus,
+    ready_state: diagnostic.readyState,
+    network_state: diagnostic.networkState,
+    current_time: diagnostic.currentTime,
+    buffered_until: diagnostic.bufferedUntil,
+    elapsed_ms: diagnostic.elapsedMs,
+  });

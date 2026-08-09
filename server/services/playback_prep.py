@@ -25,6 +25,7 @@ BOOTSTRAP_HLS_HEIGHT = 480
 PLAYLIST_NAME = "playlist.m3u8"
 MASTER_NAME = "master.m3u8"
 COMPLETE_MARKER = ".complete"
+VERIFIED_MARKER = ".verified-v1"
 FOREGROUND_PRIORITY = 0
 BACKGROUND_PRIORITY = 100
 FAST_HLS_VIDEO_CODECS = {"avc", "avc1", "h264"}
@@ -321,16 +322,62 @@ class PlaybackPrepService:
     def rendition_complete(self, media_id: str, fingerprint: str, rendition_name: str) -> bool:
         rendition_dir = self.cache_path(media_id, fingerprint) / rendition_name
         marker = rendition_dir / COMPLETE_MARKER
-        if marker.is_file():
+        verified = rendition_dir / VERIFIED_MARKER
+        if marker.is_file() and verified.is_file() and self.playlist_ready(media_id, fingerprint, rendition_name):
             return True
-        playlist = rendition_dir / PLAYLIST_NAME
-        try:
-            if playlist.is_file() and "#EXT-X-ENDLIST" in playlist.read_text(encoding="utf-8"):
-                marker.write_text("migrated", encoding="utf-8")
-                return True
-        except OSError:
-            return False
         return False
+
+    def rendition_verified(self, media_id: str, fingerprint: str, rendition_name: str) -> bool:
+        return self.rendition_complete(media_id, fingerprint, rendition_name)
+
+    def playback_ready(self, media_id: str, fingerprint: str, media_obj: Any) -> bool:
+        baseline = self.baseline_video(media_obj)
+        audios = self.audio_renditions(media_obj)
+        default_audio = next((item for item in audios if item.default), audios[0] if audios else None)
+        required_names = [baseline.name, *([default_audio.name] if default_audio else [])]
+        return (
+            all(self.rendition_verified(media_id, fingerprint, name) for name in required_names)
+            and (self.cache_path(media_id, fingerprint) / MASTER_NAME).is_file()
+        )
+
+    def _verify_rendition_output(self, target_dir: Path, rendition_name: str) -> None:
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            raise PlaybackPreparationError("FFPROBE_UNAVAILABLE", "FFprobe is required to verify adaptive playback output.")
+        playlist = target_dir / PLAYLIST_NAME
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-show_entries", "stream=codec_type,codec_name",
+                "-of", "json",
+                str(playlist),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0:
+            diagnostics = self.sanitize_diagnostics(result.stderr, 800)
+            raise PlaybackPreparationError(
+                "RENDITION_VERIFICATION_FAILED",
+                f"FFprobe rejected the prepared adaptive rendition. {diagnostics}".strip(),
+            )
+        try:
+            streams = json.loads(result.stdout).get("streams", [])
+        except (json.JSONDecodeError, AttributeError) as exc:
+            raise PlaybackPreparationError(
+                "RENDITION_VERIFICATION_FAILED",
+                "FFprobe returned invalid adaptive rendition metadata.",
+            ) from exc
+        expected_type = "audio" if rendition_name.startswith("audio_") else "video"
+        if not any(str(stream.get("codec_type")) == expected_type for stream in streams):
+            raise PlaybackPreparationError(
+                "RENDITION_VERIFICATION_FAILED",
+                f"The prepared adaptive rendition contains no {expected_type} stream.",
+            )
 
     def rendition_error(self, media_id: str, fingerprint: str, rendition_name: str) -> Optional[dict[str, str]]:
         error_path = self.cache_path(media_id, fingerprint) / f"rendition-error-{rendition_name}.json"
@@ -970,7 +1017,9 @@ class PlaybackPrepService:
                     )
                 if not self.playlist_ready(media_id, fingerprint, rendition_name):
                     raise PlaybackPreparationError("EMPTY_RENDITION", "FFmpeg completed without producing playable HLS segments.")
+                await asyncio.to_thread(self._verify_rendition_output, target_dir, rendition_name)
                 (target_dir / COMPLETE_MARKER).write_text(str(time.time()), encoding="utf-8")
+                (target_dir / VERIFIED_MARKER).write_text("1", encoding="utf-8")
                 self._clear_preparation_error(media_id, fingerprint)
                 self._clear_rendition_error(media_id, fingerprint, rendition_name)
                 self.touch(media_id, fingerprint)
@@ -1177,9 +1226,10 @@ class PlaybackPrepService:
         lock_key = f"{media_id}:{fingerprint}"
         lock = self._master_locks.setdefault(lock_key, asyncio.Lock())
         async with lock:
-            videos = [item for item in self.video_renditions(media_obj) if self.playlist_ready(media_id, fingerprint, item.name)]
-            audios = [item for item in self.audio_renditions(media_obj) if self.playlist_ready(media_id, fingerprint, item.name)]
+            videos = [item for item in self.video_renditions(media_obj) if self.rendition_verified(media_id, fingerprint, item.name)]
+            audios = [item for item in self.audio_renditions(media_obj) if self.rendition_verified(media_id, fingerprint, item.name)]
             if not videos:
+                (cache_path / MASTER_NAME).unlink(missing_ok=True)
                 return None
 
             lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
@@ -1307,14 +1357,13 @@ class PlaybackPrepService:
         for playlist in self.cache_dir.rglob(PLAYLIST_NAME):
             rendition_dir = playlist.parent
             marker = rendition_dir / COMPLETE_MARKER
-            if marker.is_file():
+            verified = rendition_dir / VERIFIED_MARKER
+            if marker.is_file() and verified.is_file() and self.playlist_ready(
+                rendition_dir.parent.parent.name,
+                rendition_dir.parent.name,
+                rendition_dir.name,
+            ):
                 continue
-            try:
-                if "#EXT-X-ENDLIST" in playlist.read_text(encoding="utf-8"):
-                    marker.write_text("migrated", encoding="utf-8")
-                    continue
-            except OSError:
-                pass
             shutil.rmtree(rendition_dir, ignore_errors=True)
 
     async def reconcile_catalog_cache_identities(self) -> None:

@@ -127,9 +127,13 @@ class PlaybackContractRegression(unittest.TestCase):
         (video_dir / "playlist.m3u8").write_text("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_00000.m4s\n#EXT-X-ENDLIST\n", encoding="utf-8")
         (video_dir / "init.mp4").write_bytes(b"video-init")
         (video_dir / "segment_00000.m4s").write_bytes(b"video-segment")
+        (video_dir / ".complete").write_text("done", encoding="utf-8")
+        (video_dir / ".verified-v1").write_text("1", encoding="utf-8")
         (audio_dir / "playlist.m3u8").write_text("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_00000.m4s\n#EXT-X-ENDLIST\n", encoding="utf-8")
         (audio_dir / "init.mp4").write_bytes(b"audio-init")
         (audio_dir / "segment_00000.m4s").write_bytes(b"audio-segment")
+        (audio_dir / ".complete").write_text("done", encoding="utf-8")
+        (audio_dir / ".verified-v1").write_text("1", encoding="utf-8")
         (cls.cache_root / "master.m3u8").write_text(
             "#EXTM3U\n"
             "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",DEFAULT=YES,URI=\"audio_0_en/playlist.m3u8\"\n"
@@ -501,6 +505,39 @@ class PlaybackContractRegression(unittest.TestCase):
         session = asyncio.run(read_session())
         self.assertEqual(session.timestamp, 0)
         self.assertFalse(session.is_finished)
+
+    def test_startup_diagnostics_are_scoped_to_the_active_run(self) -> None:
+        run = self.create_run()
+        diagnostic = self.client.post(
+            f"/api/playback/runs/{run['runId']}/diagnostics",
+            json={
+                "transport": "hls",
+                "stage": "fragment-loaded",
+                "errorType": "networkError",
+                "errorDetail": "fragLoadError",
+                "httpStatus": 404,
+                "readyState": 1,
+                "networkState": 2,
+                "currentTime": 45,
+                "bufferedUntil": 45,
+                "elapsedMs": 12000,
+            },
+        )
+        self.assertEqual(diagnostic.status_code, 204, diagnostic.text)
+
+        invalid = self.client.post(
+            f"/api/playback/runs/{run['runId']}/diagnostics",
+            json={
+                "transport": "hls",
+                "stage": "fragment loaded with spaces",
+                "readyState": 1,
+                "networkState": 2,
+                "currentTime": 0,
+                "bufferedUntil": 0,
+                "elapsedMs": 12000,
+            },
+        )
+        self.assertEqual(invalid.status_code, 422, invalid.text)
 
     def test_close_persists_confirmed_position_and_abandons_run_immediately(self) -> None:
         run = self.create_run()

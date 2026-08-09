@@ -164,6 +164,89 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
+  it("starts an incompatible source on its ready adaptive transport without probing progressive playback", async () => {
+    const adaptivePlayback: ResolvedPlayback = {
+      ...playback,
+      runResponse: {
+        ...playback.runResponse,
+        sourceMetadata: {
+          ...playback.runResponse.sourceMetadata,
+          container: "matroska,webm",
+          codec: "hevc",
+          sourceFormat: "MKV",
+        },
+        manifestUrl: "/api/playback/manifest/mounted-player-media?ticket=mounted-player-ticket",
+      },
+    };
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={adaptivePlayback} />
+      </MemoryRouter>,
+    );
+
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    await waitFor(() => expect(video.getAttribute("src")).not.toBe(playback.runResponse.progressiveUrl));
+    expect(screen.queryByText("The source stream was not playable. Switching to the prepared adaptive stream.")).toBeNull();
+
+    view.unmount();
+  });
+
+  it("creates the playback run without waiting for the catalog request to finish", async () => {
+    let resolveMovie!: (movie: Awaited<ReturnType<typeof moviesApi.getMovie>>) => void;
+    vi.spyOn(moviesApi, "getMovie").mockReturnValue(new Promise((resolve) => {
+      resolveMovie = resolve;
+    }));
+    const createRun = vi.spyOn(playbackApi, "createPlaybackRun").mockResolvedValue({
+      ...playback.runResponse,
+      mediaId: "m_parallel-startup",
+      movieId: "m_parallel-startup",
+    });
+    vi.spyOn(playbackApi, "closePlaybackRun").mockResolvedValue({
+      status: "abandoned",
+      acceptedSeconds: 0,
+      nextSequenceNumber: 2,
+    });
+
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=m_parallel-startup"]}>
+        <PlayerPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(createRun).toHaveBeenCalledWith(
+      "m_parallel-startup",
+      profile.id,
+      undefined,
+      expect.any(AbortSignal),
+    ));
+    expect(screen.queryByText("Parallel startup")).toBeNull();
+
+    resolveMovie({
+      id: "m_parallel-startup",
+      title: "Parallel startup",
+      description: "",
+      thumbnailUrl: "",
+      bannerUrl: null,
+      videoUrl: "/media/parallel-startup.mp4",
+      genres: [],
+      duration: "2m",
+      releaseYear: 2026,
+      rating: null,
+      cast: [],
+      director: null,
+      type: "movie",
+      quality: "360p",
+      languages: ["en"],
+      subtitles: [],
+      voteAverage: 0,
+      voteCount: 0,
+      skipMarkers: {},
+    });
+    expect(await screen.findByText("Parallel startup")).toBeTruthy();
+
+    view.unmount();
+  });
+
   it("activates a direct external dubbing file without replacing the video transport", async () => {
     const dualAudioPlayback: ResolvedPlayback = {
       ...playback,

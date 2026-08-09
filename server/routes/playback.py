@@ -61,6 +61,19 @@ class PlaybackProgressRequest(APIModel):
     event: Literal["heartbeat", "pause", "seek", "visibility", "exit", "ended"] = "heartbeat"
 
 
+class PlaybackStartupDiagnosticRequest(APIModel):
+    transport: Literal["progressive", "hls", "native-hls"]
+    stage: str = Field(min_length=1, max_length=48, pattern=r"^[a-z0-9_-]+$")
+    error_type: Optional[str] = Field(default=None, max_length=80, pattern=r"^[a-zA-Z0-9_.-]*$")
+    error_detail: Optional[str] = Field(default=None, max_length=120, pattern=r"^[a-zA-Z0-9_.-]*$")
+    http_status: Optional[int] = Field(default=None, ge=100, le=599)
+    ready_state: int = Field(ge=0, le=4)
+    network_state: int = Field(ge=0, le=3)
+    current_time: float = Field(ge=0)
+    buffered_until: float = Field(ge=0)
+    elapsed_ms: int = Field(ge=0, le=300_000)
+
+
 class PlaybackSourceMetadata(APIModel):
     duration: float
     container: str
@@ -520,7 +533,7 @@ def rendition_contract(media_obj: Any, media_id: str, fingerprint: str) -> list[
     result: list[PlaybackRendition] = []
     for item in playback_prep_service.video_renditions(media_obj):
         rendition_status = playback_prep_service.rendition_status(media_id, fingerprint, item.name)
-        if rendition_status not in {"streamable", "ready"}:
+        if rendition_status != "ready" or not playback_prep_service.rendition_verified(media_id, fingerprint, item.name):
             continue
         result.append(PlaybackRendition(
             id=item.name,
@@ -535,7 +548,7 @@ def rendition_contract(media_obj: Any, media_id: str, fingerprint: str) -> list[
 
 
 def ready_hls_manifest_url(media_obj: Any, fingerprint: str, encoded_ticket: str, renditions: list[PlaybackRendition]) -> Optional[str]:
-    if not renditions or playback_prep_service.preparation_state(media_obj.id, fingerprint, media_obj) != "ready":
+    if not renditions or not playback_prep_service.playback_ready(media_obj.id, fingerprint, media_obj):
         return None
     return f"/api/playback/manifest/{quote(media_obj.id, safe='')}?ticket={encoded_ticket}"
 
@@ -829,6 +842,26 @@ async def get_playback_run(
                 await db.commit()
     position = 0 if run.source_kind == "ingest_preview" else await run_resume_position(db, run, media_obj)
     return await build_run_response(db, request, user, run, media_obj, initial_resume_position=position)
+
+
+@router.post("/runs/{run_id}/diagnostics", status_code=status.HTTP_204_NO_CONTENT)
+async def record_playback_startup_diagnostic(
+    run_id: str,
+    req: PlaybackStartupDiagnosticRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> Response:
+    del user
+    run = await authorized_run(db, request, run_id)
+    logger.warning(
+        "[Playback Startup] "
+        f"run={run.id} media={run.episode_id or run.movie_id} transport={req.transport} stage={req.stage} "
+        f"error_type={req.error_type or 'none'} error_detail={req.error_detail or 'none'} "
+        f"http_status={req.http_status or 0} ready_state={req.ready_state} network_state={req.network_state} "
+        f"current_time={req.current_time:.3f} buffered_until={req.buffered_until:.3f} elapsed_ms={req.elapsed_ms}"
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/runs/{run_id}/progress")

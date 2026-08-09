@@ -570,3 +570,16 @@ export interface PlaybackRunResponse {
   fullyPrepared: boolean;
   nextSequenceNumber: number;
 }
+
+export interface PlaybackStartupDiagnosticRequest {
+  transport: "progressive" | "hls" | "native-hls";
+  stage: string;
+  errorType?: string | null;
+  errorDetail?: string | null;
+  httpStatus?: number | null;
+  readyState: number;
+  networkState: number;
+  currentTime: number;
+  bufferedUntil: number;
+  elapsedMs: number;
+}

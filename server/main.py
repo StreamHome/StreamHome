@@ -236,6 +236,7 @@ async def lifespan(app: FastAPI):
             from services.audio_extractor import repair_completed_ingestion_languages
             await repair_completed_ingestion_languages()
             await vibe_analysis_manager.start()
+            await playback_prep_service.schedule_catalog_baselines()
         except asyncio.CancelledError:
             raise
         except Exception as exc:

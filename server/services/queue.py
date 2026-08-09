@@ -544,7 +544,7 @@ class DownloadQueueManager:
                     from services.state import remove_task_metrics
                     remove_task_metrics(task_id)
                     return
-                await self._finalize_catalog_media(
+                finalized_media = await self._finalize_catalog_media(
                     db,
                     tmdb_id,
                     media_type,
@@ -558,6 +558,7 @@ class DownloadQueueManager:
                 task.error_message = None
                 db.add(task)
                 await db.commit()
+                await self._schedule_playback_baseline(db, finalized_media)
                 analysis_type = "movie" if media_type == "movie" else "episode"
                 analysis_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"
                 await vibe_analysis_manager.enqueue(analysis_type, analysis_id)
@@ -643,10 +644,12 @@ class DownloadQueueManager:
             current = os.path.dirname(current)
 
     async def _schedule_playback_baseline(self, db: AsyncSession, media_obj: Any) -> None:
-        """Refresh source identity; adaptive delivery itself is request-driven."""
+        """Refresh source identity and warm verified adaptive playback in the background."""
         if not getattr(media_obj, "video_url", ""):
             return
         try:
+            from services.playback_prep import playback_prep_service
+
             source = await resolve_media_source(media_obj.video_url)
             if not source.available:
                 return
@@ -655,6 +658,15 @@ class DownloadQueueManager:
                 media_obj.source_fingerprint = fingerprint
                 db.add(media_obj)
                 await db.flush()
+            await playback_prep_service.prepare(
+                str(media_obj.id),
+                media_obj,
+                source,
+                include_remaining=True,
+                retry_errors=True,
+                foreground=False,
+            )
+            logger.info(f"[Queue Manager] Adaptive playback warming scheduled for {media_obj.id}.")
         except Exception as exc:
             logger.warning(
                 f"[Queue Manager] Playback baseline scheduling failed for "
@@ -1171,7 +1183,7 @@ class DownloadQueueManager:
         *,
         uploaded_to_cloud: bool,
         source_fingerprint: str,
-    ) -> None:
+    ) -> Any:
         """Publish a verified seekable local or cloud catalog row in one short transaction."""
 
         if media_type == "movie":
@@ -1191,6 +1203,7 @@ class DownloadQueueManager:
             media_obj.preview_task_id = None
         media_obj.source_fingerprint = source_fingerprint
         db.add(media_obj)
+        return media_obj
 
     def _parse_duration_to_seconds(self, duration_str: str) -> float:
         total_seconds = 0.0

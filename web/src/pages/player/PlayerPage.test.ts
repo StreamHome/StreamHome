@@ -5,6 +5,7 @@ import {
   adaptiveTransportIsGrowing,
   applySubtitleTrackSelection,
   authoritativePlaybackDuration,
+  bufferedEndForTime,
   canUseProgressiveCompatibility,
   canUseProgressivePlayback,
   catalogDurationSeconds,
@@ -18,10 +19,12 @@ import {
   nextPlayableEpisode,
   preparationStatusMessage,
   playbackQualityOptions,
+  playbackStartupFailureMessage,
   progressiveAudioTrack,
   progressSequenceWasAccepted,
   shouldAutoHidePlayerControls,
   shouldAcceptObservedPlaybackTime,
+  shouldApplyDeferredStartupQuality,
   shouldExtendPlaybackStartup,
   shouldRetryPlaybackStall,
   shouldRetryPlaybackStartup,
@@ -38,6 +41,43 @@ describe("adaptive preparation status", () => {
       .toContain("2 segments ready");
     expect(preparationStatusMessage({ stage: "audio", queuePosition: 0, readySegments: 2, activeWorkers: 1 }))
       .toContain("default audio track");
+  });
+});
+
+describe("playback startup diagnostics", () => {
+  it("names the failed adaptive stage and preserves the HLS response detail", () => {
+    expect(playbackStartupFailureMessage("hls", "fragment-loaded", {
+      type: "networkError",
+      detail: "fragLoadError",
+      httpStatus: 404,
+    })).toBe(
+      "Adaptive playback stopped during fragment-loaded. HTTP 404. HLS reported fragLoadError. Retry this title after checking the playback startup entry in backend.log.",
+    );
+  });
+
+  it("explains a direct-source compatibility failure without calling it an adaptive error", () => {
+    expect(playbackStartupFailureMessage("progressive", "direct-metadata", null)).toContain(
+      "source container or selected audio codec",
+    );
+  });
+});
+
+describe("bandwidth-aware adaptive startup", () => {
+  it("waits for both measured headroom and a safe forward buffer before restoring saved quality", () => {
+    expect(shouldApplyDeferredStartupQuality(4_000_000, 5_000_000, 12)).toBe(false);
+    expect(shouldApplyDeferredStartupQuality(4_000_000, 6_000_000, 4)).toBe(false);
+    expect(shouldApplyDeferredStartupQuality(4_000_000, 6_000_000, 12)).toBe(true);
+  });
+
+  it("finds the buffer edge that contains the current playback position", () => {
+    const ranges = {
+      length: 2,
+      start: (index: number) => [0, 30][index],
+      end: (index: number) => [12, 50][index],
+    };
+    expect(bufferedEndForTime(ranges, 7)).toBe(12);
+    expect(bufferedEndForTime(ranges, 35)).toBe(50);
+    expect(bufferedEndForTime(ranges, 20)).toBe(20);
   });
 });
 
