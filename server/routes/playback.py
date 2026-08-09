@@ -247,16 +247,45 @@ async def require_available_source(media_obj: Any) -> ResolvedMediaSource:
     return source
 
 
+async def clear_preview_task_reference(
+    db: AsyncSession,
+    media_obj: Any,
+    task_id: str,
+    reason: str,
+) -> None:
+    if str(getattr(media_obj, "preview_task_id", None) or "") != task_id:
+        return
+    media_obj.preview_task_id = None
+    db.add(media_obj)
+    await db.commit()
+    logger.info(f"[Playback Run] Cleared stale preview task {task_id} for {media_obj.id}: {reason}.")
+
+
 async def active_preview_task(db: AsyncSession, movie: Movie, media_obj: Any) -> Optional[DownloadTask]:
     task_id = str(getattr(media_obj, "preview_task_id", None) or "")
     if not task_id:
         return None
     task = await db.get(DownloadTask, task_id)
-    if not task or task.status == "FAILED" or task.tmdb_id != movie.tmdb_id:
+    if not task:
+        await clear_preview_task_reference(db, media_obj, task_id, "download task no longer exists")
         return None
-    if media_obj is movie:
-        return task if task.media_type == "movie" else None
-    if task.media_type == "movie" or task.season != media_obj.season_number or task.episode != media_obj.episode_number:
+    task_matches_media = (
+        task.tmdb_id == movie.tmdb_id
+        and (
+            task.media_type == "movie"
+            if media_obj is movie
+            else (
+                task.media_type != "movie"
+                and task.season == media_obj.season_number
+                and task.episode == media_obj.episode_number
+            )
+        )
+    )
+    if not task_matches_media:
+        await clear_preview_task_reference(db, media_obj, task_id, "download task belongs to different media")
+        return None
+    if task.status not in ACTIVE_REPAIR_STATUSES:
+        await clear_preview_task_reference(db, media_obj, task_id, f"download task is {task.status.lower()}")
         return None
     return task
 
@@ -746,31 +775,37 @@ async def create_playback_run(
     auth_session = current_auth_session(request)
     await require_profile_access(db, auth_session, req.profile_id)
     movie, media_obj = await resolve_run_media(db, req.movie_id, req.episode_id)
-    preview_task = await active_preview_task(db, movie, media_obj)
+    preview_task: Optional[DownloadTask] = None
     source: Optional[ResolvedMediaSource] = None
+    try:
+        source = await require_available_source(media_obj)
+        await ensure_source_metadata(db, media_obj, source)
+        await synchronize_source_fingerprint(db, media_obj, source)
+        stale_preview_task_id = str(getattr(media_obj, "preview_task_id", None) or "")
+        if stale_preview_task_id:
+            await clear_preview_task_reference(
+                db,
+                media_obj,
+                stale_preview_task_id,
+                "completed catalog source is available",
+            )
+    except HTTPException as source_error:
+        detail = source_error.detail if isinstance(source_error.detail, dict) else {}
+        error_code = str(detail.get("code") or "")
+        if error_code not in {"MEDIA_SOURCE_MISSING", "MEDIA_PROBE_FAILED", "INVALID_MEDIA_PATH"}:
+            raise
+        preview_task = await active_preview_task(db, movie, media_obj)
+        if not preview_task:
+            preview_task = await queue_media_repair(db, movie, media_obj, error_code)
+            if not preview_task:
+                raise
+        source = None
     if preview_task:
         source_kind = "ingest_preview"
         source_fingerprint = ingest_preview_service.fingerprint(preview_task.id)
     else:
-        try:
-            source = await require_available_source(media_obj)
-            await ensure_source_metadata(db, media_obj, source)
-            await synchronize_source_fingerprint(db, media_obj, source)
-        except HTTPException as source_error:
-            detail = source_error.detail if isinstance(source_error.detail, dict) else {}
-            error_code = str(detail.get("code") or "")
-            if error_code not in {"MEDIA_SOURCE_MISSING", "MEDIA_PROBE_FAILED", "INVALID_MEDIA_PATH"}:
-                raise
-            preview_task = await queue_media_repair(db, movie, media_obj, error_code)
-            if not preview_task:
-                raise
-            source = None
-        if preview_task:
-            source_kind = "ingest_preview"
-            source_fingerprint = ingest_preview_service.fingerprint(preview_task.id)
-        else:
-            source_kind = "catalog"
-            source_fingerprint = str(media_obj.source_fingerprint or source.fingerprint)
+        source_kind = "catalog"
+        source_fingerprint = str(media_obj.source_fingerprint or source.fingerprint)
 
     filters = [PlaybackSession.profile_id == req.profile_id, PlaybackSession.movie_id == req.movie_id]
     filters.append(PlaybackSession.episode_id == req.episode_id if req.episode_id else PlaybackSession.episode_id.is_(None))

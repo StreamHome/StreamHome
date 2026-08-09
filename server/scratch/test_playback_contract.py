@@ -395,6 +395,59 @@ class PlaybackContractRegression(unittest.TestCase):
             asyncio.run(restore())
             ingest_preview_service.remove(task_id)
 
+    def test_available_local_source_wins_over_stale_completed_preview_reference(self) -> None:
+        task_id = f"completed-preview-{uuid.uuid4().hex}"
+
+        async def seed_stale_preview() -> None:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                movie = await db.get(Movie, "m_playback_contract")
+                movie.tmdb_id = 817263
+                movie.availability = "processing"
+                movie.preview_task_id = task_id
+                db.add(movie)
+                db.add(
+                    DownloadTask(
+                        id=task_id,
+                        tmdb_id=817263,
+                        title="Completed Playback Contract",
+                        media_type="movie",
+                        video_url="https://media.example.test/completed.mp4",
+                        status="COMPLETED",
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                )
+                await db.commit()
+
+        async def inspect_handoff(run_id: str) -> tuple[Movie, PlaybackRun]:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                return await db.get(Movie, "m_playback_contract"), await db.get(PlaybackRun, run_id)
+
+        async def restore() -> None:
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                movie = await db.get(Movie, "m_playback_contract")
+                movie.tmdb_id = None
+                movie.availability = "available"
+                movie.preview_task_id = None
+                db.add(movie)
+                task = await db.get(DownloadTask, task_id)
+                if task:
+                    await db.delete(task)
+                await db.commit()
+
+        asyncio.run(seed_stale_preview())
+        try:
+            run = self.create_run()
+            self.assertTrue(run["progressiveUrl"].startswith("/api/playback/progressive/m_playback_contract"))
+            self.assertEqual(run["preparationState"], "ready")
+            self.assertEqual(run["preparationProgress"]["activeWorkers"], 0)
+            self.assertNotIn("/api/playback/preview/", run.get("manifestUrl") or "")
+            movie, run_record = asyncio.run(inspect_handoff(run["runId"]))
+            self.assertIsNone(movie.preview_task_id)
+            self.assertEqual(run_record.source_kind, "catalog")
+            self.assertIsNone(run_record.source_task_id)
+        finally:
+            asyncio.run(restore())
+
     def test_missing_media_queues_one_repair_without_discarding_catalog_identity(self) -> None:
         source_task_id = f"repair-source-{uuid.uuid4().hex}"
         missing_path = self.media_file.with_suffix(".missing")
