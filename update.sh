@@ -755,11 +755,13 @@ detect_release_changes() {
     else
         WEB_DEPENDENCIES_CHANGED=true
     fi
-    if git -C "$ROOT_DIR" diff --quiet "$OLD_COMMIT" "$TARGET_COMMIT" -- web
-    then
-        WEB_BUILD_REQUIRED=false
-    else
+    if [[ "$OLD_COMMIT" != "$TARGET_COMMIT" ]]; then
         WEB_BUILD_REQUIRED=true
+        if git -C "$ROOT_DIR" diff --quiet "$OLD_COMMIT" "$TARGET_COMMIT" -- web; then
+            log "Web sources are unchanged; rebuilding production assets to embed the exact target build identity."
+        fi
+    else
+        WEB_BUILD_REQUIRED=false
     fi
     log "Preflight plan: Python dependencies changed=$PYTHON_DEPENDENCIES_CHANGED, web dependencies changed=$WEB_DEPENDENCIES_CHANGED, web build required=$WEB_BUILD_REQUIRED."
 }
@@ -787,7 +789,7 @@ prepare_candidate_web() {
     if [[ "$WEB_BUILD_REQUIRED" == false ]]; then
         [[ -d "$ROOT_DIR/web/node_modules" ]] || return 1
         installed_web_build_matches "$OLD_COMMIT" || return 1
-        log "Web sources are unchanged; reusing installed dependencies and production assets."
+        log "The release commit is unchanged; reusing its verified production assets."
         return 0
     fi
 
@@ -815,7 +817,7 @@ prepare_candidate_web() {
 activate_prepared_web() {
     local candidate_web="$STAGING_DIR/checkout/web"
     if [[ "$WEB_BUILD_REQUIRED" == false ]]; then
-        write_state "installing" "Web sources are unchanged; keeping the existing production assets."
+        write_state "installing" "The release commit is unchanged; keeping its existing production assets."
         return 0
     fi
     [[ -s "$candidate_web/dist/index.html" ]] || return 1
@@ -873,10 +875,6 @@ preflight_target() {
         return 1
     }
     detect_release_changes
-    if [[ "$WEB_BUILD_REQUIRED" == false ]] && ! installed_web_build_matches "$OLD_COMMIT"; then
-        WEB_BUILD_REQUIRED=true
-        log "Installed web assets are missing or stale for ${OLD_COMMIT:0:12}; rebuilding the target assets without reinstalling Node packages."
-    fi
     write_state "preflight" "Change analysis complete. Preparing only changed dependencies and required frontend assets while StreamHome stays online."
     prepare_candidate_python "$staged_checkout" || return 1
     prepare_candidate_web "$staged_checkout" || return 1

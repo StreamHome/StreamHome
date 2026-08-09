@@ -198,7 +198,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("detect_release_changes", update_sh)
         self.assertIn("Python dependency manifests are unchanged", update_sh)
         self.assertIn("Web dependency manifests are unchanged", update_sh)
-        self.assertIn("Web sources are unchanged", update_sh)
+        self.assertIn("rebuilding production assets to embed the exact target build identity", update_sh)
         self.assertIn("npm ci --prefer-offline --no-audit --no-fund", update_sh)
         self.assertIn("git clone --shared --no-checkout", update_sh)
         self.assertNotIn("git clone --depth 1 --branch", update_sh)
@@ -243,7 +243,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertNotIn('"$ROOT_DIR/stop.sh" --quiet || true', update_sh)
         self.assertIn("rollback will not mutate code or data while it may still be active", update_sh)
         self.assertIn("installed_web_build_matches", update_sh)
-        self.assertIn("rebuilding the target assets without reinstalling Node packages", update_sh)
+        self.assertIn("The release commit is unchanged; reusing its verified production assets", update_sh)
         self.assertIn('env VITE_BUILD_ID="$candidate_build" STREAMHOME_BUILD_ID="$candidate_build" npm run build', update_sh)
 
         self.assertIn('"$ROOT_DIR/stop.sh" --startup --lock-held', start_sh)
@@ -312,7 +312,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertNotIn("start.bat", cli_py)
         self.assertNotIn("start_background.sh", cli_py)
 
-    def test_update_change_classifier_skips_unchanged_dependency_work(self) -> None:
+    def test_update_change_classifier_rebuilds_identity_without_reinstalling_dependencies(self) -> None:
         bash = bash_command()
         if not bash:
             self.skipTest("Bash is not installed")
@@ -377,7 +377,7 @@ class SetupScriptContracts(unittest.TestCase):
                 {
                     "python_dependencies_changed": "false",
                     "web_dependencies_changed": "false",
-                    "web_build_required": "false",
+                    "web_build_required": "true",
                 },
             )
 
@@ -659,6 +659,17 @@ class SetupScriptContracts(unittest.TestCase):
             fake_curl = fake_bin / "curl"
             fake_curl.write_text("#!/usr/bin/env bash\nprintf '200'\n", encoding="utf-8", newline="\n")
             fake_curl.chmod(0o755)
+            fake_npm = fake_bin / "npm"
+            fake_npm.write_text(
+                "#!/usr/bin/env bash\n"
+                "[[ \"${1:-}\" == 'run' && \"${2:-}\" == 'build' ]] || exit 1\n"
+                "mkdir -p dist\n"
+                "printf 'candidate assets for %s\\n' \"$VITE_BUILD_ID\" > dist/index.html\n"
+                "printf '%s\\n' \"$VITE_BUILD_ID\" > dist/.streamhome-build\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            fake_npm.chmod(0o755)
             controller = fixture / "controller.sh"
             controller_source = (ROOT / "update.sh").read_text(encoding="utf-8").replace(
                 "https://github.com/StreamHome/StreamHome.git",
@@ -689,6 +700,10 @@ class SetupScriptContracts(unittest.TestCase):
                 timeout=90,
             )
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(
+                "Web sources are unchanged; rebuilding production assets to embed the exact target build identity.",
+                result.stdout + result.stderr,
+            )
             self.assertEqual(run(["git", "rev-parse", "HEAD"], cwd=installed).stdout.strip(), old_commit)
             self.assertEqual((installed / "healthy.marker").read_text(encoding="utf-8"), "healthy-old\n")
             self.assertEqual(
