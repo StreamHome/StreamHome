@@ -228,7 +228,9 @@ async def lifespan(app: FastAPI):
     async def wait_for_update_commit() -> None:
         while state.UPDATE_TRANSACTION_ID:
             await asyncio.sleep(0.25)
-            
+
+    catalog_recovery_complete = asyncio.Event()
+
     async def recover_catalog_and_playback() -> None:
         try:
             await wait_for_update_commit()
@@ -241,6 +243,8 @@ async def lifespan(app: FastAPI):
             raise
         except Exception as exc:
             logger.error(f"[Lifespan Startup] Catalog/playback recovery failed: {type(exc).__name__}: {exc}")
+        finally:
+            catalog_recovery_complete.set()
 
     try:
         background_tasks.append(
@@ -251,6 +255,8 @@ async def lifespan(app: FastAPI):
 
     async def start_runtime_workers() -> None:
         await wait_for_update_commit()
+        await catalog_recovery_complete.wait()
+        logger.info("[Server] Initial catalog recovery finished; starting database-writing runtime workers.")
         try:
             queue_manager.start()
         except Exception as q_start_err:
@@ -265,13 +271,11 @@ async def lifespan(app: FastAPI):
         except Exception as h_start_err:
             logger.error(f"[Lifespan Startup] Error starting hevc compressor: {h_start_err}")
 
-    if state.UPDATE_TRANSACTION_ID:
-        background_tasks.append(asyncio.create_task(start_runtime_workers(), name="runtime-workers-start"))
-    else:
-        await start_runtime_workers()
+    background_tasks.append(asyncio.create_task(start_runtime_workers(), name="runtime-workers-start"))
 
     async def daily_backup_worker():
         await wait_for_update_commit()
+        await catalog_recovery_complete.wait()
         await asyncio.sleep(30)
         while True:
             try:
@@ -304,11 +308,18 @@ async def lifespan(app: FastAPI):
 
     background_tasks.append(asyncio.create_task(daily_backup_worker(), name="daily-backup"))
     update_stop = asyncio.Event()
-    background_tasks.append(asyncio.create_task(automatic_update_worker(update_stop), name="automatic-update"))
+
+    async def guarded_automatic_update_worker() -> None:
+        await wait_for_update_commit()
+        await catalog_recovery_complete.wait()
+        await automatic_update_worker(update_stop)
+
+    background_tasks.append(asyncio.create_task(guarded_automatic_update_worker(), name="automatic-update"))
 
     recommendation_stop = asyncio.Event()
     async def guarded_recommendation_worker() -> None:
         await wait_for_update_commit()
+        await catalog_recovery_complete.wait()
         await recommendation_worker(recommendation_stop)
 
     recommendation_task = asyncio.create_task(guarded_recommendation_worker())
@@ -316,6 +327,7 @@ async def lifespan(app: FastAPI):
     # Spawn background reaper task for expired playback runs
     async def guarded_playback_reaper() -> None:
         await wait_for_update_commit()
+        await catalog_recovery_complete.wait()
         await playback_run_reaper()
 
     reaper_task = asyncio.create_task(guarded_playback_reaper())

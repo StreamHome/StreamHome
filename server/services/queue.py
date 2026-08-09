@@ -1369,7 +1369,7 @@ class DownloadQueueManager:
             
             # Sweep DB first to reconcile URLs and check actual file/cloud presence
             logger.info("[Queue Manager Recovery] Sweeping database to reconcile video URLs...")
-            async with AsyncSession(engine) as db:
+            async with AsyncSession(engine, expire_on_commit=False) as db:
                 # Reconcile Movies
                 movie_stmt = select(Movie)
                 movies = (await db.exec(movie_stmt)).all()
@@ -1393,7 +1393,12 @@ class DownloadQueueManager:
                             m.catalog_source = "server"
                             m.availability = "available"
                             db.add(m)
-                            
+
+                # Commit movie reconciliation before the episode query can
+                # autoflush dirty rows. Episode existence checks may perform
+                # slow cloud I/O and must never inherit a SQLite write lock.
+                await db.commit()
+
                 # Reconcile Episodes
                 ep_stmt = select(Episode)
                 episodes = (await db.exec(ep_stmt)).all()
@@ -1570,7 +1575,7 @@ class DownloadQueueManager:
                                             existing.source_fingerprint = probe_info.get("source_fingerprint")
                                             existing.audio_metadata = probe_info.get("audio_metadata", [])
                                             db.add(existing)
-                                            await db.commit()
+                                        await db.commit()
                                         continue
                                     logger.info(f"[Queue Manager Recovery] Restoring Movie TMDB {tmdb_id} from {meta_path}...")
                                     meta = await tmdb_client.fetch_movie_metadata(tmdb_id)
@@ -1600,7 +1605,7 @@ class DownloadQueueManager:
                                                 existing.source_fingerprint = probe_info.get("source_fingerprint")
                                                 existing.audio_metadata = probe_info.get("audio_metadata", [])
                                                 db.add(existing)
-                                                await db.commit()
+                                            await db.commit()
                                             continue
                                         logger.info(f"[Queue Manager Recovery] Restoring Episode S{season}E{episode} (TMDB {tmdb_id}) from {meta_path}...")
                                         meta = await tmdb_client.fetch_show_metadata(tmdb_id)
@@ -1610,6 +1615,7 @@ class DownloadQueueManager:
                                         show_id = f"tv_{tmdb_id}"
                                         existing = await db.get(Movie, show_id)
                                         if existing and not (existing.title.startswith("Captured ") or "credentials are not set" in (existing.description or "")):
+                                            await db.rollback()
                                             continue
                                         logger.info(f"[Queue Manager Recovery] Restoring Series TMDB {tmdb_id} from {meta_path}...")
                                         meta = await tmdb_client.fetch_show_metadata(tmdb_id)
@@ -1682,9 +1688,16 @@ class DownloadQueueManager:
                                     language=language, subtitles_list=data.get("subtitles"),
                                     quality=data.get("quality"), skip_markers=data.get("skip_markers")
                                 )
+                                # _catalog_media intentionally flushes without
+                                # committing so ingestion can publish atomically.
+                                # Recovery owns a separate entry transaction and
+                                # must release its write lock before probing the
+                                # next media file.
+                                await db.commit()
                                 count += 1
                                 
                             except Exception as e:
+                                await db.rollback()
                                 logger.error(f"[Queue Manager] Error recovering {meta_path}: {e}")
                                 
             logger.info(f"[Queue Manager] Disk sync complete. Recovered {count} entries.")

@@ -170,6 +170,78 @@ def test_queue_contracts() -> None:
     assert "AsyncSession(engine, expire_on_commit=False)" in analyze_source
 
 
+def test_catalog_recovery_releases_sqlite_writes_between_media_entries() -> None:
+    queue_source = Path(__file__).parents[1].joinpath("services", "queue.py").read_text(encoding="utf-8")
+    recovery_source = queue_source[
+        queue_source.index("    async def sync_media_from_disk"):
+        queue_source.index("\nqueue_manager = DownloadQueueManager()")
+    ]
+
+    movie_reconciliation_commit = recovery_source.index(
+        "# Commit movie reconciliation before the episode query"
+    )
+    episode_query = recovery_source.index("# Reconcile Episodes")
+    sweep_session = recovery_source.index("async with AsyncSession(engine, expire_on_commit=False) as db:")
+    assert sweep_session < movie_reconciliation_commit
+    assert "await db.commit()" in recovery_source[movie_reconciliation_commit:episode_query]
+
+    catalog_call = recovery_source.index("await self._catalog_media")
+    recovered_count = recovery_source.index("count += 1", catalog_call)
+    assert "await db.commit()" in recovery_source[catalog_call:recovered_count]
+
+    recovery_error = recovery_source.index("except Exception as e:", catalog_call)
+    recovery_log = recovery_source.index("logger.error", recovery_error)
+    assert "await db.rollback()" in recovery_source[recovery_error:recovery_log]
+
+    existing_movie = recovery_source.index(
+        'if existing and not (existing.title.startswith("Captured ")'
+    )
+    restore_movie = recovery_source.index(
+        'logger.info(f"[Queue Manager Recovery] Restoring Movie',
+        existing_movie,
+    )
+    assert "await db.commit()" in recovery_source[existing_movie:restore_movie]
+
+    existing_episode = recovery_source.index(
+        'if existing and not (existing.title.startswith("Episode ")'
+    )
+    restore_episode = recovery_source.index(
+        'logger.info(f"[Queue Manager Recovery] Restoring Episode',
+        existing_episode,
+    )
+    assert "await db.commit()" in recovery_source[existing_episode:restore_episode]
+
+    existing_series = recovery_source.index(
+        'if existing and not (existing.title.startswith("Captured ")',
+        existing_episode,
+    )
+    restore_series = recovery_source.index(
+        'logger.info(f"[Queue Manager Recovery] Restoring Series',
+        existing_series,
+    )
+    assert "await db.rollback()" in recovery_source[existing_series:restore_series]
+
+
+def test_database_writing_workers_wait_for_catalog_recovery() -> None:
+    main_source = Path(__file__).parents[1].joinpath("main.py").read_text(encoding="utf-8")
+    assert "catalog_recovery_complete = asyncio.Event()" in main_source
+    assert "finally:\n            catalog_recovery_complete.set()" in main_source
+
+    worker_sections = {
+        "runtime workers": ("    async def start_runtime_workers()", "    async def daily_backup_worker()"),
+        "daily backup": ("    async def daily_backup_worker()", "    background_tasks.append(asyncio.create_task(daily_backup_worker()"),
+        "automatic updates": ("    async def guarded_automatic_update_worker()", "    background_tasks.append(asyncio.create_task(guarded_automatic_update_worker()"),
+        "recommendations": ("    async def guarded_recommendation_worker()", "    recommendation_task = asyncio.create_task"),
+        "playback reaper": ("    async def guarded_playback_reaper()", "    reaper_task = asyncio.create_task"),
+    }
+    for label, (start_marker, end_marker) in worker_sections.items():
+        section = main_source[
+            main_source.index(start_marker):
+            main_source.index(end_marker, main_source.index(start_marker))
+        ]
+        assert "await catalog_recovery_complete.wait()" in section, label
+
+
 if __name__ == "__main__":
     test_failure_classification()
     test_ffmpeg_input_options_are_source_specific()
@@ -178,4 +250,6 @@ if __name__ == "__main__":
     test_compact_and_redacted_diagnostics()
     test_diagnostics_file_redacts_secrets()
     test_queue_contracts()
+    test_catalog_recovery_releases_sqlite_writes_between_media_entries()
+    test_database_writing_workers_wait_for_catalog_recovery()
     print("Queue failure handling regression checks passed.")
