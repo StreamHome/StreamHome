@@ -558,20 +558,51 @@ cleanup() {
     exit "$exit_code"
 }
 
+initialize_update_lock() {
+    CONTROLLER_START_TICKS="$(process_start_ticks "$$")"
+    if ! printf '%s\n' "$$" > "$UPDATE_LOCK/owner.pid" \
+        || ! printf '%s\n' "$CONTROLLER_START_TICKS" > "$UPDATE_LOCK/owner.start"; then
+        rm -f -- "$UPDATE_LOCK/owner.pid" "$UPDATE_LOCK/owner.start"
+        rmdir -- "$UPDATE_LOCK" 2>/dev/null || true
+        return 1
+    fi
+    LOCK_ACQUIRED=true
+    start_update_heartbeat
+}
+
+remove_quarantined_update_lock() {
+    local quarantined_lock="$1"
+    [[ "$quarantined_lock" == "$RUN_DIR"/update.lock.stale.* ]] || return 1
+    rm -f -- "$quarantined_lock"/heartbeat.tmp.*
+    rm -f -- "$quarantined_lock/heartbeat"
+    rm -f -- "$quarantined_lock/owner.pid"
+    rm -f -- "$quarantined_lock/owner.start"
+    rmdir -- "$quarantined_lock" 2>/dev/null || true
+}
+
 acquire_update_lock() {
-    local owner="" lock_age="0"
+    local owner="" lock_age="0" recovery_fd="" quarantined_lock="" lock_claimed=false
     mkdir -p "$RUN_DIR"
     chmod 700 "$RUN_DIR" 2>/dev/null || true
     if mkdir "$UPDATE_LOCK" 2>/dev/null; then
-        CONTROLLER_START_TICKS="$(process_start_ticks "$$")"
-        printf '%s\n' "$$" > "$UPDATE_LOCK/owner.pid"
-        printf '%s\n' "$CONTROLLER_START_TICKS" > "$UPDATE_LOCK/owner.start"
-        LOCK_ACQUIRED=true
-        start_update_heartbeat
-        return 0
+        initialize_update_lock
+        return $?
+    fi
+    command -v flock >/dev/null 2>&1 || return 1
+    exec {recovery_fd}> "$RUN_DIR/update-lock-recovery.lock" || return 1
+    if ! flock -n "$recovery_fd"; then
+        exec {recovery_fd}>&-
+        return 1
+    fi
+    if mkdir "$UPDATE_LOCK" 2>/dev/null; then
+        initialize_update_lock
+        lock_claimed=$?
+        exec {recovery_fd}>&-
+        return "$lock_claimed"
     fi
     owner="$(cat "$UPDATE_LOCK/owner.pid" 2>/dev/null || true)"
     if [[ "$owner" =~ ^[0-9]+$ ]] && update_process_is_controller "$owner"; then
+        exec {recovery_fd}>&-
         return 1
     fi
     lock_age="$(python3 - "$UPDATE_LOCK" <<'PY'
@@ -586,17 +617,22 @@ except OSError:
 PY
 )"
     if [[ ! "$lock_age" =~ ^[0-9]+$ ]] || (( lock_age < 30 )); then
+        exec {recovery_fd}>&-
         return 1
     fi
-    rm -f -- "$UPDATE_LOCK/owner.pid"
-    rm -f -- "$UPDATE_LOCK/owner.start"
-    rmdir -- "$UPDATE_LOCK" 2>/dev/null || return 1
-    mkdir "$UPDATE_LOCK" || return 1
-    CONTROLLER_START_TICKS="$(process_start_ticks "$$")"
-    printf '%s\n' "$$" > "$UPDATE_LOCK/owner.pid"
-    printf '%s\n' "$CONTROLLER_START_TICKS" > "$UPDATE_LOCK/owner.start"
-    LOCK_ACQUIRED=true
-    start_update_heartbeat
+    quarantined_lock="$RUN_DIR/update.lock.stale.$$.$RANDOM"
+    if ! mv -T -- "$UPDATE_LOCK" "$quarantined_lock" 2>/dev/null; then
+        exec {recovery_fd}>&-
+        return 1
+    fi
+    if mkdir "$UPDATE_LOCK" 2>/dev/null; then
+        if initialize_update_lock; then
+            lock_claimed=true
+        fi
+    fi
+    remove_quarantined_update_lock "$quarantined_lock" || true
+    exec {recovery_fd}>&-
+    [[ "$lock_claimed" == true ]]
 }
 
 start_maintenance() {

@@ -160,6 +160,7 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("-m pip check", setup_sh)
         self.assertIn("listener-inspector", setup_sh)
         self.assertIn("setsid from util-linux", setup_sh)
+        self.assertIn("flock from util-linux", setup_sh)
         self.assertIn('MIN_RCLONE_VERSION="1.68"', setup_sh)
         self.assertIn('RCLONE_INSTALL_VERSION="1.74.4"', setup_sh)
         self.assertIn("downloads.rclone.org/v${RCLONE_INSTALL_VERSION}", setup_sh)
@@ -225,6 +226,8 @@ class SetupScriptContracts(unittest.TestCase):
         self.assertIn("--finalize-recovery", update_sh)
         self.assertIn("recovery_start_failed", update_sh)
         self.assertIn("update-diagnostics.json", update_sh)
+        self.assertIn("update-lock-recovery.lock", update_sh)
+        self.assertIn('mv -T -- "$UPDATE_LOCK" "$quarantined_lock"', update_sh)
         self.assertIn("prepare_python_wheelhouse", update_sh)
         self.assertIn("--no-index", update_sh)
         self.assertIn("activate_prepared_web", update_sh)
@@ -399,6 +402,105 @@ class SetupScriptContracts(unittest.TestCase):
                 "python dependencies",
             )
             self.assertEqual(classify(web_dependencies, python_dependencies)["python_dependencies_changed"], "true")
+
+    @unittest.skipIf(os.name == "nt", "Update lock ownership requires native Linux process semantics")
+    def test_update_controller_recovers_a_stale_lock_with_heartbeat_artifacts(self) -> None:
+        bash = bash_command()
+        if not bash:
+            self.skipTest("Bash is not installed")
+
+        with tempfile.TemporaryDirectory(dir=ROOT / "temp") as temporary:
+            fixture = Path(temporary)
+            run_directory = fixture / ".run"
+            update_lock = run_directory / "update.lock"
+
+            def create_stale_lock(*, owner_pid: int = 99999999, owner_start: str = "1") -> None:
+                update_lock.mkdir(parents=True)
+                (update_lock / "owner.pid").write_text(f"{owner_pid}\n", encoding="utf-8")
+                (update_lock / "owner.start").write_text(f"{owner_start}\n", encoding="utf-8")
+                (update_lock / "heartbeat").write_text("stale\n", encoding="utf-8")
+                stale_time = time.time() - 60
+                os.utime(update_lock, (stale_time, stale_time))
+
+            update_source = (ROOT / "update.sh").read_text(encoding="utf-8")
+            function_source = update_source.split('\ncase "${1:-}" in\n', 1)[0]
+            harness = fixture / "update-controller.test.sh"
+            harness.write_text(
+                function_source
+                + "\n"
+                + f"ROOT_DIR='{bash_path(fixture)}'\n"
+                + f"RUN_DIR='{bash_path(run_directory)}'\n"
+                + 'UPDATE_LOCK="$RUN_DIR/update.lock"\n'
+                + 'STATUS_FILE="$RUN_DIR/update-state.json"\n'
+                + 'LEASE_FILE="$RUN_DIR/update-lease.json"\n'
+                + "acquire_update_lock || exit 10\n"
+                + '[[ -f "$UPDATE_LOCK/owner.pid" ]] || exit 11\n'
+                + '[[ "${2:-}" == "--hold" ]] && sleep 1\n'
+                + "release_lock\n"
+                + '[[ ! -e "$UPDATE_LOCK" ]] || exit 13\n'
+                + 'compgen -G "$RUN_DIR/update.lock.stale.*" >/dev/null && exit 14\n'
+                + "exit 0\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+
+            create_stale_lock()
+            result = run([bash, str(harness), "--execute"], cwd=fixture)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((run_directory / "update-lock-recovery.lock").is_file())
+
+            update_lock.mkdir()
+            (update_lock / "heartbeat").write_text("fresh\n", encoding="utf-8")
+            fresh = run([bash, str(harness), "--execute"], cwd=fixture)
+            self.assertEqual(fresh.returncode, 10, fresh.stdout + fresh.stderr)
+            self.assertEqual((update_lock / "heartbeat").read_text(encoding="utf-8"), "fresh\n")
+            shutil.rmtree(update_lock)
+
+            live_controller = fixture / "update-controller.live.sh"
+            live_controller.write_text(
+                "#!/usr/bin/env bash\n"
+                "while true; do\n"
+                "    sleep 1\n"
+                "done\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            live_process = subprocess.Popen(
+                [bash, str(live_controller), "--execute"],
+                cwd=fixture,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                process_stat = Path(f"/proc/{live_process.pid}/stat").read_text(encoding="utf-8")
+                process_start = process_stat[process_stat.rfind(")") + 2 :].split()[19]
+                create_stale_lock(owner_pid=live_process.pid, owner_start=process_start)
+                occupied = run([bash, str(harness), "--execute"], cwd=fixture)
+                self.assertEqual(occupied.returncode, 10, occupied.stdout + occupied.stderr)
+                self.assertEqual(
+                    (update_lock / "owner.pid").read_text(encoding="utf-8"),
+                    f"{live_process.pid}\n",
+                )
+            finally:
+                live_process.terminate()
+                live_process.wait(timeout=5)
+                shutil.rmtree(update_lock)
+
+            create_stale_lock()
+            contenders = [
+                subprocess.Popen(
+                    [bash, str(harness), "--execute", "--hold"],
+                    cwd=fixture,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                for _ in range(2)
+            ]
+            contender_results = [process.communicate(timeout=10) for process in contenders]
+            return_codes = sorted(process.returncode for process in contenders)
+            self.assertEqual(return_codes, [0, 10], contender_results)
+            self.assertFalse(update_lock.exists())
 
     def test_linux_bootstrap_is_atomic_rejects_unverified_no_start_and_refuses_dirty_update(self) -> None:
         bash = bash_command()

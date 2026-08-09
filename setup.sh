@@ -198,7 +198,9 @@ missing_commands() {
     command -v ffprobe >/dev/null 2>&1 || missing+=(ffprobe)
     command -v git >/dev/null 2>&1 || missing+=(git)
     command -v curl >/dev/null 2>&1 || missing+=(curl)
-    command -v setsid >/dev/null 2>&1 || missing+=(util-linux)
+    if ! command -v setsid >/dev/null 2>&1 || ! command -v flock >/dev/null 2>&1; then
+        missing+=(util-linux)
+    fi
     if ! command -v lsof >/dev/null 2>&1 \
         && ! command -v ss >/dev/null 2>&1 \
         && ! command -v fuser >/dev/null 2>&1; then
@@ -243,6 +245,7 @@ validate_versions() {
     command -v git >/dev/null 2>&1 || fail "git is unavailable after dependency installation."
     command -v curl >/dev/null 2>&1 || fail "curl is unavailable after dependency installation."
     command -v setsid >/dev/null 2>&1 || fail "setsid from util-linux is required for isolated StreamHome service groups."
+    command -v flock >/dev/null 2>&1 || fail "flock from util-linux is required for update-lock recovery."
     if ! command -v lsof >/dev/null 2>&1 \
         && ! command -v ss >/dev/null 2>&1 \
         && ! command -v fuser >/dev/null 2>&1; then
