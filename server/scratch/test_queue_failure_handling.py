@@ -12,7 +12,12 @@ from services.ingestion_errors import (
     write_task_diagnostics,
 )
 from services.ffmpeg_input import ffmpeg_network_input_options, is_hls_media_source
-from services.media_source import MediaSourceError, catalog_path_from_storage
+from services.media_source import (
+    MediaSourceError,
+    catalog_path_from_storage,
+    local_playback_fingerprint,
+    local_video_fingerprint,
+)
 from services.audio_extractor import apply_primary_audio_language, audio_track_labels
 from config import settings
 
@@ -91,6 +96,38 @@ def test_storage_paths_become_canonical_media_urls() -> None:
     finally:
         settings.MEDIA_DIR = original_media_dir
         settings.TEMP_DIR = original_temp_dir
+
+
+def test_local_recovery_fingerprint_detects_video_and_audio_changes() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        media_path = Path(temp_dir) / "movie.mp4"
+        audio_dir = media_path.parent / "audio"
+        audio_path = audio_dir / "en.mp3"
+        media_path.write_bytes(b"video-v1")
+        audio_dir.mkdir()
+        audio_path.write_bytes(b"audio-v1")
+        audio_stat = audio_path.stat()
+        audio_metadata = [{
+            "source": "external",
+            "fileName": audio_path.name,
+            "fileSize": audio_stat.st_size,
+            "modifiedAt": audio_stat.st_mtime_ns,
+        }]
+
+        expected = local_playback_fingerprint(media_path, audio_metadata)
+        expected_video = local_video_fingerprint(media_path)
+        assert local_playback_fingerprint(media_path, audio_metadata) == expected
+        assert local_video_fingerprint(media_path) == expected_video
+
+        media_path.write_bytes(b"video-v2-expanded")
+        assert local_playback_fingerprint(media_path, audio_metadata) != expected
+        assert local_video_fingerprint(media_path) != expected_video
+
+        video_updated = local_playback_fingerprint(media_path, audio_metadata)
+        video_identity = local_video_fingerprint(media_path)
+        audio_path.write_bytes(b"audio-v2-expanded")
+        assert local_playback_fingerprint(media_path, audio_metadata) != video_updated
+        assert local_video_fingerprint(media_path) == video_identity
 
 
 def test_audio_track_labels_are_stable_across_reingestion() -> None:
@@ -221,6 +258,13 @@ def test_catalog_recovery_releases_sqlite_writes_between_media_entries() -> None
     )
     assert "await db.rollback()" in recovery_source[existing_series:restore_series]
 
+    fingerprint_check = recovery_source.index("current_recovery_fingerprint = local_playback_fingerprint")
+    audio_extraction = recovery_source.index("extracted_langs = await extract_audio_and_strip_video")
+    completed_probe = recovery_source.index("probe_info = await probe_completed_media(abs_video_path)")
+    assert fingerprint_check < audio_extraction < completed_probe
+    assert "stored_video_fingerprint != current_video_fingerprint" in recovery_source[fingerprint_check:audio_extraction]
+    assert recovery_source.count("await probe_completed_media(abs_video_path)") == 1
+
 
 def test_database_writing_workers_wait_for_catalog_recovery() -> None:
     main_source = Path(__file__).parents[1].joinpath("main.py").read_text(encoding="utf-8")
@@ -255,6 +299,7 @@ if __name__ == "__main__":
     test_failure_classification()
     test_ffmpeg_input_options_are_source_specific()
     test_storage_paths_become_canonical_media_urls()
+    test_local_recovery_fingerprint_detects_video_and_audio_changes()
     test_audio_track_labels_are_stable_across_reingestion()
     test_compact_and_redacted_diagnostics()
     test_diagnostics_file_redacts_secrets()

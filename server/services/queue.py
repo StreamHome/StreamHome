@@ -22,7 +22,15 @@ from services.ingestion_errors import IngestionFailure, IngestionTaskError, prun
 from services.ingest_preview import ingest_preview_service
 from services.rclone import rclone_service
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
-from services.media_source import MediaSourceError, ResolvedMediaSource, catalog_path_from_storage, playback_source_fingerprint, resolve_media_source
+from services.media_source import (
+    MediaSourceError,
+    ResolvedMediaSource,
+    catalog_path_from_storage,
+    local_playback_fingerprint,
+    local_video_fingerprint,
+    playback_source_fingerprint,
+    resolve_media_source,
+)
 from services.vibe_analysis import VIBE_ANALYSIS_VERSION, compute_trope_vectors, vibe_analysis_manager
 from services.audio_extractor import apply_primary_audio_language, extract_audio_and_strip_video, normalize_language_code
 
@@ -833,6 +841,7 @@ class DownloadQueueManager:
         height = probe_meta.get("height")
         frame_rate = probe_meta.get("frame_rate")
         source_fingerprint = probe_meta.get("source_fingerprint")
+        video_fingerprint = probe_meta.get("video_fingerprint")
         selected_language = normalize_language_code(language, "en") if language else None
         audio_meta_list = apply_primary_audio_language(probe_meta.get("audio_metadata", []), selected_language)
         
@@ -964,6 +973,7 @@ class DownloadQueueManager:
                 "height": height,
                 "frame_rate": frame_rate,
                 "source_fingerprint": source_fingerprint,
+                "video_fingerprint": video_fingerprint,
                 "audio_metadata": audio_meta_list,
                 "genres": movie.genres,
                 "cast": movie.cast,
@@ -1152,6 +1162,7 @@ class DownloadQueueManager:
                 "height": height,
                 "frame_rate": frame_rate,
                 "source_fingerprint": source_fingerprint,
+                "video_fingerprint": video_fingerprint,
                 "audio_metadata": audio_meta_list,
                 "genres": show.genres,
                 "cast": show.cast,
@@ -1502,46 +1513,66 @@ class DownloadQueueManager:
                                     except Exception:
                                         pass
                                         
+                                probe_info: Dict[str, Any] = {}
                                 if video_file_rel:
                                     file_path = video_file_rel.replace("\\", "/")
                                     abs_video_path = os.path.abspath(os.path.join(server_root, file_path))
-                                    from services.audio_extractor import extract_audio_and_strip_video
-                                    default_language = data.get("language") or data.get("original_language") or "en"
-                                    extracted_langs = await extract_audio_and_strip_video(abs_video_path, default_lang=default_language)
-                                    if extracted_langs:
-                                        data["languages"] = extracted_langs
+                                    portable_audio = data.get("audio_metadata")
+                                    if not isinstance(portable_audio, list):
+                                        portable_audio = []
+                                    try:
+                                        current_video_fingerprint = local_video_fingerprint(Path(abs_video_path))
+                                        current_recovery_fingerprint = local_playback_fingerprint(
+                                            Path(abs_video_path),
+                                            portable_audio,
+                                        )
+                                    except OSError:
+                                        current_video_fingerprint = ""
+                                        current_recovery_fingerprint = ""
+                                    metadata_changed = False
+                                    if current_recovery_fingerprint == str(data.get("source_fingerprint") or ""):
+                                        probe_info = data
+                                        if current_video_fingerprint and data.get("video_fingerprint") != current_video_fingerprint:
+                                            data["video_fingerprint"] = current_video_fingerprint
+                                            metadata_changed = True
+                                    else:
+                                        stored_video_fingerprint = str(data.get("video_fingerprint") or "")
+                                        if (
+                                            stored_video_fingerprint
+                                            and current_video_fingerprint
+                                            and stored_video_fingerprint != current_video_fingerprint
+                                        ):
+                                            from services.audio_extractor import extract_audio_and_strip_video
+                                            default_language = data.get("language") or data.get("original_language") or "en"
+                                            extracted_langs = await extract_audio_and_strip_video(abs_video_path, default_lang=default_language)
+                                            if extracted_langs:
+                                                data["languages"] = extracted_langs
+
+                                                if media_type == "movie":
+                                                    movie_id = f"m_{tmdb_id}"
+                                                    movie_obj = await db.get(Movie, movie_id)
+                                                    if movie_obj:
+                                                        movie_obj.languages = extracted_langs
+                                                        db.add(movie_obj)
+                                                        await db.commit()
+                                                elif season is not None and episode is not None:
+                                                    ep_id = f"ep_{tmdb_id}_s{season}_e{episode}"
+                                                    ep_obj = await db.get(Episode, ep_id)
+                                                    if ep_obj:
+                                                        ep_obj.languages = extracted_langs
+                                                        db.add(ep_obj)
+                                                        await db.commit()
+
+                                        probe_info = await probe_completed_media(abs_video_path)
+                                        if probe_info:
+                                            data.update(probe_info)
+                                            metadata_changed = True
+                                    if metadata_changed:
                                         try:
                                             with open(meta_path, "w", encoding="utf-8") as fw:
                                                 json.dump(data, fw, indent=2, ensure_ascii=False)
                                         except Exception:
                                             pass
-                                        
-                                        if media_type == "movie":
-                                            movie_id = f"m_{tmdb_id}"
-                                            movie_obj = await db.get(Movie, movie_id)
-                                            if movie_obj:
-                                                movie_obj.languages = extracted_langs
-                                                db.add(movie_obj)
-                                                await db.commit()
-                                        else:
-                                            if season is not None and episode is not None:
-                                                ep_id = f"ep_{tmdb_id}_s{season}_e{episode}"
-                                                ep_obj = await db.get(Episode, ep_id)
-                                                if ep_obj:
-                                                    ep_obj.languages = extracted_langs
-                                                    db.add(ep_obj)
-                                                    await db.commit()
-
-                                    # Probe completed file for rich media metadata if not present in the JSON
-                                    if "source_fingerprint" not in data or not data.get("source_fingerprint"):
-                                        probe_info = await probe_completed_media(abs_video_path)
-                                        if probe_info:
-                                            data.update(probe_info)
-                                            try:
-                                                with open(meta_path, "w", encoding="utf-8") as fw:
-                                                    json.dump(data, fw, indent=2, ensure_ascii=False)
-                                            except Exception:
-                                                pass
                                 else:
                                     file_path = None
                                         
@@ -1562,10 +1593,7 @@ class DownloadQueueManager:
                                         existing.vibe_analysis_status = data.get("vibe_analysis_status", existing.vibe_analysis_status)
                                         existing.vibe_analysis_version = int(data.get("vibe_analysis_version", existing.vibe_analysis_version) or 0)
                                         existing.vibe_analyzed_at = data.get("vibe_analyzed_at", existing.vibe_analyzed_at)
-                                        # Update probed metadata even if it exists
-                                        if file_path:
-                                            abs_video_path = os.path.abspath(os.path.join(server_root, file_path))
-                                            probe_info = await probe_completed_media(abs_video_path)
+                                        if file_path and probe_info:
                                             existing.probed_duration = probe_info.get("probed_duration")
                                             existing.container = probe_info.get("container")
                                             existing.codec = probe_info.get("codec")
@@ -1592,10 +1620,7 @@ class DownloadQueueManager:
                                             existing.vibe_analysis_status = data.get("vibe_analysis_status", existing.vibe_analysis_status)
                                             existing.vibe_analysis_version = int(data.get("vibe_analysis_version", existing.vibe_analysis_version) or 0)
                                             existing.vibe_analyzed_at = data.get("vibe_analyzed_at", existing.vibe_analyzed_at)
-                                            # Update probed metadata even if it exists
-                                            if file_path:
-                                                abs_video_path = os.path.abspath(os.path.join(server_root, file_path))
-                                                probe_info = await probe_completed_media(abs_video_path)
+                                            if file_path and probe_info:
                                                 existing.probed_duration = probe_info.get("probed_duration")
                                                 existing.container = probe_info.get("container")
                                                 existing.codec = probe_info.get("codec")

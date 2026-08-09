@@ -4,13 +4,12 @@ import asyncio
 import json
 import subprocess
 import httpx
-import hashlib
 from pathlib import Path
 from typing import Dict, Any, Optional
 from config import settings
 from services.logger import logger
 from services.languages import language_label, normalize_language_tag
-from services.media_source import EXTERNAL_AUDIO_EXTENSIONS, bind_audio_fingerprint, local_media_identity
+from services.media_source import EXTERNAL_AUDIO_EXTENSIONS, local_playback_fingerprint, local_video_fingerprint
 from services.ingestion_errors import IngestionFailure, classify_failure, compact_diagnostics, sanitize_url, write_task_diagnostics
 from services.ffmpeg_input import (
     ffmpeg_network_input_options,
@@ -371,8 +370,9 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
         # valid audio/eng.*, audio/tur.*, and other standard language-tagged files.
         audio_meta = merge_local_external_audio(file_path, audio_meta)
             
-        base_fingerprint = hashlib.sha256(local_media_identity(Path(file_path)).encode("utf-8")).hexdigest()[:32]
-        source_fingerprint = bind_audio_fingerprint(base_fingerprint, audio_meta)
+        media_path = Path(file_path)
+        source_fingerprint = local_playback_fingerprint(media_path, audio_meta)
+        video_fingerprint = local_video_fingerprint(media_path)
         
         return {
             "probed_duration": duration,
@@ -382,6 +382,7 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
             "height": height,
             "frame_rate": frame_rate,
             "source_fingerprint": source_fingerprint,
+            "video_fingerprint": video_fingerprint,
             "audio_metadata": audio_meta
         }
     except Exception as e:

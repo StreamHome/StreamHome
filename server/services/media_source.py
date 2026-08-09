@@ -61,7 +61,7 @@ class ResolvedMediaSource:
         """Identify the video bytes independently from replaceable audio sidecars."""
 
         if self.local_exists:
-            value = local_video_identity(self.local_path)
+            return local_video_fingerprint(self.local_path)
         else:
             value = f"cloud:{self.cloud_identity or self.cloud_path or self.catalog_path}"
         return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
@@ -75,6 +75,12 @@ def local_video_identity(media_path: Path) -> str:
         "modified": stat.st_mtime_ns,
     }]
     return f"local:{json.dumps(value, sort_keys=True, separators=(',', ':'))}"
+
+
+def local_video_fingerprint(media_path: Path) -> str:
+    """Calculate the current local video identity without inspecting stream contents."""
+
+    return hashlib.sha256(local_video_identity(media_path).encode("utf-8")).hexdigest()[:32]
 
 
 def local_media_identity(media_path: Path) -> str:
@@ -126,6 +132,16 @@ def bind_audio_fingerprint(source_fingerprint: str, audio_metadata: list[dict] |
         separators=(",", ":"),
     )
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
+def local_playback_fingerprint(
+    media_path: Path,
+    audio_metadata: list[dict] | tuple[dict, ...],
+) -> str:
+    """Calculate the current local playback identity without opening media streams."""
+
+    base_fingerprint = hashlib.sha256(local_media_identity(media_path).encode("utf-8")).hexdigest()[:32]
+    return bind_audio_fingerprint(base_fingerprint, audio_metadata)
 
 
 def canonicalize_catalog_path(value: str) -> str:
