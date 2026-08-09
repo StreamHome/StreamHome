@@ -234,17 +234,18 @@ async def lifespan(app: FastAPI):
     async def recover_catalog_and_playback() -> None:
         try:
             await wait_for_update_commit()
-            await queue_manager.sync_media_from_disk()
-            from services.audio_extractor import repair_completed_ingestion_languages
-            await repair_completed_ingestion_languages()
+            try:
+                await queue_manager.sync_media_from_disk()
+                from services.audio_extractor import repair_completed_ingestion_languages
+                await repair_completed_ingestion_languages()
+            finally:
+                catalog_recovery_complete.set()
             await vibe_analysis_manager.start()
             await playback_prep_service.schedule_catalog_baselines()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.error(f"[Lifespan Startup] Catalog/playback recovery failed: {type(exc).__name__}: {exc}")
-        finally:
-            catalog_recovery_complete.set()
 
     try:
         background_tasks.append(

@@ -225,7 +225,16 @@ def test_catalog_recovery_releases_sqlite_writes_between_media_entries() -> None
 def test_database_writing_workers_wait_for_catalog_recovery() -> None:
     main_source = Path(__file__).parents[1].joinpath("main.py").read_text(encoding="utf-8")
     assert "catalog_recovery_complete = asyncio.Event()" in main_source
-    assert "finally:\n            catalog_recovery_complete.set()" in main_source
+    recovery_source = main_source[
+        main_source.index("    async def recover_catalog_and_playback()"):
+        main_source.index("    async def start_runtime_workers()")
+    ]
+    catalog_sync = recovery_source.index("await queue_manager.sync_media_from_disk()")
+    catalog_barrier = recovery_source.index("catalog_recovery_complete.set()")
+    vibe_start = recovery_source.index("await vibe_analysis_manager.start()")
+    playback_warming = recovery_source.index("await playback_prep_service.schedule_catalog_baselines()")
+    assert catalog_sync < catalog_barrier < vibe_start < playback_warming
+    assert "finally:\n                catalog_recovery_complete.set()" in recovery_source
 
     worker_sections = {
         "runtime workers": ("    async def start_runtime_workers()", "    async def daily_backup_worker()"),
