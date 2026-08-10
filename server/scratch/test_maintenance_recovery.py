@@ -103,11 +103,37 @@ class MaintenanceRecoveryTests(unittest.TestCase):
 
             popen.assert_called_once()
             self.assertEqual(Path(popen.call_args.args[0][0]), root / "start.sh")
-            server.shutdown.assert_not_called()
+            server.shutdown.assert_called_once()
             persisted = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["phase"], "recovering")
             self.assertEqual(persisted["error"], "controller_lost")
             self.assertTrue((run_dir / "update-recovery.tx-recover-once.requested").is_file())
+
+    def test_stale_recovery_marker_does_not_prevent_a_new_start_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / ".run"
+            run_dir.mkdir()
+            (root / "start.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            (run_dir / "update-recovery.tx-stale.requested").write_text("old\n", encoding="utf-8")
+            state_path = run_dir / "update-state.json"
+            lease_path = run_dir / "update-lease.json"
+            state_path.write_text(
+                json.dumps({"phase": "failed", "transaction_id": "tx-stale"}),
+                encoding="utf-8",
+            )
+            server = SimpleNamespace(shutdown=Mock())
+            coordinator = RecoveryCoordinator(root, state_path, lease_path, "tx-stale", 30, server)
+
+            with patch("scratch.maintenance_server.subprocess.Popen") as popen:
+                self.assertTrue(
+                    coordinator._queue_recovery(
+                        {"phase": "failed", "controllerActive": False, "transaction": "tx-stale"}
+                    )
+                )
+
+            popen.assert_called_once()
+            server.shutdown.assert_called_once()
 
     def test_terminal_rollback_failure_never_enters_an_automatic_retry_loop(self) -> None:
         self.assertFalse(
@@ -160,7 +186,7 @@ class MaintenanceRecoveryTests(unittest.TestCase):
                 thread.join(timeout=2)
 
     @unittest.skipIf(os.name == "nt", "Controller process death and executable restart handoff require native Linux")
-    def test_killed_controller_at_each_cutover_phase_launches_direct_recovery_and_keeps_maintenance(self) -> None:
+    def test_killed_controller_at_each_cutover_phase_launches_recovery_and_releases_maintenance(self) -> None:
         for phase in ("stopping", "installing", "starting", "rolling_back"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -230,7 +256,8 @@ class MaintenanceRecoveryTests(unittest.TestCase):
                     while time.monotonic() < deadline and not start_marker.is_file():
                         time.sleep(0.1)
                     self.assertTrue(start_marker.is_file(), f"recovery was not launched for {phase}")
-                    self.assertIsNone(maintenance.poll(), f"maintenance exited before recovery took ownership for {phase}")
+                    maintenance.wait(timeout=5)
+                    self.assertIsNotNone(maintenance.returncode, f"maintenance did not release its port for {phase}")
                     persisted = json.loads(state_path.read_text(encoding="utf-8"))
                     self.assertEqual(persisted["phase"], "recovering")
                     self.assertEqual(persisted["error"], "controller_lost")

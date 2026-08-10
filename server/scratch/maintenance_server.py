@@ -188,22 +188,26 @@ class RecoveryCoordinator:
         self.silence_seconds = silence_seconds
         self.server = server
         self.stop_event = threading.Event()
+        self.recovery_queued = False
 
     def _request_path(self, transaction_id: str) -> Path:
         safe_transaction = transaction_id if transaction_id and transaction_id.replace("-", "").isalnum() else "legacy"
         return self.root / ".run" / f"update-recovery.{safe_transaction}.requested"
 
     def _queue_recovery(self, status: dict[str, Any]) -> bool:
+        if self.recovery_queued:
+            return False
         transaction_id = str(status.get("transaction") or self.transaction_id or "legacy")
         request_path = self._request_path(transaction_id)
         try:
             descriptor = os.open(request_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
-            return False
+            descriptor = -1
         except OSError:
             return False
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(f"{time.time():.6f}\n")
+        if descriptor >= 0:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(f"{time.time():.6f}\n")
 
         atomic_update_json(
             self.state_path,
@@ -240,6 +244,8 @@ class RecoveryCoordinator:
                 updated_at=time.time(),
             )
             return False
+        self.recovery_queued = True
+        self.server.shutdown()
         return True
 
     def run(self) -> None:

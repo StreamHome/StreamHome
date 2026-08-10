@@ -85,7 +85,7 @@ describe("UpdatesPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Authorize install the update now" }));
 
     await waitFor(() => expect(updates.installUpdate).toHaveBeenCalledWith("now"));
-    expect(await screen.findByText(/Immediate preflight started/)).toBeTruthy();
+    expect(await screen.findByText(/Official update\.sh launch requested/)).toBeTruthy();
     expect(screen.getByText("Immediate mode ignores the window")).toBeTruthy();
   });
 

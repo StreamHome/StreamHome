@@ -25,14 +25,11 @@ from services.update import (
     install_lock_active,
     launch_queued_update_if_ready,
     maintenance_window_open,
-    persisted_update_handoff_token_matches,
     protected_cutover_blockers,
-    quiesce_cancellable_update_work,
     queue_update,
     read_update_log,
     read_update_state,
     update_lock_active,
-    update_handoff_blockers,
     write_update_state,
 )
 
@@ -162,6 +159,7 @@ def _runtime_error(exc: RuntimeError) -> HTTPException:
         "dirty_worktree": "Local source changes must be committed or moved before updating.",
         "untrusted_origin": "The installation does not use the official StreamHome repository.",
         "invalid_install_mode": "Choose either immediate installation or installation when idle.",
+        "update_script_unavailable": "The installation-root update.sh file is unavailable or could not be made executable.",
     }
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
@@ -175,46 +173,6 @@ async def update_browser_presence(
     session: AuthSession = Depends(get_current_session),
 ):
     state.record_browser_presence(session.id, payload.visible)
-
-
-@router.post("/handoff", include_in_schema=False)
-async def approve_update_handoff(
-    request: Request,
-    token: str = Header(default="", alias="X-StreamHome-Update-Handoff"),
-):
-    """Allow only the detached localhost controller to reserve a verified-idle cutover."""
-    try:
-        peer = ipaddress.ip_address(request.client.host if request.client else "")
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail={"code": "handoff_forbidden", "message": "Update handoff is local only."}) from exc
-    update_state = read_update_state()
-    memory_token_matches = bool(state.UPDATE_HANDOFF_TOKEN) and hmac.compare_digest(token, state.UPDATE_HANDOFF_TOKEN)
-    persisted_token_matches = persisted_update_handoff_token_matches(
-        token,
-        str(update_state.get("handoff_file") or ""),
-    )
-    if (
-        not peer.is_loopback
-        or update_state.get("phase") != "waiting_for_idle"
-        or not (memory_token_matches or persisted_token_matches)
-    ):
-        raise HTTPException(status_code=403, detail={"code": "handoff_forbidden", "message": "Update handoff authorization failed."})
-    install_mode = str(update_state.get("install_mode") or "when_idle")
-    blockers = await update_handoff_blockers(install_mode)
-    if blockers:
-        raise HTTPException(
-            status_code=409,
-            detail={"code": "server_busy", "message": blockers[0], "blockers": blockers},
-        )
-    state.MAINTENANCE_MODE = True
-    state.MAINTENANCE_REASON = (
-        "StreamHome is installing an administrator-requested update and will return automatically."
-        if install_mode == "now"
-        else "StreamHome is installing a validated update and will return automatically."
-    )
-    await quiesce_cancellable_update_work()
-    state.UPDATE_HANDOFF_TOKEN = ""
-    return {"approved": True}
 
 
 @router.post("/commit", include_in_schema=False)

@@ -84,7 +84,7 @@ export function UpdatesPanel() {
   const performProtectedAction = async () => {
     if (!protectedAction || !policy) return;
     if (protectedAction === "save") await run(() => updateUpdatePolicy(policy), "Automatic update settings saved.");
-    if (protectedAction === "install-now") await run(() => installUpdate("now"), "Immediate preflight started. StreamHome will restart after protected operations finish.");
+    if (protectedAction === "install-now") await run(() => installUpdate("now"), "Official update.sh launch requested. StreamHome will restart after protected operations finish.");
     if (protectedAction === "install-idle") await run(() => installUpdate("when_idle"), "Update queued. Installation begins after all activity becomes idle.");
     if (protectedAction === "retry") await run(() => installUpdate("when_idle", true), "The failed target was explicitly queued for one retry.");
     if (protectedAction === "cancel") await run(cancelPendingUpdate, "Update cancellation requested.");

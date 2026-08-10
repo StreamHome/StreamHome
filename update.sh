@@ -40,7 +40,6 @@ PUBLIC_ORIGIN_WAS_READY=false
 COMMIT_TOKEN=""
 COMMIT_FILE=""
 CANCEL_FILE=""
-UPDATE_HANDOFF_TIMEOUT_SECONDS="${STREAMHOME_UPDATE_HANDOFF_TIMEOUT_SECONDS:-21600}"
 UPDATE_COMMAND_TIMEOUT_SECONDS="${STREAMHOME_UPDATE_COMMAND_TIMEOUT_SECONDS:-1800}"
 
 usage() {
@@ -962,61 +961,6 @@ stop_installed_runtime_with_target_lifecycle() {
     return "$result"
 }
 
-wait_for_idle_handoff() {
-    local code handoff_token install_mode wait_started
-    handoff_token="$(cat "$HANDOFF_FILE" 2>/dev/null || true)"
-    [[ -n "$handoff_token" ]] || return 1
-    install_mode="$(python3 - "$STATUS_FILE" <<'PY'
-import json
-import sys
-
-try:
-    payload = json.load(open(sys.argv[1], encoding="utf-8"))
-except (OSError, ValueError, TypeError):
-    payload = {}
-print(payload.get("install_mode", "when_idle"))
-PY
-)"
-    if [[ "$install_mode" == "now" ]]; then
-        write_state "waiting_for_idle" "Preflight passed. Requesting immediate protected cutover."
-    else
-        write_state "waiting_for_idle" "Preflight passed. Waiting for the server to become idle again."
-    fi
-    wait_started="$(date +%s)"
-    while true; do
-        if cancellation_requested; then
-            log "Cancellation was requested before protected cutover."
-            return 2
-        fi
-        if (( $(date +%s) - wait_started >= UPDATE_HANDOFF_TIMEOUT_SECONDS )); then
-            log "The protected cutover handoff timed out after ${UPDATE_HANDOFF_TIMEOUT_SECONDS} seconds."
-            return 1
-        fi
-        code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
-            -H "X-StreamHome-Update-Handoff: $handoff_token" \
-            -X POST "http://127.0.0.1:8000/api/update/handoff" 2>/dev/null || true)"
-        case "$code" in
-            200)
-                rm -f -- "$HANDOFF_FILE"
-                log "The backend reserved a protected maintenance cutover."
-                return 0
-                ;;
-            403)
-                rm -f -- "$HANDOFF_FILE"
-                log "The backend rejected the update handoff authorization."
-                return 1
-                ;;
-            409)
-                sleep 30
-                ;;
-            *)
-                log "The backend became unavailable before approving the cutover."
-                return 1
-                ;;
-        esac
-    done
-}
-
 create_database_checkpoint() {
     local database="$ROOT_DIR/server/database.db" checkpoint="$RUN_DIR/pre-update-database.db"
     [[ -f "$database" ]] || {
@@ -1426,10 +1370,7 @@ execute_update() {
     trap cleanup EXIT
     trap 'exit 130' INT TERM HUP
 
-    [[ "$UPDATE_HANDOFF_TIMEOUT_SECONDS" =~ ^[0-9]+$ \
-        && "$UPDATE_COMMAND_TIMEOUT_SECONDS" =~ ^[0-9]+$ \
-        && "$UPDATE_HANDOFF_TIMEOUT_SECONDS" -ge 60 \
-        && "$UPDATE_HANDOFF_TIMEOUT_SECONDS" -le 86400 \
+    [[ "$UPDATE_COMMAND_TIMEOUT_SECONDS" =~ ^[0-9]+$ \
         && "$UPDATE_COMMAND_TIMEOUT_SECONDS" -ge 60 \
         && "$UPDATE_COMMAND_TIMEOUT_SECONDS" -le 7200 ]] || {
         write_state "failed" "Update timeout configuration is invalid." "invalid_update_timeout" "$TARGET_COMMIT"
@@ -1465,21 +1406,8 @@ execute_update() {
         write_state "failed" "The checkout changed during preflight. The running installation was not modified." "dirty_worktree" "$TARGET_COMMIT"
         return 1
     fi
-    if [[ "$MANUAL_CUTOVER" == true ]]; then
-        write_state "waiting_for_idle" "Manual terminal update approved. Beginning protected cutover."
-        log "Manual terminal update approved; active sessions will be disconnected."
-    else
-        wait_for_idle_handoff
-        handoff_result=$?
-        if [[ "$handoff_result" -eq 2 ]]; then
-            record_cancelled_update
-            return 0
-        fi
-        if [[ "$handoff_result" -ne 0 ]]; then
-            write_state "failed" "The updater could not reserve a verified-idle cutover." "idle_handoff_failed" "$TARGET_COMMIT"
-            return 1
-        fi
-    fi
+    write_state "waiting_for_idle" "The official update.sh controller is beginning protected cutover."
+    log "The official update.sh controller owns cutover; active sessions will be disconnected."
     if public_origin_matches "$OLD_COMMIT"; then
         PUBLIC_ORIGIN_WAS_READY=true
         log "The configured public origin is healthy on the installed build; post-update ingress verification is required."
@@ -1632,7 +1560,9 @@ case "${1:-}" in
         HANDOFF_FILE="$5"
         ROOT_DIR="$(cd "$6" && pwd -P)"
         [[ "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ && "$OLD_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 2
+        [[ "$AUTOMATIC" == "true" || "$AUTOMATIC" == "false" ]] || exit 2
         [[ "$HANDOFF_FILE" == "$ROOT_DIR"/.run/update-handoff.*.token ]] || exit 2
+        log "Accepting a legacy managed-update request; update.sh now owns protected cutover directly."
         execute_update
         ;;
     --manual-execute)
@@ -1642,10 +1572,11 @@ case "${1:-}" in
         UPDATE_BRANCH="$4"
         START_AFTER_UPDATE="$5"
         ROOT_DIR="$(cd "$6" && pwd -P)"
-        AUTOMATIC=false
+        AUTOMATIC="${STREAMHOME_UPDATE_AUTOMATIC:-false}"
         MANUAL_CUTOVER=true
         HANDOFF_FILE=""
         [[ "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ && "$OLD_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 2
+        [[ "$AUTOMATIC" == "true" || "$AUTOMATIC" == "false" ]] || exit 2
         [[ "$UPDATE_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$UPDATE_BRANCH" != *".."* ]] || exit 2
         [[ "$START_AFTER_UPDATE" == "true" || "$START_AFTER_UPDATE" == "false" ]] || exit 2
         execute_update

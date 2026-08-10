@@ -44,7 +44,6 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.original_update_guard = (
             state.MAINTENANCE_MODE,
             state.MAINTENANCE_REASON,
-            state.UPDATE_HANDOFF_TOKEN,
             state.UPDATE_COMMIT_TOKEN,
             state.UPDATE_TRANSACTION_ID,
         )
@@ -53,8 +52,6 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         state.ACTIVE_PROCESSES.clear()
         state.BROWSER_PRESENCE.clear()
         update.queue_manager.active_tasks.clear()
-        update.playback_prep_service.active_jobs.clear()
-        update.playback_prep_service.resume_after_update_quiesce()
         settings.SETUP_COMPLETE = True
 
     def tearDown(self) -> None:
@@ -70,12 +67,9 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         (
             state.MAINTENANCE_MODE,
             state.MAINTENANCE_REASON,
-            state.UPDATE_HANDOFF_TOKEN,
             state.UPDATE_COMMIT_TOKEN,
             state.UPDATE_TRANSACTION_ID,
         ) = self.original_update_guard
-        update.playback_prep_service.active_jobs.clear()
-        update.playback_prep_service.resume_after_update_quiesce()
         for active_patch in reversed(self.patches):
             active_patch.stop()
         self.temporary.cleanup()
@@ -252,49 +246,6 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(update, "is_database_idle", AsyncMock(return_value=True)):
             self.assertEqual(await update.idle_blockers(), [])
 
-    async def test_playback_cache_warming_is_quiesced_instead_of_blocking_cutover(self) -> None:
-        task = asyncio.create_task(asyncio.sleep(60))
-        update.playback_prep_service.active_jobs["movie:fingerprint:video_720"] = task
-
-        with patch.object(update, "is_database_idle", AsyncMock(return_value=True)):
-            idle = await update.idle_blockers()
-        protected = await update.protected_cutover_blockers()
-
-        self.assertFalse(any("active media operation" in blocker for blocker in idle))
-        self.assertFalse(any("active media operation" in blocker for blocker in protected))
-        self.assertEqual(update.playback_cache_work_count(), 1)
-        self.assertEqual(await update.quiesce_cancellable_update_work(), 0)
-        self.assertTrue(task.cancelled())
-        self.assertTrue(update.playback_prep_service.update_quiesced)
-
-    async def test_persisted_handoff_survives_backend_memory_loss_and_quiesces_cache_work(self) -> None:
-        token = "persisted-handoff-token"
-        token_path = self.run_dir / "update-handoff.test.token"
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(token, encoding="utf-8")
-        update.write_update_state(
-            phase="waiting_for_idle",
-            message="Waiting",
-            current_commit="a" * 40,
-            target_commit="b" * 40,
-            update_available=False,
-            install_mode="now",
-            handoff_file=str(token_path),
-        )
-        state.UPDATE_HANDOFF_TOKEN = ""
-        request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
-
-        with (
-            patch.object(update_route, "update_handoff_blockers", AsyncMock(return_value=[])),
-            patch.object(update_route, "quiesce_cancellable_update_work", AsyncMock(return_value=0)) as quiesce,
-        ):
-            response = await update_route.approve_update_handoff(request, token)
-
-        self.assertEqual(response, {"approved": True})
-        self.assertTrue(state.MAINTENANCE_MODE)
-        self.assertEqual(state.UPDATE_HANDOFF_TOKEN, "")
-        quiesce.assert_awaited_once()
-
     def test_managed_updates_refuse_a_concurrent_public_installer(self) -> None:
         workspace = Path(self.temporary.name) / "StreamHome"
         workspace.mkdir()
@@ -343,7 +294,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queued["phase"], "queued")
         self.assertFalse(queued["automatic"])
 
-    async def test_immediate_mode_starts_preflight_without_idle_but_keeps_protected_handoff_blockers(self) -> None:
+    async def test_immediate_mode_ignores_viewer_idle_but_waits_for_protected_work(self) -> None:
         target = "d" * 40
         update.write_update_state(
             phase="update_available",
@@ -356,28 +307,31 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queued["install_mode"], "now")
         self.assertIn("Immediate update requested", queued["message"])
 
-        with patch.object(update, "idle_blockers", AsyncMock(return_value=["1 active browser session"])) as idle:
+        with (
+            patch.object(update, "idle_blockers", AsyncMock(return_value=["1 active browser session"])) as idle,
+            patch.object(update, "protected_cutover_blockers", AsyncMock(return_value=[])) as protected,
+        ):
             self.assertEqual(await update.queued_launch_blockers(queued), [])
             idle.assert_not_awaited()
+            protected.assert_awaited_once()
 
         with patch.object(update, "protected_cutover_blockers", AsyncMock(return_value=["1 active ingestion or download task"])):
             self.assertEqual(
-                await update.update_handoff_blockers("now"),
+                await update.queued_launch_blockers(queued),
                 ["1 active ingestion or download task"],
-            )
-
-        with patch.object(update, "idle_blockers", AsyncMock(return_value=["1 active browser session"])):
-            self.assertEqual(
-                await update.update_handoff_blockers("when_idle"),
-                ["1 active browser session"],
             )
 
         with self.assertRaisesRegex(RuntimeError, "invalid_install_mode"):
             await update.queue_update(automatic=False, install_mode="force")
 
-    async def test_target_release_controller_is_launched_directly_in_a_new_session(self) -> None:
+    async def test_official_update_script_is_made_executable_and_launched_in_a_new_session(self) -> None:
         target = "e" * 40
         current = "a" * 40
+        workspace = Path(self.temporary.name) / "StreamHome"
+        workspace.mkdir()
+        update_script = workspace / "update.sh"
+        update_script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8", newline="\n")
+        update_script.chmod(0o644)
         update.write_update_state(
             phase="queued",
             message="Queued",
@@ -388,38 +342,30 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
             install_mode="now",
         )
 
-        async def fake_git(args: list[str], cwd: Path = update.WORKSPACE_ROOT):
-            del cwd
-            if args == ["show", f"{target}:update.sh"]:
-                return 0, "#!/usr/bin/env bash\nprintf 'target controller\\n'", ""
-            raise AssertionError(f"Unexpected Git command: {args}")
-
         with (
             patch.object(update.os, "name", "posix"),
+            patch.object(update, "WORKSPACE_ROOT", workspace),
+            patch.object(update, "UPDATE_SCRIPT", update_script),
             patch.object(update, "current_commit", AsyncMock(return_value=current)),
             patch.object(update, "queued_launch_blockers", AsyncMock(return_value=[])),
-            patch.object(update, "run_git_cmd", fake_git),
+            patch.object(update, "verify_update_commit_range", AsyncMock(return_value=(True, ""))),
+            patch.object(update.os, "chmod") as chmod,
             patch.object(
                 update.asyncio,
                 "create_subprocess_exec",
-                AsyncMock(),
+                AsyncMock(return_value=SimpleNamespace(pid=4321)),
             ) as launch,
         ):
             self.assertTrue(await update.launch_queued_update_if_ready())
 
         persisted = update.read_update_state()
-        self.assertEqual(persisted["phase"], "preflight")
+        self.assertEqual(persisted["phase"], "queued")
+        self.assertEqual(persisted["updater_pid"], 4321)
         launch.assert_awaited_once()
         arguments = launch.await_args.args
-        self.assertEqual(Path(persisted["handoff_file"]), Path(arguments[6]))
-        self.assertEqual(arguments[0], "bash")
-        self.assertEqual(arguments[2], "--execute")
-        self.assertEqual(arguments[3], target)
-        self.assertEqual(arguments[4], current)
-        self.assertEqual(arguments[5], "false")
-        self.assertEqual(Path(arguments[6]).parent, self.run_dir)
-        self.assertEqual(Path(arguments[7]), update.WORKSPACE_ROOT)
-        self.assertTrue(str(arguments[1]).endswith(".sh"))
+        self.assertEqual(arguments, (str(update_script),))
+        chmod.assert_called_once()
+        self.assertEqual(chmod.call_args.args[1] & 0o111, 0o111)
         self.assertEqual(launch.await_args.kwargs["start_new_session"], True)
         detached_environment = launch.await_args.kwargs["env"]
         self.assertNotIn("STREAMHOME_INSTANCE_ROOT", detached_environment)
@@ -427,8 +373,8 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("STREAMHOME_SERVICE", detached_environment)
         self.assertNotIn("STREAMHOME_UPDATE_TRANSACTION", detached_environment)
         self.assertNotIn("STREAMHOME_UPDATE_COMMIT_TOKEN", detached_environment)
-        controller = Path(arguments[1])
-        self.assertIn("target controller", controller.read_text(encoding="utf-8"))
+        self.assertEqual(detached_environment["STREAMHOME_UPDATE_AUTOMATIC"], "false")
+        self.assertEqual(detached_environment["STREAMHOME_UPDATE_INSTALL_MODE"], "now")
 
     async def test_orphaned_target_is_reconciled_without_rollback_when_both_services_are_healthy(self) -> None:
         target = "f" * 40

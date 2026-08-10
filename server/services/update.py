@@ -5,9 +5,9 @@ from contextlib import contextmanager
 import json
 import os
 import re
-import secrets
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -19,7 +19,6 @@ from typing import Any
 from config import settings
 from services.backup import BACKUP_LOCK, is_database_idle
 from services.logger import logger
-from services.playback_prep import playback_prep_service
 from services.queue import queue_manager
 import services.state as state
 
@@ -51,6 +50,7 @@ STATUS_PATH = RUN_DIR / "update-state.json"
 STATUS_LOCK_PATH = RUN_DIR / "update-state.lock"
 LOG_PATH = WORKSPACE_ROOT / "update.log"
 START_SCRIPT = WORKSPACE_ROOT / "start.sh"
+UPDATE_SCRIPT = WORKSPACE_ROOT / "update.sh"
 ORPHANED_CONTROLLER_SECONDS = 30
 RUNTIME_IDENTITY_ENV_KEYS = {
     "STREAMHOME_INSTANCE_ROOT",
@@ -429,30 +429,6 @@ def active_media_work_count() -> int:
     return len(state.ACTIVE_PROCESSES)
 
 
-def playback_cache_work_count() -> int:
-    """Count cache-only playback jobs that managed cutover may safely quiesce."""
-
-    return len(playback_prep_service.active_jobs)
-
-
-async def quiesce_cancellable_update_work() -> int:
-    """Pause and cancel cache-only playback work before process shutdown."""
-
-    pending = await playback_prep_service.quiesce_for_update(timeout=8.0)
-    if pending:
-        logger.warning(
-            f"[Update Service] {pending} playback preparation task(s) are still stopping; "
-            "the lifecycle controller will finish process-group cleanup."
-        )
-    return pending
-
-
-def resume_cancellable_update_work() -> None:
-    """Resume cache preparation when managed cutover does not proceed."""
-
-    playback_prep_service.resume_after_update_quiesce()
-
-
 async def idle_blockers() -> list[str]:
     blockers: list[str] = []
     browsers = state.active_browser_sessions()
@@ -494,12 +470,6 @@ async def protected_cutover_blockers() -> list[str]:
 
 async def queued_launch_blockers(status: dict[str, Any]) -> list[str]:
     if status.get("install_mode") == "now" and not status.get("automatic"):
-        return []
-    return await idle_blockers()
-
-
-async def update_handoff_blockers(install_mode: str) -> list[str]:
-    if install_mode == "now":
         return await protected_cutover_blockers()
     return await idle_blockers()
 
@@ -580,34 +550,6 @@ def install_lock_active() -> bool:
     except (OSError, ValueError):
         return False
     return True
-
-
-def persisted_update_handoff_token_matches(token: str, handoff_file: str) -> bool:
-    """Validate a handoff token from its private single-use controller file."""
-
-    if not token or len(token) > 256 or not handoff_file:
-        return False
-    try:
-        candidate = Path(handoff_file)
-        if candidate.is_symlink():
-            return False
-        path = candidate.resolve()
-        run_dir = RUN_DIR.resolve()
-    except OSError:
-        return False
-    if (
-        path.parent != run_dir
-        or not path.name.startswith("update-handoff.")
-        or not path.name.endswith(".token")
-    ):
-        return False
-    try:
-        if not path.is_file() or path.stat().st_size > 512:
-            return False
-        persisted = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return False
-    return secrets.compare_digest(token, persisted)
 
 
 def orphaned_controller_stale(status: dict[str, Any], current_time: float | None = None) -> bool:
@@ -937,6 +879,26 @@ async def cancel_queued_update() -> dict[str, Any]:
         )
 
 
+def prepare_official_update_script() -> Path:
+    """Validate the installation-root updater and restore its executable mode."""
+
+    try:
+        workspace = WORKSPACE_ROOT.resolve(strict=True)
+        candidate = UPDATE_SCRIPT
+        if candidate.is_symlink():
+            raise OSError("update.sh must not be a symbolic link")
+        resolved = candidate.resolve(strict=True)
+        if resolved.parent != workspace or resolved.name != "update.sh" or not resolved.is_file():
+            raise OSError("update.sh is not the installation-root updater")
+        if resolved.read_bytes()[:20] != b"#!/usr/bin/env bash\n":
+            raise OSError("update.sh does not have the expected Bash header")
+        current_mode = resolved.stat().st_mode
+        os.chmod(resolved, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        return resolved
+    except OSError as exc:
+        raise RuntimeError("update_script_unavailable") from exc
+
+
 async def launch_queued_update_if_ready() -> bool:
     async with UPDATE_QUEUE_LOCK:
         status = read_update_state()
@@ -980,76 +942,51 @@ async def launch_queued_update_if_ready() -> bool:
                 finished_at=time.time(),
             )
             return False
-        token = secrets.token_urlsafe(32)
-        RUN_DIR.mkdir(parents=True, exist_ok=True)
-        token_path = RUN_DIR / f"update-handoff.{secrets.token_hex(8)}.token"
-        token_descriptor = os.open(token_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(token_descriptor, "w", encoding="utf-8") as token_file:
-            token_file.write(token)
-            token_file.flush()
-            os.fsync(token_file.fileno())
-        controller_path = RUN_DIR / f"update-controller.{secrets.token_hex(8)}.sh"
-        code, controller_source, controller_error = await run_git_cmd(["show", f"{target}:update.sh"])
-        if code != 0 or not controller_source.startswith("#!/usr/bin/env bash"):
-            token_path.unlink(missing_ok=True)
-            controller_path.unlink(missing_ok=True)
-            logger.error(f"[Update Service] Target controller extraction failed: {controller_error}")
+        try:
+            update_script = prepare_official_update_script()
+        except RuntimeError as exc:
+            logger.error(f"[Update Service] The official update.sh launch path is unavailable: {exc.__cause__}")
             write_update_state(
                 phase="failed",
-                message="The target release does not contain a valid update controller.",
-                error="target_update_controller_unavailable",
+                message="The installation-root update.sh file is missing, untrusted, or could not be made executable.",
+                error="update_script_unavailable",
                 finished_at=time.time(),
             )
             return False
-        controller_path.write_text(controller_source.rstrip("\n") + "\n", encoding="utf-8")
-        os.chmod(controller_path, 0o700)
-        state.UPDATE_HANDOFF_TOKEN = token
-        write_update_state(
-            phase="preflight",
-            message=(
-                "The detached updater is preparing and validating the target release for immediate installation."
-                if status.get("install_mode") == "now"
-                else "The detached updater is preparing and validating the target release."
-            ),
-            started_at=time.time(),
-            error="",
-            handoff_file=str(token_path),
-        )
+        environment = detached_lifecycle_environment()
+        environment["STREAMHOME_UPDATE_AUTOMATIC"] = "true" if status.get("automatic") else "false"
+        environment["STREAMHOME_UPDATE_INSTALL_MODE"] = str(status.get("install_mode") or "when_idle")
         try:
             with LOG_PATH.open("ab", buffering=0) as log_handle:
-                await asyncio.create_subprocess_exec(
-                    "bash",
-                    str(controller_path),
-                    "--execute",
-                    target,
-                    current,
-                    "true" if status.get("automatic") else "false",
-                    str(token_path),
-                    str(WORKSPACE_ROOT),
+                updater = await asyncio.create_subprocess_exec(
+                    str(update_script),
                     cwd=str(WORKSPACE_ROOT),
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=log_handle,
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
-                    env=detached_lifecycle_environment(),
+                    env=environment,
                 )
         except (OSError, subprocess.SubprocessError) as exc:
-            state.UPDATE_HANDOFF_TOKEN = ""
-            token_path.unlink(missing_ok=True)
-            controller_path.unlink(missing_ok=True)
-            logger.error(f"[Update Service] Could not launch detached updater: {exc}")
+            logger.error(f"[Update Service] Could not launch the official update.sh process: {exc}")
             write_update_state(
                 phase="failed",
-                message="The detached update controller could not be launched.",
-                error="update_handoff_failed",
+                message="The installation-root update.sh process could not be launched.",
+                error="update_script_launch_failed",
                 finished_at=time.time(),
             )
             return False
+        write_update_state(
+            message="The official update.sh process is running and now owns the StreamHome lifecycle.",
+            started_at=time.time(),
+            updater_pid=updater.pid,
+            error="",
+        )
         return True
 
 
 async def pull_and_install_updates() -> bool:
-    """Compatibility wrapper: queue a validated update for the safe external controller."""
+    """Compatibility wrapper: queue a validated launch of the official update.sh."""
     try:
         await queue_update(automatic=False)
         await launch_queued_update_if_ready()
@@ -1082,8 +1019,6 @@ async def automatic_update_worker(stop_event: asyncio.Event, initial_delay_secon
             if state.MAINTENANCE_MODE and not state.UPDATE_TRANSACTION_ID and status.get("phase") in TERMINAL_PHASES:
                 state.MAINTENANCE_MODE = False
                 state.MAINTENANCE_REASON = ""
-                state.UPDATE_HANDOFF_TOKEN = ""
-                resume_cancellable_update_work()
             if status.get("phase") == "queued":
                 await launch_queued_update_if_ready()
             elif settings.SETUP_COMPLETE and settings.AUTO_UPDATE_ENABLED and status.get("phase") not in ACTIVE_PHASES:

@@ -1805,10 +1805,10 @@ async def manage_system_updates():
                 print_centered("[dim]Press ENTER to pull and restart, or ESC to cancel...[/dim]")
                 key = get_key()
                 if key == "ENTER":
-                    print_centered("Queuing the validated update controller...")
+                    print_centered("Launching the official update.sh process...")
                     success = await pull_and_install_updates()
                     if success:
-                        print_centered("[bold green][✓] Update queued. The detached controller will preflight, restart, health-check, and roll back automatically if required.[/bold green]")
+                        print_centered("[bold green][✓] update.sh is queued and will preflight, restart, health-check, and roll back automatically if required.[/bold green]")
                         return
                     else:
                         print_centered("[bold bright_red][✗] The update could not be queued. Review the admin status and update.log.[/bold bright_red]")
