@@ -344,6 +344,68 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
+  it("keeps video playing when an external dubbing file repeatedly buffers", async () => {
+    const dualAudioPlayback: ResolvedPlayback = {
+      ...playback,
+      runResponse: {
+        ...playback.runResponse,
+        manifestUrl: null,
+        tracks: [
+          ...playback.runResponse.tracks,
+          {
+            id: "audio_0_tr",
+            label: "Turkish",
+            language: "tr",
+            channels: 2,
+            default: false,
+            source: "external",
+            streamIndex: 0,
+            directUrl: "/api/playback/source/mounted-player-media?ticket=mounted-player-ticket&source_id=audio_0_tr",
+            ready: true,
+            status: "ready",
+          },
+        ],
+      },
+    };
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={dualAudioPlayback} />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /Audio language/ }));
+    fireEvent.click(screen.getByRole("option", { name: /Turkish/ }));
+    const root = view.container.querySelector("[data-player-root='true']") as HTMLElement;
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    const audio = view.container.querySelector("audio") as HTMLAudioElement;
+    Object.defineProperty(audio, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+    });
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    fireEvent.loadedMetadata(video);
+    fireEvent.canPlay(video);
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+    fireEvent.playing(video);
+    await waitFor(() => expect(root.dataset.playerPhase).toBe("playing"));
+
+    const pause = vi.mocked(HTMLMediaElement.prototype.pause);
+    pause.mockClear();
+    fireEvent.waiting(audio);
+    fireEvent.stalled(audio);
+    fireEvent.waiting(audio);
+
+    expect(pause).not.toHaveBeenCalled();
+    expect(root.dataset.playerPhase).toBe("playing");
+    expect(screen.queryByText("Buffering")).toBeNull();
+
+    fireEvent.waiting(video);
+    expect(root.dataset.playerPhase).toBe("buffering");
+    expect(screen.getAllByText("Buffering").length).toBeGreaterThan(0);
+    view.unmount();
+  });
+
   it("keeps the first open mounted while complete HLS preparation becomes ready", async () => {
     const preparingRun = {
       ...playback.runResponse,

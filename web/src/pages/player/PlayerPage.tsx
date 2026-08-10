@@ -138,6 +138,9 @@ export const FORWARD_BUFFER_TARGET_SECONDS = 30;
 export const FORWARD_BUFFER_MAX_SECONDS = 60;
 export const STARTUP_QUALITY_MIN_BUFFER_SECONDS = 8;
 export const STARTUP_QUALITY_HEADROOM_RATIO = 1.35;
+export const EXTERNAL_AUDIO_SOFT_SYNC_SECONDS = 0.12;
+export const EXTERNAL_AUDIO_HARD_SYNC_SECONDS = 0.75;
+export const EXTERNAL_AUDIO_MAX_RATE_CORRECTION = 0.04;
 
 type PlaybackStartupStage =
   | "transport-initializing"
@@ -245,6 +248,27 @@ export function shouldRetryPlaybackStartup(completedRetries: number): boolean {
 
 export function shouldRetryPlaybackStall(playRequested: boolean, readyState: number, completedRetries: number): boolean {
   return playRequested && readyState < HTMLMediaElement.HAVE_FUTURE_DATA && completedRetries < 2;
+}
+
+export function externalAudioSyncPlan(
+  videoTime: number,
+  audioTime: number,
+  playbackRate: number,
+  forceSeek = false,
+): { seekTime: number | null; playbackRate: number } {
+  const target = Math.max(0, Number.isFinite(videoTime) ? videoTime : 0);
+  const current = Math.max(0, Number.isFinite(audioTime) ? audioTime : target);
+  const baseRate = Math.min(4, Math.max(0.25, Number.isFinite(playbackRate) ? playbackRate : 1));
+  const drift = current - target;
+  if (forceSeek || Math.abs(drift) >= EXTERNAL_AUDIO_HARD_SYNC_SECONDS) {
+    return { seekTime: target, playbackRate: baseRate };
+  }
+  if (Math.abs(drift) <= EXTERNAL_AUDIO_SOFT_SYNC_SECONDS) {
+    return { seekTime: null, playbackRate: baseRate };
+  }
+  const maximumCorrection = baseRate * EXTERNAL_AUDIO_MAX_RATE_CORRECTION;
+  const correction = Math.min(maximumCorrection, Math.max(-maximumCorrection, -drift * 0.1));
+  return { seekTime: null, playbackRate: baseRate + correction };
 }
 
 export function isMeaningfulPointerActivity(
@@ -1027,14 +1051,18 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     const audio = externalAudioRef.current;
     if (!video || !audio || !activeExternalAudioTrackIdRef.current || audio.readyState < HTMLMediaElement.HAVE_METADATA) return false;
     const target = Math.max(0, video.currentTime || currentTimeRef.current);
-    if (force || Math.abs(audio.currentTime - target) > 0.2) {
+    if (!force && (externalAudioBufferingRef.current || audio.seeking || audio.readyState < HTMLMediaElement.HAVE_FUTURE_DATA)) {
+      return false;
+    }
+    const plan = externalAudioSyncPlan(target, audio.currentTime, video.playbackRate, force);
+    if (plan.seekTime !== null) {
       try {
-        audio.currentTime = target;
+        audio.currentTime = plan.seekTime;
       } catch {
         return false;
       }
     }
-    audio.playbackRate = video.playbackRate;
+    audio.playbackRate = plan.playbackRate;
     return true;
   }, []);
 
@@ -2779,16 +2807,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           if (activeExternalAudioTrackIdRef.current && externalAudio) {
             if (externalAudio.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
               externalAudioBufferingRef.current = true;
-              transportResettingRef.current = true;
-              videoRef.current?.pause();
-              setPhase("buffering");
-              scheduleStallRecovery();
-              return;
+            } else {
+              externalAudioBufferingRef.current = false;
+              syncExternalAudio(true);
+              void externalAudio.play().catch(() => {
+                setPlayerNotice("Press play once to allow the selected dubbing track.");
+              });
             }
-            syncExternalAudio(true);
-            void externalAudio.play().catch(() => {
-              setPlayerNotice("Press play once to allow the selected dubbing track.");
-            });
           }
           const observedTime = videoRef.current?.currentTime ?? currentTimeRef.current;
           const accepted = shouldAcceptObservedPlaybackTime(
@@ -2995,34 +3020,20 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         onLoadedMetadata={() => syncExternalAudio(true)}
         onCanPlay={() => {
           if (!activeExternalAudioTrackIdRef.current || !playbackIntentRef.current) return;
-          syncExternalAudio(true);
           const video = videoRef.current;
           const audio = externalAudioRef.current;
           externalAudioBufferingRef.current = false;
-          clearStallRecovery();
           if (!video || !audio) return;
-          if (video.paused && !completedRef.current) {
-            transportResettingRef.current = false;
-            void video.play();
-          } else {
-            void audio.play();
-          }
+          syncExternalAudio();
+          if (!video.paused && !completedRef.current) void audio.play();
         }}
         onWaiting={() => {
           if (!activeExternalAudioTrackIdRef.current || !playbackIntentRef.current) return;
           externalAudioBufferingRef.current = true;
-          transportResettingRef.current = true;
-          videoRef.current?.pause();
-          setPhase("buffering");
-          scheduleStallRecovery();
         }}
         onStalled={() => {
           if (!activeExternalAudioTrackIdRef.current || !playbackIntentRef.current) return;
           externalAudioBufferingRef.current = true;
-          transportResettingRef.current = true;
-          videoRef.current?.pause();
-          setPhase("buffering");
-          scheduleStallRecovery();
         }}
         onError={() => {
           if (!activeExternalAudioTrackIdRef.current) return;
