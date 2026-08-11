@@ -352,10 +352,11 @@ describe("player interaction contracts", () => {
     expect(shouldRetryPlaybackStall(true, HTMLMediaElement.HAVE_FUTURE_DATA, 0)).toBe(false);
   });
 
-  it("corrects ordinary external-audio drift without repeated hard seeks", () => {
+  it("keeps external audio at the selected speed and corrects drift without pitch modulation", () => {
     expect(externalAudioSyncPlan(30, 30.05, 1)).toEqual({ seekTime: null, playbackRate: 1 });
-    expect(externalAudioSyncPlan(30, 29.7, 1)).toEqual({ seekTime: null, playbackRate: 1.03 });
-    expect(externalAudioSyncPlan(30, 30.3, 1)).toEqual({ seekTime: null, playbackRate: 0.97 });
+    expect(externalAudioSyncPlan(30, 29.95, 1)).toEqual({ seekTime: null, playbackRate: 1 });
+    expect(externalAudioSyncPlan(30, 29.7, 1)).toEqual({ seekTime: 30, playbackRate: 1 });
+    expect(externalAudioSyncPlan(30, 30.3, 1)).toEqual({ seekTime: 30, playbackRate: 1 });
     expect(externalAudioSyncPlan(30, 28.5, 1)).toEqual({ seekTime: 30, playbackRate: 1 });
     expect(externalAudioSyncPlan(30, 30.05, 1, true)).toEqual({ seekTime: 30, playbackRate: 1 });
   });

@@ -53,13 +53,14 @@ describe("dedicated mobile player presentation", () => {
 
   it("keeps player actions theme-aware and gives desktop blank-space clicks standard media behavior", () => {
     const interactiveShortcutGuard = playerPage.indexOf("if (isInteractiveTarget(event.target)) return;");
-    const fullscreenShortcut = playerPage.indexOf('if (event.key.toLowerCase() === "f")');
+    const fullscreenShortcut = playerPage.indexOf('if (key === "f")');
 
     expect(playerPage).toContain("onClick={mobilePlayer ? undefined : handleDesktopSurfaceClick}");
     expect(playerPage).toContain("onDoubleClick={mobilePlayer ? undefined : handleDesktopSurfaceDoubleClick}");
     expect(playerPage).toContain("desktopClickTimerRef.current = window.setTimeout");
     expect(interactiveShortcutGuard).toBeGreaterThan(-1);
     expect(fullscreenShortcut).toBeGreaterThan(interactiveShortcutGuard);
+    expect(playerPage).not.toContain('target.closest("button, input');
     expect(playerPage).toContain("toggleFullscreen();");
     expect(playerPage).toContain("data-theme={theme}");
     expect(playerPage).toContain("data-player-theme={definition.playerVariant}");

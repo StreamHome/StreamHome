@@ -138,9 +138,7 @@ export const FORWARD_BUFFER_TARGET_SECONDS = 30;
 export const FORWARD_BUFFER_MAX_SECONDS = 60;
 export const STARTUP_QUALITY_MIN_BUFFER_SECONDS = 8;
 export const STARTUP_QUALITY_HEADROOM_RATIO = 1.35;
-export const EXTERNAL_AUDIO_SOFT_SYNC_SECONDS = 0.12;
-export const EXTERNAL_AUDIO_HARD_SYNC_SECONDS = 0.75;
-export const EXTERNAL_AUDIO_MAX_RATE_CORRECTION = 0.04;
+export const EXTERNAL_AUDIO_SYNC_TOLERANCE_SECONDS = 0.08;
 
 type PlaybackStartupStage =
   | "transport-initializing"
@@ -260,15 +258,10 @@ export function externalAudioSyncPlan(
   const current = Math.max(0, Number.isFinite(audioTime) ? audioTime : target);
   const baseRate = Math.min(4, Math.max(0.25, Number.isFinite(playbackRate) ? playbackRate : 1));
   const drift = current - target;
-  if (forceSeek || Math.abs(drift) >= EXTERNAL_AUDIO_HARD_SYNC_SECONDS) {
+  if (forceSeek || Math.abs(drift) >= EXTERNAL_AUDIO_SYNC_TOLERANCE_SECONDS) {
     return { seekTime: target, playbackRate: baseRate };
   }
-  if (Math.abs(drift) <= EXTERNAL_AUDIO_SOFT_SYNC_SECONDS) {
-    return { seekTime: null, playbackRate: baseRate };
-  }
-  const maximumCorrection = baseRate * EXTERNAL_AUDIO_MAX_RATE_CORRECTION;
-  const correction = Math.min(maximumCorrection, Math.max(-maximumCorrection, -drift * 0.1));
-  return { seekTime: null, playbackRate: baseRate + correction };
+  return { seekTime: null, playbackRate: baseRate };
 }
 
 export function isMeaningfulPointerActivity(
@@ -370,7 +363,7 @@ function loadPreferences(profileId: string): PlayerPreferences {
 }
 
 function isInteractiveTarget(target: EventTarget | null): boolean {
-  return target instanceof Element && Boolean(target.closest("button, input, select, textarea, a, [contenteditable='true'], [role='slider']"));
+  return target instanceof Element && Boolean(target.closest("input, select, textarea, a, [contenteditable='true'], [role='slider'], [role='textbox'], [role='menu'], [role='option']"));
 }
 
 export function advancingPlaybackDelta(
@@ -844,9 +837,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [asset, runResponse?.sourceMetadata.duration, streamMode]);
 
   useEffect(() => {
-    const playOnLoad = typeof window === "undefined"
-      ? true
-      : !isPhonePlayerViewport(readMobileViewport(window));
+    const playOnLoad = true;
     if (visualFixture) {
       setFatal(null);
       setAsset(visualFixture.asset);
@@ -1070,7 +1061,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         return false;
       }
     }
-    audio.playbackRate = plan.playbackRate;
+    if (Math.abs(audio.playbackRate - plan.playbackRate) > 0.001) audio.playbackRate = plan.playbackRate;
     return true;
   }, []);
 
@@ -1125,6 +1116,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     audio.volume = volumeRef.current;
     audio.muted = mutedRef.current;
     audio.playbackRate = video.playbackRate;
+    audio.preservesPitch = true;
+    video.preservesPitch = true;
     video.volume = volumeRef.current;
     video.muted = true;
     syncExternalAudio(true);
@@ -2169,6 +2162,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         timeline.value = String(liveTime);
         timeline.style.setProperty("--player-progress", `${liveDuration > 0 ? Math.min(100, (liveTime / liveDuration) * 100) : 0}%`);
       }
+      syncExternalAudio();
       timelineAnimationFrameRef.current = window.requestAnimationFrame(updateTimeline);
     };
     timelineAnimationFrameRef.current = window.requestAnimationFrame(updateTimeline);
@@ -2176,7 +2170,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       if (timelineAnimationFrameRef.current !== null) window.cancelAnimationFrame(timelineAnimationFrameRef.current);
       timelineAnimationFrameRef.current = null;
     };
-  }, [duration, phase]);
+  }, [duration, phase, syncExternalAudio]);
 
   const resolvePlayerContainer = useCallback((interactionTarget?: HTMLElement | null) => {
     const interactionContainer = interactionTarget?.matches("[data-player-root='true']")
@@ -2240,7 +2234,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (!container || !video) return;
 
     setFullscreenError("");
-    void togglePlayerFullscreen(container, video, document, { allowVideoFallback: true })
+    const operation = togglePlayerFullscreen(container, video, document, { allowVideoFallback: true });
+    interactionTarget?.blur();
+    void operation
       .then((result) => {
         const nextMode = playerFullscreenMode(container, video);
         const active = result === "entered" && nextMode !== null;
@@ -2402,31 +2398,46 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         return;
       }
       if (isInteractiveTarget(event.target)) return;
-      if (event.key.toLowerCase() === "f") {
+      const key = event.key.toLowerCase();
+      if (key === "f") {
+        if (event.repeat) return;
         event.preventDefault();
         toggleFullscreen();
         revealControls();
         return;
       }
-      if (event.key === " ") {
+      if (event.key === " " || key === "k") {
+        if (event.repeat) return;
         event.preventDefault();
-        videoRef.current?.paused ? safePlay() : pausePlayback();
+        const video = videoRef.current;
+        if (playbackIntentRef.current && video && !video.paused) pausePlayback();
+        else safePlay();
       } else if (event.key === "ArrowLeft") {
         event.preventDefault();
         seek(currentTimeRef.current - 10);
       } else if (event.key === "ArrowRight") {
         event.preventDefault();
         seek(currentTimeRef.current + 10);
-      } else if (event.key.toLowerCase() === "m" && videoRef.current) {
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setOutputVolume(volumeRef.current + 0.05, false);
+      } else if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setOutputVolume(volumeRef.current - 0.05, false);
+      } else if (key === "m" && videoRef.current) {
+        if (event.repeat) return;
+        event.preventDefault();
         toggleOutputMute();
-      } else if (event.key.toLowerCase() === "p") {
+      } else if (key === "p") {
+        if (event.repeat) return;
+        event.preventDefault();
         togglePictureInPicture();
       }
       revealControls();
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [exitPlayer, fullscreenActive, fullscreenMode, pausePlayback, revealControls, safePlay, seek, toggleFullscreen, toggleOutputMute, togglePictureInPicture]);
+  }, [exitPlayer, fullscreenActive, fullscreenMode, pausePlayback, revealControls, safePlay, seek, setOutputVolume, toggleFullscreen, toggleOutputMute, togglePictureInPicture]);
 
   const toggleMobileControls = useCallback(() => {
     if (showControlsRef.current) {
@@ -2805,10 +2816,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }}
         onPlay={() => {
           if (!playbackIntentRef.current) {
-            cancelPendingVideoPlay();
-            videoRef.current?.pause();
-            setPhase("paused");
-            return;
+            const video = videoRef.current;
+            if (!video || video.paused) {
+              cancelPendingVideoPlay();
+              setPhase("paused");
+              return;
+            }
+            playbackIntentRef.current = true;
           }
           if (!transportResettingRef.current) {
             setPhase("playing");
@@ -2819,7 +2833,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         onPause={() => {
           pauseExternalAudio();
           captureWatchedTime();
-          if (transportResettingRef.current || playbackIntentRef.current) return;
+          if (transportResettingRef.current && playbackIntentRef.current) return;
+          if (playbackIntentRef.current) {
+            playbackIntentRef.current = false;
+            cancelPendingVideoPlay();
+          }
           if (!completedRef.current) {
             setPhase("paused");
             reportProgress("pause");
@@ -2859,7 +2877,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
               externalAudioBufferingRef.current = true;
             } else {
               externalAudioBufferingRef.current = false;
-              syncExternalAudio(true);
+              syncExternalAudio();
               requestExternalAudioPlay("Press play once to allow the selected dubbing track.");
             }
           }
@@ -2900,7 +2918,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             setPhase("recovering");
             return;
           }
-          if (video.paused && resumeReady) transportResettingRef.current = false;
+          if (video.paused && resumeReady) {
+            transportResettingRef.current = false;
+            setPhase("loading");
+            window.setTimeout(() => {
+              if (playbackIntentRef.current && video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+                requestVideoPlay();
+              }
+            }, 0);
+            return;
+          }
           if (!video.paused && !transportResettingRef.current) markPlaybackStartupReady();
           setPhase(video.paused ? "paused" : transportResettingRef.current ? "recovering" : "playing");
         }}

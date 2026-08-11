@@ -106,6 +106,7 @@ describe("mounted player lifecycle", () => {
     document.body.removeAttribute("data-player-viewport-fullscreen");
     Reflect.deleteProperty(document, "fullscreenEnabled");
     Reflect.deleteProperty(document, "webkitFullscreenEnabled");
+    Reflect.deleteProperty(document, "pictureInPictureElement");
   });
 
   it("mounts the real page and commits one desktop seek when dragging ends", () => {
@@ -126,6 +127,65 @@ describe("mounted player lifecycle", () => {
     fireEvent.pointerUp(timeline, { pointerId: 1 });
 
     expect(video.currentTime).toBe(60);
+    view.unmount();
+  });
+
+  it("autostarts when media becomes ready and accepts native and global playback controls", async () => {
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={playback} />
+      </MemoryRouter>,
+    );
+    const root = view.container.querySelector("[data-player-root='true']") as HTMLElement;
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    const play = vi.mocked(HTMLMediaElement.prototype.play);
+    const pause = vi.mocked(HTMLMediaElement.prototype.pause);
+    play.mockClear();
+    pause.mockClear();
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA });
+
+    fireEvent.loadedMetadata(video);
+    fireEvent.canPlay(video);
+    await waitFor(() => expect(play).toHaveBeenCalled());
+
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+    fireEvent.playing(video);
+    await waitFor(() => expect(root.dataset.playerPhase).toBe("playing"));
+
+    const fullscreenButton = screen.getByRole("button", { name: "Fullscreen" });
+    fullscreenButton.focus();
+    fireEvent.keyDown(fullscreenButton, { key: "k" });
+    expect(pause).toHaveBeenCalled();
+    Object.defineProperty(video, "paused", { configurable: true, value: true });
+    fireEvent.pause(video);
+    expect(root.dataset.playerPhase).toBe("paused");
+
+    Object.defineProperty(document, "pictureInPictureElement", { configurable: true, value: video });
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+    fireEvent.playing(video);
+    await waitFor(() => expect(root.dataset.playerPhase).toBe("playing"));
+
+    Object.defineProperty(video, "paused", { configurable: true, value: true });
+    fireEvent.pause(video);
+    play.mockClear();
+    fullscreenButton.focus();
+    fireEvent.keyDown(fullscreenButton, { key: " " });
+    await waitFor(() => expect(play).toHaveBeenCalled());
+
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    await waitFor(() => expect((screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement).value).toBe("0.95"));
+    fireEvent.keyDown(window, { key: "ArrowUp" });
+    await waitFor(() => expect((screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement).value).toBe("1"));
+
+    video.currentTime = 30;
+    fireEvent.timeUpdate(video);
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    expect(video.currentTime).toBe(40);
+    fireEvent.keyDown(window, { key: "ArrowLeft" });
+    expect(video.currentTime).toBe(30);
     view.unmount();
   });
 
@@ -512,7 +572,7 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
-  it("enters and exits viewport fullscreen from the real player controls", async () => {
+  it("enters viewport fullscreen, releases button focus, and honors global fullscreen keys", async () => {
     Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: false });
     Object.defineProperty(document, "webkitFullscreenEnabled", { configurable: true, value: false });
     const view = render(
@@ -544,8 +604,14 @@ describe("mounted player lifecycle", () => {
     expect(screen.queryByText("The browser rejected the fullscreen request. Check the fullscreen permission for this site.")).toBeNull();
 
     const focusedFullscreenButton = screen.getByRole("button", { name: "Exit fullscreen" });
+    expect(document.activeElement).not.toBe(focusedFullscreenButton);
+    const play = vi.mocked(HTMLMediaElement.prototype.play);
+    play.mockClear();
     focusedFullscreenButton.focus();
-    fireEvent.keyDown(focusedFullscreenButton, { key: "Escape" });
+    fireEvent.keyDown(focusedFullscreenButton, { key: " " });
+    await waitFor(() => expect(play).toHaveBeenCalled());
+    expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeTruthy();
+    fireEvent.keyDown(focusedFullscreenButton, { key: "f" });
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Fullscreen" })).toBeTruthy());
     expect(player.getAttribute("data-player-viewport-fullscreen")).toBeNull();
