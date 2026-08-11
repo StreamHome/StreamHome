@@ -1,5 +1,5 @@
 import React from "react";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -192,6 +192,57 @@ describe("mounted player lifecycle", () => {
     expect(video.currentTime).toBe(40);
     fireEvent.keyDown(document.body, { key: "ArrowLeft" });
     expect(video.currentTime).toBe(30);
+    view.unmount();
+  });
+
+  it("keeps an explicit pause authoritative while a pending play request becomes ready", async () => {
+    let resolvePendingPlay!: () => void;
+    const pendingPlay = new Promise<void>((resolve) => {
+      resolvePendingPlay = resolve;
+    });
+    const play = vi.mocked(HTMLMediaElement.prototype.play);
+    const pause = vi.mocked(HTMLMediaElement.prototype.pause);
+    play.mockImplementationOnce(() => pendingPlay).mockResolvedValue(undefined);
+
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={playback} />
+      </MemoryRouter>,
+    );
+    const root = view.container.querySelector("[data-player-root='true']") as HTMLElement;
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA });
+
+    fireEvent.loadedMetadata(video);
+    await waitFor(() => expect(play).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+
+    await waitFor(() => {
+      expect(root.dataset.playerPhase).toBe("paused");
+      expect(video.preload).toBe("none");
+    });
+
+    await act(async () => {
+      resolvePendingPlay();
+      await pendingPlay;
+    });
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+    fireEvent.canPlay(video);
+    fireEvent.playing(video);
+
+    expect(root.dataset.playerPhase).toBe("paused");
+    expect(pause).toHaveBeenCalled();
+    expect(play).toHaveBeenCalledTimes(1);
+
+    Object.defineProperty(video, "paused", { configurable: true, value: true });
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    await waitFor(() => {
+      expect(video.preload).toBe("auto");
+      expect(play).toHaveBeenCalledTimes(2);
+    });
+
     view.unmount();
   });
 
