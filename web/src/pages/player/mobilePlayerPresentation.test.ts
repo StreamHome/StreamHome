@@ -53,7 +53,7 @@ describe("dedicated mobile player presentation", () => {
 
   it("keeps player actions theme-aware and gives desktop blank-space clicks standard media behavior", () => {
     const interactiveShortcutGuard = playerPage.indexOf("if (isInteractiveTarget(event.target)) return;");
-    const fullscreenShortcut = playerPage.indexOf('if (key === "f")');
+    const fullscreenShortcut = playerPage.indexOf('if (shortcut === "fullscreen")');
 
     expect(playerPage).toContain("onClick={mobilePlayer ? undefined : handleDesktopSurfaceClick}");
     expect(playerPage).toContain("onDoubleClick={mobilePlayer ? undefined : handleDesktopSurfaceDoubleClick}");
@@ -62,6 +62,10 @@ describe("dedicated mobile player presentation", () => {
     expect(fullscreenShortcut).toBeGreaterThan(interactiveShortcutGuard);
     expect(playerPage).not.toContain('target.closest("button, input');
     expect(playerPage).toContain("toggleFullscreen();");
+    expect(playerPage).toContain('document.addEventListener("keydown", handleKeyDown, true)');
+    expect(playerPage).toContain('document.addEventListener("keyup", handleKeyUp, true)');
+    expect(playerPage).toContain("event.stopImmediatePropagation()");
+    expect(playerPage).toContain("tabIndex={-1}");
     expect(playerPage).toContain("data-theme={theme}");
     expect(playerPage).toContain("data-player-theme={definition.playerVariant}");
     expect(playerStyles).toContain("var(--player-accent)");
@@ -77,5 +81,16 @@ describe("dedicated mobile player presentation", () => {
     expect(playerPage).toContain("mergePlaybackRunMetadata(active, refreshed)");
     expect(playerPage).toContain("shouldAcceptObservedPlaybackTime(");
     expect(playerStyles).toContain('.player-view[data-frame-hold="true"] .player-last-frame');
+  });
+
+  it("serializes progress keepalives and prefers transport-synchronized adaptive audio", () => {
+    const adaptiveAudioSelection = playerPage.indexOf("const transportTrack = pendingAudioSelectionRef.current");
+    const directAudioSelection = playerPage.indexOf("const directTrack = pendingAudioSelectionRef.current");
+
+    expect(playerPage).not.toContain("if (keepalive) {");
+    expect(playerPage).toContain("progressQueueRef.current = progressQueueRef.current");
+    expect(playerPage).toContain('playbackProgressFailureAction(error)');
+    expect(adaptiveAudioSelection).toBeGreaterThan(-1);
+    expect(directAudioSelection).toBeGreaterThan(adaptiveAudioSelection);
   });
 });

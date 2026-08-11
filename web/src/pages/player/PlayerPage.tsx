@@ -366,6 +366,27 @@ function isInteractiveTarget(target: EventTarget | null): boolean {
   return target instanceof Element && Boolean(target.closest("input, select, textarea, a, [contenteditable='true'], [role='slider'], [role='textbox'], [role='menu'], [role='option']"));
 }
 
+type PlayerKeyboardShortcut = "play-pause" | "fullscreen" | "mute" | "pip" | "seek-back" | "seek-forward" | "volume-up" | "volume-down";
+
+function playerKeyboardShortcut(event: Pick<KeyboardEvent, "code" | "key">): PlayerKeyboardShortcut | null {
+  const key = event.key.toLowerCase();
+  if (event.code === "Space" || event.code === "KeyK" || event.key === " " || key === "k") return "play-pause";
+  if (event.code === "KeyF" || key === "f") return "fullscreen";
+  if (event.code === "KeyM" || key === "m") return "mute";
+  if (event.code === "KeyP" || key === "p") return "pip";
+  if (event.code === "ArrowLeft" || event.key === "ArrowLeft") return "seek-back";
+  if (event.code === "ArrowRight" || event.key === "ArrowRight") return "seek-forward";
+  if (event.code === "ArrowUp" || event.key === "ArrowUp") return "volume-up";
+  if (event.code === "ArrowDown" || event.key === "ArrowDown") return "volume-down";
+  return null;
+}
+
+function suppressPlayerShortcutEvent(event: KeyboardEvent): void {
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation();
+}
+
 export function advancingPlaybackDelta(
   previousWallMilliseconds: number | null,
   previousMediaSeconds: number,
@@ -484,6 +505,14 @@ export function initialPlaybackMode(
   preferredLanguage: string,
   mediaElement?: Pick<HTMLMediaElement, "canPlayType"> | null,
 ): StreamMode {
+  const preferredTrack = progressiveAudioTrack(response.tracks, preferredTrackId, preferredLanguage);
+  if (
+    preferredTrack?.source === "external"
+    && response.preparationState === "ready"
+    && Boolean(response.manifestUrl)
+  ) {
+    return "hls";
+  }
   return canUseProgressivePlayback(response, preferredTrackId, preferredLanguage, mediaElement)
     ? "progressive"
     : "hls";
@@ -513,6 +542,25 @@ export function shouldExtendPlaybackStartup(
 
 export function progressSequenceWasAccepted(requestSequence: number, nextSequence: number): boolean {
   return nextSequence > requestSequence;
+}
+
+export type PlaybackProgressFailureAction = "reconcile" | "stop" | "retry-later";
+
+export function playbackProgressFailureAction(error: unknown): PlaybackProgressFailureAction {
+  if (!(error instanceof ApiError)) return "retry-later";
+  if (error.status === 409 && error.code === "PLAYBACK_SEQUENCE_MISMATCH") return "reconcile";
+  if (
+    [403, 404, 409, 410].includes(error.status)
+    || [
+      "PLAYBACK_RUN_EXPIRED",
+      "PLAYBACK_RUN_FORBIDDEN",
+      "PLAYBACK_RUN_NOT_FOUND",
+      "PLAYBACK_SOURCE_CHANGED",
+    ].includes(error.code)
+  ) {
+    return "stop";
+  }
+  return "retry-later";
 }
 
 export function matchAudioTrackIndexes(
@@ -1074,9 +1122,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     const audio = externalAudioRef.current;
     if (!audio || !activeExternalAudioTrackIdRef.current || !playbackIntentRef.current || completedRef.current) return;
     if (pendingExternalAudioPlayRequestRef.current === externalAudioPlayRequestRef.current) return;
+    syncExternalAudio(true);
     const request = ++externalAudioPlayRequestRef.current;
     pendingExternalAudioPlayRequestRef.current = request;
     void audio.play()
+      .then(() => {
+        if (request !== externalAudioPlayRequestRef.current || !playbackIntentRef.current) return;
+        window.requestAnimationFrame(() => {
+          if (request === externalAudioPlayRequestRef.current && playbackIntentRef.current) syncExternalAudio(true);
+        });
+      })
       .catch((error: unknown) => {
         if (request !== externalAudioPlayRequestRef.current || !playbackIntentRef.current) return;
         if ((error instanceof DOMException || error instanceof Error) && error.name === "AbortError") return;
@@ -1085,7 +1140,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       .finally(() => {
         if (pendingExternalAudioPlayRequestRef.current === request) pendingExternalAudioPlayRequestRef.current = null;
       });
-  }, []);
+  }, [syncExternalAudio]);
 
   const releaseExternalAudio = useCallback(() => {
     const audio = externalAudioRef.current;
@@ -1542,6 +1597,18 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           })
         hlsAudioOptionsRef.current = tracks;
         setAvailableAudioTracks(tracks);
+        const transportTrack = pendingAudioSelectionRef.current
+          ? tracks.find((track) => track.id === pendingAudioSelectionRef.current && track.index >= 0)
+          : tracks.find((track) => track.id === preferences.audioTrackId && track.index >= 0)
+            ?? tracks.find((track) => track.language === preferences.audioLanguage && track.index >= 0);
+        if (transportTrack) {
+          releaseExternalAudio();
+          hls.audioTrack = transportTrack.index;
+          if (transportTrack.id !== selectedAudioTrackIdRef.current) {
+            setPlayerNotice(`Switching audio to ${transportTrack.label}...`);
+          }
+          return;
+        }
         const directTrack = pendingAudioSelectionRef.current
           ? tracks.find((track) => track.id === pendingAudioSelectionRef.current && Boolean(track.directUrl))
           : tracks.find((track) => track.id === preferences.audioTrackId && Boolean(track.directUrl))
@@ -1941,29 +2008,18 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, []);
 
   const reportProgress = useCallback((event: PlaybackProgressEvent, finished = false, keepalive = false) => {
-    if (!runResponse || visualFixture) return;
+    if (!runResponse || visualFixture || runClosedRef.current) return;
     captureWatchedTime();
     const watchedSeconds = Math.floor(pendingWatchedSecondsRef.current);
     pendingWatchedSecondsRef.current -= watchedSeconds;
     const timestamp = Math.max(0, confirmedTimeRef.current);
-    if (keepalive) {
-      const sequenceNumber = sequenceNumberRef.current;
-      void updatePlaybackProgress(runResponse.runId, {
-        timestamp,
-        durationWatched: watchedSeconds,
-        isFinished: finished,
-        sequenceNumber,
-        event,
-      }, true).then((response) => {
-        sequenceNumberRef.current = Math.max(sequenceNumberRef.current, response.nextSequenceNumber);
-      }).catch(() => {
-        pendingWatchedSecondsRef.current += watchedSeconds;
-      });
-      return;
-    }
     progressQueueRef.current = progressQueueRef.current
       .catch(() => undefined)
       .then(async () => {
+        if (runClosedRef.current) {
+          pendingWatchedSecondsRef.current += watchedSeconds;
+          return;
+        }
         const sequenceNumber = sequenceNumberRef.current;
         const request = {
           timestamp,
@@ -1976,7 +2032,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           const response = await updatePlaybackProgress(runResponse.runId, request, keepalive);
           sequenceNumberRef.current = response.nextSequenceNumber;
           return;
-        } catch {
+        } catch (error: unknown) {
+          const action = playbackProgressFailureAction(error);
+          if (action === "stop") {
+            runClosedRef.current = true;
+            return;
+          }
+          if (action !== "reconcile") {
+            pendingWatchedSecondsRef.current += watchedSeconds;
+            return;
+          }
           try {
             const fresh = await getPlaybackRun(runResponse.runId);
             sequenceNumberRef.current = fresh.nextSequenceNumber;
@@ -1987,7 +2052,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
               keepalive,
             );
             sequenceNumberRef.current = retryResponse.nextSequenceNumber;
-          } catch {
+          } catch (retryError: unknown) {
+            if (playbackProgressFailureAction(retryError) === "stop") {
+              runClosedRef.current = true;
+              return;
+            }
             pendingWatchedSecondsRef.current += watchedSeconds;
           }
         }
@@ -2236,6 +2305,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     setFullscreenError("");
     const operation = togglePlayerFullscreen(container, video, document, { allowVideoFallback: true });
     interactionTarget?.blur();
+    container.focus({ preventScroll: true });
     void operation
       .then((result) => {
         const nextMode = playerFullscreenMode(container, video);
@@ -2258,6 +2328,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           ? error.message
           : "Fullscreen could not be opened. Check this browser's fullscreen permission.");
         setShowControls(true);
+      })
+      .finally(() => {
+        window.requestAnimationFrame(() => container.focus({ preventScroll: true }));
       });
   }, [mobilePlayer, resolvePlayerContainer, revealControls]);
 
@@ -2386,10 +2459,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [clearStallRecovery, releaseExternalAudio]);
 
   useEffect(() => {
-    const handleKey = (event: KeyboardEvent) => {
+    const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         if (fullscreenMode === "viewport") {
-          event.preventDefault();
+          suppressPlayerShortcutEvent(event);
           toggleFullscreen();
         } else if (!fullscreenActive && !isInteractiveTarget(event.target)) {
           exitPlayer();
@@ -2398,45 +2471,47 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         return;
       }
       if (isInteractiveTarget(event.target)) return;
-      const key = event.key.toLowerCase();
-      if (key === "f") {
+      const shortcut = playerKeyboardShortcut(event);
+      if (!shortcut) return;
+      suppressPlayerShortcutEvent(event);
+      if (shortcut === "fullscreen") {
         if (event.repeat) return;
-        event.preventDefault();
         toggleFullscreen();
         revealControls();
         return;
       }
-      if (event.key === " " || key === "k") {
+      if (shortcut === "play-pause") {
         if (event.repeat) return;
-        event.preventDefault();
         const video = videoRef.current;
         if (playbackIntentRef.current && video && !video.paused) pausePlayback();
         else safePlay();
-      } else if (event.key === "ArrowLeft") {
-        event.preventDefault();
+      } else if (shortcut === "seek-back") {
         seek(currentTimeRef.current - 10);
-      } else if (event.key === "ArrowRight") {
-        event.preventDefault();
+      } else if (shortcut === "seek-forward") {
         seek(currentTimeRef.current + 10);
-      } else if (event.key === "ArrowUp") {
-        event.preventDefault();
+      } else if (shortcut === "volume-up") {
         setOutputVolume(volumeRef.current + 0.05, false);
-      } else if (event.key === "ArrowDown") {
-        event.preventDefault();
+      } else if (shortcut === "volume-down") {
         setOutputVolume(volumeRef.current - 0.05, false);
-      } else if (key === "m" && videoRef.current) {
+      } else if (shortcut === "mute" && videoRef.current) {
         if (event.repeat) return;
-        event.preventDefault();
         toggleOutputMute();
-      } else if (key === "p") {
+      } else if (shortcut === "pip") {
         if (event.repeat) return;
-        event.preventDefault();
         togglePictureInPicture();
       }
       revealControls();
     };
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (isInteractiveTarget(event.target) || !playerKeyboardShortcut(event)) return;
+      suppressPlayerShortcutEvent(event);
+    };
+    document.addEventListener("keydown", handleKeyDown, true);
+    document.addEventListener("keyup", handleKeyUp, true);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown, true);
+      document.removeEventListener("keyup", handleKeyUp, true);
+    };
   }, [exitPlayer, fullscreenActive, fullscreenMode, pausePlayback, revealControls, safePlay, seek, setOutputVolume, toggleFullscreen, toggleOutputMute, togglePictureInPicture]);
 
   const toggleMobileControls = useCallback(() => {
@@ -2631,6 +2706,19 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       setPlayerNotice(`${selected.label} audio active`);
       return;
     }
+    if (
+      selected.source === "external"
+      && runResponse?.preparationState === "ready"
+      && runResponse.manifestUrl
+    ) {
+      captureLastFrame(true);
+      resumePositionRef.current = currentTimeRef.current;
+      resumeAppliedRef.current = false;
+      transportResettingRef.current = true;
+      setStreamMode("hls");
+      setTransportRevision((value) => value + 1);
+      return;
+    }
     if (selected.source === "external" && selected.directUrl && activateExternalAudio(selected)) {
       selectedAudioTrackIdRef.current = selected.id;
       setSelectedAudioTrackId(selected.id);
@@ -2779,6 +2867,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       data-mobile-player={mobilePlayer ? "true" : "false"}
       data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
       data-player-viewport-fullscreen={fullscreenMode === "viewport" ? "true" : undefined}
+      tabIndex={-1}
       style={{ "--caption-scale": preferences.captionScale } as React.CSSProperties}
       onMouseMove={mobilePlayer ? undefined : handleDesktopPointerActivity}
       onClick={mobilePlayer ? undefined : handleDesktopSurfaceClick}

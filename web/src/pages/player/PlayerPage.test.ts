@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ApiError } from "../../api/client";
 import type { Episode, PlaybackRunResponse } from "../../types/api";
 import {
   advancingPlaybackDelta,
@@ -21,6 +22,7 @@ import {
   nextPlayableEpisode,
   preparationStatusMessage,
   playbackQualityOptions,
+  playbackProgressFailureAction,
   playbackStartupFailureMessage,
   progressiveAudioTrack,
   progressSequenceWasAccepted,
@@ -202,6 +204,15 @@ describe("player interaction contracts", () => {
       ...base,
       tracks: [{ id: "audio_0_tr", label: "Turkish", language: "tr", channels: 2, default: true, source: "external", streamIndex: 0, directUrl: "/api/playback/source/m_media?ticket=value&source_id=audio_0_tr", ready: true, status: "ready" }],
     }, "audio_0_tr", "tr")).toBe(true);
+    const externalReady = {
+      ...base,
+      manifestUrl: "/api/playback/manifest/m_media?ticket=value",
+      preparationState: "ready",
+      tracks: [{ id: "audio_0_tr", label: "Turkish", language: "tr", channels: 2, default: true, source: "external", streamIndex: 0, directUrl: "/api/playback/source/m_media?ticket=value&source_id=audio_0_tr", ready: true, status: "ready" }],
+    } as unknown as PlaybackRunResponse;
+    expect(initialPlaybackMode(externalReady, "audio_0_tr", "tr")).toBe("hls");
+    expect(initialPlaybackMode({ ...externalReady, manifestUrl: null }, "audio_0_tr", "tr")).toBe("progressive");
+    expect(initialPlaybackMode({ ...externalReady, preparationState: "preparing" }, "audio_0_tr", "tr")).toBe("progressive");
   });
 
   it("recognizes growing HLS and extends startup only while bounded progress continues", () => {
@@ -252,6 +263,10 @@ describe("player interaction contracts", () => {
   it("distinguishes an accepted progress request from one that must be retried", () => {
     expect(progressSequenceWasAccepted(4, 5)).toBe(true);
     expect(progressSequenceWasAccepted(4, 4)).toBe(false);
+    expect(playbackProgressFailureAction(new ApiError("Sequence conflict", 409, "PLAYBACK_SEQUENCE_MISMATCH"))).toBe("reconcile");
+    expect(playbackProgressFailureAction(new ApiError("Run expired", 410, "PLAYBACK_RUN_EXPIRED"))).toBe("stop");
+    expect(playbackProgressFailureAction(new ApiError("Source changed", 409, "PLAYBACK_SOURCE_CHANGED"))).toBe("stop");
+    expect(playbackProgressFailureAction(new ApiError("Offline", 0, "server_unreachable"))).toBe("retry-later");
   });
 
   it("merges rendition status without replacing the active transport ticket or URLs", () => {

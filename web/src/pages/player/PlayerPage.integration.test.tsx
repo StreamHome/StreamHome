@@ -157,6 +157,7 @@ describe("mounted player lifecycle", () => {
     const fullscreenButton = screen.getByRole("button", { name: "Fullscreen" });
     fullscreenButton.focus();
     fireEvent.keyDown(fullscreenButton, { key: "k" });
+    fireEvent.keyUp(fullscreenButton, { key: "k" });
     expect(pause).toHaveBeenCalled();
     Object.defineProperty(video, "paused", { configurable: true, value: true });
     fireEvent.pause(video);
@@ -173,18 +174,19 @@ describe("mounted player lifecycle", () => {
     play.mockClear();
     fullscreenButton.focus();
     fireEvent.keyDown(fullscreenButton, { key: " " });
+    fireEvent.keyUp(fullscreenButton, { key: " " });
     await waitFor(() => expect(play).toHaveBeenCalled());
 
-    fireEvent.keyDown(window, { key: "ArrowDown" });
+    fireEvent.keyDown(document.body, { key: "ArrowDown" });
     await waitFor(() => expect((screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement).value).toBe("0.95"));
-    fireEvent.keyDown(window, { key: "ArrowUp" });
+    fireEvent.keyDown(document.body, { key: "ArrowUp" });
     await waitFor(() => expect((screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement).value).toBe("1"));
 
     video.currentTime = 30;
     fireEvent.timeUpdate(video);
-    fireEvent.keyDown(window, { key: "ArrowRight" });
+    fireEvent.keyDown(document.body, { key: "ArrowRight" });
     expect(video.currentTime).toBe(40);
-    fireEvent.keyDown(window, { key: "ArrowLeft" });
+    fireEvent.keyDown(document.body, { key: "ArrowLeft" });
     expect(video.currentTime).toBe(30);
     view.unmount();
   });
@@ -233,8 +235,8 @@ describe("mounted player lifecycle", () => {
     const pause = vi.mocked(HTMLMediaElement.prototype.pause);
     pause.mockClear();
 
-    fireEvent.keyDown(window, { key: "ArrowRight" });
-    fireEvent.keyDown(window, { key: "ArrowRight" });
+    fireEvent.keyDown(document.body, { key: "ArrowRight" });
+    fireEvent.keyDown(document.body, { key: "ArrowRight" });
 
     expect(video.currentTime).toBe(91.5);
     expect(screen.getByText("The download is still expanding. Jumped to the latest available point.")).toBeTruthy();
@@ -605,13 +607,16 @@ describe("mounted player lifecycle", () => {
 
     const focusedFullscreenButton = screen.getByRole("button", { name: "Exit fullscreen" });
     expect(document.activeElement).not.toBe(focusedFullscreenButton);
+    expect(document.activeElement).toBe(player);
     const play = vi.mocked(HTMLMediaElement.prototype.play);
     play.mockClear();
     focusedFullscreenButton.focus();
     fireEvent.keyDown(focusedFullscreenButton, { key: " " });
+    fireEvent.keyUp(focusedFullscreenButton, { key: " " });
     await waitFor(() => expect(play).toHaveBeenCalled());
     expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeTruthy();
     fireEvent.keyDown(focusedFullscreenButton, { key: "f" });
+    fireEvent.keyUp(focusedFullscreenButton, { key: "f" });
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Fullscreen" })).toBeTruthy());
     expect(player.getAttribute("data-player-viewport-fullscreen")).toBeNull();
