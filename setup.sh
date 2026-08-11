@@ -258,6 +258,21 @@ validate_versions() {
     node_major="$(node -p 'Number(process.versions.node.split(".")[0])')"
     [[ "$node_major" =~ ^[0-9]+$ && "$node_major" -ge 18 ]] \
         || fail "Node.js 18 or newer is required."
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '(^|[[:space:]])libx264([[:space:]]|$)' \
+        || fail "The installed FFmpeg does not provide the required libx264 encoder."
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '(^|[[:space:]])aac([[:space:]]|$)' \
+        || fail "The installed FFmpeg does not provide the required AAC encoder."
+    ffmpeg -hide_banner -muxers 2>/dev/null | grep -Eq '(^|[[:space:]])hls([[:space:]]|$)' \
+        || fail "The installed FFmpeg does not provide the required HLS muxer."
+    ffmpeg -hide_banner -filters 2>/dev/null | grep -Eq '(^|[[:space:]])scale([[:space:]]|$)' \
+        || fail "The installed FFmpeg does not provide the required scale filter."
+    ffmpeg -hide_banner -filters 2>/dev/null | grep -Eq '(^|[[:space:]])pad([[:space:]]|$)' \
+        || fail "The installed FFmpeg does not provide the required pad filter."
+    ffprobe -v error -show_program_version -of json 2>/dev/null | grep -q '"program_version"' \
+        || fail "The installed FFprobe does not provide the required JSON output support."
+    if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '(^|[[:space:]])libx265([[:space:]]|$)'; then
+        log "FFmpeg has no libx265 encoder; optional background HEVC optimization will remain unavailable"
+    fi
     if ! rclone_version_supported; then
         install_app_rclone
     fi
@@ -354,6 +369,8 @@ record_prepared_state() {
     "$ROOT_DIR/venv/bin/python" -m pip check
     [[ -d "$ROOT_DIR/web/node_modules" && -x "$ROOT_DIR/web/node_modules/.bin/vite" ]] \
         || fail "The prepared web dependency tree is missing or incomplete."
+    (cd "$ROOT_DIR/web" && npm ls --depth=0 >/dev/null) \
+        || fail "The prepared web dependency tree is inconsistent. Run ./setup.sh --force."
     [[ -s "$ROOT_DIR/web/dist/index.html" ]] || fail "The prepared production web assets are missing."
     build_id="$(current_build_id)"
     web_build_marker_matches "$build_id" \
@@ -413,7 +430,8 @@ prepare_web() {
     build_id="$(current_build_id)"
     if stamp_matches "$dependency_stamp" "$dependency_fingerprint" \
         && [[ -d "$ROOT_DIR/web/node_modules" ]] \
-        && [[ -x "$ROOT_DIR/web/node_modules/.bin/vite" ]]
+        && [[ -x "$ROOT_DIR/web/node_modules/.bin/vite" ]] \
+        && (cd "$ROOT_DIR/web" && npm ls --depth=0 >/dev/null 2>&1)
     then
         log "Web dependency manifests are unchanged; keeping the installed node modules"
     else

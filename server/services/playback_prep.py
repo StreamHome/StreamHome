@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,7 @@ from services.logger import logger
 from services.languages import language_label, normalize_language_tag
 from services.media_source import ResolvedMediaSource, playback_source_fingerprint, resolve_media_source
 from services.rclone import rclone_service
+from services.state import register_process, unregister_process
 
 
 STANDARD_HEIGHTS = (1080, 720, 480, 360, 240, 144)
@@ -48,6 +50,7 @@ class AudioRendition:
     label: str
     language: str
     stream_index: int
+    absolute_stream_index: bool
     default: bool
     codec: str = ""
     source: str = "embedded"
@@ -91,6 +94,8 @@ class PlaybackPrepService:
         self.background_semaphore = asyncio.Semaphore(max(1, concurrency - 1))
         self._master_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._last_touch_at: dict[str, float] = {}
+        self._active_cache_leases: dict[str, float] = {}
+        self._cloud_spool_locks: dict[str, asyncio.Lock] = {}
         self._update_quiesced = False
 
     @property
@@ -284,11 +289,17 @@ class PlaybackPrepService:
         if not metadata:
             return []
 
-        default_indexes = [int(item.get("index", 0)) for item in metadata if item.get("default")]
-        default_index = default_indexes[0] if default_indexes else int(metadata[0].get("index", 0))
+        default_positions = [position for position, item in enumerate(metadata) if item.get("default")]
+        default_position = default_positions[0] if default_positions else 0
         renditions: list[AudioRendition] = []
         for position, item in enumerate(metadata):
-            stream_index = int(item.get("index", position))
+            source_kind = str(item.get("source") or "embedded").lower()
+            absolute_stream_index = source_kind == "embedded" and "streamIndex" in item
+            stream_index = int(
+                item.get("streamIndex", item.get("index", position))
+                if source_kind == "embedded"
+                else item.get("index", position)
+            )
             language = normalize_language_tag(item.get("language"))
             label = language_label(language, item.get("label"))
             renditions.append(
@@ -297,9 +308,10 @@ class PlaybackPrepService:
                     label=label,
                     language=language,
                     stream_index=stream_index,
-                    default=stream_index == default_index,
+                    absolute_stream_index=absolute_stream_index,
+                    default=position == default_position,
                     codec=str(item.get("codec") or "").lower(),
-                    source=str(item.get("source") or "embedded").lower(),
+                    source=source_kind,
                     file_name=str(item.get("fileName") or item.get("file_name") or "") or None,
                 )
             )
@@ -858,20 +870,44 @@ class PlaybackPrepService:
         task = asyncio.create_task(coroutine)
         self._track_job(key, task, priority)
 
-    async def _input_process(self, source: ResolvedMediaSource) -> tuple[str, Optional[asyncio.subprocess.Process]]:
+    async def _input_process(
+        self,
+        source: ResolvedMediaSource,
+        media_id: str,
+        fingerprint: str,
+    ) -> tuple[str, Optional[asyncio.subprocess.Process]]:
         if source.local_exists:
             return str(source.local_path), None
         if not source.cloud_exists or not source.cloud_path:
             raise PlaybackPreparationError("MEDIA_SOURCE_MISSING", "The media source is no longer available.")
         if not rclone_service.executable():
             raise PlaybackPreparationError("RCLONE_UNAVAILABLE", "Google Drive playback is unavailable because rclone is missing.")
-        process = await asyncio.create_subprocess_exec(
-            *rclone_service.command("cat", source.cloud_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        return "pipe:0", process
+        if not rclone_service.cloud_write_available() and rclone_service.cloud_health().get("state") == "unauthorized":
+            raise PlaybackPreparationError("CLOUD_UNAUTHORIZED", "Google Drive authorization must be renewed.")
+
+        extension = Path(source.cloud_path).suffix or ".media"
+        source_key = hashlib.sha256(source.cloud_path.encode("utf-8")).hexdigest()[:24]
+        spool_path = self.cache_path(media_id, fingerprint) / ".sources" / f"{source_key}{extension}"
+        lock_key = str(spool_path)
+        lock = self._cloud_spool_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            expected_size = int(source.cloud_size or 0)
+            if spool_path.is_file() and (expected_size <= 0 or spool_path.stat().st_size == expected_size):
+                return str(spool_path), None
+            spool_path.parent.mkdir(parents=True, exist_ok=True)
+            result = await rclone_service.copyto_atomic(source.cloud_path, str(spool_path), timeout=6 * 60 * 60)
+            if not result.ok:
+                raise PlaybackPreparationError(
+                    result.error_code or "CLOUD_SPOOL_FAILED",
+                    "Google Drive could not stage a seekable playback source.",
+                )
+            if expected_size > 0 and spool_path.stat().st_size != expected_size:
+                spool_path.unlink(missing_ok=True)
+                raise PlaybackPreparationError(
+                    "CLOUD_SPOOL_TRUNCATED",
+                    "Google Drive staged an incomplete playback source.",
+                )
+        return str(spool_path), None
 
     async def _pump_cloud_input(
         self,
@@ -994,7 +1030,7 @@ class PlaybackPrepService:
             cloud_stderr_task: Optional[asyncio.Task[bytes]] = None
             ffmpeg_stderr_task: Optional[asyncio.Task[bytes]] = None
             try:
-                actual_input, cloud_process = await self._input_process(source)
+                actual_input, cloud_process = await self._input_process(source, media_id, fingerprint)
                 command = [self._ffmpeg_executable(), "-hide_banner", "-nostdin", "-y", "-i", actual_input, *arguments, *self._hls_output_args(target_dir)]
                 logger.info(f"[Playback Prep] Preparing {media_id} rendition {rendition_name}.")
                 ffmpeg_process = await asyncio.create_subprocess_exec(
@@ -1005,6 +1041,7 @@ class PlaybackPrepService:
                     stderr=asyncio.subprocess.PIPE,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
+                register_process(f"playback:{job_key}", ffmpeg_process)
                 publish_task = asyncio.create_task(
                     self._publish_when_streamable(media_id, fingerprint, rendition_name, media_obj, ffmpeg_process)
                 )
@@ -1101,6 +1138,7 @@ class PlaybackPrepService:
                     if process and process.returncode is None:
                         process.kill()
                         await process.wait()
+                unregister_process(f"playback:{job_key}")
                 self.running_jobs.discard(job_key)
                 self.job_started_at.pop(job_key, None)
 
@@ -1153,8 +1191,10 @@ class PlaybackPrepService:
 
     @staticmethod
     def _can_fast_package_video(media_obj: Any, rendition: VideoRendition) -> bool:
-        codec = str(getattr(media_obj, "codec", "") or "").lower()
-        return rendition.original and codec in FAST_HLS_VIDEO_CODECS
+        del media_obj, rendition
+        # Stream copy cannot insert keyframes at the configured four-second HLS
+        # boundaries, so it must not advertise independent segments.
+        return False
 
     def _external_audio_path(self, source: ResolvedMediaSource, audio: AudioRendition) -> Optional[Path]:
         audio_dir = source.local_path.parent / "audio"
@@ -1212,11 +1252,21 @@ class PlaybackPrepService:
             await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, external_source, arguments, media_obj)
             return
         if rendition.codec in FAST_HLS_AUDIO_CODECS:
-            arguments = ["-map", f"0:a:{rendition.stream_index}", "-vn", "-c:a", "copy"]
+            stream_map = (
+                f"0:{rendition.stream_index}"
+                if rendition.absolute_stream_index
+                else f"0:a:{rendition.stream_index}"
+            )
+            arguments = ["-map", stream_map, "-vn", "-c:a", "copy"]
             await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, source, arguments, media_obj)
             return
+        stream_map = (
+            f"0:{rendition.stream_index}"
+            if rendition.absolute_stream_index
+            else f"0:a:{rendition.stream_index}"
+        )
         arguments = [
-            "-map", f"0:a:{rendition.stream_index}",
+            "-map", stream_map,
             "-vn",
             "-c:a", "aac",
             "-b:a", "160k",
@@ -1342,6 +1392,7 @@ class PlaybackPrepService:
         path.mkdir(parents=True, exist_ok=True)
         key = str(path)
         now = time.monotonic()
+        self._active_cache_leases[key] = now + 120
         if now - self._last_touch_at.get(key, 0) < 30:
             return
         try:
@@ -1486,6 +1537,13 @@ class PlaybackPrepService:
             for key in list(self.active_jobs)
             if len(parts := key.split(":")) >= 3
         }
+        now = time.monotonic()
+        self._active_cache_leases = {
+            path: expires_at
+            for path, expires_at in self._active_cache_leases.items()
+            if expires_at > now
+        }
+        active_roots.update(self._active_cache_leases)
         entries: list[tuple[float, int, Path]] = []
         total = 0
         for media_dir in self.cache_dir.iterdir():

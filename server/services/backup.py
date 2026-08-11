@@ -12,7 +12,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from db import engine
-from models import PlaybackSession
+from models import PlaybackRun, PlaybackSession
 from services.logger import logger
 from services.queue import queue_manager
 from services.rclone import rclone_service
@@ -84,6 +84,17 @@ async def is_database_idle() -> bool:
             active_sessions = result.all()
             if len(active_sessions) > 0:
                 logger.info(f"[Backup Service] Database is busy: {len(active_sessions)} active playback session(s) detected.")
+                return False
+            active_runs = (
+                await session.exec(
+                    select(PlaybackRun).where(
+                        PlaybackRun.lifecycle_state == "active",
+                        PlaybackRun.last_seen_at >= time.time() - 5 * 60,
+                    )
+                )
+            ).all()
+            if active_runs:
+                logger.info(f"[Backup Service] Database is busy: {len(active_runs)} active playback run(s) detected.")
                 return False
     except Exception as e:
         logger.error(f"[Backup Service] Error checking active playback sessions: {e}")
@@ -172,6 +183,13 @@ def get_local_backups() -> list:
 
 async def sync_backups_to_cloud() -> bool:
     """Sync the local backup directory to the cloud backup location using Rclone."""
+    if not rclone_service.cloud_write_available():
+        health = rclone_service.cloud_health()
+        logger.error(
+            "[Backup Service] Cloud synchronization skipped because the storage circuit is open (%s).",
+            health.get("errorCode") or health.get("state"),
+        )
+        return False
     backup_dir = get_backup_dir()
     target_remote = f"{settings.RCLONE_REMOTE_PATH}/backup"
 

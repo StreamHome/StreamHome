@@ -217,14 +217,34 @@ class PlaybackPipelineRegression(unittest.TestCase):
             source_fingerprint=None,
             audio_metadata=[],
         )
-        database = SimpleNamespace(add=lambda _item: None, flush=AsyncMock(return_value=None))
+        database = SimpleNamespace(
+            add=lambda _item: None,
+            commit=AsyncMock(return_value=None),
+        )
+
+        class SessionContext:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, _exc_type, _exc, _tb):
+                return False
+
+            async def get(self, _model, _media_id):
+                return media
+
+            def add(self, item):
+                database.add(item)
+
+            async def commit(self):
+                await database.commit()
 
         async def run() -> None:
             with (
                 patch("services.queue.resolve_media_source", new=AsyncMock(return_value=source)),
+                patch("services.queue.AsyncSession", return_value=SessionContext()),
                 patch.object(playback_prep_service, "prepare", new=AsyncMock(return_value="preparing")) as prepare,
             ):
-                await manager._schedule_playback_baseline(database, media)
+                await manager._schedule_playback_baseline(media.id, "movie")
                 prepare.assert_awaited_once_with(
                     media.id,
                     media,
@@ -236,7 +256,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
 
         asyncio.run(run())
         self.assertEqual(media.source_fingerprint, source.fingerprint)
-        database.flush.assert_awaited_once()
+        database.commit.assert_awaited_once()
 
     def test_quality_ladder_reaches_144p_without_upscaling(self) -> None:
         source_720p = SimpleNamespace(width=1280, height=720)
@@ -498,7 +518,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             service.cache_dir = Path(directory)
             asyncio.run(exercise(service))
 
-    def test_external_dubbing_overrides_embedded_language_and_invalidates_identity(self) -> None:
+    def test_external_dubbing_coexists_with_embedded_language_and_invalidates_identity(self) -> None:
         ffmpeg = shutil.which("ffmpeg")
         self.assertIsNotNone(ffmpeg)
         sidecar_directory = self.media_directory / "sidecar-audio"
@@ -521,12 +541,21 @@ class PlaybackPipelineRegression(unittest.TestCase):
         first_source = asyncio.run(resolve_media_source(catalog_path, check_cloud=False))
         first_fingerprint = first_source.fingerprint
         probe = asyncio.run(probe_completed_media(str(sidecar_video)))
-        self.assertEqual([item["language"] for item in probe["audio_metadata"]], ["en", "tr"])
-        self.assertTrue(all(item.get("source") == "external" for item in probe["audio_metadata"]))
-        self.assertEqual([item.get("fileName") for item in probe["audio_metadata"]], ["eng.mp3", "tur.mp3"])
+        self.assertEqual([item["language"] for item in probe["audio_metadata"]], ["en", "tr", "en", "tr"])
+        self.assertEqual(
+            [item.get("source", "embedded") for item in probe["audio_metadata"]],
+            ["embedded", "embedded", "external", "external"],
+        )
+        self.assertEqual(
+            [item.get("fileName") for item in probe["audio_metadata"]],
+            [None, None, "eng.mp3", "tur.mp3"],
+        )
         refreshed = merge_local_external_audio(str(sidecar_video), [{"index": 0, "language": "en", "default": True}])
-        self.assertEqual([item["language"] for item in refreshed], ["en", "tr"])
-        self.assertTrue(all(item.get("source") == "external" for item in refreshed))
+        self.assertEqual([item["language"] for item in refreshed], ["en", "en", "tr"])
+        self.assertEqual(
+            [item.get("source", "embedded") for item in refreshed],
+            ["embedded", "external", "external"],
+        )
         with (audio_directory / "tur.mp3").open("ab") as handle:
             handle.write(b"\0")
         second_source = asyncio.run(resolve_media_source(catalog_path, check_cloud=False))
@@ -879,7 +908,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             service.semaphore = asyncio.Semaphore(1)
             asyncio.run(exercise(service))
 
-    def test_compatible_source_uses_fast_hls_packaging(self) -> None:
+    def test_hls_video_is_reencoded_with_segment_aligned_keyframes(self) -> None:
         async def exercise(service: PlaybackPrepService) -> None:
             source = await resolve_media_source(self.catalog_path, check_cloud=False)
             media = SimpleNamespace(codec="h264", width=1920, height=1080, quality="1080p")
@@ -889,8 +918,9 @@ class PlaybackPipelineRegression(unittest.TestCase):
             with patch.object(service, "_run_ffmpeg_job", new=AsyncMock()) as run_job:
                 await service._transcode_video("m_fast", "abc", source, baseline, media)
                 arguments = run_job.await_args.args[4]
-                self.assertIn("copy", arguments)
-                self.assertNotIn("libx264", arguments)
+                self.assertIn("libx264", arguments)
+                self.assertIn("-force_key_frames", arguments)
+                self.assertNotIn("copy", arguments)
 
                 audio = service.audio_renditions(SimpleNamespace(audio_metadata=[{
                     "index": 0,
@@ -974,7 +1004,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             master = cache_path / "master.m3u8"
             self.assertTrue(master.is_file())
             self.assertTrue(any(cache_path.rglob("*.m4s")))
-            self.assertTrue((cache_path / "audio_0_en" / "segment_00000.m4s").is_file(), [str(path) for path in cache_path.rglob("*")])
+            self.assertTrue((cache_path / "audio_1_en" / "segment_00000.m4s").is_file(), [str(path) for path in cache_path.rglob("*")])
             self.assertIn("#EXT-X-PLAYLIST-TYPE:EVENT", (cache_path / "video_original" / "playlist.m3u8").read_text(encoding="utf-8"))
             self.assertEqual(playback_prep_service.rendition_status(media.id, media.source_fingerprint, "video_original"), "ready")
             content = master.read_text(encoding="utf-8")

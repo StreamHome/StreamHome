@@ -9,6 +9,7 @@ import aiofiles
 import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+from urllib.parse import urlsplit
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from db import engine
@@ -21,11 +22,12 @@ from services.media_probe import probe_media_stream, notify_video_sender, probe_
 from services.ingestion_errors import IngestionFailure, IngestionTaskError, prune_task_diagnostics, write_task_diagnostics
 from services.ingest_preview import ingest_preview_service
 from services.rclone import rclone_service
-from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
+from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url, validated_stream_request
 from services.media_source import (
     MediaSourceError,
     ResolvedMediaSource,
     catalog_path_from_storage,
+    local_catalog_source_exists,
     local_playback_fingerprint,
     local_video_fingerprint,
     playback_source_fingerprint,
@@ -33,6 +35,25 @@ from services.media_source import (
 )
 from services.vibe_analysis import VIBE_ANALYSIS_VERSION, compute_trope_vectors, vibe_analysis_manager
 from services.audio_extractor import apply_primary_audio_language, extract_audio_and_strip_video, normalize_language_code
+
+
+def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
+    """Durably replace a JSON document without exposing a partial file to recovery."""
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 def srt_to_vtt(srt_path: str, vtt_path: str) -> bool:
     """
@@ -89,12 +110,18 @@ async def verify_media_exists(rel_path: str) -> bool:
 
 
 class DownloadQueueManager:
+    MINIMUM_TASK_RESERVATION_BYTES = 5 * 1024**3
+    STORAGE_SAFETY_MARGIN_BYTES = 2 * 1024**3
+    ESTIMATED_MEDIA_BYTES_PER_SECOND = 2 * 1024**2
+
     def __init__(self):
         self.loop_task: Optional[asyncio.Task] = None
         self.is_running = False
         self.active_tasks = set()
         self.worker_tasks: Dict[str, asyncio.Task] = {}
         self.cancelled_tasks: set[str] = set()
+        self.active_media_keys: Dict[str, str] = {}
+        self.storage_reservations: Dict[str, int] = {}
 
     def start(self):
         if not self.is_running:
@@ -116,6 +143,8 @@ class DownloadQueueManager:
             await asyncio.gather(*workers, return_exceptions=True)
         self.worker_tasks.clear()
         self.active_tasks.clear()
+        self.active_media_keys.clear()
+        self.storage_reservations.clear()
         self.cancelled_tasks.clear()
         logger.info("[Queue Manager] Background worker loop stopped.")
 
@@ -135,6 +164,8 @@ class DownloadQueueManager:
 
     def _worker_finished(self, task_id: str, worker: asyncio.Task) -> None:
         self.active_tasks.discard(task_id)
+        self.active_media_keys.pop(task_id, None)
+        self.storage_reservations.pop(task_id, None)
         self.worker_tasks.pop(task_id, None)
         if worker.cancelled():
             return
@@ -156,7 +187,21 @@ class DownloadQueueManager:
                 async with AsyncSession(engine) as db:
                     stmt = select(DownloadTask).where(DownloadTask.status == "PENDING").order_by(DownloadTask.created_at)
                     result = await db.exec(stmt)
-                    task = result.first()
+                    tasks = result.all()
+                    active_keys = set(self.active_media_keys.values())
+                    task = next(
+                        (
+                            candidate
+                            for candidate in tasks
+                            if self._media_identity_key(
+                                candidate.tmdb_id,
+                                candidate.media_type,
+                                candidate.season,
+                                candidate.episode,
+                            ) not in active_keys
+                        ),
+                        None,
+                    )
                     
                     if not task:
                         continue
@@ -169,6 +214,12 @@ class DownloadQueueManager:
                     task_id = task.id
                 
                 self.active_tasks.add(task_id)
+                self.active_media_keys[task_id] = self._media_identity_key(
+                    task.tmdb_id,
+                    task.media_type,
+                    task.season,
+                    task.episode,
+                )
                 worker = asyncio.create_task(self._process_task(task_id), name=f"ingestion-{task_id}")
                 self.worker_tasks[task_id] = worker
                 worker.add_done_callback(lambda future, tid=task_id: self._worker_finished(tid, future))
@@ -178,30 +229,227 @@ class DownloadQueueManager:
             except Exception as e:
                 logger.error(f"[Queue Manager] Error in worker loop: {e}")
 
-    async def run_rclone_move_dir(self, local_dir: str, remote_subpath: str) -> bool:
+    async def run_rclone_move_dir(
+        self,
+        local_dir: str,
+        remote_subpath: str,
+        task_id: str,
+    ) -> tuple[bool, Optional[str]]:
+        if not rclone_service.cloud_write_available():
+            health = rclone_service.cloud_health()
+            logger.warning(
+                f"[Queue Manager] Cloud upload circuit is open: "
+                f"{health.get('errorCode') or health.get('state')}."
+            )
+            return False, None
         if not rclone_service.executable():
             logger.error("[Queue Manager] Rclone binary not found. Cannot perform cloud upload.")
-            return False
+            return False, None
         target_remote = f"{settings.RCLONE_REMOTE_PATH}/{remote_subpath.replace('\\', '/')}"
+        safe_task_id = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)
+        staging_remote = f"{settings.RCLONE_REMOTE_PATH}/.streamhome-ingestion/{safe_task_id}"
+        backup_remote = f"{settings.RCLONE_REMOTE_PATH}/.streamhome-replacement-backups/{safe_task_id}"
+        previous_remote: Optional[str] = None
         try:
-            upload = await rclone_service.run("copy", local_dir, target_remote, "--retries", "3", timeout=6 * 60 * 60)
+            await rclone_service.run("purge", staging_remote, timeout=30 * 60)
+            await rclone_service.run("purge", backup_remote, timeout=30 * 60)
+            upload = await rclone_service.run(
+                "sync",
+                local_dir,
+                staging_remote,
+                "--retries",
+                "3",
+                timeout=6 * 60 * 60,
+            )
             if not upload.ok:
                 logger.error(f"[Queue Manager] Drive upload failed: {upload.error_code or 'rclone_failed'}")
-                return False
-            verification = await rclone_service.run("check", local_dir, target_remote, "--one-way", timeout=60 * 60)
+                return False, None
+            verification = await rclone_service.run("check", local_dir, staging_remote, "--one-way", timeout=60 * 60)
             if not verification.ok:
                 logger.error(f"[Queue Manager] Drive upload verification failed: {verification.error_code or 'rclone_failed'}")
-                return False
-            return True
-        except Exception as e:
-            logger.error(f"[Queue Manager] Rclone move subprocess exception: {e}")
-            return False
+                await rclone_service.run("purge", staging_remote, timeout=30 * 60)
+                return False, None
+
+            target_state = await rclone_service.run("lsjson", target_remote, "--stat", timeout=5 * 60)
+            if target_state.ok:
+                moved_previous = await rclone_service.run("moveto", target_remote, backup_remote, timeout=60 * 60)
+                if not moved_previous.ok:
+                    logger.error(
+                        f"[Queue Manager] Could not preserve the previous Drive tree: "
+                        f"{moved_previous.error_code or 'rclone_failed'}"
+                    )
+                    await rclone_service.run("purge", staging_remote, timeout=30 * 60)
+                    return False, None
+                previous_remote = backup_remote
+            elif target_state.error_code != "drive_not_found":
+                logger.error(
+                    f"[Queue Manager] Could not inspect the Drive publication target: "
+                    f"{target_state.error_code or 'rclone_failed'}"
+                )
+                await rclone_service.run("purge", staging_remote, timeout=30 * 60)
+                return False, None
+
+            published = await rclone_service.run("moveto", staging_remote, target_remote, timeout=60 * 60)
+            if not published.ok:
+                logger.error(
+                    f"[Queue Manager] Could not publish the verified Drive staging tree: "
+                    f"{published.error_code or 'rclone_failed'}"
+                )
+                if previous_remote:
+                    await rclone_service.run("moveto", previous_remote, target_remote, timeout=60 * 60)
+                await rclone_service.run("purge", staging_remote, timeout=30 * 60)
+                return False, None
+            logger.info(f"[Queue Manager] Rclone publication verified: {local_dir} -> {target_remote}")
+            return True, previous_remote
+        except Exception as error:
+            logger.error(f"[Queue Manager] Rclone publication exception: {type(error).__name__}")
+            if previous_remote:
+                await rclone_service.run("purge", target_remote, timeout=30 * 60)
+                await rclone_service.run("moveto", previous_remote, target_remote, timeout=60 * 60)
+            await rclone_service.run("purge", staging_remote, timeout=30 * 60)
+            return False, None
+
+    async def _rollback_cloud_publication(
+        self,
+        remote_subpath: str,
+        previous_remote: Optional[str],
+    ) -> None:
+        target_remote = f"{settings.RCLONE_REMOTE_PATH}/{remote_subpath.replace('\\', '/')}"
+        await rclone_service.run("purge", target_remote, timeout=30 * 60)
+        if previous_remote:
+            restored = await rclone_service.run("moveto", previous_remote, target_remote, timeout=60 * 60)
+            if not restored.ok:
+                raise RuntimeError(restored.error_code or "cloud_rollback_failed")
+
+    @staticmethod
+    async def _finalize_cloud_publication(previous_remote: Optional[str]) -> None:
+        if not previous_remote:
+            return
+        result = await rclone_service.run("purge", previous_remote, timeout=30 * 60)
+        if not result.ok and result.error_code != "drive_not_found":
+            logger.warning(
+                f"[Queue Manager] Could not remove committed Drive rollback data: "
+                f"{result.error_code or 'rclone_failed'}"
+            )
+
+    @staticmethod
+    def _media_identity_key(
+        tmdb_id: int,
+        media_type: str,
+        season: Optional[int],
+        episode: Optional[int],
+    ) -> str:
+        if media_type == "movie":
+            return f"movie:{tmdb_id}"
+        return f"episode:{tmdb_id}:{season or 1}:{episode or 1}"
+
+    def _reserve_storage(self, task_id: str, requested_bytes: int) -> None:
+        reservation = max(self.MINIMUM_TASK_RESERVATION_BYTES, int(requested_bytes))
+        other_reserved = sum(
+            amount for reserved_task, amount in self.storage_reservations.items() if reserved_task != task_id
+        )
+        roots = {Path(settings.TEMP_DIR).resolve(), Path(settings.MEDIA_DIR).resolve()}
+        for root in roots:
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+                free = shutil.disk_usage(root).free
+            except OSError as exc:
+                raise IngestionTaskError(
+                    IngestionFailure(
+                        "STORAGE_UNAVAILABLE",
+                        f"The configured storage root could not be checked ({type(exc).__name__}).",
+                    )
+                ) from exc
+            required = other_reserved + reservation + self.STORAGE_SAFETY_MARGIN_BYTES
+            logger.info(
+                f"[Queue Manager] Storage capacity for '{root}': "
+                f"{free / 1024**3:.2f} GB free, {required / 1024**3:.2f} GB reserved/required."
+            )
+            if free < required:
+                raise IngestionTaskError(
+                    IngestionFailure(
+                        "INSUFFICIENT_STORAGE",
+                        f"Only {free / 1024**3:.2f} GB is free in {root}; "
+                        f"active and planned ingestion requires {required / 1024**3:.2f} GB.",
+                    )
+                )
+        self.storage_reservations[task_id] = reservation
+
+    @staticmethod
+    def _assert_directory_within(path: str, root: str, label: str) -> Path:
+        candidate = Path(path).resolve()
+        expected_root = Path(root).resolve()
+        try:
+            candidate.relative_to(expected_root)
+        except ValueError as exc:
+            raise ValueError(f"{label} is outside its configured storage root") from exc
+        return candidate
+
+    def _publish_local_directory(
+        self,
+        staging_dir: str,
+        destination_dir: str,
+        task_id: str,
+    ) -> Optional[str]:
+        """Publish one task-owned directory while retaining a recoverable replacement."""
+
+        staging = self._assert_directory_within(staging_dir, settings.TEMP_DIR, "Staging directory")
+        destination = self._assert_directory_within(destination_dir, settings.MEDIA_DIR, "Media destination")
+        backup_root = Path(settings.TEMP_DIR).resolve() / "replacement-backups" / task_id
+        backup = backup_root / "previous"
+        if backup_root.exists():
+            shutil.rmtree(backup_root)
+        backup_root.mkdir(parents=True, exist_ok=True)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        had_previous = destination.exists()
+        if had_previous:
+            shutil.move(str(destination), str(backup))
+        try:
+            shutil.move(str(staging), str(destination))
+        except Exception:
+            if destination.exists():
+                shutil.rmtree(destination)
+            if had_previous and backup.exists():
+                shutil.move(str(backup), str(destination))
+            shutil.rmtree(backup_root, ignore_errors=True)
+            raise
+        return str(backup) if had_previous else None
+
+    def _rollback_local_publication(
+        self,
+        destination_dir: Optional[str],
+        replacement_backup: Optional[str],
+        task_id: str,
+    ) -> None:
+        if not destination_dir:
+            return
+        destination = self._assert_directory_within(destination_dir, settings.MEDIA_DIR, "Media destination")
+        backup = Path(replacement_backup).resolve() if replacement_backup else None
+        if destination.exists():
+            shutil.rmtree(destination)
+        if backup and backup.exists():
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(backup), str(destination))
+        shutil.rmtree(Path(settings.TEMP_DIR).resolve() / "replacement-backups" / task_id, ignore_errors=True)
+
+    @staticmethod
+    def _finalize_local_publication(task_id: str) -> None:
+        shutil.rmtree(Path(settings.TEMP_DIR).resolve() / "replacement-backups" / task_id, ignore_errors=True)
 
     async def _process_task(self, task_id: str):
         logger.info(f"[Queue Manager] Processing task: {task_id}")
         output_abs_path: Optional[str] = None
+        catalog_abs_path: Optional[str] = None
+        staging_task_root = Path(settings.TEMP_DIR).resolve() / "ingestion" / task_id
         created_artifacts: List[str] = []
         submitted_video_url = ""
+        published_local_dir: Optional[str] = None
+        replacement_backup: Optional[str] = None
+        cloud_remote_subpath: Optional[str] = None
+        cloud_replacement_backup: Optional[str] = None
+        uploaded_to_cloud = False
+        task_completed = False
         try:
             async with AsyncSession(engine) as db:
                 task = await db.get(DownloadTask, task_id)
@@ -237,13 +485,9 @@ class DownloadQueueManager:
                 raise IngestionTaskError(IngestionFailure("UNSAFE_SOURCE", str(exc), False)) from exc
 
             # 1. Disk Space Check
-            storage_root = settings.TEMP_DIR if settings.STORAGE_ENGINE == "CLOUD" else settings.MEDIA_DIR
+            storage_root = settings.TEMP_DIR
             try:
-                total, used, free = shutil.disk_usage(storage_root)
-                free_gb = free / (1024**3)
-                logger.info(f"[Queue Manager] Free space in storage root '{storage_root}': {free_gb:.2f} GB")
-                if free_gb < 5.0:
-                    raise IngestionTaskError(IngestionFailure("INSUFFICIENT_STORAGE", f"Only {free_gb:.2f} GB is free; ingestion requires at least 5 GB."))
+                self._reserve_storage(task_id, self.MINIMUM_TASK_RESERVATION_BYTES)
             except IngestionTaskError:
                 raise
             except OSError as err:
@@ -254,6 +498,8 @@ class DownloadQueueManager:
             logger.info(f"[Queue Manager] Validating media sender source for task {task_id}...")
             probe_res = None
             for probe_attempt in range(1, 4):
+                await validate_url(video_url, client_address=validation_client)
+                await validate_url(audio_url, client_address=validation_client)
                 probe_res = await probe_media_stream(
                     video_url,
                     audio_url,
@@ -325,6 +571,11 @@ class DownloadQueueManager:
             probed_duration = float(probe_res.get("probed_duration") or 0)
             if probed_duration > 0:
                 duration_secs = probed_duration
+            estimated_bytes = (
+                int(duration_secs * self.ESTIMATED_MEDIA_BYTES_PER_SECOND)
+                + self.STORAGE_SAFETY_MARGIN_BYTES
+            )
+            self._reserve_storage(task_id, estimated_bytes)
 
             raw_title = meta.get("title", f"Media_{tmdb_id}")
             clean_title = "".join(c for c in raw_title if c.isalnum() or c in " .-_")
@@ -332,16 +583,33 @@ class DownloadQueueManager:
             if media_type == "movie":
                 release_year = meta.get("releaseYear", 2026)
                 folder_name = f"{clean_title}_{release_year}_TMDB_{tmdb_id}"
-                folder_rel_path = os.path.join(storage_root, "Movies", folder_name)
+                folder_rel_path = os.path.join(storage_root, "ingestion", task_id, "Movies", folder_name)
                 filename = f"{clean_title}_{release_year}.mp4"
                 output_rel_path = os.path.join(folder_rel_path, filename)
+                catalog_abs_path = os.path.join(settings.MEDIA_DIR, "Movies", folder_name, filename)
             else:
                 season_num = season or 1
                 ep_num = episode or 1
                 folder_name = f"{clean_title}_TMDB_{tmdb_id}"
-                folder_rel_path = os.path.join(storage_root, "Series", folder_name, f"Season_{season_num}", f"Episode_{ep_num}")
+                folder_rel_path = os.path.join(
+                    storage_root,
+                    "ingestion",
+                    task_id,
+                    "Series",
+                    folder_name,
+                    f"Season_{season_num}",
+                    f"Episode_{ep_num}",
+                )
                 filename = f"{clean_title}_S{season_num:02d}E{ep_num:02d}.mp4"
                 output_rel_path = os.path.join(folder_rel_path, filename)
+                catalog_abs_path = os.path.join(
+                    settings.MEDIA_DIR,
+                    "Series",
+                    folder_name,
+                    f"Season_{season_num}",
+                    f"Episode_{ep_num}",
+                    filename,
+                )
                 
             output_abs_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", output_rel_path))
             os.makedirs(os.path.dirname(output_abs_path), exist_ok=True)
@@ -361,8 +629,15 @@ class DownloadQueueManager:
                         sub_abs_path = os.path.join(os.path.dirname(output_abs_path), f"subtitle_{sub_lang}{ext}")
                         temporary_subtitle = f"{sub_abs_path}.part"
                         total_bytes = 0
-                        async with httpx.AsyncClient(follow_redirects=False) as client:
-                            async with client.stream("GET", sub_url, headers=subtitle_headers, timeout=15.0) as response:
+                        response: Optional[httpx.Response] = None
+                        async with httpx.AsyncClient(follow_redirects=False, timeout=15.0) as client:
+                            response = await validated_stream_request(
+                                client,
+                                sub_url,
+                                headers=subtitle_headers,
+                                client_address=validation_client,
+                            )
+                            try:
                                 response.raise_for_status()
                                 async with aiofiles.open(temporary_subtitle, "wb") as subtitle_file:
                                     async for chunk in response.aiter_bytes():
@@ -370,6 +645,8 @@ class DownloadQueueManager:
                                         if total_bytes > 10 * 1024 * 1024:
                                             raise ValueError("Subtitle response exceeds the 10 MiB limit")
                                         await subtitle_file.write(chunk)
+                            finally:
+                                await response.aclose()
                         os.replace(temporary_subtitle, sub_abs_path)
                         created_artifacts.append(sub_abs_path)
                     except Exception as subtitle_error:
@@ -377,7 +654,9 @@ class DownloadQueueManager:
                             os.remove(temporary_subtitle)
                         logger.warning(
                             f"[Subtitles] Could not download {sub_lang} subtitle for task {task_id}: "
-                            f"{type(subtitle_error).__name__}"
+                            f"host={urlsplit(sub_url).hostname or 'unknown'} "
+                            f"status={getattr(locals().get('response'), 'status_code', 0)} "
+                            f"error={type(subtitle_error).__name__}"
                         )
 
             # Convert any SRT subtitles to WebVTT
@@ -410,6 +689,8 @@ class DownloadQueueManager:
                     from services.state import update_task_metrics
                     update_task_metrics(task_id, 0.0, speed=f"Retrying ({attempt}/{max_retries})...", eta="00:00:00", force_write=True)
                 
+                await validate_url(video_url, client_address=validation_client)
+                await validate_url(audio_url, client_address=validation_client)
                 success, failure = await download_and_merge(
                     task_id=task_id, video_url=video_url, audio_url=audio_url,
                     headers=headers, output_path=output_abs_path, duration_secs=duration_secs,
@@ -451,7 +732,9 @@ class DownloadQueueManager:
             local_dir = os.path.dirname(output_abs_path)
             uploaded_to_cloud = False
             cloud_ingestion = settings.STORAGE_ENGINE == "CLOUD"
-            async with AsyncSession(engine) as db:
+            finalized_media_id = ""
+            finalized_media_type = "movie" if media_type == "movie" else "episode"
+            async with AsyncSession(engine, expire_on_commit=False) as db:
                 task = await db.get(DownloadTask, task_id)
                 if not task:
                     self.active_tasks.discard(task_id)
@@ -475,6 +758,7 @@ class DownloadQueueManager:
                         task.skip_markers,
                         finalize=False,
                         preview_task_id=task_id,
+                        catalog_file_path=catalog_abs_path,
                     )
                     await db.commit()
                 except Exception as cat_err:
@@ -508,21 +792,23 @@ class DownloadQueueManager:
                     remote_subpath = os.path.join("Movies", folder_name)
                 else:
                     remote_subpath = os.path.join("Series", folder_name, f"Season_{season}", f"Episode_{episode}")
-                uploaded_to_cloud = await self.run_rclone_move_dir(local_dir, remote_subpath)
+                cloud_remote_subpath = remote_subpath
+                uploaded_to_cloud, cloud_replacement_backup = await self.run_rclone_move_dir(
+                    local_dir,
+                    remote_subpath,
+                    task_id,
+                )
                 if not uploaded_to_cloud:
                     logger.warning(f"[Queue Manager] Cloud upload failed for task {task_id}; falling back to local storage.")
-                    temp_abs = os.path.normpath(os.path.abspath(settings.TEMP_DIR))
-                    media_abs = os.path.normpath(os.path.abspath(settings.MEDIA_DIR))
-                    local_dir_norm = os.path.normpath(local_dir)
                     try:
-                        relative_dir = os.path.relpath(local_dir_norm, temp_abs)
-                        if relative_dir.startswith(".."):
-                            raise ValueError("Cloud staging folder is outside the temporary storage root")
-                        dest_dir = os.path.join(media_abs, relative_dir)
-                        os.makedirs(os.path.dirname(dest_dir), exist_ok=True)
-                        if os.path.exists(dest_dir):
-                            shutil.rmtree(dest_dir)
-                        shutil.move(local_dir, dest_dir)
+                        dest_dir = os.path.dirname(str(catalog_abs_path))
+                        replacement_backup = await asyncio.to_thread(
+                            self._publish_local_directory,
+                            local_dir,
+                            dest_dir,
+                            task_id,
+                        )
+                        published_local_dir = dest_dir
                         logger.info(f"[Queue Manager] Local fallback completed for task {task_id}: {dest_dir}")
                     except Exception as fallback_err:
                         diagnostics_path = write_task_diagnostics(task_id, "cloud fallback", traceback.format_exc())
@@ -534,6 +820,27 @@ class DownloadQueueManager:
                                 diagnostics_path,
                             )
                         ) from fallback_err
+            else:
+                dest_dir = os.path.dirname(str(catalog_abs_path))
+                try:
+                    replacement_backup = await asyncio.to_thread(
+                        self._publish_local_directory,
+                        local_dir,
+                        dest_dir,
+                        task_id,
+                    )
+                    published_local_dir = dest_dir
+                    logger.info(f"[Queue Manager] Local publication completed for task {task_id}: {dest_dir}")
+                except Exception as publish_err:
+                    diagnostics_path = write_task_diagnostics(task_id, "local publication", traceback.format_exc())
+                    raise IngestionTaskError(
+                        IngestionFailure(
+                            "LOCAL_PUBLISH_FAILED",
+                            f"The prepared media could not be published ({type(publish_err).__name__}).",
+                            False,
+                            diagnostics_path,
+                        )
+                    ) from publish_err
 
             final_fingerprint = prepared_fingerprint
             if cloud_ingestion and uploaded_to_cloud:
@@ -545,7 +852,7 @@ class DownloadQueueManager:
                     prepared_fingerprint,
                 )
 
-            async with AsyncSession(engine) as db:
+            async with AsyncSession(engine, expire_on_commit=False) as db:
                 task = await db.get(DownloadTask, task_id)
                 if not task:
                     self.active_tasks.discard(task_id)
@@ -565,12 +872,24 @@ class DownloadQueueManager:
                 task.status = "COMPLETED"
                 task.error_message = None
                 db.add(task)
+                finalized_media_id = str(finalized_media.id)
                 await db.commit()
-                await self._schedule_playback_baseline(db, finalized_media)
-                analysis_type = "movie" if media_type == "movie" else "episode"
-                analysis_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"
-                await vibe_analysis_manager.enqueue(analysis_type, analysis_id)
                 created_artifacts.clear()
+                task_completed = True
+
+            await asyncio.to_thread(self._finalize_local_publication, task_id)
+            await self._finalize_cloud_publication(cloud_replacement_backup)
+
+            await self._schedule_playback_baseline(finalized_media_id, finalized_media_type)
+            analysis_type = "movie" if media_type == "movie" else "episode"
+            analysis_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"
+            try:
+                await vibe_analysis_manager.enqueue(analysis_type, analysis_id)
+            except Exception as analysis_error:
+                logger.warning(
+                    f"[Queue Manager] Vibe analysis scheduling failed for {analysis_id}: "
+                    f"{type(analysis_error).__name__}"
+                )
             if uploaded_to_cloud and os.path.exists(local_dir):
                 shutil.rmtree(local_dir)
                     
@@ -588,6 +907,30 @@ class DownloadQueueManager:
             await self._record_task_failure(task_id, failure, submitted_video_url)
                 
         finally:
+            if published_local_dir and not task_completed:
+                try:
+                    await asyncio.to_thread(
+                        self._rollback_local_publication,
+                        published_local_dir,
+                        replacement_backup,
+                        task_id,
+                    )
+                except Exception as rollback_error:
+                    logger.error(
+                        f"[Queue Manager] Failed to roll back local publication for task {task_id}: "
+                        f"{type(rollback_error).__name__}"
+                    )
+            if uploaded_to_cloud and cloud_remote_subpath and not task_completed:
+                try:
+                    await self._rollback_cloud_publication(
+                        cloud_remote_subpath,
+                        cloud_replacement_backup,
+                    )
+                except Exception as rollback_error:
+                    logger.error(
+                        f"[Queue Manager] Failed to roll back cloud publication for task {task_id}: "
+                        f"{type(rollback_error).__name__}"
+                    )
             for artifact in created_artifacts:
                 if os.path.exists(artifact):
                     try:
@@ -596,7 +939,17 @@ class DownloadQueueManager:
                         pass
             if output_abs_path:
                 self._remove_empty_parents(os.path.dirname(output_abs_path))
+            if staging_task_root.exists():
+                try:
+                    await asyncio.to_thread(shutil.rmtree, staging_task_root)
+                except OSError as staging_cleanup_error:
+                    logger.warning(
+                        f"[Queue Manager] Could not remove staging directory for task {task_id}: "
+                        f"{type(staging_cleanup_error).__name__}"
+                    )
             self.active_tasks.discard(task_id)
+            self.active_media_keys.pop(task_id, None)
+            self.storage_reservations.pop(task_id, None)
             from services.state import remove_task_metrics
             remove_task_metrics(task_id)
 
@@ -607,6 +960,12 @@ class DownloadQueueManager:
                 task = await db.get(DownloadTask, task_id)
                 if not task:
                     return
+                if task.status == "COMPLETED":
+                    logger.warning(
+                        f"[Queue Manager] Ignoring late failure for completed task {task_id}: "
+                        f"{failure.code}"
+                    )
+                    return
                 task.status = "FAILED"
                 task.error_message = failure.display
                 db.add(task)
@@ -614,14 +973,30 @@ class DownloadQueueManager:
                 if task.media_type == "movie":
                     movie = await db.get(Movie, f"m_{task.tmdb_id}")
                     if movie and movie.preview_task_id == task_id:
-                        movie.video_url = ""
-                        movie.availability = "cached"
+                        if local_catalog_source_exists(movie.video_url):
+                            movie.availability = "available"
+                            movie.catalog_source = "server"
+                            movie.source_fingerprint = None
+                            logger.info(
+                                f"[Queue Manager] Preserved existing local movie after failed "
+                                f"replacement task {task_id}."
+                            )
+                        else:
+                            movie.video_url = ""
+                            movie.availability = "cached"
                         movie.preview_task_id = None
                         db.add(movie)
                 elif task.season is not None and task.episode is not None:
                     episode = await db.get(Episode, f"ep_{task.tmdb_id}_s{task.season}_e{task.episode}")
                     if episode and episode.preview_task_id == task_id:
-                        episode.video_url = ""
+                        if local_catalog_source_exists(episode.video_url):
+                            episode.source_fingerprint = None
+                            logger.info(
+                                f"[Queue Manager] Preserved existing local episode after failed "
+                                f"replacement task {task_id}."
+                            )
+                        else:
+                            episode.video_url = ""
                         episode.preview_task_id = None
                         db.add(episode)
                     show = await db.get(Movie, f"tv_{task.tmdb_id}")
@@ -651,34 +1026,38 @@ class DownloadQueueManager:
                 break
             current = os.path.dirname(current)
 
-    async def _schedule_playback_baseline(self, db: AsyncSession, media_obj: Any) -> None:
-        """Refresh source identity and warm verified adaptive playback in the background."""
-        if not getattr(media_obj, "video_url", ""):
-            return
+    async def _schedule_playback_baseline(self, media_id: str, media_type: str) -> None:
+        """Refresh source identity and schedule warming without affecting ingestion success."""
+
         try:
             from services.playback_prep import playback_prep_service
 
-            source = await resolve_media_source(media_obj.video_url)
-            if not source.available:
-                return
-            fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
-            if media_obj.source_fingerprint != fingerprint:
-                media_obj.source_fingerprint = fingerprint
-                db.add(media_obj)
-                await db.flush()
-            await playback_prep_service.prepare(
-                str(media_obj.id),
-                media_obj,
-                source,
-                include_remaining=True,
-                retry_errors=True,
-                foreground=False,
-            )
-            logger.info(f"[Queue Manager] Adaptive playback warming scheduled for {media_obj.id}.")
+            model = Movie if media_type == "movie" else Episode
+            async with AsyncSession(engine, expire_on_commit=False) as db:
+                media_obj = await db.get(model, media_id)
+                if not media_obj or not media_obj.video_url:
+                    return
+                source = await resolve_media_source(media_obj.video_url)
+                if not source.available:
+                    return
+                fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
+                if media_obj.source_fingerprint != fingerprint:
+                    media_obj.source_fingerprint = fingerprint
+                    db.add(media_obj)
+                    await db.commit()
+                await playback_prep_service.prepare(
+                    media_id,
+                    media_obj,
+                    source,
+                    include_remaining=True,
+                    retry_errors=True,
+                    foreground=False,
+                )
+            logger.info(f"[Queue Manager] Adaptive playback warming scheduled for {media_id}.")
         except Exception as exc:
             logger.warning(
                 f"[Queue Manager] Playback baseline scheduling failed for "
-                f"{getattr(media_obj, 'id', 'unknown')}: {type(exc).__name__}"
+                f"{media_id or 'unknown'}: {type(exc).__name__}"
             )
 
     async def _prepare_ingested_media(
@@ -758,6 +1137,7 @@ class DownloadQueueManager:
         *,
         finalize: bool = True,
         preview_task_id: Optional[str] = None,
+        catalog_file_path: Optional[str] = None,
     ):
         server_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         
@@ -803,7 +1183,8 @@ class DownloadQueueManager:
                         logger.error(f"[Queue Manager] Failed to rename folder/file {current_folder_name}: {e}")
 
             file_candidate = os.path.abspath(file_path) if os.path.isabs(file_path) else os.path.abspath(os.path.join(server_root, file_path))
-            served_url = catalog_path_from_storage(file_candidate)
+            catalog_candidate = catalog_file_path or file_candidate
+            served_url = catalog_path_from_storage(catalog_candidate)
             virtual_path = served_url.lstrip("/")
 
         abs_file_path = os.path.abspath(file_candidate) if file_path else ""
@@ -975,6 +1356,7 @@ class DownloadQueueManager:
                 "source_fingerprint": source_fingerprint,
                 "video_fingerprint": video_fingerprint,
                 "audio_metadata": audio_meta_list,
+                "stream_manifest": probe_meta.get("stream_manifest", []),
                 "genres": movie.genres,
                 "cast": movie.cast,
                 "director": movie.director,
@@ -985,10 +1367,7 @@ class DownloadQueueManager:
                 "vibe_analysis_status": movie.vibe_analysis_status,
                 "vibe_analysis_version": movie.vibe_analysis_version,
             }
-            with open(movie_metadata_file, "w", encoding="utf-8") as f:
-                json.dump(movie_metadata_content, f, indent=2, ensure_ascii=False)
-            if finalize:
-                await self._schedule_playback_baseline(db, movie)
+            _atomic_write_json(movie_metadata_file, movie_metadata_content)
         else:
             show_id = f"tv_{tmdb_id}"
             show = await db.get(Movie, show_id)
@@ -1164,6 +1543,7 @@ class DownloadQueueManager:
                 "source_fingerprint": source_fingerprint,
                 "video_fingerprint": video_fingerprint,
                 "audio_metadata": audio_meta_list,
+                "stream_manifest": probe_meta.get("stream_manifest", []),
                 "genres": show.genres,
                 "cast": show.cast,
                 "director": show.director,
@@ -1174,14 +1554,10 @@ class DownloadQueueManager:
                 "vibe_analysis_status": ep_entry.vibe_analysis_status,
                 "vibe_analysis_version": ep_entry.vibe_analysis_version,
             }
-            with open(ep_metadata_file, "w", encoding="utf-8") as f:
-                json.dump(ep_metadata_content, f, indent=2, ensure_ascii=False)
+            _atomic_write_json(ep_metadata_file, ep_metadata_content)
                 
             sync_compatible_metadata_file = os.path.join(ep_metadata_dir, f"metadata_s{season_num}_e{episode_num}.json")
-            with open(sync_compatible_metadata_file, "w", encoding="utf-8") as f:
-                json.dump(ep_metadata_content, f, indent=2, ensure_ascii=False)
-            if finalize:
-                await self._schedule_playback_baseline(db, ep_entry)
+            _atomic_write_json(sync_compatible_metadata_file, ep_metadata_content)
 
     async def _finalize_catalog_media(
         self,
@@ -1345,8 +1721,57 @@ class DownloadQueueManager:
         ep_entry.hevc_compressed = str(codec or "").lower() in {"hevc", "h265"}
         for key, value in common_probe.items():
             setattr(ep_entry, key, value)
-        db.add(ep_entry)
-        await db.flush()
+            db.add(ep_entry)
+            await db.flush()
+
+    async def _reconcile_post_commit_failures(self) -> int:
+        """Repair tasks that were published before the legacy post-commit ORM failure."""
+
+        repaired: List[tuple[str, str]] = []
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            statement = select(DownloadTask).where(DownloadTask.status == "FAILED")
+            tasks = (await db.exec(statement)).all()
+            for task in tasks:
+                error_message = str(task.error_message or "")
+                if "MissingGreenlet" not in error_message:
+                    continue
+                if task.media_type == "movie":
+                    media_id = f"m_{task.tmdb_id}"
+                    media_type = "movie"
+                    media_obj = await db.get(Movie, media_id)
+                elif task.season is not None and task.episode is not None:
+                    media_id = f"ep_{task.tmdb_id}_s{task.season}_e{task.episode}"
+                    media_type = "episode"
+                    media_obj = await db.get(Episode, media_id)
+                else:
+                    continue
+                if not media_obj or not local_catalog_source_exists(str(media_obj.video_url or "")):
+                    continue
+                task.status = "COMPLETED"
+                task.error_message = None
+                if getattr(media_obj, "preview_task_id", None) == task.id:
+                    media_obj.preview_task_id = None
+                    db.add(media_obj)
+                db.add(task)
+                repaired.append((media_id, media_type))
+            if repaired:
+                await db.commit()
+
+        for media_id, media_type in repaired:
+            await self._schedule_playback_baseline(media_id, media_type)
+            try:
+                await vibe_analysis_manager.enqueue(media_type, media_id)
+            except Exception as analysis_error:
+                logger.warning(
+                    f"[Queue Manager Recovery] Vibe analysis scheduling failed for {media_id}: "
+                    f"{type(analysis_error).__name__}"
+                )
+        if repaired:
+            logger.info(
+                f"[Queue Manager Recovery] Reconciled {len(repaired)} task(s) that were "
+                "published before a post-commit failure."
+            )
+        return len(repaired)
 
     async def sync_media_from_disk(self):
         """
@@ -1357,6 +1782,7 @@ class DownloadQueueManager:
             server_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
             media_dir = os.path.join(server_root, "media")
 
+            cloud_inventory: Optional[set[str]] = None
             if settings.STORAGE_ENGINE == "CLOUD" and rclone_service.executable():
                 metadata_sync = await rclone_service.run(
                     "copy",
@@ -1377,6 +1803,41 @@ class DownloadQueueManager:
                         f"[Queue Manager Recovery] Cloud metadata sync failed: "
                         f"{metadata_sync.error_code or 'rclone_failed'}"
                     )
+                inventory_result = await rclone_service.run(
+                    "lsf",
+                    settings.RCLONE_REMOTE_PATH,
+                    "--recursive",
+                    "--files-only",
+                    timeout=30 * 60,
+                    output_limit=None,
+                )
+                if inventory_result.ok:
+                    cloud_inventory = {
+                        path.strip().replace("\\", "/").lstrip("/")
+                        for path in inventory_result.stdout.splitlines()
+                        if path.strip()
+                    }
+                    logger.info(
+                        f"[Queue Manager Recovery] Loaded one cloud inventory containing "
+                        f"{len(cloud_inventory)} file(s)."
+                    )
+                else:
+                    logger.warning(
+                        "[Queue Manager Recovery] Cloud inventory unavailable; "
+                        "cloud-only catalog rows will be preserved without demotion."
+                    )
+
+            def recovery_source_exists(catalog_path: str) -> Optional[bool]:
+                if local_catalog_source_exists(catalog_path):
+                    return True
+                if settings.STORAGE_ENGINE != "CLOUD":
+                    return False
+                if cloud_inventory is None:
+                    return None
+                normalized = catalog_path.replace("\\", "/").lstrip("/")
+                if normalized.startswith("media/"):
+                    normalized = normalized[len("media/"):]
+                return normalized in cloud_inventory
             
             # Sweep DB first to reconcile URLs and check actual file/cloud presence
             logger.info("[Queue Manager Recovery] Sweeping database to reconcile video URLs...")
@@ -1393,14 +1854,14 @@ class DownloadQueueManager:
                                 m.video_url = f"/media/{match.group(1)}"
                         
                         rel_path = m.video_url.lstrip("/")
-                        exists = await verify_media_exists(rel_path)
-                        if not exists:
+                        exists = recovery_source_exists(rel_path)
+                        if exists is False:
                             logger.warning(f"[Sync Recovery] Movie {m.title} file missing at {rel_path}. Demoting to cached.")
                             m.video_url = ""
                             m.availability = "cached"
                             m.catalog_source = "tmdb_cache"
                             db.add(m)
-                        else:
+                        elif exists is True:
                             m.catalog_source = "server"
                             m.availability = "available"
                             db.add(m)
@@ -1421,12 +1882,12 @@ class DownloadQueueManager:
                                 ep.video_url = f"/media/{match.group(1)}"
                         
                         rel_path = ep.video_url.lstrip("/")
-                        exists = await verify_media_exists(rel_path)
-                        if not exists:
+                        exists = recovery_source_exists(rel_path)
+                        if exists is False:
                             logger.warning(f"[Sync Recovery] Episode {ep.title} file missing at {rel_path}. Clearing video URL.")
                             ep.video_url = ""
                             db.add(ep)
-                        else:
+                        elif exists is True:
                             db.add(ep)
 
                 playable_series_ids = {episode.movie_id for episode in episodes if episode.video_url}
@@ -1569,8 +2030,7 @@ class DownloadQueueManager:
                                             metadata_changed = True
                                     if metadata_changed:
                                         try:
-                                            with open(meta_path, "w", encoding="utf-8") as fw:
-                                                json.dump(data, fw, indent=2, ensure_ascii=False)
+                                            _atomic_write_json(meta_path, data)
                                         except Exception:
                                             pass
                                 else:
@@ -1665,7 +2125,7 @@ class DownloadQueueManager:
                                     not file_path
                                     and isinstance(cloud_video_url, str)
                                     and cloud_video_url.startswith("/media/")
-                                    and await verify_media_exists(cloud_video_url)
+                                    and recovery_source_exists(cloud_video_url) is True
                                 ):
                                     await self._restore_cloud_catalog_entry(db, data, meta, season, episode)
                                     await db.commit()
@@ -1677,8 +2137,7 @@ class DownloadQueueManager:
                                     data["availability"] = "cached"
                                     data["video_url"] = ""
                                     try:
-                                        with open(meta_path, "w", encoding="utf-8") as cache_meta_file:
-                                            json.dump(data, cache_meta_file, indent=2, ensure_ascii=False)
+                                        _atomic_write_json(meta_path, data)
                                     except Exception as metadata_err:
                                         logger.error(f"[Queue Manager] Failed to annotate cached metadata {meta_path}: {metadata_err}")
                                     cached_id = f"m_{tmdb_id}" if media_type == "movie" else f"tv_{tmdb_id}"
@@ -1740,7 +2199,11 @@ class DownloadQueueManager:
                                 await db.rollback()
                                 logger.error(f"[Queue Manager] Error recovering {meta_path}: {e}")
                                 
-            logger.info(f"[Queue Manager] Disk sync complete. Recovered {count} entries.")
+            reconciled_tasks = await self._reconcile_post_commit_failures()
+            logger.info(
+                f"[Queue Manager] Disk sync complete. Recovered {count} entries and "
+                f"reconciled {reconciled_tasks} published task(s)."
+            )
         except Exception as e:
             logger.error(f"[Queue Manager] Critical failure during sync_media_from_disk: {e}")
 

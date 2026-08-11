@@ -17,6 +17,7 @@ from services.ffmpeg_input import (
     is_http_media_source,
     normalize_source_type,
 )
+from services.state import register_process, unregister_process
 
 
 HLS_FALLBACK_FAILURES = {"INVALID_MEDIA_SOURCE", "MEDIA_PROBE_FAILED", "FFMPEG_OPTION_UNSUPPORTED"}
@@ -51,13 +52,12 @@ def merge_local_external_audio(file_path: str, retained_audio: list[dict[str, An
                 "language": language,
                 "label": language_label(language, existing.get("label") if existing else None),
                 "channels": int(existing.get("channels") or 2) if existing else 2,
-                "default": bool(existing.get("default")) if existing else False,
+                "default": False if existing else not refreshed,
                 "source": "external",
                 "fileName": os.path.basename(external_path),
                 "fileSize": file_stat.st_size,
                 "modifiedAt": file_stat.st_mtime_ns,
             }
-            refreshed = [item for item in refreshed if str(item.get("language") or "und") != language]
             refreshed.append(external_item)
 
     if refreshed and not any(item.get("default") for item in refreshed):
@@ -123,7 +123,12 @@ async def probe_media_stream(
                 stderr=asyncio.subprocess.PIPE,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
-            stdout, stderr = await process.communicate()
+            process_key = f"source-probe:{id(process)}"
+            register_process(process_key, process)
+            try:
+                stdout, stderr = await process.communicate()
+            finally:
+                unregister_process(process_key)
             
             if process.returncode != 0:
                 err_msg = stderr.decode("utf-8", errors="ignore").strip()
@@ -310,7 +315,12 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
             stderr=asyncio.subprocess.PIPE,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
-        stdout, stderr = await process.communicate()
+        process_key = f"catalog-probe:{id(process)}"
+        register_process(process_key, process)
+        try:
+            stdout, stderr = await process.communicate()
+        finally:
+            unregister_process(process_key)
         if process.returncode != 0:
             logger.error(f"[Media Probe] Failed to probe completed media {file_path}: {stderr.decode('utf-8', errors='ignore')}")
             return {}
@@ -365,10 +375,20 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
                 "default": bool((a.get("disposition") or {}).get("default")),
             })
 
-        # External application-owned dubbing is authoritative for its language even
-        # when the MP4 has embedded audio. Otherwise one embedded default track hides
-        # valid audio/eng.*, audio/tur.*, and other standard language-tagged files.
+        # Explicit external dubbing coexists with embedded tracks. Presentation order
+        # must not erase the source stream identity used by FFmpeg mapping.
         audio_meta = merge_local_external_audio(file_path, audio_meta)
+        stream_manifest = [
+            {
+                "index": int(stream.get("index", position)),
+                "type": str(stream.get("codec_type") or ""),
+                "codec": str(stream.get("codec_name") or ""),
+                "language": normalize_language_tag((stream.get("tags") or {}).get("language")),
+                "title": str((stream.get("tags") or {}).get("title") or ""),
+                "default": bool((stream.get("disposition") or {}).get("default")),
+            }
+            for position, stream in enumerate(streams)
+        ]
             
         media_path = Path(file_path)
         source_fingerprint = local_playback_fingerprint(media_path, audio_meta)
@@ -383,7 +403,8 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
             "frame_rate": frame_rate,
             "source_fingerprint": source_fingerprint,
             "video_fingerprint": video_fingerprint,
-            "audio_metadata": audio_meta
+            "audio_metadata": audio_meta,
+            "stream_manifest": stream_manifest,
         }
     except Exception as e:
         logger.error(f"[Media Probe] Exception probing completed media {file_path}: {e}")

@@ -30,9 +30,16 @@ async def run_backup_endpoint(session: AuthSession = Depends(require_recent_reau
         if settings.STORAGE_ENGINE == "CLOUD":
             cloud_synced = await sync_backups_to_cloud()
             
+        cloud_required = settings.STORAGE_ENGINE == "CLOUD"
         return {
-            "status": "success",
-            "message": "Backup created successfully.",
+            "status": "success" if not cloud_required or cloud_synced else "partial",
+            "message": (
+                "Backup created and synchronized successfully."
+                if cloud_synced
+                else "Local backup created, but cloud synchronization failed."
+                if cloud_required
+                else "Local backup created successfully."
+            ),
             "backup_file": os.path.basename(backup_path),
             "cloud_synced": cloud_synced
         }

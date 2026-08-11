@@ -16,6 +16,7 @@ from models import Episode, Movie, PlaybackSession
 from services.logger import logger
 from services.media_probe import probe_completed_media
 from services.media_source import MediaSourceError, resolve_media_source
+from services.state import register_process, unregister_process
 
 
 class HEVCCompressorWorker:
@@ -141,12 +142,30 @@ class HEVCCompressorWorker:
         if original_duration <= 0 or transcode_duration <= 0:
             return False
         tolerance = max(5.0, original_duration * 0.05)
-        return abs(original_duration - transcode_duration) <= tolerance
+        if abs(original_duration - transcode_duration) > tolerance:
+            return False
+
+        original_manifest = list(original_probe.get("stream_manifest") or [])
+        transcode_manifest = list(transcode_probe.get("stream_manifest") or [])
+        if not original_manifest or len(original_manifest) != len(transcode_manifest):
+            return False
+        original_non_video = [item for item in original_manifest if item.get("type") != "video"]
+        transcode_non_video = [item for item in transcode_manifest if item.get("type") != "video"]
+        if len(original_non_video) != len(transcode_non_video):
+            return False
+        for original, transcoded in zip(original_non_video, transcode_non_video):
+            identity_fields = ("type", "codec", "language", "title", "default")
+            if any(original.get(field) != transcoded.get(field) for field in identity_fields):
+                return False
+        original_video_count = sum(item.get("type") == "video" for item in original_manifest)
+        transcode_video_count = sum(item.get("type") == "video" for item in transcode_manifest)
+        return original_video_count == transcode_video_count
 
     async def _worker_loop(self) -> None:
         ffmpeg_path = shutil.which("ffmpeg") or r"C:\ffmpeg\bin\ffmpeg.exe"
         while self.is_running:
             temporary_file: Optional[Path] = None
+            rollback_file: Optional[Path] = None
             try:
                 await asyncio.sleep(60.0)
                 mode = getattr(settings, "HEVC_COMPRESSION_MODE", "auto")
@@ -175,7 +194,7 @@ class HEVCCompressorWorker:
                     logger.warning(f"[HEVC Compressor] Refusing to transcode unprobeable source: {file_path}")
                     continue
 
-                temporary_file = file_path.with_name(f".{file_path.stem}.hevc-part.mp4")
+                temporary_file = file_path.with_name(f".{file_path.stem}.hevc-part{file_path.suffix}")
                 temporary_file.unlink(missing_ok=True)
                 command = [
                     ffmpeg_path,
@@ -184,14 +203,20 @@ class HEVCCompressorWorker:
                     "error",
                     "-i",
                     str(file_path),
-                    "-c:v",
+                    "-map",
+                    "0",
+                    "-map_metadata",
+                    "0",
+                    "-map_chapters",
+                    "0",
+                    "-c",
+                    "copy",
+                    "-c:v:0",
                     "libx265",
                     "-preset",
                     "medium",
                     "-crf",
                     "28",
-                    "-c:a",
-                    "copy",
                     "-threads",
                     "2",
                     str(temporary_file),
@@ -203,16 +228,21 @@ class HEVCCompressorWorker:
                     stderr=asyncio.subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
+                process_key = f"hevc:{item_id}"
+                register_process(process_key, self.active_process)
 
                 killed_for_activity = False
-                while self.active_process.returncode is None:
-                    await asyncio.sleep(15.0)
-                    if not await self._is_server_idle():
-                        self.active_process.kill()
-                        killed_for_activity = True
-                        break
-                return_code = await self.active_process.wait()
-                self.active_process = None
+                try:
+                    while self.active_process.returncode is None:
+                        await asyncio.sleep(15.0)
+                        if not await self._is_server_idle():
+                            self.active_process.kill()
+                            killed_for_activity = True
+                            break
+                    return_code = await self.active_process.wait()
+                finally:
+                    unregister_process(process_key)
+                    self.active_process = None
                 if killed_for_activity:
                     await asyncio.sleep(5 * 60)
                     continue
@@ -230,9 +260,29 @@ class HEVCCompressorWorker:
                     logger.warning(f"[HEVC Compressor] Validation rejected the transcode for {file_path}; original preserved.")
                     continue
 
+                rollback_file = file_path.with_name(f".{file_path.stem}.hevc-original{file_path.suffix}")
+                rollback_file.unlink(missing_ok=True)
+                try:
+                    os.link(file_path, rollback_file)
+                except OSError:
+                    shutil.copy2(file_path, rollback_file)
                 os.replace(temporary_file, file_path)
-                final_probe = await probe_completed_media(str(file_path))
-                await self._mark_complete(model, item_id, final_probe)
+                try:
+                    final_probe = await probe_completed_media(str(file_path))
+                    if not self._valid_transcode(
+                        original_probe,
+                        final_probe,
+                        rollback_file.stat().st_size,
+                        file_path.stat().st_size,
+                    ):
+                        raise ValueError("Published HEVC file failed final stream-preservation validation")
+                    await self._mark_complete(model, item_id, final_probe)
+                except Exception:
+                    os.replace(rollback_file, file_path)
+                    rollback_file = None
+                    raise
+                rollback_file.unlink(missing_ok=True)
+                rollback_file = None
                 logger.info(f"[HEVC Compressor] Verified and replaced {file_path}.")
             except asyncio.CancelledError:
                 if self.active_process and self.active_process.returncode is None:
@@ -246,6 +296,8 @@ class HEVCCompressorWorker:
             finally:
                 if temporary_file:
                     temporary_file.unlink(missing_ok=True)
+                if rollback_file:
+                    rollback_file.unlink(missing_ok=True)
 
 
 hevc_compressor = HEVCCompressorWorker()

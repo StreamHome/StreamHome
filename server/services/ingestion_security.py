@@ -5,7 +5,9 @@ import ipaddress
 import re
 import socket
 from typing import Mapping
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
+
+import httpx
 
 from config import settings
 
@@ -21,6 +23,9 @@ ALLOWED_HEADERS = {
     "range",
     "user-agent",
 }
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+SENSITIVE_CROSS_ORIGIN_HEADERS = {"authorization", "cookie", "origin", "referer"}
+MAX_VALIDATED_REDIRECTS = 5
 
 
 class UnsafeIngestionSource(ValueError):
@@ -87,3 +92,39 @@ async def validate_url(url: str | None, *, client_address: str = "") -> str | No
         if _blocked(address) and not explicitly_trusted and not local_loopback_exception:
             raise UnsafeIngestionSource("Private, local, metadata, and reserved source networks are blocked.")
     return url
+
+
+async def validated_stream_request(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    client_address: str = "",
+) -> httpx.Response:
+    """Open a streamed GET and revalidate every redirect before connecting."""
+
+    selected_url = url
+    selected_headers = validate_headers(headers)
+    previous_origin: tuple[str, str, int | None] | None = None
+    for _ in range(MAX_VALIDATED_REDIRECTS + 1):
+        await validate_url(selected_url, client_address=client_address)
+        parsed = urlsplit(selected_url)
+        origin = (parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port)
+        if previous_origin is not None and origin != previous_origin:
+            selected_headers = {
+                key: value
+                for key, value in selected_headers.items()
+                if key.lower() not in SENSITIVE_CROSS_ORIGIN_HEADERS
+            }
+        request = client.build_request("GET", selected_url, headers=selected_headers)
+        response = await client.send(request, stream=True)
+        if response.status_code not in REDIRECT_STATUSES:
+            response.extensions["streamhome_final_url"] = selected_url
+            return response
+        location = response.headers.get("location")
+        await response.aclose()
+        if not location:
+            raise UnsafeIngestionSource("Source redirect did not include a destination.")
+        previous_origin = origin
+        selected_url = urljoin(selected_url, location)
+    raise UnsafeIngestionSource("Source redirected too many times.")

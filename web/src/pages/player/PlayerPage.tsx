@@ -434,6 +434,8 @@ export function canUseProgressiveCompatibility(
   mediaElement?: Pick<HTMLMediaElement, "canPlayType"> | null,
 ): boolean {
   const codec = metadata.codec.trim().toLowerCase();
+  const audioCodec = (metadata.audioCodec ?? "").trim().toLowerCase();
+  if (!["", "aac", "mp4a", "mp3"].includes(audioCodec)) return false;
   const formats = `${metadata.container},${metadata.sourceFormat}`.toLowerCase().split(",").map((item) => item.trim());
   const mp4 = formats.some((item) => ["mp4", "mov", "mov,mp4", "m4v"].includes(item));
   const webm = formats.some((item) => item === "webm");
@@ -489,7 +491,7 @@ export function initialPlaybackMode(
   preferredLanguage: string,
   mediaElement?: Pick<HTMLMediaElement, "canPlayType"> | null,
 ): StreamMode {
-  return canUseProgressivePlayback(response, preferredTrackId, preferredLanguage, mediaElement) || !response.manifestUrl
+  return canUseProgressivePlayback(response, preferredTrackId, preferredLanguage, mediaElement)
     ? "progressive"
     : "hls";
 }

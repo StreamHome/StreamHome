@@ -82,6 +82,8 @@ class PlaybackSourceMetadata(APIModel):
     height: int
     frame_rate: float
     source_format: str
+    audio_codec: str = ""
+    progressive_compatible: bool = False
 
 
 class PlaybackTrack(APIModel):
@@ -519,6 +521,18 @@ def source_metadata(media_obj: Any) -> PlaybackSourceMetadata:
         source_format = suffix.lstrip(".").upper()
     else:
         source_format = container.split(",", 1)[0].upper() if container else "Server media"
+    embedded_audio = [
+        item
+        for item in (media_obj.audio_metadata or [])
+        if str(item.get("source") or "embedded").lower() == "embedded"
+    ]
+    default_audio = next((item for item in embedded_audio if item.get("default")), embedded_audio[0] if embedded_audio else None)
+    audio_codec = str((default_audio or {}).get("codec") or "").lower()
+    progressive_compatible = (
+        (suffix == ".mp4" or "mp4" in container.lower())
+        and str(media_obj.codec or "").lower() in {"h264", "avc", "avc1"}
+        and audio_codec in {"", "aac", "mp4a", "mp3"}
+    )
     return PlaybackSourceMetadata(
         duration=media_duration_seconds(media_obj),
         container=container,
@@ -527,11 +541,18 @@ def source_metadata(media_obj: Any) -> PlaybackSourceMetadata:
         height=max(0, int(media_obj.height or 0)),
         frame_rate=max(0.0, float(media_obj.frame_rate or 0)),
         source_format=source_format,
+        audio_codec=audio_codec,
+        progressive_compatible=progressive_compatible,
     )
 
 
+def progressive_source_compatible(media_obj: Any) -> bool:
+    return source_metadata(media_obj).progressive_compatible
+
+
 def track_contract(media_obj: Any, media_id: str, fingerprint: str, encoded_ticket: str) -> list[PlaybackTrack]:
-    channel_by_index = {int(item.get("index", index)): int(item.get("channels", 2)) for index, item in enumerate(media_obj.audio_metadata or [])}
+    metadata = list(media_obj.audio_metadata or [])
+    direct_embedded_ready = progressive_source_compatible(media_obj)
     result: list[PlaybackTrack] = []
     for item in playback_prep_service.audio_renditions(media_obj):
         rendition_status = playback_prep_service.rendition_status(media_id, fingerprint, item.name)
@@ -540,20 +561,32 @@ def track_contract(media_obj: Any, media_id: str, fingerprint: str, encoded_tick
             if item.source == "external"
             else None
         )
-        actionable = bool(direct_url) or item.default or rendition_status in {"streamable", "ready"}
-        if not actionable:
-            continue
+        ready = bool(direct_url) or (item.default and direct_embedded_ready) or rendition_status in {"streamable", "ready"}
+        effective_status = "ready" if bool(direct_url) or (item.default and direct_embedded_ready) else rendition_status
+        source_item = next(
+            (
+                candidate
+                for position, candidate in enumerate(metadata)
+                if str(candidate.get("source") or "embedded").lower() == item.source
+                and (
+                    int(candidate.get("streamIndex", candidate.get("index", position))) == item.stream_index
+                    if item.source == "embedded"
+                    else int(candidate.get("index", position)) == item.stream_index
+                )
+            ),
+            {},
+        )
         result.append(PlaybackTrack(
             id=item.name,
             label=item.label,
             language=item.language,
-            channels=channel_by_index.get(item.stream_index, 2),
+            channels=int(source_item.get("channels", 2)),
             default=item.default,
             source="external" if item.source == "external" else "embedded",
             stream_index=item.stream_index,
             direct_url=direct_url,
-            ready=True,
-            status="ready",
+            ready=ready,
+            status=effective_status,
         ))
     return result
 
@@ -666,6 +699,8 @@ async def build_run_response(
                 height=min(720, max(0, int(getattr(media_obj, "height", 0) or 720))),
                 frame_rate=max(0.0, float(getattr(media_obj, "frame_rate", 0) or 0)),
                 source_format="HLS preview",
+                audio_codec="aac",
+                progressive_compatible=False,
             ),
             tracks=[],
             renditions=[
@@ -721,6 +756,28 @@ async def build_run_response(
     if not manifest_url:
         renditions = []
     duration = media_duration_seconds(media_obj)
+    direct_ready = progressive_source_compatible(media_obj)
+    adaptive_ready = bool(manifest_url)
+    required_failure = playback_prep_service.required_preparation_error(media_obj.id, fingerprint, media_obj)
+    preparation_error = (
+        PlaybackPreparationFailure(code=required_failure["code"], message=required_failure["message"])
+        if required_failure and not direct_ready
+        else None
+    )
+    if direct_ready or adaptive_ready:
+        preparation_state = "ready"
+    elif preparation_error:
+        preparation_state = "error"
+    else:
+        preparation_state = "preparing"
+    progress_payload = playback_prep_service.preparation_progress(media_obj.id, fingerprint, media_obj)
+    progress = PlaybackPreparationProgress(**progress_payload)
+    baseline = playback_prep_service.baseline_video(media_obj)
+    adaptive_seekable = playback_prep_service.rendition_seekable_until(
+        media_obj.id,
+        fingerprint,
+        baseline.name,
+    )
     return PlaybackRunResponse(
         run_id=run.id,
         media_id=media_obj.id,
@@ -737,17 +794,17 @@ async def build_run_response(
         manifest_url=manifest_url,
         progressive_url=f"/api/playback/progressive/{quote(media_obj.id, safe='')}?ticket={encoded_ticket}",
         next_episode_id=next_episode_id,
-        preparation_state="ready",
-        preparation_error=None,
-        preparation_progress=PlaybackPreparationProgress(
-            stage="streamable",
-            ready_segments=0,
-            active_workers=0,
+        preparation_state=preparation_state,
+        preparation_error=preparation_error,
+        preparation_progress=(
+            PlaybackPreparationProgress(stage="streamable", ready_segments=0, active_workers=0)
+            if direct_ready
+            else progress
         ),
-        seekable_until=duration,
-        resume_ready=True,
-        switching_ready=True,
-        fully_prepared=True,
+        seekable_until=duration if direct_ready else adaptive_seekable,
+        resume_ready=direct_ready or adaptive_seekable >= initial_resume_position,
+        switching_ready=playback_prep_service.switching_ready(media_obj.id, fingerprint, media_obj),
+        fully_prepared=playback_prep_service.fully_prepared(media_obj.id, fingerprint, media_obj),
         next_sequence_number=run.sequence_number,
     )
 
@@ -806,6 +863,19 @@ async def create_playback_run(
     else:
         source_kind = "catalog"
         source_fingerprint = str(media_obj.source_fingerprint or source.fingerprint)
+        if not progressive_source_compatible(media_obj) and not playback_prep_service.playback_ready(
+            media_obj.id,
+            source_fingerprint,
+            media_obj,
+        ):
+            await playback_prep_service.prepare(
+                media_obj.id,
+                media_obj,
+                source,
+                include_remaining=False,
+                retry_errors=False,
+                foreground=True,
+            )
 
     filters = [PlaybackSession.profile_id == req.profile_id, PlaybackSession.movie_id == req.movie_id]
     filters.append(PlaybackSession.episode_id == req.episode_id if req.episode_id else PlaybackSession.episode_id.is_(None))
@@ -861,6 +931,14 @@ async def get_playback_run(
                 source = await require_available_source(media_obj)
                 await ensure_source_metadata(db, media_obj, source)
                 await synchronize_source_fingerprint(db, media_obj, source)
+                await playback_prep_service.prepare(
+                    media_obj.id,
+                    media_obj,
+                    source,
+                    include_remaining=False,
+                    retry_errors=True,
+                    foreground=True,
+                )
             except HTTPException as source_error:
                 detail = source_error.detail if isinstance(source_error.detail, dict) else {}
                 error_code = str(detail.get("code") or "")

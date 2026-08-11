@@ -20,6 +20,7 @@ from config import settings
 from services.backup import BACKUP_LOCK, is_database_idle
 from services.logger import logger
 from services.queue import queue_manager
+from services.playback_prep import playback_prep_service
 import services.state as state
 
 
@@ -426,7 +427,8 @@ def _minutes_since_http_activity() -> float:
 def active_media_work_count() -> int:
     """Count non-cancellable media subprocesses that must finish before cutover."""
 
-    return len(state.ACTIVE_PROCESSES)
+    preparation_jobs = sum(not task.done() for task in playback_prep_service.active_jobs.values())
+    return len(state.ACTIVE_PROCESSES) + preparation_jobs
 
 
 async def idle_blockers() -> list[str]:

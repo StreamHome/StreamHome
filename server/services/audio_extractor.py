@@ -7,6 +7,7 @@ import re
 from typing import List, Dict, Any, Optional
 from services.logger import logger
 from services.languages import language_label, normalize_language_tag
+from services.state import register_process, unregister_process
 
 def get_ffmpeg_path() -> str:
     return shutil.which("ffmpeg") or r"C:\ffmpeg\bin\ffmpeg.exe"
@@ -161,17 +162,14 @@ async def extract_audio_and_strip_video(
     override_primary: bool = False,
 ) -> List[str]:
     """
-    Probes the video file for audio streams. Extracts each stream to a separate MP3 file
-    inside an 'audio' folder next to the video file. Does NOT strip audio from the original
-    video file (keeps the default audio intact). Returns a list of language codes extracted.
+    Probe embedded audio and return stable language identities without creating lossy
+    generated sidecars. Explicit external dubbing files remain application-owned inputs.
     """
     if not os.path.exists(video_path):
         logger.warning(f"[Audio Extractor] File not found: {video_path}")
         return []
 
     ffprobe = get_ffprobe_path()
-    ffmpeg = get_ffmpeg_path()
-    
     # 1. Probe for audio streams
     cmd_probe = [
         ffprobe, "-v", "error", "-select_streams", "a",
@@ -186,7 +184,12 @@ async def extract_audio_and_strip_video(
             stderr=asyncio.subprocess.PIPE,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
-        stdout, stderr = await proc.communicate()
+        process_key = f"audio-probe:{id(proc)}"
+        register_process(process_key, proc)
+        try:
+            stdout, stderr = await proc.communicate()
+        finally:
+            unregister_process(process_key)
         if proc.returncode != 0:
             logger.error(f"[Audio Extractor] Probe failed: {stderr.decode('utf-8', errors='ignore')}")
             return []
@@ -201,53 +204,9 @@ async def extract_audio_and_strip_video(
         logger.info(f"[Audio Extractor] No audio streams found in {video_path}.")
         return []
 
-    # 2. Prepare folders
-    dir_name = os.path.dirname(video_path)
-    audio_dir = os.path.join(dir_name, "audio")
-    os.makedirs(audio_dir, exist_ok=True)
-    
-    languages: List[str] = []
-    logger.info(f"[Audio Extractor] Found {len(streams)} audio streams. Extracting...")
-    
-    # 3. Extract each audio stream using deterministic names. FFmpeg's -y
-    # refreshes the current track instead of inventing en_1, en_2,
-    # and so on each time the same title is re-ingested.
-    expected_languages = audio_track_labels(streams, default_lang, override_primary=override_primary)
-    for idx, lang in enumerate(expected_languages):
-        audio_out_path = os.path.join(audio_dir, f"{lang}.mp3")
-        
-        # ffmpeg extract command: -map 0:a:idx
-        cmd_extract = [
-            ffmpeg, "-y", "-i", video_path,
-            "-map", f"0:a:{idx}",
-            "-c:a", "libmp3lame", "-q:a", "2",
-            audio_out_path
-        ]
-        
-        try:
-            proc_ext = await asyncio.create_subprocess_exec(
-                *cmd_extract,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
-            _, stderr_ext = await proc_ext.communicate()
-            if proc_ext.returncode == 0:
-                languages.append(lang)
-                logger.info(f"[Audio Extractor] Successfully extracted track {idx} as language '{lang}' to {audio_out_path}")
-            else:
-                logger.error(f"[Audio Extractor] Extraction failed for track {idx}: {stderr_ext.decode('utf-8', errors='ignore')}")
-        except Exception as e:
-            logger.error(f"[Audio Extractor] Extraction exception for track {idx}: {e}")
-
-    if len(languages) == len(expected_languages):
-        expected_files = {f"{lang}.mp3" for lang in expected_languages}
-        for existing_name in os.listdir(audio_dir):
-            if existing_name.lower().endswith(".mp3") and existing_name not in expected_files:
-                try:
-                    os.remove(os.path.join(audio_dir, existing_name))
-                    logger.info(f"[Audio Extractor] Removed stale generated track: {existing_name}")
-                except OSError as error:
-                    logger.warning(f"[Audio Extractor] Could not remove stale track {existing_name}: {error}")
-
+    languages = audio_track_labels(streams, default_lang, override_primary=override_primary)
+    logger.info(
+        f"[Audio Extractor] Preserved {len(streams)} embedded audio stream(s) "
+        "without generating lossy sidecars."
+    )
     return languages

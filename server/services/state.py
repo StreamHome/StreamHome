@@ -2,7 +2,7 @@ import asyncio
 import os
 import subprocess
 import time
-from typing import Dict, Any, Union
+from typing import Any, Dict, Union
 
 # In-memory dictionary storing active download transient metrics:
 # task_id -> {"progress": float, "speed": str, "eta": str}
@@ -81,7 +81,7 @@ def remove_task_metrics(task_id: str):
     except Exception:
         pass
 
-def register_process(task_id: str, process: asyncio.subprocess.Process):
+def register_process(task_id: str, process: Union[asyncio.subprocess.Process, subprocess.Popen]):
     """Register an active media subprocess for cancellation and update safety."""
     ACTIVE_PROCESSES[task_id] = process
 
@@ -96,18 +96,21 @@ async def cancel_and_kill_process(task_id: str) -> bool:
         return False
         
     try:
-        logger.info(f"[Process Registry] Terminating active FFmpeg process for task: {task_id}")
+        logger.info(f"[Process Registry] Terminating active media process for task: {task_id}")
         process.terminate()
         try:
-            # Give the process 2 seconds to clean up and exit gracefully
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, process.wait, 2.0)
+            if isinstance(process, subprocess.Popen):
+                await asyncio.to_thread(process.wait, 2.0)
+            else:
+                await asyncio.wait_for(process.wait(), timeout=2.0)
             logger.info(f"[Process Registry] Process for task {task_id} exited gracefully.")
-        except Exception:
+        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
             logger.warning(f"[Process Registry] Process did not respond to SIGTERM. Killing task {task_id}...")
             process.kill()
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, process.wait)
+            if isinstance(process, subprocess.Popen):
+                await asyncio.to_thread(process.wait)
+            else:
+                await process.wait()
             logger.info(f"[Process Registry] Process for task {task_id} killed successfully.")
         return True
     except Exception as e:

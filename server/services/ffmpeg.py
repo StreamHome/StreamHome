@@ -20,6 +20,31 @@ time_regex = re.compile(r"time=\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)")
 speed_regex = re.compile(r"speed=\s*(\d+\.?\d*)x")
 bitrate_regex = re.compile(r"bitrate=\s*(\d+\.?\d*)\s*kbits/s")
 
+
+def _iter_ffmpeg_status_lines(stream: Any):
+    """Read FFmpeg status in large chunks while honoring CR and LF delimiters."""
+
+    buffer = bytearray()
+    while chunk := stream.read(64 * 1024):
+        buffer.extend(chunk)
+        while True:
+            delimiters = [position for position in (buffer.find(b"\r"), buffer.find(b"\n")) if position >= 0]
+            if not delimiters:
+                if len(buffer) > 64 * 1024:
+                    del buffer[:-64 * 1024]
+                break
+            boundary = min(delimiters)
+            line = bytes(buffer[:boundary]).decode("utf-8", errors="ignore").strip()
+            del buffer[: boundary + 1]
+            while buffer[:1] in (b"\r", b"\n"):
+                del buffer[:1]
+            if line:
+                yield line
+    if buffer:
+        line = bytes(buffer).decode("utf-8", errors="ignore").strip()
+        if line:
+            yield line
+
 async def download_and_cache_metadata_image(image_url: str, dest_path: str) -> Optional[str]:
     """
     Asynchronously downloads a remote TMDB image and caches it locally under dest_path.
@@ -95,18 +120,9 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float, preview_enab
                 pass
         current_speed_str = "0 Mbps"
 
-        # Read from raw binary stream buffer unbuffered
-        buffer_bytes = bytearray()
-        while True:
-            char_bytes = process.stderr.read(1)
-            if not char_bytes:
-                break
-            if char_bytes in (b"\r", b"\n"):
-                line = buffer_bytes.decode("utf-8", errors="ignore").strip()
-                buffer_bytes.clear()
-                if not line:
-                    continue
-                
+        assert process.stderr is not None
+        for line in _iter_ffmpeg_status_lines(process.stderr):
+            if line:
                 stderr_lines.append(line)
                 if len(stderr_lines) > 15:
                     stderr_lines.pop(0)
@@ -177,8 +193,6 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float, preview_enab
                         size_str = f"{total_mb:.1f} MB"
                     
                     update_task_metrics(task_id, progress, speed=current_speed_str, eta=eta, size=size_str)
-            else:
-                buffer_bytes.extend(char_bytes)
                 
         process.wait()
         
@@ -187,6 +201,9 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float, preview_enab
         return success, error_msg
         
     except Exception as e:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
         return False, f"Exception occurred during execution: {repr(e)}\n{traceback.format_exc()}"
     finally:
         if process is not None and process.stderr is not None:
@@ -265,9 +282,32 @@ async def download_and_merge(
                 str(preview_dir / "playlist.m3u8"),
             ])
         if audio_url:
-            command.extend(["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", "-shortest"])
+            command.extend([
+                "-map", "0:v:0",
+                "-map", "0:a?",
+                "-map", "1:a:0",
+                "-map", "0:s?",
+                "-map_metadata", "0",
+                "-map_chapters", "0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-c:s", "mov_text",
+                "-movflags", "+faststart",
+            ])
         else:
-            command.extend(["-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy", "-movflags", "+faststart"])
+            command.extend([
+                "-map", "0:v:0",
+                "-map", "0:a?",
+                "-map", "0:s?",
+                "-map_metadata", "0",
+                "-map_chapters", "0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-c:s", "mov_text",
+                "-movflags", "+faststart",
+            ])
         command.append(temp_output_path)
         return command
 

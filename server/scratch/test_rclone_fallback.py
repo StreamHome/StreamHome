@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 # Import config (should trigger PATH injection)
 from config import settings
 from services.queue import DownloadQueueManager
+from services.rclone import RcloneResult, rclone_service
 
 def verify_rclone_paths():
     print("=== Testing Rclone Binary Fallback Logic ===")
@@ -51,5 +52,15 @@ def verify_rclone_paths():
 
     print("\n[OK] Rclone path resolution verification complete!")
 
+
+def verify_cloud_health_circuit():
+    rclone_service._observe_cloud_result(RcloneResult(1, error_code="drive_unauthorized"))
+    assert rclone_service.cloud_health()["state"] == "unauthorized"
+    assert not rclone_service.cloud_write_available()
+    rclone_service._observe_cloud_result(RcloneResult(0))
+    assert rclone_service.cloud_health()["state"] == "healthy"
+    assert rclone_service.cloud_write_available()
+
 if __name__ == "__main__":
     verify_rclone_paths()
+    verify_cloud_health_circuit()

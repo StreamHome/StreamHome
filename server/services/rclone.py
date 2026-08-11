@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Optional
@@ -48,6 +49,9 @@ class RcloneService:
         self.setup_root = self.root / "server" / "temp" / "rclone-setup"
         self._semaphore = asyncio.Semaphore(4)
         self._config_lock = asyncio.Lock()
+        self._cloud_state = "unknown"
+        self._cloud_error_code: Optional[str] = None
+        self._cloud_checked_at: Optional[float] = None
 
     def executable(self) -> Optional[str]:
         candidate = self.root / "bin" / ("rclone.exe" if os.name == "nt" else "rclone")
@@ -118,19 +122,62 @@ class RcloneService:
             return "drive_network_error"
         return "rclone_failed"
 
+    def _uses_active_remote(self, arguments: tuple[str, ...], config_path: Optional[Path]) -> bool:
+        if config_path is not None or ":" not in settings.RCLONE_REMOTE_PATH:
+            return False
+        remote_prefix = settings.RCLONE_REMOTE_PATH.split(":", 1)[0] + ":"
+        return any(str(argument).startswith(remote_prefix) for argument in arguments)
+
+    def _observe_cloud_result(self, result: RcloneResult) -> None:
+        self._cloud_checked_at = time.time()
+        self._cloud_error_code = result.error_code
+        if result.ok:
+            self._cloud_state = "healthy"
+            return
+        state_by_error = {
+            "drive_unauthorized": "unauthorized",
+            "drive_rate_limited": "rate_limited",
+            "drive_quota_exceeded": "quota_exceeded",
+            "drive_permission_denied": "permission_denied",
+            "drive_network_error": "unreachable",
+            "rclone_timeout": "unreachable",
+            "rclone_unavailable": "unavailable",
+        }
+        self._cloud_state = state_by_error.get(result.error_code or "", "degraded")
+
+    def cloud_write_available(self) -> bool:
+        return self._cloud_state not in {
+            "unauthorized",
+            "quota_exceeded",
+            "permission_denied",
+            "unavailable",
+        }
+
+    def cloud_health(self) -> dict[str, object]:
+        return {
+            "state": self._cloud_state,
+            "errorCode": self._cloud_error_code,
+            "checkedAt": self._cloud_checked_at,
+            "writeAvailable": self.cloud_write_available(),
+        }
+
     async def run(
         self,
         *arguments: str,
         config_path: Optional[Path] = None,
         timeout: float = 60,
         input_data: Optional[bytes] = None,
-        output_limit: int = 8000,
+        output_limit: Optional[int] = 8000,
         password_command: bool = False,
     ) -> RcloneResult:
+        active_remote = self._uses_active_remote(tuple(map(str, arguments)), config_path)
         try:
             command = self.command(*arguments, config_path=config_path, password_command=password_command)
         except FileNotFoundError:
-            return RcloneResult(127, error_code="rclone_unavailable")
+            result = RcloneResult(127, error_code="rclone_unavailable")
+            if active_remote:
+                self._observe_cloud_result(result)
+            return result
         selected_config = Path(config_path or self.config_path)
         selected_config.parent.mkdir(parents=True, exist_ok=True)
         async with self._semaphore:
@@ -150,7 +197,10 @@ class RcloneService:
                     await asyncio.wait_for(process.wait(), timeout=5)
                 except asyncio.TimeoutError:
                     logger.error(f"[Rclone] Timed out reaping process {process.pid} after a command timeout.")
-                return RcloneResult(124, error_code="rclone_timeout")
+                result = RcloneResult(124, error_code="rclone_timeout")
+                if active_remote:
+                    self._observe_cloud_result(result)
+                return result
             except asyncio.CancelledError:
                 process.kill()
                 try:
@@ -168,14 +218,19 @@ class RcloneService:
                 raise
             finally:
                 unregister_process(process_key)
-        stdout_text = stdout.decode("utf-8", errors="replace")[-output_limit:]
-        stderr_text = stderr.decode("utf-8", errors="replace")[-output_limit:]
-        return RcloneResult(
+        decoded_stdout = stdout.decode("utf-8", errors="replace")
+        decoded_stderr = stderr.decode("utf-8", errors="replace")
+        stdout_text = decoded_stdout if output_limit is None else decoded_stdout[-output_limit:]
+        stderr_text = decoded_stderr if output_limit is None else decoded_stderr[-output_limit:]
+        result = RcloneResult(
             process.returncode or 0,
             stdout=stdout_text,
             stderr=stderr_text,
             error_code=self.classify(process.returncode or 0, f"{stdout_text}\n{stderr_text}"),
         )
+        if active_remote:
+            self._observe_cloud_result(result)
+        return result
 
     async def open_stream(
         self,

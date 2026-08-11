@@ -498,6 +498,8 @@ export interface PlaybackSourceMetadata {
   height: number;
   frameRate: number;
   sourceFormat: string;
+  audioCodec?: string;
+  progressiveCompatible?: boolean;
 }
 
 export type PlaybackRenditionStatus = "idle" | "preparing" | "streamable" | "ready" | "failed";

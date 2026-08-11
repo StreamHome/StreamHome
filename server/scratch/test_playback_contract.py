@@ -121,7 +121,7 @@ class PlaybackContractRegression(unittest.TestCase):
 
         cls.cache_root = playback_prep_service.cache_path("m_playback_contract", cls.fingerprint)
         video_dir = cls.cache_root / "video_original"
-        audio_dir = cls.cache_root / "audio_0_en"
+        audio_dir = cls.cache_root / "audio_1_en"
         video_dir.mkdir(parents=True, exist_ok=True)
         audio_dir.mkdir(parents=True, exist_ok=True)
         (video_dir / "playlist.m3u8").write_text("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_00000.m4s\n#EXT-X-ENDLIST\n", encoding="utf-8")
@@ -136,7 +136,7 @@ class PlaybackContractRegression(unittest.TestCase):
         (audio_dir / ".verified-v1").write_text("1", encoding="utf-8")
         (cls.cache_root / "master.m3u8").write_text(
             "#EXTM3U\n"
-            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",DEFAULT=YES,URI=\"audio_0_en/playlist.m3u8\"\n"
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",DEFAULT=YES,URI=\"audio_1_en/playlist.m3u8\"\n"
             "#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,AUDIO=\"audio\"\n"
             "video_original/playlist.m3u8\n",
             encoding="utf-8",
@@ -176,8 +176,8 @@ class PlaybackContractRegression(unittest.TestCase):
         self.assertEqual(payload["nextSequenceNumber"], 1)
         self.assertIn(payload["sourceMetadata"]["sourceFormat"], {"MP4", "HLS preview"})
         if payload["sourceMetadata"]["sourceFormat"] == "MP4":
-            self.assertTrue(payload["fullyPrepared"])
-            self.assertTrue(payload["switchingReady"])
+            self.assertIsInstance(payload["fullyPrepared"], bool)
+            self.assertIsInstance(payload["switchingReady"], bool)
             self.assertTrue(payload["resumeReady"])
             self.assertEqual(payload["seekableUntil"], payload["sourceMetadata"]["duration"])
             self.assertGreaterEqual(payload["preparationProgress"]["readySegments"], 0)

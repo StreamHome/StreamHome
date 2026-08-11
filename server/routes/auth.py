@@ -22,6 +22,7 @@ from config import settings
 from db import engine, get_session
 from models import AuthChallenge, AuthSession, IntegrationCredential, RecoveryCode, SecurityEvent, TOTPEnrollment, User
 from services.logger import logger
+from services.rclone import rclone_service
 from services.request_security import client_ip, request_is_secure
 from services.secret_crypto import is_protected_secret, protect_secret, reveal_secret
 from services.rate_limit import clear as clear_rate_limit
@@ -354,6 +355,8 @@ async def health():
             "buildId": settings.BUILD_ID,
             "serverTime": now(),
             "updateTransaction": service_state.UPDATE_TRANSACTION_ID,
+            "storageEngine": settings.STORAGE_ENGINE,
+            "cloudStorage": rclone_service.cloud_health() if settings.STORAGE_ENGINE == "CLOUD" else None,
         }
     except Exception as exc:
         message = str(exc).lower()

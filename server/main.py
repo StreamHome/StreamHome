@@ -281,7 +281,7 @@ async def lifespan(app: FastAPI):
         while True:
             try:
                 if settings.BACKUP_ENABLED:
-                    from services.backup import get_local_backups, is_database_idle, create_backup, prune_old_backups, sync_backups_to_cloud
+                    from services.backup import get_local_backups, create_backup, prune_old_backups, sync_backups_to_cloud
                     backups = get_local_backups()
                     should_backup = True
                     if backups:
@@ -292,17 +292,19 @@ async def lifespan(app: FastAPI):
                             should_backup = False
                     
                     if should_backup:
-                        if await is_database_idle():
-                            logger.info("[Backup Worker] Database is idle. Initiating daily database backup...")
-                            backup_path = await create_backup()
-                            prune_old_backups(keep_count=7)
-                            if settings.STORAGE_ENGINE == "CLOUD":
-                                await sync_backups_to_cloud()
-                            logger.info(f"[Backup Worker] Daily database backup successfully completed: {backup_path}")
+                        logger.info("[Backup Worker] Initiating online daily database backup...")
+                        backup_path = await create_backup()
+                        prune_old_backups(keep_count=7)
+                        cloud_synced = None
+                        if settings.STORAGE_ENGINE == "CLOUD":
+                            cloud_synced = await sync_backups_to_cloud()
+                        if cloud_synced is False:
+                            logger.error(
+                                f"[Backup Worker] Local daily backup completed but cloud synchronization failed: "
+                                f"{backup_path}"
+                            )
                         else:
-                            logger.info("[Backup Worker] Daily backup is due, but database is currently in use. Deferring check...")
-                            await asyncio.sleep(300)
-                            continue
+                            logger.info(f"[Backup Worker] Daily database backup successfully completed: {backup_path}")
             except Exception as e:
                 logger.error(f"[Backup Worker] Error in daily backup scheduler: {e}")
             await asyncio.sleep(3600)
@@ -1142,6 +1144,7 @@ class SystemSettingsResponse(APIModel):
     drive_configured: bool = False
     drive_reachable: Optional[bool] = None
     drive_error_code: Optional[str] = None
+    drive_health_state: str = "unknown"
     google_drive_audience: str = "external"
     google_drive_publishing_status: str = "production"
 
@@ -1163,6 +1166,7 @@ async def get_system_settings(user = Depends(get_current_user)):
         drive_configured=drive_configured,
         drive_reachable=drive_reachable,
         drive_error_code=drive_error_code,
+        drive_health_state=str(rclone_service.cloud_health()["state"]),
         google_drive_audience=settings.GOOGLE_DRIVE_AUDIENCE,
         google_drive_publishing_status=settings.GOOGLE_DRIVE_PUBLISHING_STATUS,
     )
@@ -1199,6 +1203,7 @@ async def save_system_settings(req: SystemSettingsRequest, session = Depends(req
         drive_configured=drive_configured,
         drive_reachable=drive_reachable,
         drive_error_code=drive_error_code,
+        drive_health_state=str(rclone_service.cloud_health()["state"]),
         google_drive_audience=settings.GOOGLE_DRIVE_AUDIENCE,
         google_drive_publishing_status=settings.GOOGLE_DRIVE_PUBLISHING_STATUS,
     )

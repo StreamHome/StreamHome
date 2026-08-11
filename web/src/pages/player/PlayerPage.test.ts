@@ -166,6 +166,7 @@ describe("player interaction contracts", () => {
       { ...metadata, codec: "hevc" },
       { canPlayType: (type: string) => type.includes("hvc1") ? "probably" : "" },
     )).toBe(true);
+    expect(canUseProgressiveCompatibility({ ...metadata, audioCodec: "dts" })).toBe(false);
     expect(canUseProgressiveCompatibility({ ...metadata, container: "matroska", sourceFormat: "MKV" })).toBe(false);
   });
 
@@ -226,14 +227,14 @@ describe("player interaction contracts", () => {
     expect(playbackTransportIsReady({ ...available, preparationState: "preparing" }, "progressive")).toBe(true);
   });
 
-  it("tries the protected source instead of waiting forever when no ready HLS exists", () => {
+  it("waits for adaptive playback when the protected source is not browser compatible", () => {
     const response = {
       progressiveUrl: "/api/playback/progressive/m_media?ticket=value",
       manifestUrl: null,
       sourceMetadata: { duration: 120, container: "matroska", codec: "hevc", width: 1280, height: 720, frameRate: 24, sourceFormat: "MKV" },
       tracks: [],
     } as unknown as PlaybackRunResponse;
-    expect(initialPlaybackMode(response, "", "")).toBe("progressive");
+    expect(initialPlaybackMode(response, "", "")).toBe("hls");
     expect(initialPlaybackMode({ ...response, manifestUrl: "/api/playback/manifest/m_media?ticket=value" }, "", "")).toBe("hls");
   });
 
