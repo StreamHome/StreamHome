@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import type Hls from "hls.js";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -92,6 +92,8 @@ interface PlayerPreferences {
   subtitleTrackId: string;
   captionScale: number;
   playbackRate: number;
+  volume: number;
+  muted: boolean;
 }
 
 interface FatalState {
@@ -126,6 +128,8 @@ const DEFAULT_PREFERENCES: PlayerPreferences = {
   subtitleTrackId: "off",
   captionScale: 1,
   playbackRate: 1,
+  volume: 1,
+  muted: false,
 };
 const TICKET_RENEWAL_MARGIN = 3 * 60 * 1_000;
 const NEXT_EPISODE_SECONDS = 10;
@@ -356,6 +360,10 @@ function loadPreferences(profileId: string): PlayerPreferences {
         : typeof parsed.subtitleLanguage === "string" ? parsed.subtitleLanguage : "off",
       captionScale: typeof parsed.captionScale === "number" ? Math.min(1.5, Math.max(0.8, parsed.captionScale)) : 1,
       playbackRate: typeof parsed.playbackRate === "number" ? parsed.playbackRate : 1,
+      volume: typeof parsed.volume === "number" && Number.isFinite(parsed.volume)
+        ? Math.min(1, Math.max(0, parsed.volume))
+        : 1,
+      muted: typeof parsed.muted === "boolean" ? parsed.muted : false,
     };
   } catch {
     return DEFAULT_PREFERENCES;
@@ -658,6 +666,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const theme = useThemeStore((state) => state.activeTheme);
   const definition = getThemeDefinition(theme);
   const { reduced } = useAppMotion();
+  const initialPreferences = useMemo(
+    () => profile ? loadPreferences(profile.id) : DEFAULT_PREFERENCES,
+    [profile],
+  );
 
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -697,8 +709,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const selectedAudioTrackIdRef = useRef("");
   const activeExternalAudioTrackIdRef = useRef<string | null>(null);
   const externalAudioBufferingRef = useRef(false);
-  const volumeRef = useRef(1);
-  const mutedRef = useRef(false);
+  const volumeRef = useRef(initialPreferences.volume);
+  const mutedRef = useRef(initialPreferences.muted);
+  const preferencesProfileIdRef = useRef(profile?.id ?? "");
   const stallRecoveryTimerRef = useRef<number | null>(null);
   const stallRecoveryAttemptsRef = useRef(0);
   const lastFrameCaptureAtRef = useRef(0);
@@ -739,8 +752,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [bufferedEnd, setBufferedEnd] = useState(0);
-  const [volume, setVolume] = useState(1);
-  const [muted, setMuted] = useState(false);
+  const [preferences, setPreferences] = useState<PlayerPreferences>(initialPreferences);
+  const [volume, setVolume] = useState(initialPreferences.volume);
+  const [muted, setMuted] = useState(initialPreferences.muted);
   const [showControls, setShowControls] = useState(true);
   const [controlMenuOpen, setControlMenuOpen] = useState(false);
   const [timelineScrubbing, setTimelineScrubbing] = useState(false);
@@ -748,7 +762,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [selectedQualityId, setSelectedQualityId] = useState("auto");
   const [availableAudioTracks, setAvailableAudioTracks] = useState<PlayerAudioOption[]>([]);
   const [selectedAudioTrackId, setSelectedAudioTrackId] = useState("");
-  const [preferences, setPreferences] = useState<PlayerPreferences>(() => profile ? loadPreferences(profile.id) : DEFAULT_PREFERENCES);
   const [nextCountdown, setNextCountdown] = useState<number | null>(null);
   const [nextCancelled, setNextCancelled] = useState(false);
   const [timelinePreview, setTimelinePreview] = useState<{ x: number; time: number } | null>(null);
@@ -775,6 +788,19 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   useEffect(() => {
     mutedRef.current = muted;
   }, [muted]);
+
+  useLayoutEffect(() => {
+    const video = videoRef.current;
+    const audio = externalAudioRef.current;
+    if (video) {
+      video.volume = volume;
+      video.muted = activeExternalAudioTrackIdRef.current ? true : muted;
+    }
+    if (audio) {
+      audio.volume = volume;
+      audio.muted = muted;
+    }
+  }, [muted, volume]);
 
   useEffect(() => {
     if (phase !== "preparing") {
@@ -864,13 +890,19 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [showControls]);
 
   useEffect(() => {
-    if (!profile) return;
+    if (!profile || preferencesProfileIdRef.current !== profile.id) return;
     localStorage.setItem(`streamhome_player_preferences_${profile.id}`, JSON.stringify(preferences));
   }, [preferences, profile]);
 
   useEffect(() => {
-    if (!profile) return;
-    setPreferences(loadPreferences(profile.id));
+    if (!profile || preferencesProfileIdRef.current === profile.id) return;
+    const restored = loadPreferences(profile.id);
+    preferencesProfileIdRef.current = profile.id;
+    volumeRef.current = restored.volume;
+    mutedRef.current = restored.muted;
+    setPreferences(restored);
+    setVolume(restored.volume);
+    setMuted(restored.muted);
   }, [profile]);
 
   useEffect(() => {
@@ -1179,12 +1211,20 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     return true;
   }, [syncExternalAudio]);
 
-  const setOutputVolume = useCallback((nextVolume: number, nextMuted: boolean) => {
+  const rememberOutputVolume = useCallback((nextVolume: number, nextMuted: boolean) => {
     const boundedVolume = Math.min(1, Math.max(0, nextVolume));
     volumeRef.current = boundedVolume;
     mutedRef.current = nextMuted;
     setVolume(boundedVolume);
     setMuted(nextMuted);
+    setPreferences((current) => current.volume === boundedVolume && current.muted === nextMuted
+      ? current
+      : { ...current, volume: boundedVolume, muted: nextMuted });
+    return boundedVolume;
+  }, []);
+
+  const setOutputVolume = useCallback((nextVolume: number, nextMuted: boolean) => {
+    const boundedVolume = rememberOutputVolume(nextVolume, nextMuted);
     const video = videoRef.current;
     const audio = externalAudioRef.current;
     if (video) {
@@ -1195,7 +1235,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       audio.volume = boundedVolume;
       audio.muted = nextMuted;
     }
-  }, []);
+  }, [rememberOutputVolume]);
 
   const toggleOutputMute = useCallback(() => {
     setOutputVolume(volumeRef.current, !mutedRef.current);
@@ -3106,16 +3146,15 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }}
         onVolumeChange={() => {
           if (activeExternalAudioTrackIdRef.current) {
-            setVolume(externalAudioRef.current?.volume ?? volumeRef.current);
-            setMuted(externalAudioRef.current?.muted ?? mutedRef.current);
+            rememberOutputVolume(
+              externalAudioRef.current?.volume ?? volumeRef.current,
+              externalAudioRef.current?.muted ?? mutedRef.current,
+            );
             return;
           }
           const nextVolume = videoRef.current?.volume ?? 1;
           const nextMuted = videoRef.current?.muted ?? false;
-          volumeRef.current = nextVolume;
-          mutedRef.current = nextMuted;
-          setVolume(nextVolume);
-          setMuted(nextMuted);
+          rememberOutputVolume(nextVolume, nextMuted);
         }}
         onEnded={() => {
           pauseExternalAudio();

@@ -90,9 +90,12 @@ const playback: ResolvedPlayback = {
   },
 };
 
+const playerPreferencesKey = `streamhome_player_preferences_${profile.id}`;
+
 
 describe("mounted player lifecycle", () => {
   beforeEach(() => {
+    localStorage.removeItem(playerPreferencesKey);
     useProfileStore.setState({ profiles: [profile], activeProfile: profile, isAdmin: false });
     vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
     vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
@@ -100,6 +103,7 @@ describe("mounted player lifecycle", () => {
   });
 
   afterEach(() => {
+    localStorage.removeItem(playerPreferencesKey);
     vi.restoreAllMocks();
     useProfileStore.setState({ profiles: [], activeProfile: null, isAdmin: false });
     document.documentElement.removeAttribute("data-player-viewport-fullscreen");
@@ -189,6 +193,47 @@ describe("mounted player lifecycle", () => {
     fireEvent.keyDown(document.body, { key: "ArrowLeft" });
     expect(video.currentTime).toBe(30);
     view.unmount();
+  });
+
+  it("restores the profile audio level before playback and preserves changes across titles", async () => {
+    localStorage.setItem(playerPreferencesKey, JSON.stringify({ volume: 0.36, muted: false }));
+    const firstView = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={playback} />
+      </MemoryRouter>,
+    );
+
+    const firstVideo = firstView.container.querySelector("video") as HTMLVideoElement;
+    const firstVolume = screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement;
+    await waitFor(() => expect(firstVolume.value).toBe("0.36"));
+    expect(firstVideo.volume).toBe(0.36);
+
+    fireEvent.change(firstVolume, { target: { value: "0.24" } });
+    await waitFor(() => expect(JSON.parse(localStorage.getItem(playerPreferencesKey) || "{}")).toMatchObject({
+      volume: 0.24,
+      muted: false,
+    }));
+    firstView.unmount();
+
+    const nextTitle: ResolvedPlayback = {
+      ...playback,
+      asset: {
+        ...playback.asset,
+        id: "mounted-player-next-media",
+        movieId: "mounted-player-next-media",
+        title: "Mounted player next title",
+      },
+    };
+    const secondView = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-next-media"]}>
+        <PlayerPage visualFixture={nextTitle} />
+      </MemoryRouter>,
+    );
+
+    const secondVideo = secondView.container.querySelector("video") as HTMLVideoElement;
+    await waitFor(() => expect((screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement).value).toBe("0.24"));
+    expect(secondVideo.volume).toBe(0.24);
+    secondView.unmount();
   });
 
   it("clamps rapid seeks to a growing preview edge and pauses synchronized audio", () => {
