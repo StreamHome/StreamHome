@@ -19,8 +19,8 @@ security = HTTPBearer(auto_error=False)
 
 INTEGRATION_SCOPE_DEFINITIONS = {
     "ingest": {
-        "label": "Add media",
-        "description": "Submit movies and episodes to the ingestion queue.",
+        "label": "Manage media",
+        "description": "Submit media and manage application-owned markers, subtitles, and dubbing sidecars.",
     },
     "downloads:read": {
         "label": "View download queue",

@@ -817,6 +817,63 @@ class SubtitleInput(BaseModel):
         self.language = normalize_language_tag(self.language)
         return self
 
+
+class SkipMarkerRange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start: float = PydanticField(ge=0)
+    end: float = PydanticField(gt=0)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "SkipMarkerRange":
+        if self.end <= self.start:
+            raise ValueError("Marker end must be greater than marker start")
+        return self
+
+
+class MediaSkipMarkersUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    skip_markers: Dict[str, List[SkipMarkerRange]] = PydanticField(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_markers(self) -> "MediaSkipMarkersUpdate":
+        if len(self.skip_markers) > 16:
+            raise ValueError("No more than 16 marker groups may be supplied")
+        marker_count = 0
+        for name, markers in self.skip_markers.items():
+            if not name or len(name) > 32 or not all(character.isalnum() or character in "_-" for character in name):
+                raise ValueError("Marker group names may contain only letters, numbers, underscores, and hyphens")
+            marker_count += len(markers)
+        if marker_count > 128:
+            raise ValueError("No more than 128 markers may be supplied")
+        return self
+
+
+class MediaSubtitleUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    language: str = PydanticField(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    url: str = PydanticField(min_length=1, max_length=4096)
+    label: Optional[str] = PydanticField(default=None, min_length=1, max_length=128)
+    headers: Optional[Dict[str, str]] = None
+
+    @model_validator(mode="after")
+    def normalize_language(self) -> "MediaSubtitleUpdate":
+        normalized = normalize_language_tag(self.language, "")
+        if not normalized:
+            raise ValueError("Subtitle language is invalid")
+        self.language = normalized
+        return self
+
+
+class MediaAudioUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = PydanticField(min_length=1, max_length=4096)
+    headers: Optional[Dict[str, str]] = None
+    source_type: Literal["auto", "hls"] = "auto"
+
 class TelemetryRequest(BaseModel):
     event_type: str
     movie_id: Optional[str] = None

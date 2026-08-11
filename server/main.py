@@ -67,6 +67,7 @@ from routes.update import router as update_router
 from routes.setup import router as setup_router
 from routes.playback import router as playback_router
 from routes.admin_profiles import router as admin_profiles_router
+from routes.media_updates import router as media_updates_router
 
 # 💥 WINDOWS ASYNC SUBPROCESS FIX
 if sys.platform == 'win32':
@@ -472,6 +473,7 @@ app.include_router(queue_router)
 app.include_router(auth_router)
 app.include_router(health_router)
 app.include_router(playback_router)
+app.include_router(media_updates_router)
 app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
 app.include_router(update_router, prefix="/api/update", tags=["update"])
 app.include_router(setup_router)

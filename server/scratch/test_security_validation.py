@@ -161,6 +161,29 @@ async def run() -> None:
         assert not same_origin_request(extension_ingest)
         assert integration_bearer_request(extension_ingest)
         assert not unsafe_cookie_request_requires_same_origin(extension_ingest)
+        for method, path in (
+            ("PATCH", "/api/media/m_550/metadata"),
+            ("PUT", "/api/media/m_550/subtitles/en-cc"),
+            ("DELETE", "/api/media/m_550/subtitles/en-cc"),
+            ("PUT", "/api/media/m_550/audio/tr"),
+            ("DELETE", "/api/media/m_550/audio/tr"),
+        ):
+            mutation = browser_request(
+                origin="chrome-extension://abcdefghijklmnop",
+                client="198.51.100.20",
+                path=path,
+                authorization="Bearer shk_extension-test-key",
+                method=method,
+            )
+            assert integration_bearer_request(mutation)
+            assert not unsafe_cookie_request_requires_same_origin(mutation)
+        assert not integration_bearer_request(browser_request(
+            origin="chrome-extension://abcdefghijklmnop",
+            client="198.51.100.20",
+            path="/api/media/m_550/metadata/unexpected",
+            authorization="Bearer shk_extension-test-key",
+            method="PATCH",
+        ))
         assert not integration_bearer_request(browser_request(
             origin="chrome-extension://abcdefghijklmnop",
             client="198.51.100.20",

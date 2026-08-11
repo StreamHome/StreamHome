@@ -118,8 +118,21 @@ def integration_bearer_request(request: Request) -> bool:
     if separator != " " or scheme.lower() != "bearer" or not token.startswith("shk_"):
         return False
     path = request.url.path
+    media_parts = path.removeprefix("/api/media/").split("/") if path.startswith("/api/media/") else []
+    media_mutation = bool(
+        all(media_parts)
+        and (
+            (request.method == "PATCH" and len(media_parts) == 2 and media_parts[1] == "metadata")
+            or (
+                request.method in {"PUT", "DELETE"}
+                and len(media_parts) == 3
+                and media_parts[1] in {"subtitles", "audio"}
+            )
+        )
+    )
     return bool(
         (request.method == "POST" and path == "/api/add-movie")
+        or media_mutation
         or (
             request.method == "DELETE"
             and path.startswith("/api/downloads/")
