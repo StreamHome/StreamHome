@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 const playerPage = readFileSync(resolve("src/pages/player/PlayerPage.tsx"), "utf8");
 const playerStyles = readFileSync(resolve("src/index.css"), "utf8");
+const applicationStyles = readFileSync(resolve("src/themes/application/application.css"), "utf8");
 
 describe("dedicated mobile player presentation", () => {
   it("keeps phone controls separate from the desktop control surface", () => {
@@ -92,5 +93,21 @@ describe("dedicated mobile player presentation", () => {
     expect(playerPage).toContain('playbackProgressFailureAction(error)');
     expect(adaptiveAudioSelection).toBeGreaterThan(-1);
     expect(directAudioSelection).toBeGreaterThan(adaptiveAudioSelection);
+  });
+
+  it("uses a theme-aware timeline and removes Ember control blur", () => {
+    const timelineStart = playerStyles.indexOf(".player-timeline {");
+    const timelineEnd = playerStyles.indexOf(".player-view video::cue", timelineStart);
+    const timelineStyles = playerStyles.slice(timelineStart, timelineEnd);
+    const emberControls = applicationStyles.match(/\.player-view\[data-player-theme="terminal"\] \.player-controls \{[^}]+\}/)?.[0] ?? "";
+
+    expect(timelineStyles).toContain("--player-timeline-track-size: 0.2rem");
+    expect(timelineStyles).toContain("color-mix(in srgb, var(--player-accent) 88%, white 12%)");
+    expect(timelineStyles).toContain("--player-timeline-thumb-size: 0.58rem");
+    expect(timelineStyles).not.toContain("background: white");
+    expect(playerStyles).toContain('.player-view[data-player-theme="terminal"] .player-control-button');
+    expect(emberControls).toContain("backdrop-filter: none");
+    expect(emberControls).toContain("box-shadow: none");
+    expect(emberControls).toContain("rgba(15,6,3,.46)");
   });
 });
