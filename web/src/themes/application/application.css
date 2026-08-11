@@ -889,7 +889,7 @@
 .theme-app--gemini.profile-editor .profile-editor__panel { background: rgba(24,24,27,.78); }
 
 /* Neutral profile gallery */
-.player-view[data-player-theme="terminal"] .player-controls { border: 0; padding-top: 4.5rem; background: linear-gradient(to top,rgba(15,6,3,.88),rgba(15,6,3,.46) 50%,transparent); font-family: var(--font-mono); box-shadow: none; backdrop-filter: none; }
+.player-view[data-player-theme="terminal"] .player-controls { border: 0; padding-top: 4.5rem; background: linear-gradient(to top,rgba(0,0,0,.42),transparent 68%); font-family: var(--font-mono); box-shadow: none; backdrop-filter: none; }
 .player-controls { transform: translateZ(0); }
 .player-complete-panel { animation: player-panel-enter .2s cubic-bezier(.2,0,0,1) both; }
 .player-view[data-player-theme="terminal"] .player-controls button { border-radius: 0; text-transform: uppercase; letter-spacing: .08em; font-size: 10px; }

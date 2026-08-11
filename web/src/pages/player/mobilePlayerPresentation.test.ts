@@ -95,7 +95,7 @@ describe("dedicated mobile player presentation", () => {
     expect(directAudioSelection).toBeGreaterThan(adaptiveAudioSelection);
   });
 
-  it("uses a theme-aware timeline and removes Ember control blur", () => {
+  it("centers player range thumbs and removes the heavy Ember control effect", () => {
     const timelineStart = playerStyles.indexOf(".player-timeline {");
     const timelineEnd = playerStyles.indexOf(".player-view video::cue", timelineStart);
     const timelineStyles = playerStyles.slice(timelineStart, timelineEnd);
@@ -104,10 +104,15 @@ describe("dedicated mobile player presentation", () => {
     expect(timelineStyles).toContain("--player-timeline-track-size: 0.2rem");
     expect(timelineStyles).toContain("color-mix(in srgb, var(--player-accent) 88%, white 12%)");
     expect(timelineStyles).toContain("--player-timeline-thumb-size: 0.58rem");
+    expect(timelineStyles).toContain("box-sizing: border-box");
+    expect(timelineStyles).toContain("--player-volume-track-size: 0.28rem");
+    expect(timelineStyles).toContain("--player-volume-thumb-size: 0.85rem");
+    expect(timelineStyles).toContain("margin-top: calc((var(--player-volume-track-size) - var(--player-volume-thumb-size)) / 2)");
     expect(timelineStyles).not.toContain("background: white");
     expect(playerStyles).toContain('.player-view[data-player-theme="terminal"] .player-control-button');
     expect(emberControls).toContain("backdrop-filter: none");
     expect(emberControls).toContain("box-shadow: none");
-    expect(emberControls).toContain("rgba(15,6,3,.46)");
+    expect(emberControls).toContain("rgba(0,0,0,.42)");
+    expect(emberControls).not.toContain("rgba(15,6,3,.46)");
   });
 });
