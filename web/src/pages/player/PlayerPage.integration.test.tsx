@@ -382,6 +382,21 @@ describe("mounted player lifecycle", () => {
       configurable: true,
       value: HTMLMediaElement.HAVE_FUTURE_DATA,
     });
+    const play = vi.mocked(HTMLMediaElement.prototype.play);
+    let pendingAudioPlayCaptured = false;
+    let rejectPendingAudioPlay = (_reason?: unknown): void => {
+      throw new Error("Expected an external-audio play request to be pending.");
+    };
+    play.mockImplementation(function (this: HTMLMediaElement) {
+      if (this === audio) {
+        return new Promise<void>((_resolve, reject) => {
+          pendingAudioPlayCaptured = true;
+          rejectPendingAudioPlay = reject;
+        });
+      }
+      return Promise.resolve();
+    });
+    play.mockClear();
     Object.defineProperty(video, "duration", { configurable: true, value: 120 });
     fireEvent.loadedMetadata(video);
     fireEvent.canPlay(video);
@@ -389,6 +404,9 @@ describe("mounted player lifecycle", () => {
     fireEvent.play(video);
     fireEvent.playing(video);
     await waitFor(() => expect(root.dataset.playerPhase).toBe("playing"));
+    fireEvent.canPlay(audio);
+    fireEvent.canPlay(audio);
+    expect(play.mock.contexts.filter((context) => context === audio)).toHaveLength(1);
 
     const pause = vi.mocked(HTMLMediaElement.prototype.pause);
     pause.mockClear();
@@ -403,6 +421,11 @@ describe("mounted player lifecycle", () => {
     fireEvent.waiting(video);
     expect(root.dataset.playerPhase).toBe("buffering");
     expect(screen.getAllByText("Buffering").length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("button", { name: "Pause" }).length).toBeGreaterThan(0);
+    expect(pendingAudioPlayCaptured).toBe(true);
+    rejectPendingAudioPlay(new DOMException("The play() request was interrupted by a call to pause().", "AbortError"));
+    await waitFor(() => expect(root.dataset.playerPhase).toBe("buffering"));
+    expect(screen.queryByText("Press play once to allow the selected dubbing track.")).toBeNull();
     view.unmount();
   });
 
