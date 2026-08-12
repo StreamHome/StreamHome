@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -26,7 +27,7 @@ from config import settings
 from db import get_session
 from models import AuthSession, DownloadTask, Movie, PlaybackRun, PlaybackSession, Profile, User
 from routes.auth import get_current_user
-from routes.playback import router
+from routes.playback import ensure_source_metadata, router
 from services.media_source import resolve_media_source
 from services.ingest_preview import ingest_preview_service
 from services.playback_prep import playback_prep_service
@@ -337,6 +338,62 @@ class PlaybackContractRegression(unittest.TestCase):
         prioritize.assert_awaited_once()
         self.assertEqual(prioritize.await_args.args[0], "m_playback_contract")
         self.assertEqual(prioritize.await_args.args[3], requested["id"])
+
+    def test_stale_portable_video_identity_forces_stream_metadata_reprobe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            media_path = Path(directory) / "fixture.mp4"
+            media_path.write_bytes(b"current-video")
+            metadata_path = media_path.parent / ".metadata" / "metadata.json"
+            metadata_path.parent.mkdir()
+            metadata_path.write_text(json.dumps({
+                "title": "Fixture",
+                "codec": "h264",
+                "video_fingerprint": "stale-video-fingerprint",
+            }), encoding="utf-8")
+            source = SimpleNamespace(
+                local_exists=True,
+                local_path=media_path,
+                video_fingerprint="current-video-fingerprint",
+                fingerprint="current-playback-fingerprint",
+            )
+            media = SimpleNamespace(
+                id="m_stale_probe",
+                probed_duration=120.0,
+                container="mov,mp4",
+                codec="h264",
+                width=1920,
+                height=1080,
+                frame_rate=24.0,
+                source_fingerprint="current-playback-fingerprint",
+                audio_metadata=[],
+            )
+            db = SimpleNamespace(add=lambda _value: None, commit=AsyncMock())
+            refreshed_probe = {
+                "probed_duration": 120.0,
+                "container": "mov,mp4",
+                "codec": "hevc",
+                "width": 1920,
+                "height": 1080,
+                "frame_rate": 59.94,
+                "source_fingerprint": "current-playback-fingerprint",
+                "video_fingerprint": "current-video-fingerprint",
+                "audio_metadata": [],
+                "stream_manifest": [],
+            }
+
+            with (
+                patch("routes.playback.merge_local_external_audio", return_value=[]),
+                patch("routes.playback.playback_source_fingerprint", return_value="current-playback-fingerprint"),
+                patch("routes.playback.probe_completed_media", new=AsyncMock(return_value=refreshed_probe)) as probe,
+            ):
+                asyncio.run(ensure_source_metadata(db, media, source))
+
+            probe.assert_awaited_once_with(str(media_path))
+            self.assertEqual(media.codec, "hevc")
+            self.assertEqual(media.frame_rate, 59.94)
+            portable = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(portable["codec"], "hevc")
+            self.assertEqual(portable["video_fingerprint"], "current-video-fingerprint")
 
     def test_ingest_preview_is_protected_and_survives_local_catalog_handoff(self) -> None:
         task_id = f"preview-{uuid.uuid4().hex}"

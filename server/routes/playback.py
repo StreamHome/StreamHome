@@ -439,10 +439,23 @@ async def ensure_source_metadata(
         db.add(media_obj)
         await db.commit()
     metadata_missing = not media_obj.probed_duration or not media_obj.codec or not media_obj.width or not media_obj.height
-    if audio_changed and not metadata_missing:
-        return
     source_replaced = media_obj.source_fingerprint != playback_source_fingerprint(source, media_obj.audio_metadata or [])
-    if not metadata_missing and not source_replaced:
+    metadata_path = source.local_path.parent / ".metadata" / "metadata.json"
+    portable_metadata: dict[str, Any] | None = None
+    if metadata_path.is_file():
+        try:
+            loaded_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_metadata, dict):
+                portable_metadata = loaded_metadata
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            logger.warning(f"[Playback Metadata] Could not inspect {metadata_path}: {exc}")
+    stored_video_fingerprint = str((portable_metadata or {}).get("video_fingerprint") or "")
+    video_identity_stale = portable_metadata is not None and stored_video_fingerprint != source.video_fingerprint
+    source_change_requires_probe = source_replaced and not (
+        portable_metadata is not None
+        and stored_video_fingerprint == source.video_fingerprint
+    )
+    if not metadata_missing and not video_identity_stale and not source_change_requires_probe:
         return
     probe = await probe_completed_media(str(source.local_path))
     if not probe:
@@ -452,6 +465,30 @@ async def ensure_source_metadata(
     media_obj.audio_metadata = probe.get("audio_metadata", [])
     db.add(media_obj)
     await db.commit()
+    if portable_metadata is not None:
+        try:
+            for field in (
+                "probed_duration",
+                "container",
+                "codec",
+                "width",
+                "height",
+                "frame_rate",
+                "source_fingerprint",
+                "video_fingerprint",
+                "audio_metadata",
+                "stream_manifest",
+            ):
+                portable_metadata[field] = probe.get(field)
+            portable_metadata["languages"] = list(dict.fromkeys([
+                normalize_language_tag(item.get("language"))
+                for item in (probe.get("audio_metadata") or [])
+            ]))
+            temporary = metadata_path.with_suffix(f"{metadata_path.suffix}.tmp")
+            temporary.write_text(json.dumps(portable_metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(temporary, metadata_path)
+        except (OSError, TypeError) as exc:
+            logger.warning(f"[Playback Metadata] Could not refresh {metadata_path}: {exc}")
 
 
 async def next_playable_episode(db: AsyncSession, movie_id: str, current_id: str) -> Optional[str]:
