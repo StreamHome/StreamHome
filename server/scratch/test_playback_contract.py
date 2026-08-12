@@ -12,6 +12,7 @@ import unittest
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import jwt
@@ -121,7 +122,15 @@ class PlaybackContractRegression(unittest.TestCase):
 
         cls.cache_root = playback_prep_service.cache_path("m_playback_contract", cls.fingerprint)
         video_dir = cls.cache_root / "video_original"
-        audio_dir = cls.cache_root / "audio_1_en"
+        cls.default_audio_rendition = playback_prep_service.audio_renditions(SimpleNamespace(audio_metadata=[{
+            "index": 0,
+            "streamIndex": 1,
+            "language": "eng",
+            "label": "English",
+            "channels": 2,
+            "default": True,
+        }]))[0].name
+        audio_dir = cls.cache_root / cls.default_audio_rendition
         video_dir.mkdir(parents=True, exist_ok=True)
         audio_dir.mkdir(parents=True, exist_ok=True)
         (video_dir / "playlist.m3u8").write_text("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_00000.m4s\n#EXT-X-ENDLIST\n", encoding="utf-8")
@@ -136,7 +145,7 @@ class PlaybackContractRegression(unittest.TestCase):
         (audio_dir / ".verified-v1").write_text("1", encoding="utf-8")
         (cls.cache_root / "master.m3u8").write_text(
             "#EXTM3U\n"
-            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",DEFAULT=YES,URI=\"audio_1_en/playlist.m3u8\"\n"
+            f"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",DEFAULT=YES,URI=\"{cls.default_audio_rendition}/playlist.m3u8\"\n"
             "#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,AUDIO=\"audio\"\n"
             "video_original/playlist.m3u8\n",
             encoding="utf-8",
@@ -184,9 +193,10 @@ class PlaybackContractRegression(unittest.TestCase):
             self.assertGreater(payload["sourceMetadata"]["duration"], 0)
             if payload["manifestUrl"]:
                 self.assertEqual(payload["renditions"][0]["label"], "1080p")
-                self.assertIn(payload["renditions"][0]["status"], {"streamable", "ready"})
+                self.assertTrue(any(item["ready"] for item in payload["renditions"]))
             else:
-                self.assertEqual(payload["renditions"], [])
+                self.assertTrue(payload["renditions"])
+                self.assertTrue(any(not item["ready"] for item in payload["renditions"]))
         return payload
 
     def test_ready_hls_manifest_serves_only_existing_ticket_protected_assets(self) -> None:
@@ -249,7 +259,7 @@ class PlaybackContractRegression(unittest.TestCase):
             turkish = next(track for track in run["tracks"] if track["source"] == "external")
             self.assertEqual(turkish["language"], "tr")
             self.assertTrue(turkish["ready"])
-            self.assertIn("source_id=audio_1_tr", turkish["directUrl"])
+            self.assertIn(f"source_id={turkish['id']}", turkish["directUrl"])
             ranged = self.client.get(turkish["directUrl"], headers={"Range": "bytes=4-14"})
             self.assertEqual(ranged.status_code, 206, ranged.text)
             self.assertEqual(ranged.content, dubbing_file.read_bytes()[4:15])
@@ -302,10 +312,31 @@ class PlaybackContractRegression(unittest.TestCase):
 
     def test_quality_capability_is_immediately_actionable_without_whole_title_preparation(self) -> None:
         run = self.create_run()
-        self.assertTrue(all(item["ready"] for item in run["renditions"]))
+        original = next(item for item in run["renditions"] if item["id"] == "video_original")
+        self.assertTrue(original["ready"])
+        self.assertTrue(any(not item["ready"] for item in run["renditions"]))
         master = self.client.get(run["manifestUrl"])
         self.assertEqual(master.status_code, 200, master.text)
         self.assertIn("video_original/playlist.m3u8", master.text)
+
+    def test_unprepared_quality_is_exposed_and_can_be_prioritized_by_its_run(self) -> None:
+        run = self.create_run()
+        requested = next(item for item in run["renditions"] if item["id"] == "video_240p")
+        self.assertFalse(requested["ready"])
+        self.assertIn(requested["status"], {"idle", "preparing", "streamable"})
+
+        prioritize = AsyncMock(return_value="preparing")
+        with patch.object(playback_prep_service, "prioritize_video_rendition", new=prioritize):
+            response = self.client.post(
+                f"/api/playback/runs/{run['runId']}/quality",
+                json={"renditionId": requested["id"]},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"status": "preparing", "renditionId": requested["id"]})
+        prioritize.assert_awaited_once()
+        self.assertEqual(prioritize.await_args.args[0], "m_playback_contract")
+        self.assertEqual(prioritize.await_args.args[3], requested["id"])
 
     def test_ingest_preview_is_protected_and_survives_local_catalog_handoff(self) -> None:
         task_id = f"preview-{uuid.uuid4().hex}"

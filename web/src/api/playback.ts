@@ -19,6 +19,11 @@ export const createPlaybackRun = (movieId: string, profileId: string, episodeId?
 export const getPlaybackRun = (runId: string, options?: { retry?: boolean; signal?: AbortSignal }) =>
   apiGet<PlaybackRunResponse>(`/api/playback/runs/${runId}${options?.retry ? "?retry=true" : ""}`, { signal: options?.signal });
 
+export const prioritizePlaybackQuality = (runId: string, renditionId: string) =>
+  apiPost<{ status: string; renditionId: string }>(`/api/playback/runs/${runId}/quality`, {
+    rendition_id: renditionId,
+  });
+
 export const updatePlaybackProgress = (runId: string, progress: PlaybackProgressRequest, keepalive = false) =>
   apiPost<PlaybackProgressResponse>(`/api/playback/runs/${runId}/progress`, {
     timestamp: progress.timestamp,

@@ -184,6 +184,8 @@ describe("mounted player lifecycle", () => {
     fullscreenButton.focus();
     fireEvent.keyDown(fullscreenButton, { key: " " });
     fireEvent.keyUp(fullscreenButton, { key: " " });
+    fireEvent.loadedMetadata(video);
+    fireEvent.canPlay(video);
     await waitFor(() => expect(play).toHaveBeenCalled());
 
     fireEvent.keyDown(document.body, { key: "ArrowDown" });
@@ -221,12 +223,18 @@ describe("mounted player lifecycle", () => {
 
     fireEvent.loadedMetadata(video);
     await waitFor(() => expect(play).toHaveBeenCalledTimes(1));
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 42 });
+    fireEvent.timeUpdate(video);
     fireEvent.click(screen.getByRole("button", { name: "Pause" }));
 
     await waitFor(() => {
       expect(root.dataset.playerPhase).toBe("paused");
       expect(video.preload).toBe("none");
     });
+    video.currentTime = 0;
+    fireEvent.timeUpdate(video);
+    expect((screen.getByRole("slider", { name: "Playback position" }) as HTMLInputElement).value).toBe("42");
 
     await act(async () => {
       resolvePendingPlay();
@@ -243,6 +251,10 @@ describe("mounted player lifecycle", () => {
 
     Object.defineProperty(video, "paused", { configurable: true, value: true });
     fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    expect(play).toHaveBeenCalledTimes(1);
+    fireEvent.loadedMetadata(video);
+    expect(video.currentTime).toBe(42);
+    fireEvent.canPlay(video);
     await waitFor(() => {
       expect(video.preload).toBe("auto");
       expect(play).toHaveBeenCalledTimes(2);
@@ -380,6 +392,51 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
+  it("prioritizes an idle quality without interrupting progressive playback", async () => {
+    const onDemandPlayback: ResolvedPlayback = {
+      ...playback,
+      runResponse: {
+        ...playback.runResponse,
+        fullyPrepared: false,
+        renditions: [
+          ...playback.runResponse.renditions,
+          {
+            id: "video_240p",
+            label: "240p",
+            height: 240,
+            width: 426,
+            original: false,
+            ready: false,
+            status: "idle",
+          },
+        ],
+      },
+    };
+    const prioritize = vi.spyOn(playbackApi, "prioritizePlaybackQuality").mockResolvedValue({
+      status: "preparing",
+      renditionId: "video_240p",
+    });
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={onDemandPlayback} />
+      </MemoryRouter>,
+    );
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    const load = vi.mocked(HTMLMediaElement.prototype.load);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Quality: Auto" }));
+    const idleQuality = screen.getByRole("option", { name: /240p/ });
+    expect(idleQuality.getAttribute("aria-disabled")).not.toBe("true");
+    expect(idleQuality.textContent).toContain("Prepare on request");
+    load.mockClear();
+    fireEvent.click(idleQuality);
+
+    await waitFor(() => expect(prioritize).toHaveBeenCalledWith("mounted-player-run", "video_240p"));
+    expect(video.getAttribute("src")).toBe(playback.runResponse.progressiveUrl);
+    expect(load.mock.contexts.filter((context) => context === video)).toHaveLength(0);
+    view.unmount();
+  });
+
   it("starts an incompatible source on its ready adaptive transport without probing progressive playback", async () => {
     const adaptivePlayback: ResolvedPlayback = {
       ...playback,
@@ -504,7 +561,16 @@ describe("mounted player lifecycle", () => {
       skipMarkers: {},
     });
     vi.spyOn(playbackApi, "createPlaybackRun").mockResolvedValue(incompleteRun);
-    const poll = vi.spyOn(playbackApi, "getPlaybackRun").mockResolvedValue(incompleteRun);
+    const poll = vi.spyOn(playbackApi, "getPlaybackRun").mockImplementation(async () => ({
+      ...incompleteRun,
+      preparationProgress: { ...incompleteRun.preparationProgress },
+    }));
+    const progress = vi.spyOn(playbackApi, "updatePlaybackProgress").mockResolvedValue({
+      status: "ok",
+      acceptedSeconds: 0,
+      nextSequenceNumber: 2,
+    });
+    const intervals = vi.spyOn(window, "setInterval");
     vi.spyOn(playbackApi, "closePlaybackRun").mockResolvedValue({
       status: "abandoned",
       acceptedSeconds: 0,
@@ -525,6 +591,17 @@ describe("mounted player lifecycle", () => {
     await waitFor(() => expect(poll.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 2_000 });
     expect(video.getAttribute("src")).toBe(incompleteRun.progressiveUrl);
     expect(load.mock.contexts.filter((context) => context === video)).toHaveLength(initialVideoLoadCount);
+    const heartbeatIntervals = intervals.mock.calls.filter(([, delay]) => delay === 10_000);
+    expect(heartbeatIntervals).toHaveLength(1);
+    await act(async () => {
+      (heartbeatIntervals[0][0] as () => void)();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(progress).toHaveBeenCalledWith(
+      "progressive-poll-run",
+      expect.objectContaining({ event: "heartbeat" }),
+      false,
+    ));
 
     view.unmount();
   });

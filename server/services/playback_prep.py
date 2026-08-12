@@ -284,6 +284,29 @@ class PlaybackPrepService:
     def _audio_slug(language: str) -> str:
         return re.sub(r"[^a-z0-9-]", "-", language.lower()).strip("-") or "und"
 
+    def _audio_rendition_name(
+        self,
+        *,
+        source_kind: str,
+        stream_index: int,
+        position: int,
+        language: str,
+        file_name: Optional[str],
+    ) -> str:
+        source_slug = "external" if source_kind == "external" else "embedded"
+        identity = json.dumps(
+            {
+                "source": source_slug,
+                "streamIndex": stream_index,
+                "position": position,
+                "fileName": str(file_name or "").casefold(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        identity_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:10]
+        return f"audio_{source_slug}_{stream_index}_{identity_hash}_{self._audio_slug(language)}"
+
     def audio_renditions(self, media_obj: Any) -> list[AudioRendition]:
         metadata = list(getattr(media_obj, "audio_metadata", []) or [])
         if not metadata:
@@ -302,9 +325,16 @@ class PlaybackPrepService:
             )
             language = normalize_language_tag(item.get("language"))
             label = language_label(language, item.get("label"))
+            file_name = str(item.get("fileName") or item.get("file_name") or "") or None
             renditions.append(
                 AudioRendition(
-                    name=f"audio_{stream_index}_{self._audio_slug(language)}",
+                    name=self._audio_rendition_name(
+                        source_kind=source_kind,
+                        stream_index=stream_index,
+                        position=position,
+                        language=language,
+                        file_name=file_name,
+                    ),
                     label=label,
                     language=language,
                     stream_index=stream_index,
@@ -312,7 +342,7 @@ class PlaybackPrepService:
                     default=position == default_position,
                     codec=str(item.get("codec") or "").lower(),
                     source=source_kind,
-                    file_name=str(item.get("fileName") or item.get("file_name") or "") or None,
+                    file_name=file_name,
                 )
             )
         return renditions

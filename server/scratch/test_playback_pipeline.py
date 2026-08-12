@@ -296,6 +296,10 @@ class PlaybackPipelineRegression(unittest.TestCase):
             languages=["eng", "tur"],
         )
         scheduled = []
+        requested_rendition = next(
+            item for item in service.audio_renditions(media)
+            if item.source == "external" and item.language == "tr"
+        )
 
         async def run() -> str:
             with (
@@ -304,13 +308,13 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 patch.object(service, "_schedule_remaining"),
                 patch.object(service, "playlist_ready", return_value=False),
             ):
-                status = await service.prioritize_audio_rendition(media.id, media, source, "audio_1_tr")
-                preempt.assert_awaited_once_with({f"{media.id}:{source.fingerprint}:audio_1_tr"})
+                status = await service.prioritize_audio_rendition(media.id, media, source, requested_rendition.name)
+                preempt.assert_awaited_once_with({f"{media.id}:{source.fingerprint}:{requested_rendition.name}"})
                 return status
 
         self.assertEqual(asyncio.run(run()), "preparing")
         self.assertEqual(len(scheduled), 1)
-        self.assertEqual(scheduled[0][0][3].name, "audio_1_tr")
+        self.assertEqual(scheduled[0][0][3].name, requested_rendition.name)
 
     def test_rendition_status_distinguishes_streamable_complete_and_failed(self) -> None:
         media_id = f"m_status_{uuid.uuid4().hex}"
@@ -595,6 +599,37 @@ class PlaybackPipelineRegression(unittest.TestCase):
             self.assertTrue((target / ".complete").is_file())
             self.assertTrue((target / ".verified-v1").is_file())
 
+    def test_embedded_and_external_audio_with_the_same_index_and_language_have_distinct_identities(self) -> None:
+        service = PlaybackPrepService()
+        media = SimpleNamespace(audio_metadata=[
+            {
+                "index": 0,
+                "streamIndex": 1,
+                "codec": "aac",
+                "language": "en",
+                "label": "English",
+                "default": True,
+            },
+            {
+                "index": 1,
+                "streamIndex": 0,
+                "codec": "mp3",
+                "language": "en",
+                "label": "English",
+                "default": False,
+                "source": "external",
+                "fileName": "en.mp3",
+            },
+        ])
+
+        renditions = service.audio_renditions(media)
+
+        self.assertEqual(len(renditions), 2)
+        self.assertEqual(len({item.name for item in renditions}), 2)
+        self.assertTrue(renditions[0].name.startswith("audio_embedded_"))
+        self.assertTrue(renditions[1].name.startswith("audio_external_"))
+        self.assertNotEqual(renditions[0].name, renditions[1].name)
+
     def test_verified_source_optimization_preserves_complete_video_and_audio_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = PlaybackPrepService()
@@ -618,7 +653,8 @@ class PlaybackPipelineRegression(unittest.TestCase):
             )
             source_fingerprint = "1" * 64
             target_fingerprint = "2" * 64
-            for rendition_name in ("video_original", "audio_0_en"):
+            audio_rendition_name = service.audio_renditions(media)[0].name
+            for rendition_name in ("video_original", audio_rendition_name):
                 rendition = service.cache_path(
                     "m_verified_optimization",
                     source_fingerprint,
@@ -639,7 +675,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 target_fingerprint,
                 media,
             )
-            self.assertEqual(set(reused), {"video_original", "audio_0_en"})
+            self.assertEqual(set(reused), {"video_original", audio_rendition_name})
 
             master = asyncio.run(
                 service.rebuild_master(
@@ -651,14 +687,14 @@ class PlaybackPipelineRegression(unittest.TestCase):
             self.assertIsNotNone(master)
             master_text = master.read_text(encoding="utf-8")
             self.assertIn("video_original/playlist.m3u8", master_text)
-            self.assertIn("audio_0_en/playlist.m3u8", master_text)
+            self.assertIn(f"{audio_rendition_name}/playlist.m3u8", master_text)
             self.assertEqual(
                 (
                     service.cache_path("m_verified_optimization", target_fingerprint)
-                    / "audio_0_en"
+                    / audio_rendition_name
                     / "segment_00000.m4s"
                 ).read_bytes(),
-                b"audio_0_en",
+                audio_rendition_name.encode("utf-8"),
             )
 
     def test_cloud_external_dubbing_uses_the_same_language_contract(self) -> None:
@@ -1002,9 +1038,10 @@ class PlaybackPipelineRegression(unittest.TestCase):
         cache_path, media = asyncio.run(run())
         try:
             master = cache_path / "master.m3u8"
+            default_audio_rendition = next(item for item in playback_prep_service.audio_renditions(media) if item.default)
             self.assertTrue(master.is_file())
             self.assertTrue(any(cache_path.rglob("*.m4s")))
-            self.assertTrue((cache_path / "audio_1_en" / "segment_00000.m4s").is_file(), [str(path) for path in cache_path.rglob("*")])
+            self.assertTrue((cache_path / default_audio_rendition.name / "segment_00000.m4s").is_file(), [str(path) for path in cache_path.rglob("*")])
             self.assertIn("#EXT-X-PLAYLIST-TYPE:EVENT", (cache_path / "video_original" / "playlist.m3u8").read_text(encoding="utf-8"))
             self.assertEqual(playback_prep_service.rendition_status(media.id, media.source_fingerprint, "video_original"), "ready")
             content = master.read_text(encoding="utf-8")

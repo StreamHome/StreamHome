@@ -28,7 +28,7 @@ from services.logger import logger
 from services.languages import language_label, normalize_language_tag
 from services.media_source import MediaSourceError, ResolvedMediaSource, playback_source_fingerprint, resolve_media_source
 from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
-from services.playback_prep import playback_prep_service
+from services.playback_prep import PlaybackPreparationError, playback_prep_service
 from services.playback_source import PlaybackSourceFailure, source_reader
 from services.ingest_preview import IngestPreviewError, ingest_preview_service
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
@@ -51,6 +51,10 @@ class PlaybackRunRequest(APIModel):
     movie_id: str
     profile_id: str
     episode_id: Optional[str] = None
+
+
+class PlaybackQualityRequest(APIModel):
+    rendition_id: str = Field(min_length=1, max_length=96, pattern=r"^[a-zA-Z0-9_-]+$")
 
 
 class PlaybackProgressRequest(APIModel):
@@ -595,15 +599,14 @@ def rendition_contract(media_obj: Any, media_id: str, fingerprint: str) -> list[
     result: list[PlaybackRendition] = []
     for item in playback_prep_service.video_renditions(media_obj):
         rendition_status = playback_prep_service.rendition_status(media_id, fingerprint, item.name)
-        if rendition_status != "ready" or not playback_prep_service.rendition_verified(media_id, fingerprint, item.name):
-            continue
+        verified = rendition_status == "ready" and playback_prep_service.rendition_verified(media_id, fingerprint, item.name)
         result.append(PlaybackRendition(
             id=item.name,
             label=item.label,
             height=item.height,
             width=item.width,
             original=item.original,
-            ready=rendition_status in {"streamable", "ready"},
+            ready=verified,
             status=rendition_status,
         ))
     return result
@@ -753,8 +756,6 @@ async def build_run_response(
     tracks = track_contract(media_obj, media_obj.id, fingerprint, encoded_ticket)
     renditions = rendition_contract(media_obj, media_obj.id, fingerprint)
     manifest_url = ready_hls_manifest_url(media_obj, fingerprint, encoded_ticket, renditions)
-    if not manifest_url:
-        renditions = []
     duration = media_duration_seconds(media_obj)
     direct_ready = progressive_source_compatible(media_obj)
     adaptive_ready = bool(manifest_url)
@@ -955,6 +956,48 @@ async def get_playback_run(
                 await db.commit()
     position = 0 if run.source_kind == "ingest_preview" else await run_resume_position(db, run, media_obj)
     return await build_run_response(db, request, user, run, media_obj, initial_resume_position=position)
+
+
+@router.post("/runs/{run_id}/quality")
+async def prioritize_playback_quality(
+    run_id: str,
+    req: PlaybackQualityRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    del user
+    run = await authorized_run(db, request, run_id)
+    if run.source_kind == "ingest_preview":
+        raise playback_error(
+            status.HTTP_409_CONFLICT,
+            "QUALITY_SELECTION_UNAVAILABLE",
+            "Quality selection is unavailable while the media source is still downloading.",
+        )
+    _, media_obj = await resolve_run_media(db, run.movie_id, run.episode_id)
+    source = await require_available_source(media_obj)
+    await ensure_source_metadata(db, media_obj, source)
+    await synchronize_source_fingerprint(db, media_obj, source)
+    if req.rendition_id not in {item.name for item in playback_prep_service.video_renditions(media_obj)}:
+        raise playback_error(
+            status.HTTP_404_NOT_FOUND,
+            "RENDITION_NOT_FOUND",
+            "The requested playback quality does not exist for this media source.",
+        )
+    try:
+        rendition_status = await playback_prep_service.prioritize_video_rendition(
+            media_obj.id,
+            media_obj,
+            source,
+            req.rendition_id,
+        )
+    except PlaybackPreparationError as exc:
+        raise playback_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            exc.code,
+            str(exc),
+        ) from exc
+    return {"status": rendition_status, "renditionId": req.rendition_id}
 
 
 @router.post("/runs/{run_id}/diagnostics", status_code=status.HTTP_204_NO_CONTENT)
