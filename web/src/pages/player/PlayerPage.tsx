@@ -138,6 +138,7 @@ const MEDIA_RECOVERY_LIMIT = 2;
 export const PLAYER_CONTROLS_IDLE_MS = 3_000;
 export const PLAYBACK_STARTUP_TIMEOUT_MS = 12_000;
 export const PLAYBACK_STARTUP_MAX_PROGRESS_WAIT_MS = 30_000;
+export const PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS = 2_000;
 export const FORWARD_BUFFER_TARGET_SECONDS = 30;
 export const FORWARD_BUFFER_MAX_SECONDS = 60;
 export const STARTUP_QUALITY_MIN_BUFFER_SECONDS = 8;
@@ -681,6 +682,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const hlsQualityOptionsRef = useRef<ReturnType<typeof playbackQualityOptions>>([]);
   const controlsTimerRef = useRef<number | null>(null);
   const playbackStartupTimerRef = useRef<number | null>(null);
+  const playbackClockAdvanceTimerRef = useRef<number | null>(null);
   const playbackStartupRetriesRef = useRef(0);
   const playbackStartupStartedAtRef = useRef(0);
   const playbackStartupProgressAtRef = useRef(0);
@@ -1006,6 +1008,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     setPlaybackLoadingSuspended(false);
     if (playbackStartupTimerRef.current !== null) window.clearTimeout(playbackStartupTimerRef.current);
     playbackStartupTimerRef.current = null;
+    if (playbackClockAdvanceTimerRef.current !== null) window.clearTimeout(playbackClockAdvanceTimerRef.current);
+    playbackClockAdvanceTimerRef.current = null;
     if (hlsRetryTimerRef.current !== null) window.clearTimeout(hlsRetryTimerRef.current);
     hlsRetryTimerRef.current = null;
     if (stallRecoveryTimerRef.current !== null) window.clearTimeout(stallRecoveryTimerRef.current);
@@ -1285,6 +1289,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     playbackStartupProgressAtRef.current = 0;
   }, [clearPlaybackStartupWatchdog]);
 
+  const clearPlaybackClockAdvanceWatchdog = useCallback(() => {
+    if (playbackClockAdvanceTimerRef.current !== null) {
+      window.clearTimeout(playbackClockAdvanceTimerRef.current);
+      playbackClockAdvanceTimerRef.current = null;
+    }
+  }, []);
+
   const cancelPendingVideoPlay = useCallback(() => {
     if (pendingVideoPlayRequestRef.current !== null) staleVideoPlayEventRef.current = true;
     videoPlayRequestRef.current += 1;
@@ -1374,6 +1385,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     networkRetriesRef.current = 0;
     mediaRecoveriesRef.current = 0;
     cancelPendingVideoPlay();
+    clearPlaybackClockAdvanceWatchdog();
     clearPlaybackStartupWatchdog();
     const startupStartedAt = performance.now();
     playbackStartupStartedAtRef.current = startupStartedAt;
@@ -1546,6 +1558,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       video.load();
       return () => {
         clearPlaybackStartupWatchdog();
+        clearPlaybackClockAdvanceWatchdog();
         captureLastFrame(true);
         transportResettingRef.current = true;
         video.removeEventListener("loadedmetadata", beginPlayback);
@@ -1793,6 +1806,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       });
       return () => {
         clearPlaybackStartupWatchdog();
+        clearPlaybackClockAdvanceWatchdog();
         if (hlsRetryTimerRef.current !== null) window.clearTimeout(hlsRetryTimerRef.current);
         hlsRetryTimerRef.current = null;
         captureLastFrame(true);
@@ -1852,6 +1866,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       video.load();
       return () => {
         clearPlaybackStartupWatchdog();
+        clearPlaybackClockAdvanceWatchdog();
         captureLastFrame(true);
         transportResettingRef.current = true;
         video.removeEventListener("loadedmetadata", onLoadedMetadata);
@@ -1875,6 +1890,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     cancelPendingVideoPlay,
     captureLastFrame,
     clearPlaybackStartupWatchdog,
+    clearPlaybackClockAdvanceWatchdog,
     hlsEngine,
     markPlaybackStartupProgress,
     runResponse?.manifestUrl,
@@ -1959,6 +1975,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     let attempts = 0;
     let consecutiveFailures = 0;
     let timer: number | null = null;
+    let lastPolledResponse = runResponse;
 
     const poll = async () => {
       attempts += 1;
@@ -1966,7 +1983,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         const refreshed = await getPlaybackRun(runResponse.runId, { signal: abort.signal });
         if (abort.signal.aborted) return;
         consecutiveFailures = 0;
-        const previous = runResponseRef.current;
+        const previous = lastPolledResponse;
         sequenceNumberRef.current = Math.max(sequenceNumberRef.current, refreshed.nextSequenceNumber);
         const requestedQuality = pendingQualitySelectionRef.current
           ? refreshed.renditions.find((item) => item.id === pendingQualitySelectionRef.current)
@@ -1974,17 +1991,42 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         const requestedAudio = pendingAudioSelectionRef.current
           ? refreshed.tracks.find((item) => item.id === pendingAudioSelectionRef.current)
           : undefined;
-        const missingReadyQuality = refreshed.renditions.some(
-          (item) => ["streamable", "ready"].includes(item.status) && !hlsQualityOptionsRef.current.some((option) => option.id === item.id && option.index >= 0),
+        const readyStatus = (status: PlaybackRendition["status"] | PlaybackAudioTrack["status"]) => ["streamable", "ready"].includes(status);
+        const qualityBecameReady = refreshed.renditions.some((item) => (
+          readyStatus(item.status)
+          && !previous.renditions.some((candidate) => candidate.id === item.id && readyStatus(candidate.status))
+        ));
+        const audioBecameReady = refreshed.tracks.some((item) => (
+          readyStatus(item.status)
+          && !previous.tracks.some((candidate) => candidate.id === item.id && readyStatus(candidate.status))
+        ));
+        const pendingQualityBecameReady = Boolean(
+          pendingQualitySelectionRef.current
+          && refreshed.renditions.some((item) => item.id === pendingQualitySelectionRef.current && readyStatus(item.status))
+          && !previous.renditions.some((item) => item.id === pendingQualitySelectionRef.current && readyStatus(item.status)),
         );
-        const missingReadyAudio = refreshed.tracks.some(
-          (item) => ["streamable", "ready"].includes(item.status) && !hlsAudioOptionsRef.current.some((option) => option.id === item.id && option.index >= 0),
+        const pendingAudioBecameReady = Boolean(
+          pendingAudioSelectionRef.current
+          && refreshed.tracks.some((item) => item.id === pendingAudioSelectionRef.current && readyStatus(item.status))
+          && !previous.tracks.some((item) => item.id === pendingAudioSelectionRef.current && readyStatus(item.status)),
         );
-        const manifestChanged = refreshed.manifestUrl !== previous?.manifestUrl;
-        const fingerprintChanged = refreshed.sourceFingerprint !== previous?.sourceFingerprint;
-        const preparationCompleted = refreshed.fullyPrepared && !previous?.fullyPrepared;
+        const adaptiveTransportRequired = streamMode !== "progressive"
+          || progressiveFailedRef.current
+          || pendingQualitySelectionRef.current !== null
+          || pendingAudioSelectionRef.current !== null;
+        const manifestChanged = refreshed.manifestUrl !== previous.manifestUrl && adaptiveTransportRequired;
+        const fingerprintChanged = refreshed.sourceFingerprint !== previous.sourceFingerprint;
+        const preparationCompleted = refreshed.fullyPrepared && !previous.fullyPrepared && adaptiveTransportRequired;
+        lastPolledResponse = refreshed;
         setRunResponse((active) => active?.runId === refreshed.runId ? mergePlaybackRunMetadata(active, refreshed) : active);
-        if (manifestChanged || fingerprintChanged || preparationCompleted || requestedQuality?.ready || requestedAudio?.ready || missingReadyQuality || missingReadyAudio) {
+        if (
+          manifestChanged
+          || fingerprintChanged
+          || preparationCompleted
+          || pendingQualityBecameReady
+          || pendingAudioBecameReady
+          || (streamMode !== "progressive" && (qualityBecameReady || audioBecameReady))
+        ) {
           setTransportRevision((value) => value + 1);
         }
         if (refreshed.preparationState === "error") {
@@ -2163,6 +2205,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     playbackLoadingSuspendedRef.current = true;
     setPlaybackLoadingSuspended(true);
     markPlaybackStartupReady();
+    clearPlaybackClockAdvanceWatchdog();
     clearStallRecovery();
     if (hlsRetryTimerRef.current !== null) {
       window.clearTimeout(hlsRetryTimerRef.current);
@@ -2182,7 +2225,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       if (audio.getAttribute("src")) audio.load();
     }
     if (!completedRef.current) setPhase("paused");
-  }, [clearStallRecovery, markPlaybackStartupReady]);
+  }, [clearPlaybackClockAdvanceWatchdog, clearStallRecovery, markPlaybackStartupReady]);
 
   const safePlay = useCallback(() => {
     const wasSuspended = playbackLoadingSuspendedRef.current;
@@ -2215,13 +2258,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     suspendPlaybackLoading();
   }, [cancelPendingVideoPlay, pauseExternalAudio, suspendPlaybackLoading]);
 
-  const scheduleStallRecovery = useCallback(() => {
+  const scheduleStallRecovery = useCallback((clockBaseline: number | null = null) => {
     if (!playbackIntentRef.current || stallRecoveryTimerRef.current !== null) return;
     stallRecoveryTimerRef.current = window.setTimeout(() => {
       stallRecoveryTimerRef.current = null;
       const video = videoRef.current;
-      if (!video || !playbackIntentRef.current || video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) return;
-      if (!shouldRetryPlaybackStall(playbackIntentRef.current, video.readyState, stallRecoveryAttemptsRef.current)) {
+      if (!video || !playbackIntentRef.current) return;
+      const clockStillFrozen = clockBaseline !== null && video.currentTime <= clockBaseline + 0.05;
+      if (!clockStillFrozen && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) return;
+      const recoveryReadyState = clockStillFrozen ? HTMLMediaElement.HAVE_METADATA : video.readyState;
+      if (!shouldRetryPlaybackStall(playbackIntentRef.current, recoveryReadyState, stallRecoveryAttemptsRef.current)) {
         setFatal({
           title: "Playback connection stalled",
           message: "The media source stopped responding after automatic recovery attempts. Retry this title.",
@@ -2240,6 +2286,26 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       setTransportRevision((value) => value + 1);
     }, 4_000);
   }, [captureLastFrame]);
+
+  const armPlaybackClockAdvanceWatchdog = useCallback(() => {
+    clearPlaybackClockAdvanceWatchdog();
+    const video = videoRef.current;
+    if (!video || !playbackIntentRef.current || video.paused || completedRef.current) return;
+    const baseline = video.currentTime;
+    playbackClockAdvanceTimerRef.current = window.setTimeout(() => {
+      playbackClockAdvanceTimerRef.current = null;
+      const activeVideo = videoRef.current;
+      if (
+        !activeVideo
+        || !playbackIntentRef.current
+        || activeVideo.paused
+        || completedRef.current
+        || activeVideo.currentTime > baseline + 0.05
+      ) return;
+      setPhase("buffering");
+      scheduleStallRecovery(baseline);
+    }, PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS);
+  }, [clearPlaybackClockAdvanceWatchdog, scheduleStallRecovery]);
 
   const seek = useCallback((nextTime: number, report = true) => {
     const video = videoRef.current;
@@ -3036,7 +3102,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             hlsRef.current?.startLoad(Math.max(0, currentTimeRef.current));
           }
           if (!transportResettingRef.current) {
-            setPhase("playing");
+            setPhase("loading");
             lastAdvanceWallRef.current = performance.now();
             lastAdvanceMediaRef.current = currentTimeRef.current;
           }
@@ -3060,6 +3126,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             setPhase("paused");
             return;
           }
+          clearPlaybackClockAdvanceWatchdog();
           if (!hasLastFrameRef.current) captureLastFrame(true);
           pauseExternalAudio();
           setPhase("buffering");
@@ -3070,6 +3137,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             setPhase("paused");
             return;
           }
+          clearPlaybackClockAdvanceWatchdog();
           if (!hasLastFrameRef.current) captureLastFrame(true);
           pauseExternalAudio();
           setPhase("buffering");
@@ -3107,10 +3175,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           }
           transportResettingRef.current = false;
           markPlaybackStartupProgress("playing");
-          markPlaybackStartupReady();
-          phaseRef.current = "playing";
-          setPhase("playing");
-          scheduleControlsHide();
+          phaseRef.current = "loading";
+          setPhase("loading");
+          armPlaybackClockAdvanceWatchdog();
           window.requestAnimationFrame(() => captureLastFrame(true));
         }}
         onCanPlay={() => {
@@ -3140,16 +3207,19 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             }, 0);
             return;
           }
-          if (!video.paused && !transportResettingRef.current) markPlaybackStartupReady();
-          setPhase(video.paused ? "paused" : transportResettingRef.current ? "recovering" : "playing");
+          setPhase(video.paused ? "paused" : transportResettingRef.current ? "recovering" : "loading");
         }}
         onTimeUpdate={() => {
-          clearStallRecovery();
           captureWatchedTime();
           const video = videoRef.current;
           if (!video) return;
           const nextTime = video.currentTime;
-          if (nextTime > confirmedTimeRef.current + 0.1) stallRecoveryAttemptsRef.current = 0;
+          const clockAdvanced = nextTime > confirmedTimeRef.current + 0.05;
+          if (clockAdvanced) {
+            clearPlaybackClockAdvanceWatchdog();
+            clearStallRecovery();
+            stallRecoveryAttemptsRef.current = 0;
+          }
           if (!shouldAcceptObservedPlaybackTime(
             nextTime,
             currentTimeRef.current,
@@ -3165,6 +3235,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           resumePositionRef.current = nextTime;
           setCurrentTime(nextTime);
           syncExternalAudio();
+          if (clockAdvanced && playbackIntentRef.current && !video.paused) {
+            transportResettingRef.current = false;
+            markPlaybackStartupReady();
+            phaseRef.current = "playing";
+            setPhase("playing");
+            scheduleControlsHide();
+          }
           if (confirmedPendingSeek && pendingSeekReportRef.current) {
             pendingSeekReportRef.current = false;
             reportProgress("seek");
@@ -3240,11 +3317,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           rememberOutputVolume(nextVolume, nextMuted);
         }}
         onEnded={() => {
+          clearPlaybackClockAdvanceWatchdog();
           pauseExternalAudio();
           finishPlayback();
         }}
         onError={() => {
           if (!videoRef.current?.getAttribute("src")) return;
+          clearPlaybackClockAdvanceWatchdog();
           if (streamMode === "native-hls") {
             captureLastFrame(true);
             resumePositionRef.current = currentTimeRef.current;

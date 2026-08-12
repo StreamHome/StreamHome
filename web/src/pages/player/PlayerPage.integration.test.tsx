@@ -7,7 +7,7 @@ import { useProfileStore } from "../../stores/profileStore";
 import type { Profile } from "../../types/api";
 import * as moviesApi from "../../api/movies";
 import * as playbackApi from "../../api/playback";
-import { PlayerPage, type ResolvedPlayback } from "./PlayerPage";
+import { PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS, PlayerPage, type ResolvedPlayback } from "./PlayerPage";
 
 
 const profile: Profile = {
@@ -103,6 +103,7 @@ describe("mounted player lifecycle", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     localStorage.removeItem(playerPreferencesKey);
     vi.restoreAllMocks();
     useProfileStore.setState({ profiles: [], activeProfile: null, isAdmin: false });
@@ -156,6 +157,8 @@ describe("mounted player lifecycle", () => {
     Object.defineProperty(video, "paused", { configurable: true, value: false });
     fireEvent.play(video);
     fireEvent.playing(video);
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 12.5 });
+    fireEvent.timeUpdate(video);
     await waitFor(() => expect(root.dataset.playerPhase).toBe("playing"));
 
     const fullscreenButton = screen.getByRole("button", { name: "Fullscreen" });
@@ -171,6 +174,8 @@ describe("mounted player lifecycle", () => {
     Object.defineProperty(video, "paused", { configurable: true, value: false });
     fireEvent.play(video);
     fireEvent.playing(video);
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 13 });
+    fireEvent.timeUpdate(video);
     await waitFor(() => expect(root.dataset.playerPhase).toBe("playing"));
 
     Object.defineProperty(video, "paused", { configurable: true, value: true });
@@ -458,6 +463,97 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
+  it("keeps progressive playback mounted while adaptive preparation polling remains incomplete", async () => {
+    const incompleteRun = {
+      ...playback.runResponse,
+      runId: "progressive-poll-run",
+      mediaId: "m_progressive-poll",
+      movieId: "m_progressive-poll",
+      ticketExpiresAt: Math.floor(Date.now() / 1_000) + 3_600,
+      renditions: [],
+      manifestUrl: null,
+      preparationState: "ready" as const,
+      preparationProgress: {
+        stage: "streamable" as const,
+        queuePosition: 0,
+        readySegments: 0,
+        activeWorkers: 1,
+      },
+      switchingReady: false,
+      fullyPrepared: false,
+    };
+    vi.spyOn(moviesApi, "getMovie").mockResolvedValue({
+      id: "m_progressive-poll",
+      title: "Progressive polling",
+      description: "",
+      thumbnailUrl: "",
+      bannerUrl: null,
+      videoUrl: "/media/progressive-poll.mp4",
+      genres: [],
+      duration: "2m",
+      releaseYear: 2026,
+      rating: null,
+      cast: [],
+      director: null,
+      type: "movie",
+      quality: "360p",
+      languages: ["en"],
+      subtitles: [],
+      voteAverage: 0,
+      voteCount: 0,
+      skipMarkers: {},
+    });
+    vi.spyOn(playbackApi, "createPlaybackRun").mockResolvedValue(incompleteRun);
+    const poll = vi.spyOn(playbackApi, "getPlaybackRun").mockResolvedValue(incompleteRun);
+    vi.spyOn(playbackApi, "closePlaybackRun").mockResolvedValue({
+      status: "abandoned",
+      acceptedSeconds: 0,
+      nextSequenceNumber: 2,
+    });
+
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=m_progressive-poll"]}>
+        <PlayerPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Progressive polling")).toBeTruthy();
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    await waitFor(() => expect(video.getAttribute("src")).toBe(incompleteRun.progressiveUrl));
+    const load = vi.mocked(HTMLMediaElement.prototype.load);
+    const initialVideoLoadCount = load.mock.contexts.filter((context) => context === video).length;
+    await waitFor(() => expect(poll.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 2_000 });
+    expect(video.getAttribute("src")).toBe(incompleteRun.progressiveUrl);
+    expect(load.mock.contexts.filter((context) => context === video)).toHaveLength(initialVideoLoadCount);
+
+    view.unmount();
+  });
+
+  it("does not report playing until the media clock advances and detects a frozen clock", async () => {
+    vi.useFakeTimers();
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={playback} />
+      </MemoryRouter>,
+    );
+    const root = view.container.querySelector("[data-player-root='true']") as HTMLElement;
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA });
+    fireEvent.loadedMetadata(video);
+    fireEvent.canPlay(video);
+    await act(async () => undefined);
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.play(video);
+    fireEvent.playing(video);
+
+    expect(root.dataset.playerPhase).toBe("loading");
+    act(() => vi.advanceTimersByTime(PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS + 1));
+    expect(root.dataset.playerPhase).toBe("buffering");
+
+    view.unmount();
+  });
+
   it("activates a direct external dubbing file without replacing the video transport", async () => {
     const dualAudioPlayback: ResolvedPlayback = {
       ...playback,
@@ -561,6 +657,8 @@ describe("mounted player lifecycle", () => {
     Object.defineProperty(video, "paused", { configurable: true, value: false });
     fireEvent.play(video);
     fireEvent.playing(video);
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 12.5 });
+    fireEvent.timeUpdate(video);
     await waitFor(() => expect(root.dataset.playerPhase).toBe("playing"));
     fireEvent.canPlay(audio);
     fireEvent.canPlay(audio);
