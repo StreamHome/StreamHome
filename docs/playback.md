@@ -24,7 +24,7 @@ The video element uses eager browser preloading. Local media is read directly fr
 
 ## Ready HLS quality switching
 
-If a protected HLS cache already contains a valid master, initialization fragments, playlists, and media fragments, the descriptor includes `/api/playback/manifest/{mediaId}`. A video rendition becomes ready only after FFprobe opens its completed playlist and confirms its stream. Adaptive audio is always normalized to AAC-LC, 48 kHz, stereo with repaired zero-based timestamps; FFprobe must confirm that exact contract and FFmpeg must decode the complete playlist before publication. Independently versioned audio verification invalidates legacy stream-copied audio without rebuilding verified video. The player uses hls.js or native HLS to select only verified variants.
+If a protected HLS cache already contains a valid master, initialization fragments, playlists, and media fragments, the descriptor includes `/api/playback/manifest/{mediaId}`. A video rendition becomes ready only after FFprobe opens its completed playlist and confirms its stream. Adaptive audio is always normalized to AAC-LC, 48 kHz, stereo with repaired zero-based timestamps; FFprobe must confirm that exact contract, its start position must remain within 250 ms of a verified video rendition, and FFmpeg must decode the complete audio playlist before publication. Independently versioned audio verification invalidates legacy stream-copied audio without rebuilding verified video. The player uses hls.js or native HLS to select only verified variants.
 
 Quality clicks change the active ready HLS level. They never call a preparation endpoint and never start FFmpeg. If no ready HLS master exists, the source plays directly and unavailable qualities are not displayed.
 
@@ -40,7 +40,7 @@ Adaptive startup records transport initialization, media attachment, manifest, l
 
 Sibling files inside the title's `audio/` directory are direct playback assets. Each discovered external track receives a ticket-protected `/api/playback/source/{mediaId}?source_id=...` URL with the same range behavior as video.
 
-The web player keeps a hidden audio element synchronized with the visible video. Selecting dubbing does not replace or reload the video. Play, pause, resume, seek, playback rate, volume, mute, completion, recovery, and teardown preserve video ownership. Track activation, user seek, and metadata readiness explicitly align the audio clock; routine playback and recovery events never hard-seek an already-playing sidecar. If a sidecar cannot be decoded, the player restores the default embedded audio without changing the video position.
+The web player keeps a hidden audio element synchronized with the visible video. Selecting dubbing does not replace or reload the video. Play, pause, resume, seek, playback rate, volume, mute, completion, recovery, and teardown preserve video ownership. Track activation, the newest confirmed user seek, and metadata readiness explicitly align the audio clock. Ordinary playback synchronization does not seek; severe drift of at least one second may receive one hard correction per five-second cooldown. If a sidecar cannot be decoded, the player restores the default embedded audio without changing the video position.
 
 A ready HLS video can also use a direct external dubbing sidecar when that audio is not inside the manifest.
 
@@ -48,7 +48,7 @@ A ready HLS video can also use a direct external dubbing sidecar when that audio
 
 The saved position is included in the initial descriptor and applied after media metadata is available but before playback begins. The player never intentionally starts at zero and corrects the position later.
 
-Direct seeking assigns the requested `video.currentTime`, which causes a new byte-range request near that position. Ready HLS seeking asks hls.js for the containing prepared range. Video and external audio move to the same target, and the stable application clock rejects transient zero or stale media events during the transition.
+Direct seeking assigns the requested `video.currentTime`, which causes a new byte-range request near that position. Ready HLS seeking asks hls.js for the containing prepared range. The newest requested position remains authoritative until a target-local `timeupdate` or `seeked` confirms it. Out-of-order rapid-seek events, late transport readiness, and unsolicited backward jumps cannot reset the stable clock; external audio aligns only after that newest target settles.
 
 The server-probed duration remains authoritative. Buffered ranges and HLS playlist growth cannot shorten the visible title duration.
 

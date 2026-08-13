@@ -7,7 +7,12 @@ import { useProfileStore } from "../../stores/profileStore";
 import type { Profile } from "../../types/api";
 import * as moviesApi from "../../api/movies";
 import * as playbackApi from "../../api/playback";
-import { PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS, PlayerPage, type ResolvedPlayback } from "./PlayerPage";
+import {
+  PLAYER_CONTROLS_IDLE_MS,
+  PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS,
+  PlayerPage,
+  type ResolvedPlayback,
+} from "./PlayerPage";
 
 
 const profile: Profile = {
@@ -357,6 +362,89 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
+  it("keeps the authoritative position through transient zero and out-of-order rapid seek events", () => {
+    const resumedPlayback: ResolvedPlayback = {
+      ...playback,
+      runResponse: { ...playback.runResponse, resumePosition: 107 },
+    };
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={resumedPlayback} />
+      </MemoryRouter>,
+    );
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    const timeline = screen.getByRole("slider", { name: "Playback position" }) as HTMLInputElement;
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA });
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+
+    fireEvent.loadedMetadata(video);
+    expect(video.currentTime).toBe(107);
+    video.currentTime = 0;
+    fireEvent.playing(video);
+    fireEvent.timeUpdate(video);
+    expect(timeline.value).toBe("107");
+
+    video.currentTime = 107;
+    fireEvent.seeked(video);
+    fireEvent.keyDown(document.body, { key: "ArrowLeft" });
+    fireEvent.keyDown(document.body, { key: "ArrowLeft" });
+    expect(timeline.value).toBe("87");
+
+    video.currentTime = 97;
+    fireEvent.seeked(video);
+    expect(timeline.value).toBe("87");
+    video.currentTime = 87;
+    fireEvent.seeked(video);
+    expect(timeline.value).toBe("87");
+
+    video.currentTime = 0;
+    fireEvent.timeUpdate(video);
+    expect(timeline.value).toBe("87");
+    view.unmount();
+  });
+
+  it("hides idle paused controls and keeps interaction guards authoritative", () => {
+    vi.useFakeTimers();
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={playback} />
+      </MemoryRouter>,
+    );
+    const root = view.container.querySelector("[data-player-root='true']") as HTMLElement;
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    const timeline = screen.getByRole("slider", { name: "Playback position" }) as HTMLInputElement;
+
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA });
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.loadedMetadata(video);
+    video.currentTime = 12;
+    fireEvent.seeked(video);
+    fireEvent.pause(video);
+    fireEvent.mouseMove(root, { clientX: 20, clientY: 20 });
+    act(() => vi.advanceTimersByTime(PLAYER_CONTROLS_IDLE_MS + 1));
+    expect(root.dataset.controlsVisible).toBe("false");
+
+    fireEvent.mouseMove(root, { clientX: 20, clientY: 20, movementX: 8 });
+    expect(root.dataset.controlsVisible).toBe("false");
+    fireEvent.mouseMove(root, { clientX: 21, clientY: 20 });
+    expect(root.dataset.controlsVisible).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: /Audio language/ }));
+    act(() => vi.advanceTimersByTime(PLAYER_CONTROLS_IDLE_MS + 1));
+    expect(root.dataset.controlsVisible).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: /Audio language/ }));
+
+    fireEvent.pointerDown(timeline, { pointerId: 1 });
+    act(() => vi.advanceTimersByTime(PLAYER_CONTROLS_IDLE_MS + 1));
+    expect(root.dataset.controlsVisible).toBe("true");
+    fireEvent.pointerUp(timeline, { pointerId: 1 });
+    act(() => vi.advanceTimersByTime(PLAYER_CONTROLS_IDLE_MS + 1));
+    expect(root.dataset.controlsVisible).toBe("false");
+    view.unmount();
+  });
+
   it("keeps an already-ready HLS quality actionable without a preparation request", async () => {
     const onDemandPlayback: ResolvedPlayback = {
       ...playback,
@@ -682,6 +770,68 @@ describe("mounted player lifecycle", () => {
     fireEvent.playing(video);
     expect(audio.currentTime).toBe(27);
 
+    view.unmount();
+  });
+
+  it("realigns external dubbing only when the newest rapid seek settles", async () => {
+    const dualAudioPlayback: ResolvedPlayback = {
+      ...playback,
+      runResponse: {
+        ...playback.runResponse,
+        tracks: [
+          ...playback.runResponse.tracks,
+          {
+            id: "audio_0_tr",
+            label: "Turkish",
+            language: "tr",
+            channels: 2,
+            default: false,
+            source: "external",
+            streamIndex: 0,
+            directUrl: "/api/playback/source/mounted-player-media?ticket=mounted-player-ticket&source_id=audio_0_tr",
+            ready: true,
+            status: "ready",
+          },
+        ],
+      },
+    };
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={dualAudioPlayback} />
+      </MemoryRouter>,
+    );
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    const audio = view.container.querySelector("audio") as HTMLAudioElement;
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA });
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    Object.defineProperty(audio, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA });
+    Object.defineProperty(audio, "currentTime", { configurable: true, writable: true, value: 0 });
+    fireEvent.loadedMetadata(video);
+    video.currentTime = 12;
+    fireEvent.seeked(video);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Audio language/ }));
+    fireEvent.click(screen.getByRole("option", { name: /Turkish/ }));
+    audio.currentTime = 3;
+    fireEvent.keyDown(document.body, { key: "ArrowRight" });
+    expect(video.currentTime).toBe(22);
+
+    video.currentTime = 12;
+    fireEvent.seeked(video);
+    expect(audio.currentTime).toBe(3);
+    video.currentTime = 22;
+    fireEvent.seeked(video);
+    expect(audio.currentTime).toBe(22);
+
+    audio.currentTime = 3;
+    video.currentTime = 23;
+    fireEvent.timeUpdate(video);
+    expect(audio.currentTime).toBe(23);
+    audio.currentTime = 3;
+    video.currentTime = 24;
+    fireEvent.timeUpdate(video);
+    expect(audio.currentTime).toBe(3);
     view.unmount();
   });
 

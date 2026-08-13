@@ -6,6 +6,7 @@ import {
   adaptiveTransportIsGrowing,
   applySubtitleTrackSelection,
   authoritativePlaybackDuration,
+  authoritativePlaybackPosition,
   bufferedEndForTime,
   canUseProgressiveCompatibility,
   canUseProgressivePlayback,
@@ -134,8 +135,10 @@ describe("player interaction contracts", () => {
 
   it("rejects transient zero and stale seek events while transport state is settling", () => {
     expect(shouldAcceptObservedPlaybackTime(0, 850, true, null)).toBe(false);
+    expect(shouldAcceptObservedPlaybackTime(0, 850, false, null)).toBe(false);
     expect(shouldAcceptObservedPlaybackTime(100, 110, false, 110)).toBe(false);
     expect(shouldAcceptObservedPlaybackTime(110, 110, false, 110)).toBe(true);
+    expect(shouldAcceptObservedPlaybackTime(140, 110, true, 110, true)).toBe(true);
     expect(shouldAcceptObservedPlaybackTime(851, 850, true, null)).toBe(true);
   });
 
@@ -339,7 +342,7 @@ describe("player interaction contracts", () => {
 
   it("auto-hides after inactivity unless a menu or scrub interaction is active", () => {
     expect(shouldAutoHidePlayerControls("playing", false, false)).toBe(true);
-    expect(shouldAutoHidePlayerControls("paused", false, false)).toBe(false);
+    expect(shouldAutoHidePlayerControls("paused", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("buffering", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("recovering", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("playing", true, false)).toBe(false);
@@ -349,8 +352,15 @@ describe("player interaction contracts", () => {
   it("ignores stationary synthetic pointer events when deciding whether to reveal controls", () => {
     expect(isMeaningfulPointerActivity(null, { x: 10, y: 10 }, 0, 0)).toBe(false);
     expect(isMeaningfulPointerActivity({ x: 10, y: 10 }, { x: 10, y: 10 }, 0, 0)).toBe(false);
-    expect(isMeaningfulPointerActivity({ x: 10, y: 10 }, { x: 10, y: 10 }, 1, 0)).toBe(true);
+    expect(isMeaningfulPointerActivity({ x: 10, y: 10 }, { x: 10, y: 10 }, 1, 0)).toBe(false);
     expect(isMeaningfulPointerActivity({ x: 10, y: 10 }, { x: 11, y: 10 }, 0, 0)).toBe(true);
+  });
+
+  it("preserves the newest requested position over stale resume and confirmed clocks", () => {
+    expect(authoritativePlaybackPosition(107, 107, null)).toBe(107);
+    expect(authoritativePlaybackPosition(107, 107, 137)).toBe(137);
+    expect(authoritativePlaybackPosition(107, 0, null)).toBe(107);
+    expect(authoritativePlaybackPosition(Number.NaN, 42, null)).toBe(42);
   });
 
   it("allows exactly one bounded playback-startup recovery attempt", () => {

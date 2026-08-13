@@ -419,7 +419,7 @@ class PlaybackPrepService:
             [
                 ffprobe,
                 "-v", "error",
-                "-show_entries", "stream=codec_type,codec_name,profile,sample_rate,channels",
+                "-show_entries", "stream=codec_type,codec_name,profile,sample_rate,channels,start_time",
                 "-of", "json",
                 str(playlist),
             ],
@@ -460,6 +460,46 @@ class PlaybackPrepService:
                     "RENDITION_VERIFICATION_FAILED",
                     "The prepared adaptive audio does not match the AAC-LC 48 kHz stereo contract.",
                 )
+            verified_video_playlists = sorted(
+                directory / PLAYLIST_NAME
+                for directory in target_dir.parent.glob("video_*")
+                if (directory / VIDEO_VERIFIED_MARKER).is_file() and (directory / PLAYLIST_NAME).is_file()
+            )
+            if verified_video_playlists:
+                video_probe = subprocess.run(
+                    [
+                        ffprobe,
+                        "-v", "error",
+                        "-show_entries", "stream=codec_type,start_time",
+                        "-of", "json",
+                        str(verified_video_playlists[0]),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+                if video_probe.returncode != 0:
+                    raise PlaybackPreparationError(
+                        "RENDITION_VERIFICATION_FAILED",
+                        "FFprobe could not compare the prepared adaptive audio and video timelines.",
+                    )
+                try:
+                    video_streams = json.loads(video_probe.stdout).get("streams", [])
+                    video_stream = next(stream for stream in video_streams if str(stream.get("codec_type")) == "video")
+                    audio_start = float(audio_stream["start_time"])
+                    video_start = float(video_stream["start_time"])
+                except (json.JSONDecodeError, AttributeError, KeyError, StopIteration, TypeError, ValueError) as exc:
+                    raise PlaybackPreparationError(
+                        "RENDITION_VERIFICATION_FAILED",
+                        "FFprobe returned incomplete adaptive timeline metadata.",
+                    ) from exc
+                if abs(audio_start - video_start) > 0.25:
+                    raise PlaybackPreparationError(
+                        "RENDITION_VERIFICATION_FAILED",
+                        "The prepared adaptive audio and video timelines do not share a safe start position.",
+                    )
             ffmpeg = shutil.which("ffmpeg")
             if not ffmpeg:
                 raise PlaybackPreparationError(

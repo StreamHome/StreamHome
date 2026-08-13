@@ -752,6 +752,38 @@ class PlaybackPipelineRegression(unittest.TestCase):
 
             self.assertEqual(context.exception.code, "RENDITION_VERIFICATION_FAILED")
 
+    def test_audio_verification_rejects_an_offset_from_verified_video(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            target = cache / "audio_embedded_0_contract_en"
+            video = cache / "video_original"
+            target.mkdir()
+            video.mkdir()
+            (target / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+            (video / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+            (video / VIDEO_VERIFIED_MARKER).write_text("1", encoding="utf-8")
+            audio_probe = SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    '{"streams":[{"codec_type":"audio","codec_name":"aac",'
+                    '"profile":"LC","sample_rate":"48000","channels":2,"start_time":"0.000000"}]}'
+                ),
+                stderr="",
+            )
+            video_probe = SimpleNamespace(
+                returncode=0,
+                stdout='{"streams":[{"codec_type":"video","start_time":"1.000000"}]}',
+                stderr="",
+            )
+            with (
+                patch("services.playback_prep.shutil.which", return_value="ffprobe"),
+                patch("services.playback_prep.subprocess.run", side_effect=[audio_probe, video_probe]),
+                self.assertRaises(PlaybackPreparationError) as context,
+            ):
+                PlaybackPrepService()._verify_rendition_output(target, "audio_embedded_0_contract_en")
+
+            self.assertEqual(context.exception.code, "RENDITION_VERIFICATION_FAILED")
+
     def test_cloud_external_dubbing_uses_the_same_language_contract(self) -> None:
         response = SimpleNamespace(
             ok=True,
@@ -1139,6 +1171,24 @@ class PlaybackPipelineRegression(unittest.TestCase):
             )
             self.assertEqual(audio_result.returncode, 0, audio_result.stderr)
             self.assertIn("aac,48000,2", audio_result.stdout.strip())
+
+            ffmpeg = shutil.which("ffmpeg")
+            self.assertIsNotNone(ffmpeg)
+            combined_decode = subprocess.run(
+                [
+                    str(ffmpeg),
+                    "-hide_banner", "-nostdin", "-v", "error", "-xerror",
+                    "-i", str(master),
+                    "-map", "0:v:0", "-map", "0:a:0",
+                    "-t", "5",
+                    "-f", "null", "-",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(combined_decode.returncode, 0, combined_decode.stderr)
         finally:
             if os.getenv("KEEP_PLAYBACK_TEST_CACHE") != "1":
                 shutil.rmtree(cache_path.parent, ignore_errors=True)
