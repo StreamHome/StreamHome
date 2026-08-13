@@ -28,7 +28,7 @@ from services.logger import logger
 from services.languages import language_label, normalize_language_tag
 from services.media_source import MediaSourceError, ResolvedMediaSource, playback_source_fingerprint, resolve_media_source
 from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
-from services.playback_prep import PlaybackPreparationError, playback_prep_service
+from services.playback_prep import playback_prep_service
 from services.playback_source import PlaybackSourceFailure, source_reader
 from services.ingest_preview import IngestPreviewError, ingest_preview_service
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
@@ -637,14 +637,16 @@ def rendition_contract(media_obj: Any, media_id: str, fingerprint: str) -> list[
     for item in playback_prep_service.video_renditions(media_obj):
         rendition_status = playback_prep_service.rendition_status(media_id, fingerprint, item.name)
         verified = rendition_status == "ready" and playback_prep_service.rendition_verified(media_id, fingerprint, item.name)
+        if not verified:
+            continue
         result.append(PlaybackRendition(
             id=item.name,
             label=item.label,
             height=item.height,
             width=item.width,
             original=item.original,
-            ready=verified,
-            status=rendition_status,
+            ready=True,
+            status="ready",
         ))
     return result
 
@@ -901,19 +903,6 @@ async def create_playback_run(
     else:
         source_kind = "catalog"
         source_fingerprint = str(media_obj.source_fingerprint or source.fingerprint)
-        if not progressive_source_compatible(media_obj) and not playback_prep_service.playback_ready(
-            media_obj.id,
-            source_fingerprint,
-            media_obj,
-        ):
-            await playback_prep_service.prepare(
-                media_obj.id,
-                media_obj,
-                source,
-                include_remaining=False,
-                retry_errors=False,
-                foreground=True,
-            )
 
     filters = [PlaybackSession.profile_id == req.profile_id, PlaybackSession.movie_id == req.movie_id]
     filters.append(PlaybackSession.episode_id == req.episode_id if req.episode_id else PlaybackSession.episode_id.is_(None))
@@ -969,14 +958,6 @@ async def get_playback_run(
                 source = await require_available_source(media_obj)
                 await ensure_source_metadata(db, media_obj, source)
                 await synchronize_source_fingerprint(db, media_obj, source)
-                await playback_prep_service.prepare(
-                    media_obj.id,
-                    media_obj,
-                    source,
-                    include_remaining=False,
-                    retry_errors=True,
-                    foreground=True,
-                )
             except HTTPException as source_error:
                 detail = source_error.detail if isinstance(source_error.detail, dict) else {}
                 error_code = str(detail.get("code") or "")
@@ -996,7 +977,7 @@ async def get_playback_run(
 
 
 @router.post("/runs/{run_id}/quality")
-async def prioritize_playback_quality(
+async def select_playback_quality(
     run_id: str,
     req: PlaybackQualityRequest,
     request: Request,
@@ -1021,19 +1002,18 @@ async def prioritize_playback_quality(
             "RENDITION_NOT_FOUND",
             "The requested playback quality does not exist for this media source.",
         )
-    try:
-        rendition_status = await playback_prep_service.prioritize_video_rendition(
-            media_obj.id,
-            media_obj,
-            source,
-            req.rendition_id,
-        )
-    except PlaybackPreparationError as exc:
+    fingerprint = str(media_obj.source_fingerprint or source.fingerprint)
+    rendition_status = playback_prep_service.rendition_status(
+        media_obj.id,
+        fingerprint,
+        req.rendition_id,
+    )
+    if rendition_status not in {"streamable", "ready"}:
         raise playback_error(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            exc.code,
-            str(exc),
-        ) from exc
+            status.HTTP_409_CONFLICT,
+            "RENDITION_NOT_READY",
+            "The requested quality is not present in the prepared adaptive stream.",
+        )
     return {"status": rendition_status, "renditionId": req.rendition_id}
 
 

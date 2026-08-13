@@ -236,6 +236,12 @@
   animation: player-menu-enter 170ms cubic-bezier(.16, 1, .3, 1) both;
 }
 
+.player-view[data-player-theme="terminal"] .player-control-menu__list {
+  background: rgba(8, 8, 10, 0.96);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.58);
+  backdrop-filter: none;
+}
+
 .player-control-menu__label {
   display: block;
   padding: 0.45rem 0.55rem 0.55rem;
@@ -300,6 +306,11 @@
 
 .player-view[data-controls-visible="false"] {
   cursor: none;
+}
+
+.player-controls[data-visible="false"],
+.mobile-player-chrome[data-visible="false"] {
+  pointer-events: none;
 }
 
 .player-control-menu__list > button .player-icon {
@@ -700,7 +711,7 @@ body[data-player-viewport-fullscreen="true"] {
 }
 
 .player-view[data-player-theme="terminal"] .mobile-player-bottom {
-  background: linear-gradient(to top, rgba(15, 6, 3, 0.86), rgba(15, 6, 3, 0.42) 56%, transparent);
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.94), rgba(0, 0, 0, 0.7) 56%, transparent);
 }
 
 .mobile-player-timeline {

@@ -8,6 +8,7 @@
     "build": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && vite build",
     "lint": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run",
+    "test:browser": "playwright test",
     "preview": "vite preview",
     "server": "tsx server.ts"
   },
@@ -21,6 +22,7 @@
     "zustand": "^5.0.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@tailwindcss/vite": "^4.0.0",
     "@testing-library/react": "^16.3.0",
     "@types/express": "^5.0.0",

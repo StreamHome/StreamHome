@@ -63,11 +63,34 @@ export default defineConfig(({ mode }) => {
             response.setHeader('Cache-Control', 'no-store');
             createReadStream(asset).pipe(response);
           });
-          server.middlewares.use('/__player-visual-fixture.mp4', (_request, response) => {
-            response.statusCode = 200;
+          server.middlewares.use('/__player-visual-fixture.mp4', (request, response) => {
+            const asset = path.resolve(__dirname, 'test-assets/player-visual-fixture.mp4');
+            const size = statSync(asset).size;
+            const range = request.headers.range?.match(/^bytes=(\d*)-(\d*)$/);
             response.setHeader('Content-Type', 'video/mp4');
             response.setHeader('Cache-Control', 'no-store');
-            createReadStream(path.resolve(__dirname, 'test-assets/player-visual-fixture.mp4')).pipe(response);
+            response.setHeader('Accept-Ranges', 'bytes');
+            if (range) {
+              const start = range[1] ? Number.parseInt(range[1], 10) : 0;
+              const requestedEnd = range[2] ? Number.parseInt(range[2], 10) : size - 1;
+              const end = Math.min(size - 1, requestedEnd);
+              if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start > end || start >= size) {
+                response.statusCode = 416;
+                response.setHeader('Content-Range', `bytes */${size}`);
+                response.end();
+                return;
+              }
+              response.statusCode = 206;
+              response.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
+              response.setHeader('Content-Length', String(end - start + 1));
+              if (request.method === 'HEAD') response.end();
+              else createReadStream(asset, { start, end }).pipe(response);
+              return;
+            }
+            response.statusCode = 200;
+            response.setHeader('Content-Length', String(size));
+            if (request.method === 'HEAD') response.end();
+            else createReadStream(asset).pipe(response);
           });
         },
       },

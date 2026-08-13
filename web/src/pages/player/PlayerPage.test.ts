@@ -166,7 +166,7 @@ describe("player interaction contracts", () => {
   });
 
   it("uses progressive seeking only for browser-compatible source media", () => {
-    const metadata = { duration: 6_000, container: "mov,mp4,m4a", codec: "h264", width: 1920, height: 1080, frameRate: 24, sourceFormat: "MP4" };
+    const metadata = { duration: 6_000, container: "mov,mp4,m4a", codec: "h264", width: 1920, height: 1080, frameRate: 24, sourceFormat: "MP4", progressiveCompatible: true };
     expect(canUseProgressiveCompatibility(metadata)).toBe(true);
     expect(canUseProgressiveCompatibility({ ...metadata, codec: "hevc" })).toBe(false);
     expect(canUseProgressiveCompatibility(
@@ -191,7 +191,7 @@ describe("player interaction contracts", () => {
     ];
     const response = {
       progressiveUrl: "/api/playback/progressive/m_media?ticket=value",
-      sourceMetadata: { duration: 120, container: "mov,mp4", codec: "h264", width: 1280, height: 720, frameRate: 24, sourceFormat: "MP4" },
+      sourceMetadata: { duration: 120, container: "mov,mp4", codec: "h264", width: 1280, height: 720, frameRate: 24, sourceFormat: "MP4", progressiveCompatible: true },
       tracks: multipleEmbedded,
     } as unknown as PlaybackRunResponse;
     expect(canUseProgressivePlayback(response, "audio_1_es", "es")).toBe(false);
@@ -201,7 +201,7 @@ describe("player interaction contracts", () => {
   it("allows progressive startup without audio metadata but preserves external dubbing preferences", () => {
     const base = {
       progressiveUrl: "/api/playback/progressive/m_media?ticket=value",
-      sourceMetadata: { duration: 120, container: "mov,mp4", codec: "h264", width: 1280, height: 720, frameRate: 24, sourceFormat: "MP4" },
+      sourceMetadata: { duration: 120, container: "mov,mp4", codec: "h264", width: 1280, height: 720, frameRate: 24, sourceFormat: "MP4", progressiveCompatible: true },
       tracks: [],
     } as unknown as PlaybackRunResponse;
     expect(canUseProgressivePlayback(base, "", "")).toBe(true);
@@ -342,12 +342,12 @@ describe("player interaction contracts", () => {
     expect(mergePlaybackRunMetadata(active, refreshed)).toEqual(refreshed);
   });
 
-  it("auto-hides after inactivity unless a menu or scrub interaction is active", () => {
-    expect(shouldAutoHidePlayerControls("loading", false, false)).toBe(true);
+  it("auto-hides only during uninterrupted playing", () => {
+    expect(shouldAutoHidePlayerControls("loading", false, false)).toBe(false);
     expect(shouldAutoHidePlayerControls("playing", false, false)).toBe(true);
-    expect(shouldAutoHidePlayerControls("paused", false, false)).toBe(true);
-    expect(shouldAutoHidePlayerControls("buffering", false, false)).toBe(true);
-    expect(shouldAutoHidePlayerControls("recovering", false, false)).toBe(true);
+    expect(shouldAutoHidePlayerControls("paused", false, false)).toBe(false);
+    expect(shouldAutoHidePlayerControls("buffering", false, false)).toBe(false);
+    expect(shouldAutoHidePlayerControls("recovering", false, false)).toBe(false);
     expect(shouldAutoHidePlayerControls("playing", true, false)).toBe(false);
     expect(shouldAutoHidePlayerControls("playing", false, true)).toBe(false);
   });
@@ -415,7 +415,7 @@ describe("player interaction contracts", () => {
     expect(authoritativePlaybackDuration(0, "", "progressive", 272)).toBe(272);
   });
 
-  it("shows every source capability while transport indexes are attached independently", () => {
+  it("shows only qualities that are present in the prepared HLS master", () => {
     const options = playbackQualityOptions([
       { id: "video_original", label: "1080p", height: 800, width: 1920, original: true, ready: true, status: "ready" },
       { id: "video_720p", label: "720p", height: 720, width: 1728, original: false, ready: true, status: "streamable" },
@@ -428,11 +428,11 @@ describe("player interaction contracts", () => {
       { height: 612, url: "/api/playback/hls/movie/video_720p/playlist.m3u8" },
     ]);
 
-    expect(options.map((item) => item.height)).toEqual(["auto", 800, 720, 480, 360, 240, 144]);
+    expect(options.map((item) => item.height)).toEqual(["auto", 800, 720]);
     expect(options.find((item) => item.id === "video_original")?.label).toBe("1080p · Original");
     expect(options.find((item) => item.id === "video_720p")?.ready).toBe(true);
-    expect(options.find((item) => item.height === 144)?.ready).toBe(false);
-    expect(options.find((item) => item.height === 240)?.status).toBe("failed");
+    expect(options.find((item) => item.height === 144)).toBeUndefined();
+    expect(options.find((item) => item.height === 240)).toBeUndefined();
     expect(options.find((item) => item.height === 720)?.index).toBe(1);
   });
 

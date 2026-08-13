@@ -21,6 +21,8 @@ __pycache__/
 .coverage.*
 coverage/
 htmlcov/
+web/playwright-report/
+web/test-results/
 
 # Environment files and runtime secrets
 .env

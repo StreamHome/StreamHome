@@ -9,7 +9,6 @@ import {
   closePlaybackRun,
   createPlaybackRun,
   getPlaybackRun,
-  prioritizePlaybackQuality,
   reportPlaybackStartupDiagnostic,
   startOverPlaybackRun,
   updatePlaybackProgress,
@@ -230,7 +229,10 @@ export function playbackQualityOptions(
         status: rendition.status,
       };
     });
-  return [{ id: "auto", label: "Auto", height: "auto", index: -1, ready: true, status: "ready" }, ...options];
+  return [
+    { id: "auto", label: "Auto", height: "auto", index: -1, ready: true, status: "ready" },
+    ...options.filter((option) => option.ready),
+  ];
 }
 
 export function applySubtitleTrackSelection(video: HTMLVideoElement, selectedTrackId: string): void {
@@ -248,7 +250,7 @@ export function applySubtitleTrackSelection(video: HTMLVideoElement, selectedTra
 }
 
 export function shouldAutoHidePlayerControls(phase: PlayerPhase, menuOpen: boolean, scrubbing: boolean): boolean {
-  return ["loading", "playing", "paused", "buffering", "recovering"].includes(phase) && !menuOpen && !scrubbing;
+  return phase === "playing" && !menuOpen && !scrubbing;
 }
 
 export function timelineValueFromPointer(
@@ -557,7 +559,11 @@ export function canUseProgressivePlayback(
   preferredLanguage: string,
   mediaElement?: Pick<HTMLMediaElement, "canPlayType"> | null,
 ): boolean {
-  if (!response.progressiveUrl || !canUseProgressiveCompatibility(response.sourceMetadata, mediaElement)) return false;
+  if (
+    !response.progressiveUrl
+    || response.sourceMetadata.progressiveCompatible !== true
+    || !canUseProgressiveCompatibility(response.sourceMetadata, mediaElement)
+  ) return false;
   if (response.tracks.length === 0) return true;
   const selected = progressiveAudioTrack(response.tracks, preferredTrackId, preferredLanguage);
   const embedded = response.tracks.filter((track) => track.source === "embedded");
@@ -782,6 +788,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const externalAudioLastDriftRecoveryAtRef = useRef(Number.NEGATIVE_INFINITY);
   const volumeRef = useRef(initialPreferences.volume);
   const mutedRef = useRef(initialPreferences.muted);
+  const preferencesRef = useRef(initialPreferences);
   const preferencesProfileIdRef = useRef(profile?.id ?? "");
   const stallRecoveryTimerRef = useRef<number | null>(null);
   const stallRecoveryAttemptsRef = useRef(0);
@@ -862,6 +869,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   useEffect(() => {
     mutedRef.current = muted;
   }, [muted]);
+
+  useEffect(() => {
+    preferencesRef.current = preferences;
+  }, [preferences]);
 
   useLayoutEffect(() => {
     const video = videoRef.current;
@@ -1163,8 +1174,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         sequenceNumberRef.current = resolved.runResponse.nextSequenceNumber;
         const initialMode = initialPlaybackMode(
           resolved.runResponse,
-          preferences.audioTrackId,
-          preferences.audioLanguage,
+          preferencesRef.current.audioTrackId,
+          preferencesRef.current.audioLanguage,
           videoRef.current,
         );
         setStreamMode(initialMode);
@@ -1180,8 +1191,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     return () => {
       active = false;
       abort.abort();
+      closeActiveRun();
     };
-  }, [mediaId, profile, retryVersion, visualFixture]);
+  }, [closeActiveRun, mediaId, profile, retryVersion, visualFixture]);
 
   const captureLastFrame = useCallback((force = false) => {
     const video = videoRef.current;
@@ -1342,7 +1354,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [setOutputVolume]);
 
   const applyResume = useCallback((video: HTMLVideoElement) => {
-    if (resumeAppliedRef.current && pendingSeekTargetRef.current === null) return true;
+    if (resumeAppliedRef.current) return true;
     const position = authoritativePlaybackPosition(
       confirmedTimeRef.current,
       resumePositionRef.current,
@@ -1493,6 +1505,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       return;
     }
     const transportGeneration = ++transportGenerationRef.current;
+    const transportPreferences = preferencesRef.current;
     preservePlaybackPosition();
     resumeAppliedRef.current = false;
     transportResettingRef.current = true;
@@ -1520,8 +1533,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           && !progressiveFailedRef.current
           && canUseProgressivePlayback(
             runResponse,
-            preferences.audioTrackId,
-            preferences.audioLanguage,
+            transportPreferences.audioTrackId,
+            transportPreferences.audioLanguage,
             video,
           )
         ) {
@@ -1608,11 +1621,15 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         status: track.status,
       }));
     setAvailableAudioTracks(serverAudioTracks);
-    const serverPreferredAudio = serverAudioTracks.find((track) => track.id === preferences.audioTrackId)
-      ?? serverAudioTracks.find((track) => track.language === preferences.audioLanguage)
+    const serverPreferredAudio = serverAudioTracks.find((track) => track.id === transportPreferences.audioTrackId)
+      ?? serverAudioTracks.find((track) => track.language === transportPreferences.audioLanguage)
       ?? serverAudioTracks.find((track) => track.default)
       ?? serverAudioTracks[0];
-    const requestedProgressiveTrack = progressiveAudioTrack(runResponse.tracks, preferences.audioTrackId, preferences.audioLanguage);
+    const requestedProgressiveTrack = progressiveAudioTrack(
+      runResponse.tracks,
+      transportPreferences.audioTrackId,
+      transportPreferences.audioLanguage,
+    );
     const embeddedTracks = runResponse.tracks.filter((track) => track.source === "embedded");
     const progressiveTrack = requestedProgressiveTrack && (
       requestedProgressiveTrack.source === "external"
@@ -1632,7 +1649,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       pendingAudioSelectionRef.current = serverPreferredAudio.id;
     }
     const beginPlayback = () => {
-      video.playbackRate = preferences.playbackRate;
+      video.playbackRate = transportPreferences.playbackRate;
       if (streamMode === "progressive") {
         if (!applyResume(video)) {
           setPhase("recovering");
@@ -1725,9 +1742,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           ? options.find((item) => item.id === pendingQualitySelectionRef.current && item.ready)
           : undefined;
         const readyOptions = options.filter((item) => item.ready && item.height !== "auto");
-        const preferred = requestedQuality || (preferences.qualityHeight === "auto" || readyOptions.length === 0
+        const preferred = requestedQuality || (transportPreferences.qualityHeight === "auto" || readyOptions.length === 0
           ? options[0]
-          : readyOptions.reduce((best, item) => Math.abs(Number(item.height) - Number(preferences.qualityHeight)) < Math.abs(Number(best.height) - Number(preferences.qualityHeight)) ? item : best));
+          : readyOptions.reduce((best, item) => Math.abs(Number(item.height) - Number(transportPreferences.qualityHeight)) < Math.abs(Number(best.height) - Number(transportPreferences.qualityHeight)) ? item : best));
         if (requestedQuality && requestedQuality.index >= 0) {
           deferredStartupQualityRef.current = null;
           hls.currentLevel = requestedQuality.index;
@@ -1753,7 +1770,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }
         const requestedQuality = pendingQualitySelectionRef.current;
         const automatic = requestedQuality === "auto"
-          || (requestedQuality === null && preferences.qualityHeight === "auto");
+          || (requestedQuality === null && transportPreferences.qualityHeight === "auto");
         const selectedId = automatic ? "auto" : selected?.id ?? "auto";
         setSelectedQualityId(selectedId);
         pendingQualitySelectionRef.current = null;
@@ -1791,8 +1808,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         setAvailableAudioTracks(tracks);
         const transportTrack = pendingAudioSelectionRef.current
           ? tracks.find((track) => track.id === pendingAudioSelectionRef.current && track.index >= 0)
-          : tracks.find((track) => track.id === preferences.audioTrackId && track.index >= 0)
-            ?? tracks.find((track) => track.language === preferences.audioLanguage && track.index >= 0);
+          : tracks.find((track) => track.id === transportPreferences.audioTrackId && track.index >= 0)
+            ?? tracks.find((track) => track.language === transportPreferences.audioLanguage && track.index >= 0);
         if (transportTrack) {
           releaseExternalAudio();
           hls.audioTrack = transportTrack.index;
@@ -1803,8 +1820,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }
         const directTrack = pendingAudioSelectionRef.current
           ? tracks.find((track) => track.id === pendingAudioSelectionRef.current && Boolean(track.directUrl))
-          : tracks.find((track) => track.id === preferences.audioTrackId && Boolean(track.directUrl))
-            ?? tracks.find((track) => track.language === preferences.audioLanguage && Boolean(track.directUrl));
+          : tracks.find((track) => track.id === transportPreferences.audioTrackId && Boolean(track.directUrl))
+            ?? tracks.find((track) => track.language === transportPreferences.audioLanguage && Boolean(track.directUrl));
         if (directTrack?.directUrl && activateExternalAudio(directTrack)) {
           selectedAudioTrackIdRef.current = directTrack.id;
           setSelectedAudioTrackId(directTrack.id);
@@ -1821,8 +1838,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           ? tracks.find((track) => track.id === pendingAudioSelectionRef.current && track.index >= 0)
           : undefined;
         const preferredTrack = requestedTrack
-          || tracks.find((track) => track.id === preferences.audioTrackId && track.index >= 0)
-          || tracks.find((track) => track.language === preferences.audioLanguage && track.index >= 0)
+          || tracks.find((track) => track.id === transportPreferences.audioTrackId && track.index >= 0)
+          || tracks.find((track) => track.language === transportPreferences.audioLanguage && track.index >= 0)
           || tracks.find((track) => track.index >= 0);
         if (preferredTrack) {
           hls.audioTrack = preferredTrack.index;
@@ -1880,6 +1897,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }
         if (data.type === HlsRuntime.ErrorTypes.MEDIA_ERROR && mediaRecoveriesRef.current < MEDIA_RECOVERY_LIMIT) {
           mediaRecoveriesRef.current += 1;
+          captureLastFrame(true);
+          preservePlaybackPosition();
+          resumeAppliedRef.current = false;
+          transportResettingRef.current = true;
           setPhase("recovering");
           hls.recoverMediaError();
           return;
@@ -1962,7 +1983,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           .filter((track) => track.index >= 0);
         setAvailableAudioTracks(options);
         const active = options.find((option) => nativeTracks[option.index]?.enabled)
-          ?? options.find((option) => option.id === preferences.audioTrackId)
+          ?? options.find((option) => option.id === transportPreferences.audioTrackId)
           ?? options.find((option) => option.default)
           ?? options[0];
         if (active) {
@@ -1990,8 +2011,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (runResponse.manifestUrl && !hlsEngine) return;
     if (!progressiveFailedRef.current && canUseProgressivePlayback(
       runResponse,
-      preferences.audioTrackId,
-      preferences.audioLanguage,
+      transportPreferences.audioTrackId,
+      transportPreferences.audioLanguage,
       video,
     )) {
       setStreamMode("progressive");
@@ -2048,6 +2069,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       const auto = current.find((item) => item.id === "auto") ?? { id: "auto", label: "Auto", height: "auto" as const, index: -1, ready: true, status: "ready" as const };
       const currentById = new Map(current.map((item) => [item.id, item]));
       const renditions = runResponse.renditions
+        .filter((rendition) => rendition.ready)
         .slice()
         .sort((left, right) => right.height - left.height)
         .map((rendition) => {
@@ -2190,7 +2212,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         consecutiveFailures += 1;
         if (consecutiveFailures >= 4) setPlayerNotice("Stream preparation status is temporarily unavailable; retrying.");
       }
-      if (attempts < 720 && !abort.signal.aborted) {
+      if (!abort.signal.aborted) {
         const latest = runResponseRef.current;
         const delay = consecutiveFailures > 0
           ? Math.min(15_000, 1_000 * (2 ** Math.min(consecutiveFailures, 4)))
@@ -2555,15 +2577,22 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     setShowControls(visible);
   }, []);
 
+  const playerControlsContainFocus = useCallback(() => {
+    const activeElement = document.activeElement;
+    if (!(activeElement instanceof HTMLElement)) return false;
+    return Boolean(activeElement.closest(".player-controls, .mobile-player-chrome"));
+  }, []);
+
   const scheduleControlsHide = useCallback(() => {
     if (controlsTimerRef.current !== null) return;
     if (shouldAutoHidePlayerControls(phaseRef.current, controlMenuOpenRef.current, scrubbingRef.current)) {
       controlsTimerRef.current = window.setTimeout(() => {
-        setControlsVisibility(false);
         controlsTimerRef.current = null;
+        if (playerControlsContainFocus()) return;
+        setControlsVisibility(false);
       }, PLAYER_CONTROLS_IDLE_MS);
     }
-  }, [setControlsVisibility]);
+  }, [playerControlsContainFocus, setControlsVisibility]);
 
   const revealControls = useCallback(() => {
     if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
@@ -2571,6 +2600,12 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     setControlsVisibility(true);
     scheduleControlsHide();
   }, [scheduleControlsHide, setControlsVisibility]);
+
+  const handleControlsBlur = useCallback(() => {
+    window.setTimeout(() => {
+      if (!playerControlsContainFocus()) scheduleControlsHide();
+    }, 0);
+  }, [playerControlsContainFocus, scheduleControlsHide]);
 
   const handleDesktopPointerActivity = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     const previous = desktopPointerPositionRef.current;
@@ -3072,22 +3107,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       return;
     }
     if (!selected.ready) {
-      if (!runResponse) {
-        pendingQualitySelectionRef.current = null;
-        setPlayerNotice("Playback quality preparation is unavailable without an active run.");
-        return;
-      }
-      setPlayerNotice(`Preparing ${selected.label} quality without interrupting playback…`);
-      void prioritizePlaybackQuality(runResponse.runId, selected.id)
-        .then(() => {
-          if (pendingQualitySelectionRef.current === selected.id) {
-            setPlayerNotice(`${selected.label} preparation prioritized.`);
-          }
-        })
-        .catch((error: unknown) => {
-          if (pendingQualitySelectionRef.current === selected.id) pendingQualitySelectionRef.current = null;
-          setPlayerNotice(error instanceof Error ? error.message : `${selected.label} could not be prepared.`);
-        });
+      pendingQualitySelectionRef.current = null;
+      setPlayerNotice(`${selected.label} is not present in the prepared adaptive stream.`);
       return;
     }
     if (hlsRef.current && selected.index >= 0) {
@@ -3572,11 +3593,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           if (!video) return;
           markPlaybackStartupProgress("fragment-buffered");
           applyDeferredResume(video);
-          const pendingTarget = pendingSeekTargetRef.current;
-          if (pendingTarget !== null && isPlaybackTimeSeekable(video.seekable, pendingTarget)) {
-            video.currentTime = pendingTarget;
-            resumeAppliedRef.current = true;
-          }
+          if (!resumeAppliedRef.current) applyResume(video);
           if (video.buffered.length === 0) {
             return;
           }
@@ -3835,11 +3852,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       </AnimatePresence>
 
       <AnimatePresence>
-        {mobilePlayer && shouldShowMobileChrome(phase, showControls) && phase !== "ended" && (
+        {mobilePlayer && phase !== "ended" && (
           <motion.div
             className="mobile-player-chrome"
+            data-visible={shouldShowMobileChrome(phase, showControls) ? "true" : "false"}
+            aria-hidden={!shouldShowMobileChrome(phase, showControls)}
+            inert={!shouldShowMobileChrome(phase, showControls)}
+            onFocusCapture={revealControls}
+            onBlurCapture={handleControlsBlur}
             initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
+            animate={{ opacity: shouldShowMobileChrome(phase, showControls) ? 1 : 0 }}
             exit={{ opacity: 0 }}
             transition={{ duration: reduced ? MOTION_TIMINGS.reduced : 0.16, ease: MOTION_EASE }}
           >
@@ -3983,11 +4005,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       </AnimatePresence>
 
       <AnimatePresence>
-        {!mobilePlayer && showControls && phase !== "ended" && (
+        {!mobilePlayer && phase !== "ended" && (
           <motion.div
             className="player-controls absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black via-black/85 to-transparent px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-24 md:px-10 md:pb-7"
+            data-visible={showControls ? "true" : "false"}
+            aria-hidden={!showControls}
+            inert={!showControls}
+            onFocusCapture={revealControls}
+            onBlurCapture={handleControlsBlur}
             initial={reduced ? { opacity: 0 } : { opacity: 0, y: 18 }}
-            animate={{ opacity: 1, y: 0 }}
+            animate={{ opacity: showControls ? 1 : 0, y: showControls ? 0 : 12 }}
             exit={reduced ? { opacity: 0 } : { opacity: 0, y: 12 }}
           >
             <div className="mx-auto max-w-7xl">

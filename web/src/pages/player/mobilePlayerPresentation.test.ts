@@ -12,12 +12,12 @@ describe("dedicated mobile player presentation", () => {
     expect(playerPage).toContain('className="mobile-player-topbar"');
     expect(playerPage).toContain('className="mobile-player-transport"');
     expect(playerPage).toContain('className="mobile-player-bottom"');
-    expect(playerPage).toContain('!mobilePlayer && showControls && phase !== "ended"');
+    expect(playerPage).toContain('!mobilePlayer && phase !== "ended"');
   });
 
   it("omits phone volume controls and gates subtitles in both presentations", () => {
     const mobileStart = playerPage.indexOf('className="mobile-player-chrome"');
-    const desktopStart = playerPage.indexOf('!mobilePlayer && showControls && phase !== "ended"');
+    const desktopStart = playerPage.indexOf('!mobilePlayer && phase !== "ended"');
     const mobilePresentation = playerPage.slice(mobileStart, desktopStart);
 
     expect(mobilePresentation).not.toContain('className="player-volume"');
@@ -114,6 +114,8 @@ describe("dedicated mobile player presentation", () => {
     expect(emberControls).toContain("box-shadow: none");
     expect(emberControls).toContain("rgba(0,0,0,.42)");
     expect(emberControls).not.toContain("rgba(15,6,3,.46)");
+    expect(playerStyles).toContain('.player-view[data-player-theme="terminal"] .player-control-menu__list');
+    expect(playerStyles).toContain('background: linear-gradient(to top, rgba(0, 0, 0, 0.94)');
   });
 
   it("renders captions above visible controls and keeps exit actions opaque", () => {

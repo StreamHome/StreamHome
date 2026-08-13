@@ -196,8 +196,7 @@ class PlaybackContractRegression(unittest.TestCase):
                 self.assertEqual(payload["renditions"][0]["label"], "1080p")
                 self.assertTrue(any(item["ready"] for item in payload["renditions"]))
             else:
-                self.assertTrue(payload["renditions"])
-                self.assertTrue(any(not item["ready"] for item in payload["renditions"]))
+                self.assertEqual(payload["renditions"], [])
         return payload
 
     def test_ready_hls_manifest_serves_only_existing_ticket_protected_assets(self) -> None:
@@ -284,6 +283,15 @@ class PlaybackContractRegression(unittest.TestCase):
         self.assertEqual(refreshed.status_code, 200, refreshed.text)
         self.assertEqual(after, before)
 
+    def test_viewer_retry_refreshes_contract_without_scheduling_hls_generation(self) -> None:
+        run = self.create_run()
+        prepare = AsyncMock(return_value="preparing")
+        with patch.object(playback_prep_service, "prepare", new=prepare):
+            refreshed = self.client.get(f"/api/playback/runs/{run['runId']}?retry=true")
+
+        self.assertEqual(refreshed.status_code, 200, refreshed.text)
+        prepare.assert_not_awaited()
+
     def test_subtitle_delivery_requires_the_exact_track_identity(self) -> None:
         subtitle_file = self.media_directory / "subtitle_eng_main.vtt"
         subtitle_file.write_text("WEBVTT\n\n00:00.000 --> 00:01.000\nHello\n", encoding="utf-8")
@@ -312,33 +320,42 @@ class PlaybackContractRegression(unittest.TestCase):
             asyncio.run(configure_subtitle([]))
             subtitle_file.unlink(missing_ok=True)
 
-    def test_quality_capability_is_immediately_actionable_without_whole_title_preparation(self) -> None:
+    def test_quality_contract_contains_only_verified_master_variants(self) -> None:
         run = self.create_run()
         original = next(item for item in run["renditions"] if item["id"] == "video_original")
         self.assertTrue(original["ready"])
-        self.assertTrue(any(not item["ready"] for item in run["renditions"]))
+        self.assertTrue(all(item["ready"] and item["status"] == "ready" for item in run["renditions"]))
+        self.assertNotIn("video_240p", {item["id"] for item in run["renditions"]})
         master = self.client.get(run["manifestUrl"])
         self.assertEqual(master.status_code, 200, master.text)
         self.assertIn("video_original/playlist.m3u8", master.text)
 
-    def test_unprepared_quality_is_exposed_and_can_be_prioritized_by_its_run(self) -> None:
+    def test_viewer_quality_request_never_schedules_hls_generation(self) -> None:
         run = self.create_run()
-        requested = next(item for item in run["renditions"] if item["id"] == "video_240p")
-        self.assertFalse(requested["ready"])
-        self.assertIn(requested["status"], {"idle", "preparing", "streamable"})
+        requested_id = "video_240p"
+        self.assertNotIn(requested_id, {item["id"] for item in run["renditions"]})
 
         prioritize = AsyncMock(return_value="preparing")
         with patch.object(playback_prep_service, "prioritize_video_rendition", new=prioritize):
             response = self.client.post(
                 f"/api/playback/runs/{run['runId']}/quality",
-                json={"renditionId": requested["id"]},
+                json={"renditionId": requested_id},
+            )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "RENDITION_NOT_READY")
+        prioritize.assert_not_awaited()
+
+    def test_creating_a_viewer_run_never_schedules_hls_generation(self) -> None:
+        prepare = AsyncMock(return_value="preparing")
+        with patch.object(playback_prep_service, "prepare", new=prepare):
+            response = self.client.post(
+                "/api/playback/runs",
+                json={"movieId": "m_playback_contract", "profileId": "contract-profile"},
             )
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json(), {"status": "preparing", "renditionId": requested["id"]})
-        prioritize.assert_awaited_once()
-        self.assertEqual(prioritize.await_args.args[0], "m_playback_contract")
-        self.assertEqual(prioritize.await_args.args[3], requested["id"])
+        prepare.assert_not_awaited()
 
     def test_stale_portable_video_identity_forces_stream_metadata_reprobe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
