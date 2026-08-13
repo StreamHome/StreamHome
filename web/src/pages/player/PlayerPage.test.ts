@@ -367,14 +367,14 @@ describe("player interaction contracts", () => {
     expect(shouldRetryPlaybackStall(true, HTMLMediaElement.HAVE_FUTURE_DATA, 0)).toBe(false);
   });
 
-  it("keeps external audio at the selected speed and avoids routine hard seeks for small drift", () => {
+  it("keeps external audio at the selected speed and reserves hard seeks for explicit synchronization", () => {
     expect(externalAudioSyncPlan(30, 30.05, 1)).toEqual({ seekTime: null, playbackRate: 1 });
     expect(externalAudioSyncPlan(30, 29.95, 1)).toEqual({ seekTime: null, playbackRate: 1 });
     expect(externalAudioSyncPlan(30, 29.7, 1)).toEqual({ seekTime: null, playbackRate: 1 });
     expect(externalAudioSyncPlan(30, 30.3, 1)).toEqual({ seekTime: null, playbackRate: 1 });
-    expect(externalAudioSyncPlan(30, 29.2, 1)).toEqual({ seekTime: 30, playbackRate: 1 });
-    expect(externalAudioSyncPlan(30, 30.8, 1)).toEqual({ seekTime: 30, playbackRate: 1 });
-    expect(externalAudioSyncPlan(30, 28.5, 1)).toEqual({ seekTime: 30, playbackRate: 1 });
+    expect(externalAudioSyncPlan(30, 29.2, 1)).toEqual({ seekTime: null, playbackRate: 1 });
+    expect(externalAudioSyncPlan(30, 30.8, 1)).toEqual({ seekTime: null, playbackRate: 1 });
+    expect(externalAudioSyncPlan(30, 28.5, 1)).toEqual({ seekTime: null, playbackRate: 1 });
     expect(externalAudioSyncPlan(30, 30.05, 1, true)).toEqual({ seekTime: 30, playbackRate: 1 });
   });
 

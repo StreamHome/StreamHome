@@ -25,7 +25,14 @@ from routes.playback import (
 from services.languages import normalize_language_tag
 from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
 from services.media_source import MediaSourceError, ResolvedMediaSource, canonicalize_catalog_path, clear_cloud_object_cache, is_safe_presentation_asset, resolve_media_source
-from services.playback_prep import PlaybackMediaSnapshot, PlaybackPrepService, PlaybackPreparationError, playback_prep_service
+from services.playback_prep import (
+    AUDIO_VERIFIED_MARKER,
+    VIDEO_VERIFIED_MARKER,
+    PlaybackMediaSnapshot,
+    PlaybackPrepService,
+    PlaybackPreparationError,
+    playback_prep_service,
+)
 from services.playback_source import HttpPlaybackSource, LocalPlaybackSource
 from services.rclone import rclone_service
 from services.queue import DownloadQueueManager, srt_to_vtt
@@ -667,7 +674,8 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 (rendition / "init.mp4").write_bytes(b"init")
                 (rendition / "segment_00000.m4s").write_bytes(rendition_name.encode("utf-8"))
                 (rendition / ".complete").write_text("done", encoding="utf-8")
-                (rendition / ".verified-v1").write_text("1", encoding="utf-8")
+                marker = AUDIO_VERIFIED_MARKER if rendition_name.startswith("audio_") else VIDEO_VERIFIED_MARKER
+                (rendition / marker).write_text("1", encoding="utf-8")
 
             reused = service.reuse_verified_playback_cache(
                 "m_verified_optimization",
@@ -696,6 +704,53 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 ).read_bytes(),
                 audio_rendition_name.encode("utf-8"),
             )
+
+    def test_legacy_audio_marker_is_invalidated_without_invalidating_video(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = PlaybackPrepService()
+            service.cache_dir = Path(directory)
+            media_id = "m_audio_marker_upgrade"
+            fingerprint = "3" * 64
+            for rendition_name in ("video_original", "audio_embedded_0_contract_en"):
+                rendition = service.cache_path(media_id, fingerprint) / rendition_name
+                rendition.mkdir(parents=True)
+                (rendition / "playlist.m3u8").write_text(
+                    "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_00000.m4s\n",
+                    encoding="utf-8",
+                )
+                (rendition / "init.mp4").write_bytes(b"init")
+                (rendition / "segment_00000.m4s").write_bytes(b"segment")
+                (rendition / ".complete").write_text("done", encoding="utf-8")
+                (rendition / VIDEO_VERIFIED_MARKER).write_text("1", encoding="utf-8")
+
+            self.assertTrue(service.rendition_complete(media_id, fingerprint, "video_original"))
+            self.assertFalse(service.rendition_complete(media_id, fingerprint, "audio_embedded_0_contract_en"))
+
+            audio_dir = service.cache_path(media_id, fingerprint) / "audio_embedded_0_contract_en"
+            (audio_dir / AUDIO_VERIFIED_MARKER).write_text("1", encoding="utf-8")
+            self.assertTrue(service.rendition_complete(media_id, fingerprint, "audio_embedded_0_contract_en"))
+
+    def test_audio_verification_rejects_a_rendition_that_cannot_be_decoded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            (target / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+            probe_result = SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    '{"streams":[{"codec_type":"audio","codec_name":"aac",'
+                    '"profile":"LC","sample_rate":"48000","channels":2}]}'
+                ),
+                stderr="",
+            )
+            decode_result = SimpleNamespace(returncode=1, stdout="", stderr="Invalid audio packet")
+            with (
+                patch("services.playback_prep.shutil.which", side_effect=lambda name: name),
+                patch("services.playback_prep.subprocess.run", side_effect=[probe_result, decode_result]),
+                self.assertRaises(PlaybackPreparationError) as context,
+            ):
+                PlaybackPrepService()._verify_rendition_output(target, "audio_embedded_0_contract_en")
+
+            self.assertEqual(context.exception.code, "RENDITION_VERIFICATION_FAILED")
 
     def test_cloud_external_dubbing_uses_the_same_language_contract(self) -> None:
         response = SimpleNamespace(
@@ -966,8 +1021,11 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 }]))[0]
                 await service._transcode_audio("m_fast", "abc", source, audio, media)
                 audio_arguments = run_job.await_args.args[4]
-                self.assertIn("copy", audio_arguments)
-                self.assertNotIn("160k", audio_arguments)
+                self.assertNotIn("copy", audio_arguments)
+                self.assertIn("aresample=async=1:first_pts=0", audio_arguments)
+                self.assertIn("aac_low", audio_arguments)
+                self.assertIn("192k", audio_arguments)
+                self.assertIn("48000", audio_arguments)
 
             hevc = SimpleNamespace(codec="hevc", width=1920, height=1080, quality="1080p")
             self.assertEqual(service.baseline_video(hevc).height, 480)
@@ -1042,6 +1100,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             self.assertTrue(master.is_file())
             self.assertTrue(any(cache_path.rglob("*.m4s")))
             self.assertTrue((cache_path / default_audio_rendition.name / "segment_00000.m4s").is_file(), [str(path) for path in cache_path.rglob("*")])
+            self.assertTrue((cache_path / default_audio_rendition.name / AUDIO_VERIFIED_MARKER).is_file())
             self.assertIn("#EXT-X-PLAYLIST-TYPE:EVENT", (cache_path / "video_original" / "playlist.m3u8").read_text(encoding="utf-8"))
             self.assertEqual(playback_prep_service.rendition_status(media.id, media.source_fingerprint, "video_original"), "ready")
             content = master.read_text(encoding="utf-8")
@@ -1065,6 +1124,21 @@ class PlaybackPipelineRegression(unittest.TestCase):
             stream_types = set(result.stdout.split())
             self.assertIn("video", stream_types)
             self.assertIn("audio", stream_types)
+
+            audio_result = subprocess.run(
+                [
+                    str(ffprobe),
+                    "-v", "error",
+                    "-show_entries", "stream=codec_name,sample_rate,channels",
+                    "-of", "csv=p=0",
+                    str(cache_path / default_audio_rendition.name / "playlist.m3u8"),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(audio_result.returncode, 0, audio_result.stderr)
+            self.assertIn("aac,48000,2", audio_result.stdout.strip())
         finally:
             if os.getenv("KEEP_PLAYBACK_TEST_CACHE") != "1":
                 shutil.rmtree(cache_path.parent, ignore_errors=True)

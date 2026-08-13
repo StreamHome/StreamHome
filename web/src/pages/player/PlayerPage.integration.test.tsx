@@ -672,6 +672,16 @@ describe("mounted player lifecycle", () => {
     expect(video.getAttribute("src")).toBe(playback.runResponse.progressiveUrl);
     expect(video.muted).toBe(true);
 
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 30 });
+    Object.defineProperty(audio, "currentTime", { configurable: true, writable: true, value: 27 });
+    Object.defineProperty(audio, "readyState", {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+    });
+    fireEvent.playing(video);
+    expect(audio.currentTime).toBe(27);
+
     view.unmount();
   });
 

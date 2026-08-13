@@ -27,11 +27,11 @@ BOOTSTRAP_HLS_HEIGHT = 480
 PLAYLIST_NAME = "playlist.m3u8"
 MASTER_NAME = "master.m3u8"
 COMPLETE_MARKER = ".complete"
-VERIFIED_MARKER = ".verified-v1"
+VIDEO_VERIFIED_MARKER = ".verified-v1"
+AUDIO_VERIFIED_MARKER = ".verified-audio-v2"
 FOREGROUND_PRIORITY = 0
 BACKGROUND_PRIORITY = 100
 FAST_HLS_VIDEO_CODECS = {"avc", "avc1", "h264"}
-FAST_HLS_AUDIO_CODECS = {"aac", "mp4a"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,10 +388,14 @@ class PlaybackPrepService:
     def rendition_complete(self, media_id: str, fingerprint: str, rendition_name: str) -> bool:
         rendition_dir = self.cache_path(media_id, fingerprint) / rendition_name
         marker = rendition_dir / COMPLETE_MARKER
-        verified = rendition_dir / VERIFIED_MARKER
+        verified = rendition_dir / self._verified_marker_name(rendition_name)
         if marker.is_file() and verified.is_file() and self.playlist_ready(media_id, fingerprint, rendition_name):
             return True
         return False
+
+    @staticmethod
+    def _verified_marker_name(rendition_name: str) -> str:
+        return AUDIO_VERIFIED_MARKER if rendition_name.startswith("audio_") else VIDEO_VERIFIED_MARKER
 
     def rendition_verified(self, media_id: str, fingerprint: str, rendition_name: str) -> bool:
         return self.rendition_complete(media_id, fingerprint, rendition_name)
@@ -415,7 +419,7 @@ class PlaybackPrepService:
             [
                 ffprobe,
                 "-v", "error",
-                "-show_entries", "stream=codec_type,codec_name",
+                "-show_entries", "stream=codec_type,codec_name,profile,sample_rate,channels",
                 "-of", "json",
                 str(playlist),
             ],
@@ -444,6 +448,48 @@ class PlaybackPrepService:
                 "RENDITION_VERIFICATION_FAILED",
                 f"The prepared adaptive rendition contains no {expected_type} stream.",
             )
+        if expected_type == "audio":
+            audio_stream = next(stream for stream in streams if str(stream.get("codec_type")) == "audio")
+            if (
+                str(audio_stream.get("codec_name") or "").lower() != "aac"
+                or str(audio_stream.get("profile") or "").upper() != "LC"
+                or str(audio_stream.get("sample_rate") or "") != "48000"
+                or str(audio_stream.get("channels") or "") != "2"
+            ):
+                raise PlaybackPreparationError(
+                    "RENDITION_VERIFICATION_FAILED",
+                    "The prepared adaptive audio does not match the AAC-LC 48 kHz stereo contract.",
+                )
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                raise PlaybackPreparationError(
+                    "FFMPEG_UNAVAILABLE",
+                    "FFmpeg is required to verify adaptive audio output.",
+                )
+            decode_result = subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-nostdin",
+                    "-v", "error",
+                    "-xerror",
+                    "-i", str(playlist),
+                    "-map", "0:a:0",
+                    "-f", "null",
+                    "-",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            if decode_result.returncode != 0:
+                diagnostics = self.sanitize_diagnostics(decode_result.stderr, 800)
+                raise PlaybackPreparationError(
+                    "RENDITION_VERIFICATION_FAILED",
+                    f"FFmpeg rejected the prepared adaptive audio. {diagnostics}".strip(),
+                )
 
     def rendition_error(self, media_id: str, fingerprint: str, rendition_name: str) -> Optional[dict[str, str]]:
         error_path = self.cache_path(media_id, fingerprint) / f"rendition-error-{rendition_name}.json"
@@ -1118,7 +1164,7 @@ class PlaybackPrepService:
                     raise PlaybackPreparationError("EMPTY_RENDITION", "FFmpeg completed without producing playable HLS segments.")
                 await asyncio.to_thread(self._verify_rendition_output, target_dir, rendition_name)
                 (target_dir / COMPLETE_MARKER).write_text(str(time.time()), encoding="utf-8")
-                (target_dir / VERIFIED_MARKER).write_text("1", encoding="utf-8")
+                (target_dir / self._verified_marker_name(rendition_name)).write_text("1", encoding="utf-8")
                 self._clear_preparation_error(media_id, fingerprint)
                 self._clear_rendition_error(media_id, fingerprint, rendition_name)
                 self.touch(media_id, fingerprint)
@@ -1276,32 +1322,29 @@ class PlaybackPrepService:
         rendition: AudioRendition,
         media_obj: Any,
     ) -> None:
+        def normalized_audio_arguments(stream_map: str) -> list[str]:
+            return [
+                "-map", stream_map,
+                "-vn",
+                "-af", "aresample=async=1:first_pts=0",
+                "-c:a", "aac",
+                "-profile:a", "aac_low",
+                "-b:a", "192k",
+                "-ar", "48000",
+                "-ac", "2",
+            ]
+
         external_source = self._external_audio_source(source, rendition, self._external_audio_path(source, rendition))
         if external_source:
-            arguments = ["-map", "0:a:0", "-vn", "-c:a", "aac", "-b:a", "160k", "-ac", "2"]
+            arguments = normalized_audio_arguments("0:a:0")
             await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, external_source, arguments, media_obj)
-            return
-        if rendition.codec in FAST_HLS_AUDIO_CODECS:
-            stream_map = (
-                f"0:{rendition.stream_index}"
-                if rendition.absolute_stream_index
-                else f"0:a:{rendition.stream_index}"
-            )
-            arguments = ["-map", stream_map, "-vn", "-c:a", "copy"]
-            await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, source, arguments, media_obj)
             return
         stream_map = (
             f"0:{rendition.stream_index}"
             if rendition.absolute_stream_index
             else f"0:a:{rendition.stream_index}"
         )
-        arguments = [
-            "-map", stream_map,
-            "-vn",
-            "-c:a", "aac",
-            "-b:a", "160k",
-            "-ac", "2",
-        ]
+        arguments = normalized_audio_arguments(stream_map)
         await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, source, arguments, media_obj)
 
     @staticmethod
@@ -1471,7 +1514,7 @@ class PlaybackPrepService:
         for playlist in self.cache_dir.rglob(PLAYLIST_NAME):
             rendition_dir = playlist.parent
             marker = rendition_dir / COMPLETE_MARKER
-            verified = rendition_dir / VERIFIED_MARKER
+            verified = rendition_dir / self._verified_marker_name(rendition_dir.name)
             if marker.is_file() and verified.is_file() and self.playlist_ready(
                 rendition_dir.parent.parent.name,
                 rendition_dir.parent.name,

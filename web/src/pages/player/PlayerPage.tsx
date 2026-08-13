@@ -144,8 +144,6 @@ export const FORWARD_BUFFER_TARGET_SECONDS = 30;
 export const FORWARD_BUFFER_MAX_SECONDS = 60;
 export const STARTUP_QUALITY_MIN_BUFFER_SECONDS = 8;
 export const STARTUP_QUALITY_HEADROOM_RATIO = 1.35;
-export const EXTERNAL_AUDIO_HARD_SYNC_SECONDS = 0.75;
-export const EXTERNAL_AUDIO_HARD_SYNC_COOLDOWN_MS = 3_000;
 
 type PlaybackStartupStage =
   | "transport-initializing"
@@ -257,15 +255,13 @@ export function shouldRetryPlaybackStall(playRequested: boolean, readyState: num
 
 export function externalAudioSyncPlan(
   videoTime: number,
-  audioTime: number,
+  _audioTime: number,
   playbackRate: number,
   forceSeek = false,
 ): { seekTime: number | null; playbackRate: number } {
   const target = Math.max(0, Number.isFinite(videoTime) ? videoTime : 0);
-  const current = Math.max(0, Number.isFinite(audioTime) ? audioTime : target);
   const baseRate = Math.min(4, Math.max(0.25, Number.isFinite(playbackRate) ? playbackRate : 1));
-  const drift = current - target;
-  if (forceSeek || Math.abs(drift) >= EXTERNAL_AUDIO_HARD_SYNC_SECONDS) {
+  if (forceSeek) {
     return { seekTime: target, playbackRate: baseRate };
   }
   return { seekTime: null, playbackRate: baseRate };
@@ -715,7 +711,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const selectedAudioTrackIdRef = useRef("");
   const activeExternalAudioTrackIdRef = useRef<string | null>(null);
   const externalAudioBufferingRef = useRef(false);
-  const externalAudioLastHardSyncAtRef = useRef(0);
   const volumeRef = useRef(initialPreferences.volume);
   const mutedRef = useRef(initialPreferences.muted);
   const preferencesProfileIdRef = useRef(profile?.id ?? "");
@@ -980,7 +975,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     selectedAudioTrackIdRef.current = "";
     activeExternalAudioTrackIdRef.current = null;
     externalAudioBufferingRef.current = false;
-    externalAudioLastHardSyncAtRef.current = 0;
     externalAudioPlayRequestRef.current += 1;
     videoPlayRequestRef.current += 1;
     const externalAudio = externalAudioRef.current;
@@ -1152,14 +1146,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     }
     const plan = externalAudioSyncPlan(target, audio.currentTime, video.playbackRate, force);
     if (plan.seekTime !== null) {
-      const now = performance.now();
-      if (!force && now - externalAudioLastHardSyncAtRef.current < EXTERNAL_AUDIO_HARD_SYNC_COOLDOWN_MS) {
-        if (Math.abs(audio.playbackRate - plan.playbackRate) > 0.001) audio.playbackRate = plan.playbackRate;
-        return false;
-      }
       try {
         audio.currentTime = plan.seekTime;
-        externalAudioLastHardSyncAtRef.current = now;
       } catch {
         return false;
       }
@@ -1177,14 +1165,14 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     const audio = externalAudioRef.current;
     if (!audio || !activeExternalAudioTrackIdRef.current || !playbackIntentRef.current || completedRef.current) return;
     if (pendingExternalAudioPlayRequestRef.current === externalAudioPlayRequestRef.current) return;
-    syncExternalAudio(true);
+    syncExternalAudio();
     const request = ++externalAudioPlayRequestRef.current;
     pendingExternalAudioPlayRequestRef.current = request;
     void audio.play()
       .then(() => {
         if (request !== externalAudioPlayRequestRef.current || !playbackIntentRef.current) return;
         window.requestAnimationFrame(() => {
-          if (request === externalAudioPlayRequestRef.current && playbackIntentRef.current) syncExternalAudio(true);
+          if (request === externalAudioPlayRequestRef.current && playbackIntentRef.current) syncExternalAudio();
         });
       })
       .catch((error: unknown) => {
@@ -1206,7 +1194,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     }
     activeExternalAudioTrackIdRef.current = null;
     externalAudioBufferingRef.current = false;
-    externalAudioLastHardSyncAtRef.current = 0;
     const video = videoRef.current;
     if (video) {
       video.volume = volumeRef.current;
@@ -1220,7 +1207,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (!video || !audio || !track.directUrl) return false;
     activeExternalAudioTrackIdRef.current = track.id;
     externalAudioBufferingRef.current = false;
-    externalAudioLastHardSyncAtRef.current = 0;
     if (audio.getAttribute("src") !== track.directUrl) {
       audio.src = track.directUrl;
       audio.load();

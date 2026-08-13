@@ -24,7 +24,7 @@ The video element uses eager browser preloading. Local media is read directly fr
 
 ## Ready HLS quality switching
 
-If a protected HLS cache already contains a valid master, initialization fragments, playlists, and media fragments, the descriptor includes `/api/playback/manifest/{mediaId}`. A rendition becomes ready only after FFprobe opens its completed playlist and confirms the expected video or audio stream; interrupted and legacy unverified output is rebuilt in the background. The player uses hls.js or native HLS to select only those verified variants.
+If a protected HLS cache already contains a valid master, initialization fragments, playlists, and media fragments, the descriptor includes `/api/playback/manifest/{mediaId}`. A video rendition becomes ready only after FFprobe opens its completed playlist and confirms its stream. Adaptive audio is always normalized to AAC-LC, 48 kHz, stereo with repaired zero-based timestamps; FFprobe must confirm that exact contract and FFmpeg must decode the complete playlist before publication. Independently versioned audio verification invalidates legacy stream-copied audio without rebuilding verified video. The player uses hls.js or native HLS to select only verified variants.
 
 Quality clicks change the active ready HLS level. They never call a preparation endpoint and never start FFmpeg. If no ready HLS master exists, the source plays directly and unavailable qualities are not displayed.
 
@@ -40,7 +40,7 @@ Adaptive startup records transport initialization, media attachment, manifest, l
 
 Sibling files inside the title's `audio/` directory are direct playback assets. Each discovered external track receives a ticket-protected `/api/playback/source/{mediaId}?source_id=...` URL with the same range behavior as video.
 
-The web player keeps a hidden audio element synchronized with the visible video. Selecting dubbing does not replace or reload the video. Play, pause, resume, seek, playback rate, volume, mute, buffering, completion, recovery, and teardown keep both media clocks aligned. Drift above 200 milliseconds is corrected to the video clock. If a sidecar cannot be decoded, the player restores the default embedded audio without changing the video position.
+The web player keeps a hidden audio element synchronized with the visible video. Selecting dubbing does not replace or reload the video. Play, pause, resume, seek, playback rate, volume, mute, completion, recovery, and teardown preserve video ownership. Track activation, user seek, and metadata readiness explicitly align the audio clock; routine playback and recovery events never hard-seek an already-playing sidecar. If a sidecar cannot be decoded, the player restores the default embedded audio without changing the video position.
 
 A ready HLS video can also use a direct external dubbing sidecar when that audio is not inside the manifest.
 
@@ -56,7 +56,7 @@ The server-probed duration remains authoritative. Buffered ranges and HLS playli
 
 The browser keeps upcoming direct media buffered according to its media engine. hls.js targets 30 seconds ahead and may grow to 60 seconds when bandwidth permits. The timeline reports the currently buffered range.
 
-Temporary network or source stalls retain the last decoded frame. After four seconds without future media, the player reloads the same transport from the confirmed position. Two bounded recovery attempts are allowed before an actionable error is shown. HLS retains its bounded network and media recovery budgets, and external audio buffering pauses video so dubbing cannot drift ahead.
+Temporary network or source stalls retain the last decoded frame. After four seconds without future media, the player reloads the same transport from the confirmed position. Two bounded recovery attempts are allowed before an actionable error is shown. HLS retains its bounded network and media recovery budgets. External audio may buffer and recover independently, but it never pauses or restarts the master video and never owns the global buffering state.
 
 ## Ingestion preview
 

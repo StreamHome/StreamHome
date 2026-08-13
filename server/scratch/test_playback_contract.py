@@ -30,7 +30,7 @@ from routes.auth import get_current_user
 from routes.playback import ensure_source_metadata, router
 from services.media_source import resolve_media_source
 from services.ingest_preview import ingest_preview_service
-from services.playback_prep import playback_prep_service
+from services.playback_prep import AUDIO_VERIFIED_MARKER, VIDEO_VERIFIED_MARKER, playback_prep_service
 
 
 class PlaybackContractRegression(unittest.TestCase):
@@ -138,12 +138,12 @@ class PlaybackContractRegression(unittest.TestCase):
         (video_dir / "init.mp4").write_bytes(b"video-init")
         (video_dir / "segment_00000.m4s").write_bytes(b"video-segment")
         (video_dir / ".complete").write_text("done", encoding="utf-8")
-        (video_dir / ".verified-v1").write_text("1", encoding="utf-8")
+        (video_dir / VIDEO_VERIFIED_MARKER).write_text("1", encoding="utf-8")
         (audio_dir / "playlist.m3u8").write_text("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nsegment_00000.m4s\n#EXT-X-ENDLIST\n", encoding="utf-8")
         (audio_dir / "init.mp4").write_bytes(b"audio-init")
         (audio_dir / "segment_00000.m4s").write_bytes(b"audio-segment")
         (audio_dir / ".complete").write_text("done", encoding="utf-8")
-        (audio_dir / ".verified-v1").write_text("1", encoding="utf-8")
+        (audio_dir / AUDIO_VERIFIED_MARKER).write_text("1", encoding="utf-8")
         (cls.cache_root / "master.m3u8").write_text(
             "#EXTM3U\n"
             f"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",DEFAULT=YES,URI=\"{cls.default_audio_rendition}/playlist.m3u8\"\n"
@@ -247,6 +247,7 @@ class PlaybackContractRegression(unittest.TestCase):
                 movie = await db.get(Movie, "m_playback_contract")
                 movie.audio_metadata = [{"index": 0, "streamIndex": 1, "language": "eng", "label": "English", "channels": 2, "default": True}]
                 movie.source_fingerprint = self.fingerprint
+                movie.probed_duration = 120
                 db.add(movie)
                 await db.commit()
 
