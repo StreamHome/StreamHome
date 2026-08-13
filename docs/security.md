@@ -14,6 +14,7 @@ StreamHome is a self-hosted application. The operator is responsible for the hos
 - Ingestion uses scoped integration credentials rather than the administrator session.
 - Rclone configuration is application-owned and encrypted.
 - Setup is protected by a one-time bootstrap code and a short-lived signed session.
+- HTTP access logs preserve request method, route, protocol, and status while redacting sensitive query values such as playback tickets, OAuth codes/state, tokens, API keys, signatures, passwords, and secrets before formatting or persistence.
 
 ## Network deployment
 

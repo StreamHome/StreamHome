@@ -64,7 +64,7 @@ Play While Downloading remains a separate exception. An active ingestion can exp
 
 ## Authentication
 
-Playback remains restricted to a signed-in session and selected profile. Tickets are scoped to the authentication session, profile, playback run, media identity, and source fingerprint. Direct video, direct dubbing, ready HLS, preview assets, and subtitles validate the ticket.
+Playback remains restricted to a signed-in session and selected profile. Tickets are scoped to the authentication session, profile, playback run, media identity, and source fingerprint. Direct video, direct dubbing, ready HLS, preview assets, and subtitles validate the ticket. Access logging redacts the ticket query value before formatting any protected playback request.
 
 ## Validation
 
