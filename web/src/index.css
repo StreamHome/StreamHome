@@ -13,7 +13,7 @@
   --player-accent: #f97316;
   --player-accent-soft: rgba(249, 115, 22, 0.2);
   --player-border: rgba(255, 255, 255, 0.16);
-  --player-control: rgba(8, 8, 10, 0.74);
+  --player-control: rgba(8, 8, 10, 0.9);
   --player-control-hover: rgba(249, 115, 22, 0.2);
   --player-menu: rgba(10, 10, 12, 0.96);
   --player-menu-radius: 0.7rem;
@@ -25,7 +25,7 @@
   --player-accent: #ff6b2c;
   --player-accent-soft: rgba(255, 95, 31, 0.18);
   --player-border: rgba(255, 126, 78, 0.3);
-  --player-control: rgba(30, 13, 8, 0.82);
+  --player-control: rgba(30, 13, 8, 0.94);
   --player-control-hover: rgba(255, 95, 31, 0.22);
   --player-menu: rgba(24, 10, 6, 0.98);
   --player-menu-radius: 0;
@@ -37,7 +37,7 @@
   --player-accent: #f4f4f5;
   --player-accent-soft: rgba(255, 255, 255, 0.14);
   --player-border: rgba(255, 255, 255, 0.14);
-  --player-control: rgba(20, 20, 23, 0.76);
+  --player-control: rgba(20, 20, 23, 0.9);
   --player-control-hover: rgba(255, 255, 255, 0.12);
   --player-menu: rgba(18, 18, 21, 0.96);
   --player-menu-radius: 1rem;
@@ -48,7 +48,7 @@
   --player-accent: #f03b45;
   --player-accent-soft: rgba(229, 9, 20, 0.2);
   --player-border: rgba(255, 255, 255, 0.14);
-  --player-control: rgba(14, 10, 10, 0.8);
+  --player-control: rgba(14, 10, 10, 0.92);
   --player-control-hover: rgba(229, 9, 20, 0.22);
   --player-menu: rgba(15, 10, 10, 0.98);
   --player-menu-radius: 0.35rem;
@@ -60,7 +60,7 @@
   --player-accent: #8ab4f8;
   --player-accent-soft: rgba(66, 133, 244, 0.2);
   --player-border: rgba(138, 180, 248, 0.2);
-  --player-control: rgba(24, 24, 29, 0.84);
+  --player-control: rgba(24, 24, 29, 0.92);
   --player-control-hover: rgba(66, 133, 244, 0.2);
   --player-menu: rgba(24, 24, 29, 0.98);
   --player-menu-radius: 0.85rem;
@@ -181,6 +181,9 @@
   padding: 0 0.8rem;
   font-size: 0.75rem;
   font-weight: 650;
+  border-color: color-mix(in srgb, var(--player-accent) 42%, rgba(255, 255, 255, 0.28));
+  background: color-mix(in srgb, var(--player-control) 92%, black 8%);
+  color: white;
 }
 
 .player-control-menu {
@@ -464,12 +467,43 @@
   box-shadow: none;
 }
 
-.player-view video::cue {
+.player-caption-layer {
+  position: absolute;
+  z-index: 25;
+  inset-inline: max(1rem, env(safe-area-inset-left)) max(1rem, env(safe-area-inset-right));
+  bottom: max(2.5rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+  display: grid;
+  justify-items: center;
+  gap: 0.24rem;
+  pointer-events: none;
+  text-align: center;
+  transition: bottom 180ms cubic-bezier(.2, 0, 0, 1);
+}
+
+.player-caption-layer > span {
+  max-width: min(76ch, 88vw);
+  border-radius: 0.18rem;
+  background: rgba(0, 0, 0, 0.82);
   color: white;
-  background: rgba(0, 0, 0, 0.78);
-  font-size: calc(1em * var(--caption-scale, 1));
+  padding: 0.16em 0.38em 0.2em;
+  font-size: calc(clamp(1rem, 2.2vw, 1.55rem) * var(--caption-scale, 1));
+  font-weight: 560;
   line-height: 1.35;
+  text-wrap: balance;
+  white-space: pre-line;
   text-shadow: 0 1px 3px black;
+}
+
+.player-view[data-controls-visible="true"]:not([data-mobile-player="true"]) .player-caption-layer {
+  bottom: clamp(9.5rem, 20vh, 13rem);
+}
+
+.player-view[data-controls-visible="true"][data-mobile-player="true"] .player-caption-layer {
+  bottom: clamp(6.5rem, 25vh, 9rem);
+}
+
+.player-view[data-player-theme="terminal"] .player-caption-layer > span {
+  border-radius: 0;
 }
 
 html[data-player-viewport-fullscreen="true"],

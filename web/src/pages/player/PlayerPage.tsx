@@ -92,6 +92,7 @@ interface PlayerPreferences {
   audioLanguage: string;
   subtitleTrackId: string;
   captionScale: number;
+  subtitleOffset: number;
   playbackRate: number;
   volume: number;
   muted: boolean;
@@ -128,10 +129,15 @@ const DEFAULT_PREFERENCES: PlayerPreferences = {
   audioLanguage: "",
   subtitleTrackId: "off",
   captionScale: 1,
+  subtitleOffset: 0,
   playbackRate: 1,
   volume: 1,
   muted: false,
 };
+const SUBTITLE_OFFSET_OPTIONS = [-5, -3, -2, -1.5, -1, -0.5, -0.25, 0, 0.25, 0.5, 1, 1.5, 2, 3, 5].map((value) => ({
+  value,
+  label: value === 0 ? "Subtitle timing: synced" : `${Math.abs(value)}s ${value < 0 ? "earlier" : "later"}`,
+}));
 const TICKET_RENEWAL_MARGIN = 3 * 60 * 1_000;
 const NEXT_EPISODE_SECONDS = 10;
 const NETWORK_RETRY_LIMIT = 3;
@@ -233,14 +239,51 @@ export function applySubtitleTrackSelection(video: HTMLVideoElement, selectedTra
     video.textTracks[index].mode = "disabled";
   }
   for (const trackElement of trackElements) {
-    trackElement.track.mode = selectedTrackId !== "off" && trackElement.dataset.subtitleId === selectedTrackId
-      ? "showing"
+    const textTrack = trackElement.track;
+    if (!textTrack) continue;
+    textTrack.mode = selectedTrackId !== "off" && trackElement.dataset.subtitleId === selectedTrackId
+      ? "hidden"
       : "disabled";
   }
 }
 
 export function shouldAutoHidePlayerControls(phase: PlayerPhase, menuOpen: boolean, scrubbing: boolean): boolean {
-  return ["playing", "paused", "buffering", "recovering"].includes(phase) && !menuOpen && !scrubbing;
+  return ["loading", "playing", "paused", "buffering", "recovering"].includes(phase) && !menuOpen && !scrubbing;
+}
+
+export function timelineValueFromPointer(
+  clientX: number,
+  left: number,
+  width: number,
+  minimum: number,
+  maximum: number,
+): number {
+  if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(maximum) || maximum <= minimum) return minimum;
+  const ratio = Math.min(1, Math.max(0, (clientX - left) / width));
+  return minimum + ratio * (maximum - minimum);
+}
+
+export function subtitleCueIsActive(
+  cueStart: number,
+  cueEnd: number,
+  mediaTime: number,
+  subtitleOffset: number,
+): boolean {
+  const adjustedTime = mediaTime - subtitleOffset;
+  return cueStart <= adjustedTime && adjustedTime < cueEnd;
+}
+
+function plainSubtitleCueText(value: string): string {
+  return value
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]*>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .trim();
 }
 
 export function shouldResumePlaybackAfterTransport(playRequested: boolean, completed: boolean): boolean {
@@ -372,6 +415,9 @@ function loadPreferences(profileId: string): PlayerPreferences {
         ? parsed.subtitleTrackId
         : typeof parsed.subtitleLanguage === "string" ? parsed.subtitleLanguage : "off",
       captionScale: typeof parsed.captionScale === "number" ? Math.min(1.5, Math.max(0.8, parsed.captionScale)) : 1,
+      subtitleOffset: typeof parsed.subtitleOffset === "number" && Number.isFinite(parsed.subtitleOffset)
+        ? Math.min(5, Math.max(-5, parsed.subtitleOffset))
+        : 0,
       playbackRate: typeof parsed.playbackRate === "number" ? parsed.playbackRate : 1,
       volume: typeof parsed.volume === "number" && Number.isFinite(parsed.volume)
         ? Math.min(1, Math.max(0, parsed.volume))
@@ -763,6 +809,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const scrubbingRef = useRef(false);
   const scrubOriginRef = useRef(0);
   const timelineAnimationFrameRef = useRef<number | null>(null);
+  const captionSignatureRef = useRef("");
 
   const [asset, setAsset] = useState<PlayableAsset | null>(null);
   const [episodeSequence, setEpisodeSequence] = useState<Episode[]>([]);
@@ -790,6 +837,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [nextCountdown, setNextCountdown] = useState<number | null>(null);
   const [nextCancelled, setNextCancelled] = useState(false);
   const [timelinePreview, setTimelinePreview] = useState<{ x: number; time: number } | null>(null);
+  const [captionLines, setCaptionLines] = useState<string[]>([]);
   const [fullscreenActive, setFullscreenActive] = useState(false);
   const [fullscreenMode, setFullscreenMode] = useState<PlayerFullscreenMode>(null);
   const [fullscreenError, setFullscreenError] = useState("");
@@ -1011,6 +1059,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     hlsQualityOptionsRef.current = [];
     setControlMenuOpen(false);
     setTimelineScrubbing(false);
+    showControlsRef.current = true;
     setShowControls(true);
     setNextCountdown(null);
     setNextCancelled(false);
@@ -2163,13 +2212,48 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     video.playbackRate = preferences.playbackRate;
   }, [preferences.playbackRate]);
 
+  const updateCaptionOverlay = useCallback((mediaTime?: number) => {
+    const video = videoRef.current;
+    const clearCaptions = () => {
+      if (!captionSignatureRef.current) return;
+      captionSignatureRef.current = "";
+      setCaptionLines([]);
+    };
+    if (!video || preferences.subtitleTrackId === "off") {
+      clearCaptions();
+      return;
+    }
+    const trackElement = Array.from(video.querySelectorAll<HTMLTrackElement>("track[data-subtitle-id]"))
+      .find((candidate) => candidate.dataset.subtitleId === preferences.subtitleTrackId);
+    const cues = trackElement?.track?.cues;
+    if (!cues) {
+      clearCaptions();
+      return;
+    }
+    const clock = Number.isFinite(mediaTime) ? Number(mediaTime) : video.currentTime;
+    const lines: string[] = [];
+    for (let index = 0; index < cues.length; index += 1) {
+      const cue = cues[index];
+      if (!cue || !subtitleCueIsActive(cue.startTime, cue.endTime, clock, preferences.subtitleOffset)) continue;
+      const text = plainSubtitleCueText((cue as VTTCue).text || "");
+      if (text) lines.push(text);
+    }
+    const signature = lines.join("\u0000");
+    if (signature === captionSignatureRef.current) return;
+    captionSignatureRef.current = signature;
+    setCaptionLines(lines);
+  }, [preferences.subtitleOffset, preferences.subtitleTrackId]);
+
   const applySubtitlePreference = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
     applySubtitleTrackSelection(video, preferences.subtitleTrackId);
-  }, [preferences.subtitleTrackId]);
+    updateCaptionOverlay();
+  }, [preferences.subtitleTrackId, updateCaptionOverlay]);
 
   useEffect(() => applySubtitlePreference(), [applySubtitlePreference, runResponse]);
+
+  useEffect(() => updateCaptionOverlay(), [updateCaptionOverlay]);
 
   useEffect(() => {
     if (!runResponse || preferences.subtitleTrackId === "off") return;
@@ -2466,23 +2550,26 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     reportProgress("seek");
   }, [reportProgress]);
 
+  const setControlsVisibility = useCallback((visible: boolean) => {
+    showControlsRef.current = visible;
+    setShowControls(visible);
+  }, []);
+
   const scheduleControlsHide = useCallback(() => {
     if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
     controlsTimerRef.current = null;
     if (shouldAutoHidePlayerControls(phaseRef.current, controlMenuOpenRef.current, scrubbingRef.current)) {
       controlsTimerRef.current = window.setTimeout(() => {
-        showControlsRef.current = false;
-        setShowControls(false);
+        setControlsVisibility(false);
         controlsTimerRef.current = null;
       }, PLAYER_CONTROLS_IDLE_MS);
     }
-  }, []);
+  }, [setControlsVisibility]);
 
   const revealControls = useCallback(() => {
-    showControlsRef.current = true;
-    setShowControls(true);
+    setControlsVisibility(true);
     scheduleControlsHide();
-  }, [scheduleControlsHide]);
+  }, [scheduleControlsHide, setControlsVisibility]);
 
   const handleDesktopPointerActivity = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     const previous = desktopPointerPositionRef.current;
@@ -2520,6 +2607,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         timeline.value = String(liveTime);
         timeline.style.setProperty("--player-progress", `${liveDuration > 0 ? Math.min(100, (liveTime / liveDuration) * 100) : 0}%`);
       }
+      updateCaptionOverlay(video?.currentTime);
       syncExternalAudio();
       timelineAnimationFrameRef.current = window.requestAnimationFrame(updateTimeline);
     };
@@ -2528,7 +2616,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       if (timelineAnimationFrameRef.current !== null) window.cancelAnimationFrame(timelineAnimationFrameRef.current);
       timelineAnimationFrameRef.current = null;
     };
-  }, [duration, phase, syncExternalAudio]);
+  }, [duration, phase, syncExternalAudio, updateCaptionOverlay]);
 
   const resolvePlayerContainer = useCallback((interactionTarget?: HTMLElement | null) => {
     const interactionContainer = interactionTarget?.matches("[data-player-root='true']")
@@ -2565,7 +2653,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         return;
       }
       setFullscreenError("The browser rejected the fullscreen request. Check the fullscreen permission for this site.");
-      setShowControls(true);
+      setControlsVisibility(true);
     };
 
     updateFullscreenState();
@@ -2584,7 +2672,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       video?.removeEventListener("webkitendfullscreen", updateFullscreenState);
       releaseViewportPlayerFullscreen(container);
     };
-  }, [mobilePlayer, resolvePlayerContainer, runResponse?.runId]);
+  }, [mobilePlayer, resolvePlayerContainer, runResponse?.runId, setControlsVisibility]);
 
   const toggleFullscreen = useCallback((interactionTarget?: HTMLElement | null) => {
     const container = resolvePlayerContainer(interactionTarget);
@@ -2616,12 +2704,12 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         setFullscreenError(error instanceof Error
           ? error.message
           : "Fullscreen could not be opened. Check this browser's fullscreen permission.");
-        setShowControls(true);
+        setControlsVisibility(true);
       })
       .finally(() => {
         window.requestAnimationFrame(() => container.focus({ preventScroll: true }));
       });
-  }, [mobilePlayer, resolvePlayerContainer, revealControls]);
+  }, [mobilePlayer, resolvePlayerContainer, revealControls, setControlsVisibility]);
 
   const ensureMobileLandscape = useCallback(() => {
     if (!mobilePlayer) return;
@@ -2688,9 +2776,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       .then(() => setPlayerNotice(document.pictureInPictureElement ? "Picture-in-picture active" : "Picture-in-picture closed"))
       .catch((error: unknown) => {
         setPlayerNotice(error instanceof Error ? error.message : "Picture-in-picture could not be opened.");
-        setShowControls(true);
+        setControlsVisibility(true);
       });
-  }, []);
+  }, [setControlsVisibility]);
 
   const startOver = useCallback(() => {
     if (!runResponse) return;
@@ -2806,11 +2894,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const toggleMobileControls = useCallback(() => {
     if (showControlsRef.current) {
       if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
-      setShowControls(false);
+      setControlsVisibility(false);
       return;
     }
     revealControls();
-  }, [revealControls]);
+  }, [revealControls, setControlsVisibility]);
 
   const resetMobileTapTimers = useCallback(() => {
     if (mobileSingleTapTimerRef.current !== null) window.clearTimeout(mobileSingleTapTimerRef.current);
@@ -2888,21 +2976,53 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     else handleMobileSurfaceTap(side);
   }, [handleMobileCenterTap, handleMobileSurfaceTap]);
 
-  const beginTimelineScrub = useCallback(() => {
-    scrubbingRef.current = true;
-    setTimelineScrubbing(true);
-    scrubOriginRef.current = currentTimeRef.current;
-    if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
-    setShowControls(true);
-  }, []);
+  const timelinePointerValue = useCallback((event: React.PointerEvent<HTMLInputElement>) => {
+    const timeline = event.currentTarget;
+    const rect = timeline.getBoundingClientRect();
+    return timelineValueFromPointer(
+      event.clientX,
+      rect.left,
+      rect.width,
+      Number(timeline.min || 0),
+      Number(timeline.max || duration || 0),
+    );
+  }, [duration]);
 
   const previewTimelineScrub = useCallback((value: number) => {
     currentTimeRef.current = value;
     setCurrentTime(value);
+    updateCaptionOverlay(value);
     const timeline = timelineRef.current;
     const max = Number(timeline?.max || duration || 1);
+    if (timeline) timeline.value = String(value);
     timeline?.style.setProperty("--player-progress", `${Math.min(100, (value / max) * 100)}%`);
-  }, [duration]);
+  }, [duration, updateCaptionOverlay]);
+
+  const updateTimelinePointerPreview = useCallback((event: React.PointerEvent<HTMLInputElement>, value: number) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const ratio = rect.width > 0 ? Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)) : 0;
+    setTimelinePreview({ x: ratio * rect.width, time: value });
+  }, []);
+
+  const beginTimelineScrub = useCallback((event: React.PointerEvent<HTMLInputElement>) => {
+    event.preventDefault();
+    event.currentTarget.focus({ preventScroll: true });
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    scrubbingRef.current = true;
+    setTimelineScrubbing(true);
+    scrubOriginRef.current = currentTimeRef.current;
+    if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
+    setControlsVisibility(true);
+    const value = timelinePointerValue(event);
+    previewTimelineScrub(value);
+    updateTimelinePointerPreview(event, value);
+  }, [previewTimelineScrub, setControlsVisibility, timelinePointerValue, updateTimelinePointerPreview]);
+
+  const moveTimelinePointer = useCallback((event: React.PointerEvent<HTMLInputElement>) => {
+    const value = timelinePointerValue(event);
+    updateTimelinePointerPreview(event, value);
+    if (scrubbingRef.current) previewTimelineScrub(value);
+  }, [previewTimelineScrub, timelinePointerValue, updateTimelinePointerPreview]);
 
   const commitTimelineScrub = useCallback((value: number) => {
     if (!scrubbingRef.current) return;
@@ -2912,6 +3032,14 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     revealControls();
   }, [revealControls, seek]);
 
+  const endTimelineScrub = useCallback((event: React.PointerEvent<HTMLInputElement>) => {
+    event.preventDefault();
+    const value = timelinePointerValue(event);
+    updateTimelinePointerPreview(event, value);
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    commitTimelineScrub(value);
+  }, [commitTimelineScrub, timelinePointerValue, updateTimelinePointerPreview]);
+
   const cancelTimelineScrub = useCallback(() => {
     if (!scrubbingRef.current) return;
     scrubbingRef.current = false;
@@ -2919,12 +3047,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     previewTimelineScrub(scrubOriginRef.current);
     revealControls();
   }, [previewTimelineScrub, revealControls]);
-
-  const handleTimelinePreview = (event: React.PointerEvent<HTMLInputElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
-    setTimelinePreview({ x: ratio * rect.width, time: ratio * duration });
-  };
 
   const changeQuality = (renditionId: string) => {
     const selected = availableQualities.find((item) => item.id === renditionId);
@@ -3209,7 +3331,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           if (authoritativeDuration > 0) setDuration(authoritativeDuration);
           applyResume(video);
           syncExternalAudio(true);
-          window.setTimeout(applySubtitlePreference, 0);
+          window.setTimeout(() => {
+            applySubtitlePreference();
+            updateCaptionOverlay(video.currentTime);
+          }, 0);
         }}
         onPlay={() => {
           if (!playbackIntentRef.current) {
@@ -3341,6 +3466,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           const video = videoRef.current;
           if (!video) return;
           const nextTime = video.currentTime;
+          updateCaptionOverlay(nextTime);
           const clockAdvanced = nextTime > confirmedTimeRef.current + 0.05;
           if (clockAdvanced) {
             clearPlaybackClockAdvanceWatchdog();
@@ -3389,6 +3515,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           const video = videoRef.current;
           if (!video) return;
           const nextTime = video.currentTime;
+          updateCaptionOverlay(nextTime);
           const stableTime = currentTimeRef.current;
           const pendingTarget = pendingSeekTargetRef.current;
           if (!shouldAcceptObservedPlaybackTime(
@@ -3531,7 +3658,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             srcLang={normalizeLanguageTag(subtitle.language)}
             label={languageDisplayName(subtitle.language, subtitle.label)}
             data-subtitle-id={subtitle.id}
-            onLoad={applySubtitlePreference}
+            onLoad={() => {
+              applySubtitlePreference();
+              updateCaptionOverlay();
+            }}
           />
         ))}
       </video>
@@ -3577,6 +3707,12 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           if (playbackIntentRef.current) requestVideoPlay();
         }}
       />
+
+      {captionLines.length > 0 && (
+        <div className="player-caption-layer" role="region" aria-label="Subtitles" aria-live="off">
+          {captionLines.map((line, index) => <span key={`${index}-${line}`}>{line}</span>)}
+        </div>
+      )}
 
       {mobilePlayer && phase !== "ended" && (
         <div className="mobile-player-gesture-layer" aria-hidden="true">
@@ -3755,8 +3891,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                 step={0.1}
                 value={Math.min(currentTime, duration || currentTime)}
                 onPointerDown={beginTimelineScrub}
+                onPointerMove={moveTimelinePointer}
                 onInput={(event) => previewTimelineScrub(Number(event.currentTarget.value))}
-                onPointerUp={(event) => commitTimelineScrub(Number(event.currentTarget.value))}
+                onPointerUp={endTimelineScrub}
                 onPointerCancel={cancelTimelineScrub}
                 onChange={(event) => {
                   if (!scrubbingRef.current) seek(Number(event.currentTarget.value));
@@ -3797,6 +3934,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                       value={preferences.subtitleTrackId}
                       options={[{ value: "off", label: "Subtitles off" }, ...runResponse.subtitles.map((subtitle) => ({ value: subtitle.id, label: languageDisplayName(subtitle.language, subtitle.label) }))]}
                       onSelect={(value) => setPreferences((current) => ({ ...current, subtitleTrackId: value }))}
+                      onOpenChange={handleControlMenuOpenChange}
+                    />
+                  )}
+                  {hasSubtitles && preferences.subtitleTrackId !== "off" && (
+                    <PlayerControlMenu
+                      label="Subtitle timing"
+                      icon="captions"
+                      value={preferences.subtitleOffset}
+                      options={SUBTITLE_OFFSET_OPTIONS}
+                      onSelect={(value) => setPreferences((current) => ({ ...current, subtitleOffset: value }))}
                       onOpenChange={handleControlMenuOpenChange}
                     />
                   )}
@@ -3871,10 +4018,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                   max={duration || 0}
                   step={0.1}
                   value={Math.min(currentTime, duration || currentTime)}
-                  onPointerMove={handleTimelinePreview}
-                  onPointerLeave={() => setTimelinePreview(null)}
+                  onPointerMove={moveTimelinePointer}
+                  onPointerLeave={() => { if (!scrubbingRef.current) setTimelinePreview(null); }}
                   onPointerDown={beginTimelineScrub}
-                  onPointerUp={(event) => commitTimelineScrub(Number(event.currentTarget.value))}
+                  onPointerUp={endTimelineScrub}
                   onPointerCancel={cancelTimelineScrub}
                   onBlur={(event) => {
                     if (scrubbingRef.current) commitTimelineScrub(Number(event.currentTarget.value));
@@ -3926,6 +4073,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                       value={preferences.subtitleTrackId}
                       options={[{ value: "off", label: "Subtitles off" }, ...runResponse.subtitles.map((subtitle) => ({ value: subtitle.id, label: languageDisplayName(subtitle.language, subtitle.label) }))]}
                       onSelect={(value) => setPreferences((current) => ({ ...current, subtitleTrackId: value }))}
+                      onOpenChange={handleControlMenuOpenChange}
+                    />
+                  )}
+                  {hasSubtitles && preferences.subtitleTrackId !== "off" && (
+                    <PlayerControlMenu
+                      label="Subtitle timing"
+                      icon="captions"
+                      value={preferences.subtitleOffset}
+                      options={SUBTITLE_OFFSET_OPTIONS}
+                      onSelect={(value) => setPreferences((current) => ({ ...current, subtitleOffset: value }))}
                       onOpenChange={handleControlMenuOpenChange}
                     />
                   )}

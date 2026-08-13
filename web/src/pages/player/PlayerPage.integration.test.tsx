@@ -129,14 +129,66 @@ describe("mounted player lifecycle", () => {
     expect(screen.getByText("Mounted player regression")).toBeTruthy();
     const timeline = screen.getByRole("slider", { name: "Playback position" }) as HTMLInputElement;
     const video = view.container.querySelector("video") as HTMLVideoElement;
+    vi.spyOn(timeline, "getBoundingClientRect").mockReturnValue({
+      x: 100,
+      y: 0,
+      left: 100,
+      right: 500,
+      top: 0,
+      bottom: 16,
+      width: 400,
+      height: 16,
+      toJSON: () => ({}),
+    });
+    const dispatchTimelinePointer = (type: string, clientX: number) => {
+      const event = new MouseEvent(type, { bubbles: true, clientX });
+      Object.defineProperty(event, "pointerId", { value: 1 });
+      fireEvent(timeline, event);
+    };
     expect(video.currentTime).toBe(0);
 
-    fireEvent.pointerDown(timeline, { pointerId: 1 });
-    fireEvent.change(timeline, { target: { value: "60" } });
+    dispatchTimelinePointer("pointerdown", 100);
+    dispatchTimelinePointer("pointermove", 300);
     expect(video.currentTime).toBe(0);
-    fireEvent.pointerUp(timeline, { pointerId: 1 });
+    expect(screen.getByText("1:00")).toBeTruthy();
+    dispatchTimelinePointer("pointerup", 300);
 
     expect(video.currentTime).toBe(60);
+    view.unmount();
+  });
+
+  it("renders selected captions through the player overlay with profile timing", () => {
+    localStorage.setItem(playerPreferencesKey, JSON.stringify({
+      subtitleTrackId: "subtitle-en",
+      subtitleOffset: -0.5,
+    }));
+    const captionPlayback: ResolvedPlayback = {
+      ...playback,
+      runResponse: {
+        ...playback.runResponse,
+        resumePosition: 0,
+        subtitles: [{ id: "subtitle-en", language: "en", label: "English" }],
+      },
+    };
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={captionPlayback} />
+      </MemoryRouter>,
+    );
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    const track = view.container.querySelector("track[data-subtitle-id='subtitle-en']") as HTMLTrackElement;
+    const cue = { startTime: 10, endTime: 12, text: "<i>Early caption</i>" };
+    Object.defineProperty(track, "track", {
+      configurable: true,
+      value: { mode: "disabled", cues: { 0: cue, length: 1 } },
+    });
+
+    fireEvent.load(track);
+    video.currentTime = 9.5;
+    fireEvent.timeUpdate(video);
+
+    expect(screen.getByRole("region", { name: "Subtitles" }).textContent).toBe("Early caption");
+    expect(track.track.mode).not.toBe("showing");
     view.unmount();
   });
 

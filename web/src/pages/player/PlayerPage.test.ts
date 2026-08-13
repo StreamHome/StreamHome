@@ -34,6 +34,8 @@ import {
   shouldRetryPlaybackStall,
   shouldRetryPlaybackStartup,
   shouldResumePlaybackAfterTransport,
+  subtitleCueIsActive,
+  timelineValueFromPointer,
 } from "./PlayerPage";
 
 describe("adaptive preparation status", () => {
@@ -341,12 +343,27 @@ describe("player interaction contracts", () => {
   });
 
   it("auto-hides after inactivity unless a menu or scrub interaction is active", () => {
+    expect(shouldAutoHidePlayerControls("loading", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("playing", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("paused", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("buffering", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("recovering", false, false)).toBe(true);
     expect(shouldAutoHidePlayerControls("playing", true, false)).toBe(false);
     expect(shouldAutoHidePlayerControls("playing", false, true)).toBe(false);
+  });
+
+  it("uses one exact pointer mapping for timeline preview and seek targets", () => {
+    expect(timelineValueFromPointer(100, 100, 400, 0, 120)).toBe(0);
+    expect(timelineValueFromPointer(300, 100, 400, 0, 120)).toBe(60);
+    expect(timelineValueFromPointer(500, 100, 400, 0, 120)).toBe(120);
+    expect(timelineValueFromPointer(700, 100, 400, 0, 120)).toBe(120);
+  });
+
+  it("applies subtitle timing offsets without changing source cue timestamps", () => {
+    expect(subtitleCueIsActive(10, 12, 9.5, -0.5)).toBe(true);
+    expect(subtitleCueIsActive(10, 12, 10, 0)).toBe(true);
+    expect(subtitleCueIsActive(10, 12, 10, 0.5)).toBe(false);
+    expect(subtitleCueIsActive(10, 12, 10.5, 0.5)).toBe(true);
   });
 
   it("ignores stationary synthetic pointer events when deciding whether to reveal controls", () => {
@@ -438,10 +455,10 @@ describe("player interaction contracts", () => {
     video.append(english, spanish);
 
     applySubtitleTrackSelection(video, "en");
-    expect(englishState.mode).toBe("showing");
+    expect(englishState.mode).toBe("hidden");
     expect(spanishState.mode).toBe("disabled");
     applySubtitleTrackSelection(video, "es");
     expect(englishState.mode).toBe("disabled");
-    expect(spanishState.mode).toBe("showing");
+    expect(spanishState.mode).toBe("hidden");
   });
 });

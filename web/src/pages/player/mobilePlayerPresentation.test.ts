@@ -23,7 +23,7 @@ describe("dedicated mobile player presentation", () => {
     expect(mobilePresentation).not.toContain('className="player-volume"');
     expect(mobilePresentation).not.toContain('icon={muted ? "mute" : "volume"}');
     expect((playerPage.match(/\{hasSubtitles && \(/g) ?? [])).toHaveLength(2);
-    expect((playerPage.match(/\{hasSubtitles && preferences\.subtitleTrackId !== "off" && \(/g) ?? [])).toHaveLength(2);
+    expect((playerPage.match(/\{hasSubtitles && preferences\.subtitleTrackId !== "off" && \(/g) ?? [])).toHaveLength(4);
   });
 
   it("defines automatic locked-portrait landscape fallback, safe areas, gesture feedback, and touch tooltip suppression", () => {
@@ -114,5 +114,13 @@ describe("dedicated mobile player presentation", () => {
     expect(emberControls).toContain("box-shadow: none");
     expect(emberControls).toContain("rgba(0,0,0,.42)");
     expect(emberControls).not.toContain("rgba(15,6,3,.46)");
+  });
+
+  it("renders captions above visible controls and keeps exit actions opaque", () => {
+    expect(playerPage).toContain('className="player-caption-layer"');
+    expect(playerPage).toContain('label="Subtitle timing"');
+    expect(playerStyles).toContain('.player-view[data-controls-visible="true"]:not([data-mobile-player="true"]) .player-caption-layer');
+    expect(playerStyles).toContain('.player-view[data-controls-visible="true"][data-mobile-player="true"] .player-caption-layer');
+    expect(playerStyles).toContain('background: color-mix(in srgb, var(--player-control) 92%, black 8%)');
   });
 });
