@@ -79,7 +79,7 @@ describe("dedicated mobile player presentation", () => {
     expect(playerPage).toContain('className="player-last-frame"');
     expect(playerPage).toContain('data-frame-hold={holdLastFrame ? "true" : "false"}');
     expect(playerPage).toContain("captureLastFrame(true)");
-    expect(playerPage).toContain("mergePlaybackRunMetadata(active, refreshed)");
+    expect(playerPage).toContain("mergePlaybackRunMetadata(active, refreshed, acceptFirstTransport)");
     expect(playerPage).toContain("shouldAcceptObservedPlaybackTime(");
     expect(playerStyles).toContain('.player-view[data-frame-hold="true"] .player-last-frame');
   });
@@ -116,6 +116,8 @@ describe("dedicated mobile player presentation", () => {
     expect(emberControls).not.toContain("rgba(15,6,3,.46)");
     expect(playerStyles).toContain('.player-view[data-player-theme="terminal"] .player-control-menu__list');
     expect(playerStyles).toContain('background: linear-gradient(to top, rgba(0, 0, 0, 0.94)');
+    expect(applicationStyles).toContain('@media (max-height: 420px) and (min-width: 641px)');
+    expect(applicationStyles).toContain('.player-controls__transport { margin-top: .35rem; flex-wrap: nowrap; gap: .35rem; }');
   });
 
   it("renders captions above visible controls and keeps exit actions opaque", () => {

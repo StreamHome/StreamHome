@@ -695,6 +695,7 @@ class DownloadQueueManager:
                     task_id=task_id, video_url=video_url, audio_url=audio_url,
                     headers=headers, output_path=output_abs_path, duration_secs=duration_secs,
                     video_source_type=video_source_type, audio_source_type=audio_source_type,
+                    audio_timeline_offset=float(probe_res.get("audio_timeline_offset") or 0.0),
                 )
                 
                 if success:

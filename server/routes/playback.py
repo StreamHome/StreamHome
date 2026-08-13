@@ -101,6 +101,8 @@ class PlaybackTrack(APIModel):
     direct_url: Optional[str] = None
     ready: bool
     status: Literal["idle", "preparing", "streamable", "ready", "failed"]
+    timeline_offset: float = 0.0
+    duration: float = 0.0
 
 
 class PlaybackRendition(APIModel):
@@ -628,6 +630,8 @@ def track_contract(media_obj: Any, media_id: str, fingerprint: str, encoded_tick
             direct_url=direct_url,
             ready=ready,
             status=effective_status,
+            timeline_offset=float(source_item.get("timelineOffset") or 0.0),
+            duration=max(0.0, float(source_item.get("duration") or 0.0)),
         ))
     return result
 

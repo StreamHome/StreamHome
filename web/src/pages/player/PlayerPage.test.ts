@@ -14,6 +14,7 @@ import {
   clampGrowingPlaybackTime,
   clampPlaybackTime,
   externalAudioSyncPlan,
+  externalAudioShouldPlay,
   isMeaningfulPointerActivity,
   initialPlaybackMode,
   isPlaybackTimeSeekable,
@@ -322,7 +323,7 @@ describe("player interaction contracts", () => {
     expect(mergePlaybackRunMetadata(active, refreshed)).toEqual(refreshed);
   });
 
-  it("accepts a newly ready manifest instead of preserving an initial null URL", () => {
+  it("preserves the mounted progressive transport unless replacement is explicitly accepted", () => {
     const active = {
       runId: "run-1",
       sourceFingerprint: "fingerprint-a",
@@ -339,7 +340,8 @@ describe("player interaction contracts", () => {
       progressiveUrl: "/progressive?ticket=ready",
     };
 
-    expect(mergePlaybackRunMetadata(active, refreshed)).toEqual(refreshed);
+    expect(mergePlaybackRunMetadata(active, refreshed).manifestUrl).toBeNull();
+    expect(mergePlaybackRunMetadata(active, refreshed, true)).toEqual(refreshed);
   });
 
   it("auto-hides only during uninterrupted playing", () => {
@@ -394,15 +396,19 @@ describe("player interaction contracts", () => {
     expect(shouldRetryPlaybackStall(true, HTMLMediaElement.HAVE_FUTURE_DATA, 0)).toBe(false);
   });
 
-  it("keeps external audio at the selected speed and reserves hard seeks for explicit synchronization", () => {
+  it("keeps external audio at the selected speed and corrects persistent drift above 80ms", () => {
     expect(externalAudioSyncPlan(30, 30.05, 1)).toEqual({ seekTime: null, playbackRate: 1 });
     expect(externalAudioSyncPlan(30, 29.95, 1)).toEqual({ seekTime: null, playbackRate: 1 });
-    expect(externalAudioSyncPlan(30, 29.7, 1)).toEqual({ seekTime: null, playbackRate: 1 });
-    expect(externalAudioSyncPlan(30, 30.3, 1)).toEqual({ seekTime: null, playbackRate: 1 });
-    expect(externalAudioSyncPlan(30, 29.2, 1)).toEqual({ seekTime: null, playbackRate: 1 });
-    expect(externalAudioSyncPlan(30, 30.8, 1)).toEqual({ seekTime: null, playbackRate: 1 });
-    expect(externalAudioSyncPlan(30, 28.5, 1)).toEqual({ seekTime: null, playbackRate: 1 });
+    expect(externalAudioSyncPlan(30, 29.7, 1)).toEqual({ seekTime: 30, playbackRate: 1 });
+    expect(externalAudioSyncPlan(30, 30.3, 1)).toEqual({ seekTime: 30, playbackRate: 1 });
+    expect(externalAudioSyncPlan(30, 29.2, 1)).toEqual({ seekTime: 30, playbackRate: 1 });
+    expect(externalAudioSyncPlan(30, 30.8, 1)).toEqual({ seekTime: 30, playbackRate: 1 });
+    expect(externalAudioSyncPlan(30, 28.5, 1)).toEqual({ seekTime: 30, playbackRate: 1 });
     expect(externalAudioSyncPlan(30, 30.05, 1, true)).toEqual({ seekTime: 30, playbackRate: 1 });
+    expect(externalAudioShouldPlay(0.3, 0.478)).toBe(false);
+    expect(externalAudioShouldPlay(0.4, 0.478)).toBe(false);
+    expect(externalAudioShouldPlay(0.478, 0.478)).toBe(true);
+    expect(externalAudioShouldPlay(0, -0.478)).toBe(true);
   });
 
   it("keeps the complete runtime stable while an adaptive playlist grows", () => {

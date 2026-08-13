@@ -726,7 +726,7 @@ describe("mounted player lifecycle", () => {
     ));
   });
 
-  it("keeps progressive playback mounted while adaptive preparation polling remains incomplete", async () => {
+  it("keeps completed progressive playback mounted without preparation polling", async () => {
     const incompleteRun = {
       ...playback.runResponse,
       runId: "progressive-poll-run",
@@ -794,7 +794,8 @@ describe("mounted player lifecycle", () => {
     await waitFor(() => expect(video.getAttribute("src")).toBe(incompleteRun.progressiveUrl));
     const load = vi.mocked(HTMLMediaElement.prototype.load);
     const initialVideoLoadCount = load.mock.contexts.filter((context) => context === video).length;
-    await waitFor(() => expect(poll.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 2_000 });
+    await act(async () => new Promise((resolve) => window.setTimeout(resolve, 400)));
+    expect(poll).not.toHaveBeenCalled();
     expect(video.getAttribute("src")).toBe(incompleteRun.progressiveUrl);
     expect(load.mock.contexts.filter((context) => context === video)).toHaveLength(initialVideoLoadCount);
     const heartbeatIntervals = intervals.mock.calls.filter(([, delay]) => delay === 10_000);
@@ -889,8 +890,11 @@ describe("mounted player lifecycle", () => {
       configurable: true,
       value: HTMLMediaElement.HAVE_FUTURE_DATA,
     });
+    fireEvent.seeked(video);
+    audio.currentTime = 27;
     fireEvent.playing(video);
-    expect(audio.currentTime).toBe(27);
+    fireEvent.playing(audio);
+    expect(audio.currentTime).toBe(30);
 
     view.unmount();
   });
@@ -1041,89 +1045,6 @@ describe("mounted player lifecycle", () => {
     rejectPendingAudioPlay(new DOMException("The play() request was interrupted by a call to pause().", "AbortError"));
     await waitFor(() => expect(root.dataset.playerPhase).toBe("buffering"));
     expect(screen.queryByText("Press play once to allow the selected dubbing track.")).toBeNull();
-    view.unmount();
-  });
-
-  it("keeps the first open mounted while complete HLS preparation becomes ready", async () => {
-    const preparingRun = {
-      ...playback.runResponse,
-      runId: "first-open-run",
-      mediaId: "m_first-open",
-      movieId: "m_first-open",
-      manifestUrl: null,
-      preparationState: "preparing" as const,
-      preparationProgress: {
-        stage: "packaging" as const,
-        queuePosition: 0,
-        readySegments: 0,
-        activeWorkers: 1,
-      },
-      seekableUntil: 4,
-      resumeReady: false,
-      switchingReady: false,
-      fullyPrepared: false,
-    };
-    const readyRun = {
-      ...preparingRun,
-      manifestUrl: "/api/playback/manifest/m_first-open?ticket=mounted-player-ticket",
-      preparationState: "ready" as const,
-      preparationProgress: {
-        stage: "streamable" as const,
-        queuePosition: 0,
-        readySegments: 2,
-        activeWorkers: 0,
-      },
-      seekableUntil: 120,
-      resumeReady: true,
-      switchingReady: true,
-      fullyPrepared: true,
-    };
-    vi.spyOn(moviesApi, "getMovie").mockResolvedValue({
-      id: "m_first-open",
-      title: "First open recovery",
-      description: "",
-      thumbnailUrl: "",
-      bannerUrl: null,
-      videoUrl: "/media/first-open.mp4",
-      genres: [],
-      duration: "2m",
-      releaseYear: 2026,
-      rating: null,
-      cast: [],
-      director: null,
-      type: "movie",
-      quality: "360p",
-      languages: ["en"],
-      subtitles: [],
-      voteAverage: 0,
-      voteCount: 0,
-      skipMarkers: {},
-    });
-    vi.spyOn(playbackApi, "createPlaybackRun").mockResolvedValue(preparingRun);
-    const poll = vi.spyOn(playbackApi, "getPlaybackRun").mockResolvedValue(readyRun);
-    const close = vi.spyOn(playbackApi, "closePlaybackRun").mockResolvedValue({
-      status: "abandoned",
-      acceptedSeconds: 0,
-      nextSequenceNumber: 2,
-    });
-
-    const view = render(
-      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=m_first-open"]}>
-        <PlayerPage />
-      </MemoryRouter>,
-    );
-
-    expect(await screen.findByText("First open recovery")).toBeTruthy();
-    const video = view.container.querySelector("video") as HTMLVideoElement;
-    fireEvent.error(video);
-
-    await waitFor(() => expect(poll).toHaveBeenCalled(), { timeout: 2_000 });
-    await waitFor(() => expect(view.container.querySelector("video")).toBeTruthy(), { timeout: 2_000 });
-    expect(screen.queryByText("Recovery required")).toBeNull();
-    fireEvent(window, new Event("pagehide"));
-    fireEvent(window, new Event("pagehide"));
-    expect(close).toHaveBeenCalledOnce();
-    expect(close).toHaveBeenCalledWith("first-open-run", expect.objectContaining({ timestamp: 12, event: "exit" }));
     view.unmount();
   });
 

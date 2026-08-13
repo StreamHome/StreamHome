@@ -220,6 +220,7 @@ async def download_and_merge(
     video_source_type: str = "auto",
     audio_source_type: str = "auto",
     preview_enabled: bool = True,
+    audio_timeline_offset: float = 0.0,
 ) -> tuple[bool, Optional[IngestionFailure]]:
     """Download video/audio streams, merge losslessly, inject headers, track progress."""
     
@@ -257,9 +258,20 @@ async def download_and_merge(
 
     def build_command(include_preview: bool) -> list[str]:
         command = list(input_cmd)
+        if audio_url:
+            audio_filters: list[str] = []
+            if audio_timeline_offset > 0:
+                audio_filters.append(f"adelay={round(audio_timeline_offset * 1000)}:all=1")
+            elif audio_timeline_offset < 0:
+                audio_filters.extend([f"atrim=start={abs(audio_timeline_offset):.6f}", "asetpts=PTS-STARTPTS"])
+            audio_filters.append("aresample=async=1:first_pts=0")
+            if duration_secs > 0:
+                audio_filters.extend(["apad", f"atrim=duration={duration_secs:.6f}"])
+            split = "asplit=2[preview_external_audio][final_external_audio]" if include_preview and preview_dir is not None else "anull[final_external_audio]"
+            command.extend(["-filter_complex", f"[1:a:0]{','.join(audio_filters)},{split}"])
         if include_preview and preview_dir is not None:
             command.extend(["-map", "0:v:0"])
-            command.extend(["-map", "1:a:0"] if audio_url else ["-map", "0:a:0?"])
+            command.extend(["-map", "[preview_external_audio]"] if audio_url else ["-map", "0:a:0?"])
             command.extend([
                 "-vf", "scale=-2:min(720\\,ih)",
                 "-c:v", "libx264",
@@ -285,7 +297,7 @@ async def download_and_merge(
             command.extend([
                 "-map", "0:v:0",
                 "-map", "0:a?",
-                "-map", "1:a:0",
+                "-map", "[final_external_audio]",
                 "-map", "0:s?",
                 "-map_metadata", "0",
                 "-map_chapters", "0",

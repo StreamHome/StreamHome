@@ -23,7 +23,47 @@ from services.state import register_process, unregister_process
 HLS_FALLBACK_FAILURES = {"INVALID_MEDIA_SOURCE", "MEDIA_PROBE_FAILED", "FFMPEG_OPTION_UNSUPPORTED"}
 
 
-def merge_local_external_audio(file_path: str, retained_audio: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+        return parsed if parsed == parsed and abs(parsed) != float("inf") else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _probe_local_audio_timing(file_path: str) -> dict[str, Any]:
+    ffprobe_path = shutil.which("ffprobe") or r"C:\ffmpeg\bin\ffprobe.exe"
+    try:
+        result = subprocess.run(
+            [
+                ffprobe_path, "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=start_time,duration,time_base:format=duration",
+                "-of", "json", file_path,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0:
+            return {}
+        payload = json.loads(result.stdout)
+        stream = next(iter(payload.get("streams") or []), {})
+        return {
+            "startTime": _finite_float(stream.get("start_time")),
+            "duration": max(0.0, _finite_float(stream.get("duration"), _finite_float((payload.get("format") or {}).get("duration")))),
+            "timeBase": str(stream.get("time_base") or ""),
+        }
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return {}
+
+
+def merge_local_external_audio(
+    file_path: str,
+    retained_audio: list[dict[str, Any]],
+    video_start_time: float = 0.0,
+) -> list[dict[str, Any]]:
     """Refresh application-owned local dubbing sidecars without re-probing the video."""
 
     embedded_audio = [dict(item) for item in retained_audio if str(item.get("source") or "embedded").lower() != "external"]
@@ -36,6 +76,11 @@ def merge_local_external_audio(file_path: str, retained_audio: list[dict[str, An
             if os.path.isfile(path) and os.path.splitext(path)[1].lower() in EXTERNAL_AUDIO_EXTENSIONS
         )
         embedded_by_language = {str(item.get("language") or "und"): item for item in embedded_audio}
+        retained_external_by_name = {
+            str(item.get("fileName") or ""): item
+            for item in retained_audio
+            if str(item.get("source") or "embedded").lower() == "external"
+        }
         external_languages: set[str] = set()
         refreshed = list(embedded_audio)
         for external_path in external_files:
@@ -45,6 +90,16 @@ def merge_local_external_audio(file_path: str, retained_audio: list[dict[str, An
             external_languages.add(language)
             existing = embedded_by_language.get(language)
             file_stat = os.stat(external_path)
+            retained = retained_external_by_name.get(os.path.basename(external_path), {})
+            timing = (
+                retained
+                if int(retained.get("fileSize") or -1) == file_stat.st_size
+                and int(retained.get("modifiedAt") or -1) == file_stat.st_mtime_ns
+                and "timelineOffset" in retained
+                and "duration" in retained
+                else _probe_local_audio_timing(external_path)
+            )
+            start_time = _finite_float(timing.get("startTime"))
             external_item = {
                 "index": 0,
                 "streamIndex": 0,
@@ -57,6 +112,10 @@ def merge_local_external_audio(file_path: str, retained_audio: list[dict[str, An
                 "fileName": os.path.basename(external_path),
                 "fileSize": file_stat.st_size,
                 "modifiedAt": file_stat.st_mtime_ns,
+                "startTime": start_time,
+                "duration": max(0.0, _finite_float(timing.get("duration"))),
+                "timeBase": str(timing.get("timeBase") or ""),
+                "timelineOffset": start_time - video_start_time,
             }
             refreshed.append(external_item)
 
@@ -102,7 +161,7 @@ async def probe_media_stream(
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type,height,width:format=format_name",
+            "stream=codec_type,height,width,start_time,duration,time_base:format=format_name,duration",
             "-of",
             "json",
         ]
@@ -159,6 +218,8 @@ async def probe_media_stream(
             # Find the max height among video streams
             heights = [int(s.get("height", 0)) for s in streams if s.get("codec_type") == "video" and s.get("height")]
             max_height = max(heights) if heights else 0
+            video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+            audio_stream = next((stream for stream in streams if stream.get("codec_type") == "audio"), {})
             
             return {
                 "has_video": has_video,
@@ -167,6 +228,9 @@ async def probe_media_stream(
                 "source_type": detected_source_type,
                 "diagnostics": "",
                 "failure": None,
+                "start_time": _finite_float((video_stream if has_video else audio_stream).get("start_time")),
+                "duration": max(0.0, _finite_float((video_stream if has_video else audio_stream).get("duration"), _finite_float((data.get("format") or {}).get("duration")))),
+                "time_base": str((video_stream if has_video else audio_stream).get("time_base") or ""),
             }
             
         except Exception as e:
@@ -250,6 +314,11 @@ async def probe_media_stream(
         "scan_quality": quality,
         "video_source_type": video_res.get("source_type", normalize_source_type(video_source_type)),
         "audio_source_type": audio_res.get("source_type", normalize_source_type(audio_source_type)),
+        "video_start_time": _finite_float(video_res.get("start_time")),
+        "audio_start_time": _finite_float(audio_res.get("start_time")),
+        "audio_timeline_offset": _finite_float(audio_res.get("start_time")) - _finite_float(video_res.get("start_time")) if audio_url else 0.0,
+        "video_duration": max(0.0, _finite_float(video_res.get("duration"))),
+        "audio_duration": max(0.0, _finite_float(audio_res.get("duration"))),
         "failure": failure,
     }
 
@@ -304,7 +373,7 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
     
     cmd = [
         ffprobe_path, "-v", "error",
-        "-show_entries", "format=duration,format_name:stream=index,codec_type,codec_name,width,height,r_frame_rate,channels:stream_tags=language,title:stream_disposition=default",
+        "-show_entries", "format=duration,format_name:stream=index,codec_type,codec_name,width,height,r_frame_rate,channels,start_time,duration,time_base:stream_tags=language,title:stream_disposition=default",
         "-of", "json", file_path
     ]
     
@@ -359,12 +428,14 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
                     frame_rate = float(r_fr)
                 except ValueError:
                     pass
+        video_start_time = _finite_float(video_streams[0].get("start_time")) if video_streams else 0.0
         
         audio_meta = []
         for idx, a in enumerate(audio_streams):
             tags = a.get("tags", {})
             lang = normalize_language_tag(tags.get("language"))
             channels = int(a.get("channels") or 2)
+            start_time = _finite_float(a.get("start_time"))
             audio_meta.append({
                 "index": idx,
                 "streamIndex": int(a.get("index", idx)),
@@ -373,11 +444,15 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
                 "label": language_label(lang, tags.get("title")),
                 "channels": channels,
                 "default": bool((a.get("disposition") or {}).get("default")),
+                "startTime": start_time,
+                "duration": max(0.0, _finite_float(a.get("duration"), duration)),
+                "timeBase": str(a.get("time_base") or ""),
+                "timelineOffset": start_time - video_start_time,
             })
 
         # Explicit external dubbing coexists with embedded tracks. Presentation order
         # must not erase the source stream identity used by FFmpeg mapping.
-        audio_meta = merge_local_external_audio(file_path, audio_meta)
+        audio_meta = merge_local_external_audio(file_path, audio_meta, video_start_time)
         stream_manifest = [
             {
                 "index": int(stream.get("index", position)),
@@ -386,6 +461,9 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
                 "language": normalize_language_tag((stream.get("tags") or {}).get("language")),
                 "title": str((stream.get("tags") or {}).get("title") or ""),
                 "default": bool((stream.get("disposition") or {}).get("default")),
+                "startTime": _finite_float(stream.get("start_time")),
+                "duration": max(0.0, _finite_float(stream.get("duration"), duration)),
+                "timeBase": str(stream.get("time_base") or ""),
             }
             for position, stream in enumerate(streams)
         ]
@@ -453,6 +531,10 @@ async def probe_cloud_external_audio(cloud_video_path: str, embedded_audio: list
             "fileName": file_name,
             "fileSize": int(item.get("Size") or 0),
             "modifiedAt": str(item.get("ModTime") or ""),
+            "startTime": 0.0,
+            "duration": 0.0,
+            "timeBase": "",
+            "timelineOffset": 0.0,
         })
     if merged and not any(item.get("default") for item in merged):
         merged[0]["default"] = True

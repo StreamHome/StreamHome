@@ -561,12 +561,36 @@ class PlaybackPipelineRegression(unittest.TestCase):
             [item.get("fileName") for item in probe["audio_metadata"]],
             [None, None, "eng.mp3", "tur.mp3"],
         )
+        self.assertTrue(all("timelineOffset" in item for item in probe["audio_metadata"]))
+        self.assertTrue(all("duration" in item for item in probe["audio_metadata"]))
         refreshed = merge_local_external_audio(str(sidecar_video), [{"index": 0, "language": "en", "default": True}])
         self.assertEqual([item["language"] for item in refreshed], ["en", "en", "tr"])
         self.assertEqual(
             [item.get("source", "embedded") for item in refreshed],
             ["embedded", "external", "external"],
         )
+        english_stat = (audio_directory / "eng.mp3").stat()
+        retained_without_timing = [
+            {"index": 0, "language": "en", "default": True},
+            {
+                "source": "external",
+                "fileName": "eng.mp3",
+                "fileSize": english_stat.st_size,
+                "modifiedAt": english_stat.st_mtime_ns,
+                "language": "en",
+            },
+        ]
+        with patch(
+            "services.media_probe._probe_local_audio_timing",
+            return_value={"startTime": 0.478, "duration": 1.0, "timeBase": "1/48000"},
+        ) as timing_probe:
+            refreshed_legacy = merge_local_external_audio(str(sidecar_video), retained_without_timing)
+        english_external = next(
+            item for item in refreshed_legacy
+            if item.get("source") == "external" and item.get("fileName") == "eng.mp3"
+        )
+        self.assertGreaterEqual(timing_probe.call_count, 1)
+        self.assertAlmostEqual(english_external["timelineOffset"], 0.478, places=3)
         with (audio_directory / "tur.mp3").open("ab") as handle:
             handle.write(b"\0")
         second_source = asyncio.run(resolve_media_source(catalog_path, check_cloud=False))
@@ -685,13 +709,15 @@ class PlaybackPipelineRegression(unittest.TestCase):
             )
             self.assertEqual(set(reused), {"video_original", audio_rendition_name})
 
-            master = asyncio.run(
-                service.rebuild_master(
-                    "m_verified_optimization",
-                    target_fingerprint,
-                    media,
+            with patch.object(service, "_verify_master_timeline") as verify_timeline:
+                master = asyncio.run(
+                    service.rebuild_master(
+                        "m_verified_optimization",
+                        target_fingerprint,
+                        media,
+                    )
                 )
-            )
+            verify_timeline.assert_called_once()
             self.assertIsNotNone(master)
             master_text = master.read_text(encoding="utf-8")
             self.assertIn("video_original/playlist.m3u8", master_text)
@@ -752,37 +778,31 @@ class PlaybackPipelineRegression(unittest.TestCase):
 
             self.assertEqual(context.exception.code, "RENDITION_VERIFICATION_FAILED")
 
-    def test_audio_verification_rejects_an_offset_from_verified_video(self) -> None:
+    def test_master_verification_rejects_an_offset_regardless_of_completion_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory)
-            target = cache / "audio_embedded_0_contract_en"
-            video = cache / "video_original"
-            target.mkdir()
-            video.mkdir()
-            (target / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
-            (video / "playlist.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
-            (video / VIDEO_VERIFIED_MARKER).write_text("1", encoding="utf-8")
             audio_probe = SimpleNamespace(
                 returncode=0,
-                stdout=(
-                    '{"streams":[{"codec_type":"audio","codec_name":"aac",'
-                    '"profile":"LC","sample_rate":"48000","channels":2,"start_time":"0.000000"}]}'
-                ),
+                stdout='{"streams":[{"codec_type":"audio","start_time":"0.000000","duration":"10.0"}],"format":{"duration":"10.0"}}',
                 stderr="",
             )
             video_probe = SimpleNamespace(
                 returncode=0,
-                stdout='{"streams":[{"codec_type":"video","start_time":"1.000000"}]}',
+                stdout='{"streams":[{"codec_type":"video","start_time":"1.000000","duration":"10.0"}],"format":{"duration":"10.0"}}',
                 stderr="",
             )
             with (
                 patch("services.playback_prep.shutil.which", return_value="ffprobe"),
-                patch("services.playback_prep.subprocess.run", side_effect=[audio_probe, video_probe]),
+                patch("services.playback_prep.subprocess.run", side_effect=[video_probe, audio_probe]),
                 self.assertRaises(PlaybackPreparationError) as context,
             ):
-                PlaybackPrepService()._verify_rendition_output(target, "audio_embedded_0_contract_en")
+                PlaybackPrepService()._verify_master_timeline(
+                    cache,
+                    [SimpleNamespace(name="video_original")],
+                    [SimpleNamespace(name="audio_embedded_0_contract_en")],
+                )
 
-            self.assertEqual(context.exception.code, "RENDITION_VERIFICATION_FAILED")
+            self.assertEqual(context.exception.code, "RENDITION_TIMELINE_MISMATCH")
 
     def test_cloud_external_dubbing_uses_the_same_language_contract(self) -> None:
         response = SimpleNamespace(

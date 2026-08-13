@@ -488,6 +488,8 @@ export interface PlaybackAudioTrack {
   directUrl?: string | null;
   ready: boolean;
   status: PlaybackRenditionStatus;
+  timelineOffset?: number;
+  duration?: number;
 }
 
 export interface PlaybackSourceMetadata {

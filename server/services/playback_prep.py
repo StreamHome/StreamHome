@@ -28,10 +28,12 @@ PLAYLIST_NAME = "playlist.m3u8"
 MASTER_NAME = "master.m3u8"
 COMPLETE_MARKER = ".complete"
 VIDEO_VERIFIED_MARKER = ".verified-v1"
-AUDIO_VERIFIED_MARKER = ".verified-audio-v2"
+AUDIO_VERIFIED_MARKER = ".verified-audio-v3"
 FOREGROUND_PRIORITY = 0
 BACKGROUND_PRIORITY = 100
 FAST_HLS_VIDEO_CODECS = {"avc", "avc1", "h264"}
+MAX_HLS_START_DELTA_SECONDS = 0.1
+MAX_HLS_END_DELTA_SECONDS = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +57,8 @@ class AudioRendition:
     codec: str = ""
     source: str = "embedded"
     file_name: Optional[str] = None
+    timeline_offset: float = 0.0
+    duration: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -343,6 +347,8 @@ class PlaybackPrepService:
                     codec=str(item.get("codec") or "").lower(),
                     source=source_kind,
                     file_name=file_name,
+                    timeline_offset=float(item.get("timelineOffset") or 0.0),
+                    duration=max(0.0, float(item.get("duration") or 0.0)),
                 )
             )
         return renditions
@@ -460,46 +466,6 @@ class PlaybackPrepService:
                     "RENDITION_VERIFICATION_FAILED",
                     "The prepared adaptive audio does not match the AAC-LC 48 kHz stereo contract.",
                 )
-            verified_video_playlists = sorted(
-                directory / PLAYLIST_NAME
-                for directory in target_dir.parent.glob("video_*")
-                if (directory / VIDEO_VERIFIED_MARKER).is_file() and (directory / PLAYLIST_NAME).is_file()
-            )
-            if verified_video_playlists:
-                video_probe = subprocess.run(
-                    [
-                        ffprobe,
-                        "-v", "error",
-                        "-show_entries", "stream=codec_type,start_time",
-                        "-of", "json",
-                        str(verified_video_playlists[0]),
-                    ],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                )
-                if video_probe.returncode != 0:
-                    raise PlaybackPreparationError(
-                        "RENDITION_VERIFICATION_FAILED",
-                        "FFprobe could not compare the prepared adaptive audio and video timelines.",
-                    )
-                try:
-                    video_streams = json.loads(video_probe.stdout).get("streams", [])
-                    video_stream = next(stream for stream in video_streams if str(stream.get("codec_type")) == "video")
-                    audio_start = float(audio_stream["start_time"])
-                    video_start = float(video_stream["start_time"])
-                except (json.JSONDecodeError, AttributeError, KeyError, StopIteration, TypeError, ValueError) as exc:
-                    raise PlaybackPreparationError(
-                        "RENDITION_VERIFICATION_FAILED",
-                        "FFprobe returned incomplete adaptive timeline metadata.",
-                    ) from exc
-                if abs(audio_start - video_start) > 0.25:
-                    raise PlaybackPreparationError(
-                        "RENDITION_VERIFICATION_FAILED",
-                        "The prepared adaptive audio and video timelines do not share a safe start position.",
-                    )
             ffmpeg = shutil.which("ffmpeg")
             if not ffmpeg:
                 raise PlaybackPreparationError(
@@ -1291,7 +1257,7 @@ class PlaybackPrepService:
         arguments = [
             "-map", "0:v:0",
             "-an",
-            "-vf", f"scale={rendition.width}:{rendition.height}:force_original_aspect_ratio=decrease,pad={rendition.width}:{rendition.height}:(ow-iw)/2:(oh-ih)/2",
+            "-vf", f"setpts=PTS-STARTPTS,scale={rendition.width}:{rendition.height}:force_original_aspect_ratio=decrease,pad={rendition.width}:{rendition.height}:(ow-iw)/2:(oh-ih)/2",
             "-c:v", "libx264",
             "-preset", "veryfast",
             "-profile:v", "high",
@@ -1362,11 +1328,20 @@ class PlaybackPrepService:
         rendition: AudioRendition,
         media_obj: Any,
     ) -> None:
-        def normalized_audio_arguments(stream_map: str) -> list[str]:
+        def normalized_audio_arguments(stream_map: str, timeline_offset: float = 0.0) -> list[str]:
+            filters: list[str] = []
+            if timeline_offset > 0:
+                filters.append(f"adelay={round(timeline_offset * 1000)}:all=1")
+            elif timeline_offset < 0:
+                filters.extend([f"atrim=start={abs(timeline_offset):.6f}", "asetpts=PTS-STARTPTS"])
+            filters.append("aresample=async=1:first_pts=0")
+            media_duration = max(0.0, float(getattr(media_obj, "probed_duration", 0.0) or 0.0))
+            if media_duration > 0:
+                filters.extend(["apad", f"atrim=duration={media_duration:.6f}"])
             return [
                 "-map", stream_map,
                 "-vn",
-                "-af", "aresample=async=1:first_pts=0",
+                "-af", ",".join(filters),
                 "-c:a", "aac",
                 "-profile:a", "aac_low",
                 "-b:a", "192k",
@@ -1376,7 +1351,7 @@ class PlaybackPrepService:
 
         external_source = self._external_audio_source(source, rendition, self._external_audio_path(source, rendition))
         if external_source:
-            arguments = normalized_audio_arguments("0:a:0")
+            arguments = normalized_audio_arguments("0:a:0", rendition.timeline_offset)
             await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, external_source, arguments, media_obj)
             return
         stream_map = (
@@ -1416,6 +1391,57 @@ class PlaybackPrepService:
         except (OSError, ValueError, ZeroDivisionError):
             return None
 
+    def _probe_playlist_timeline(self, playlist: Path, expected_type: str) -> tuple[float, float]:
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            raise PlaybackPreparationError("FFPROBE_UNAVAILABLE", "FFprobe is required to verify adaptive playback output.")
+        result = subprocess.run(
+            [
+                ffprobe, "-v", "error",
+                "-show_entries", "stream=codec_type,start_time,duration:format=duration",
+                "-of", "json", str(playlist),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0:
+            raise PlaybackPreparationError(
+                "RENDITION_VERIFICATION_FAILED",
+                "FFprobe could not compare the prepared adaptive timelines.",
+            )
+        try:
+            payload = json.loads(result.stdout)
+            stream = next(item for item in payload.get("streams", []) if str(item.get("codec_type")) == expected_type)
+            start = float(stream.get("start_time") or 0.0)
+            duration = float(stream.get("duration") or (payload.get("format") or {}).get("duration") or 0.0)
+        except (json.JSONDecodeError, AttributeError, StopIteration, TypeError, ValueError) as exc:
+            raise PlaybackPreparationError(
+                "RENDITION_VERIFICATION_FAILED",
+                "FFprobe returned incomplete adaptive timeline metadata.",
+            ) from exc
+        return start, start + max(0.0, duration)
+
+    def _verify_master_timeline(self, cache_path: Path, videos: list[VideoRendition], audios: list[AudioRendition]) -> None:
+        if not videos or not audios:
+            return
+        video_timelines = [self._probe_playlist_timeline(cache_path / item.name / PLAYLIST_NAME, "video") for item in videos]
+        audio_timelines = [self._probe_playlist_timeline(cache_path / item.name / PLAYLIST_NAME, "audio") for item in audios]
+        for video_start, video_end in video_timelines:
+            for audio_start, audio_end in audio_timelines:
+                if abs(audio_start - video_start) > MAX_HLS_START_DELTA_SECONDS:
+                    raise PlaybackPreparationError(
+                        "RENDITION_TIMELINE_MISMATCH",
+                        "Prepared adaptive audio and video do not share the canonical playback epoch.",
+                    )
+                if video_end > video_start and audio_end > audio_start and abs(audio_end - video_end) > MAX_HLS_END_DELTA_SECONDS:
+                    raise PlaybackPreparationError(
+                        "RENDITION_TIMELINE_MISMATCH",
+                        "Prepared adaptive audio and video do not share the canonical playback duration.",
+                    )
+
     async def rebuild_master(self, media_id: str, fingerprint: str, media_obj: Any) -> Optional[Path]:
         cache_path = self.cache_path(media_id, fingerprint)
         lock_key = f"{media_id}:{fingerprint}"
@@ -1426,6 +1452,7 @@ class PlaybackPrepService:
             if not videos:
                 (cache_path / MASTER_NAME).unlink(missing_ok=True)
                 return None
+            await asyncio.to_thread(self._verify_master_timeline, cache_path, videos, audios)
 
             lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
             measured_audio = [
