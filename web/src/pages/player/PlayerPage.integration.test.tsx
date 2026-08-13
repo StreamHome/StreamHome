@@ -497,6 +497,42 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
+  it("hides idle playing controls while recurring media updates continue", () => {
+    vi.useFakeTimers();
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={playback} />
+      </MemoryRouter>,
+    );
+    const root = view.container.querySelector("[data-player-root='true']") as HTMLElement;
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA });
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 12 });
+    fireEvent.loadedMetadata(video);
+    fireEvent.play(video);
+    fireEvent.playing(video);
+    fireEvent.timeUpdate(video);
+    expect(root.dataset.playerPhase).toBe("playing");
+
+    fireEvent.mouseMove(root, { clientX: 20, clientY: 20 });
+    fireEvent.mouseMove(root, { clientX: 21, clientY: 20 });
+    expect(root.dataset.controlsVisible).toBe("true");
+
+    for (let update = 1; update <= 4; update += 1) {
+      act(() => vi.advanceTimersByTime(750));
+      video.currentTime = 12 + update;
+      fireEvent.timeUpdate(video);
+    }
+    act(() => vi.advanceTimersByTime(1));
+
+    expect(root.dataset.playerPhase).toBe("playing");
+    expect(root.dataset.controlsVisible).toBe("false");
+    view.unmount();
+  });
+
   it("keeps an already-ready HLS quality actionable without a preparation request", async () => {
     const onDemandPlayback: ResolvedPlayback = {
       ...playback,

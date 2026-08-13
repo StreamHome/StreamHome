@@ -2556,8 +2556,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, []);
 
   const scheduleControlsHide = useCallback(() => {
-    if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
-    controlsTimerRef.current = null;
+    if (controlsTimerRef.current !== null) return;
     if (shouldAutoHidePlayerControls(phaseRef.current, controlMenuOpenRef.current, scrubbingRef.current)) {
       controlsTimerRef.current = window.setTimeout(() => {
         setControlsVisibility(false);
@@ -2567,6 +2566,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [setControlsVisibility]);
 
   const revealControls = useCallback(() => {
+    if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
+    controlsTimerRef.current = null;
     setControlsVisibility(true);
     scheduleControlsHide();
   }, [scheduleControlsHide, setControlsVisibility]);
@@ -3502,7 +3503,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             markPlaybackStartupReady();
             phaseRef.current = "playing";
             setPhase("playing");
-            scheduleControlsHide();
           }
           if (confirmedPendingSeek && playbackIntentRef.current && video.paused) requestVideoPlay();
           if (confirmedPendingSeek && pendingSeekReportRef.current) {
@@ -3546,7 +3546,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             else {
               phaseRef.current = "playing";
               setPhase("playing");
-              scheduleControlsHide();
             }
           }
         }}
