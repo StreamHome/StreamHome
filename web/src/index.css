@@ -471,13 +471,12 @@
   position: absolute;
   z-index: 25;
   inset-inline: max(1rem, env(safe-area-inset-left)) max(1rem, env(safe-area-inset-right));
-  bottom: max(2.5rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+  bottom: max(clamp(9.5rem, 20vh, 13rem), calc(env(safe-area-inset-bottom) + 1.5rem));
   display: grid;
   justify-items: center;
   gap: 0.24rem;
   pointer-events: none;
   text-align: center;
-  transition: bottom 180ms cubic-bezier(.2, 0, 0, 1);
 }
 
 .player-caption-layer > span {
@@ -494,12 +493,8 @@
   text-shadow: 0 1px 3px black;
 }
 
-.player-view[data-controls-visible="true"]:not([data-mobile-player="true"]) .player-caption-layer {
-  bottom: clamp(9.5rem, 20vh, 13rem);
-}
-
-.player-view[data-controls-visible="true"][data-mobile-player="true"] .player-caption-layer {
-  bottom: clamp(6.5rem, 25vh, 9rem);
+.player-view[data-mobile-player="true"] .player-caption-layer {
+  bottom: max(clamp(6.5rem, 25vh, 9rem), calc(env(safe-area-inset-bottom) + 1.5rem));
 }
 
 .player-view[data-player-theme="terminal"] .player-caption-layer > span {

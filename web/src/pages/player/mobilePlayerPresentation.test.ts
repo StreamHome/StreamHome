@@ -119,8 +119,10 @@ describe("dedicated mobile player presentation", () => {
   it("renders captions above visible controls and keeps exit actions opaque", () => {
     expect(playerPage).toContain('className="player-caption-layer"');
     expect(playerPage).toContain('label="Subtitle timing"');
-    expect(playerStyles).toContain('.player-view[data-controls-visible="true"]:not([data-mobile-player="true"]) .player-caption-layer');
-    expect(playerStyles).toContain('.player-view[data-controls-visible="true"][data-mobile-player="true"] .player-caption-layer');
+    expect(playerStyles).toContain('bottom: max(clamp(9.5rem, 20vh, 13rem), calc(env(safe-area-inset-bottom) + 1.5rem))');
+    expect(playerStyles).toContain('.player-view[data-mobile-player="true"] .player-caption-layer');
+    expect(playerStyles).not.toContain('[data-controls-visible="true"]:not([data-mobile-player="true"]) .player-caption-layer');
+    expect(playerStyles).not.toContain('[data-controls-visible="true"][data-mobile-player="true"] .player-caption-layer');
     expect(playerStyles).toContain('background: color-mix(in srgb, var(--player-control) 92%, black 8%)');
   });
 });

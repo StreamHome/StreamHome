@@ -192,6 +192,50 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
+  it("keeps an active caption mounted when idle playing controls hide", () => {
+    vi.useFakeTimers();
+    localStorage.setItem(playerPreferencesKey, JSON.stringify({ subtitleTrackId: "subtitle-en" }));
+    const captionPlayback: ResolvedPlayback = {
+      ...playback,
+      runResponse: {
+        ...playback.runResponse,
+        resumePosition: 0,
+        subtitles: [{ id: "subtitle-en", language: "en", label: "English" }],
+      },
+    };
+    const view = render(
+      <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
+        <PlayerPage visualFixture={captionPlayback} />
+      </MemoryRouter>,
+    );
+    const root = view.container.querySelector("[data-player-root='true']") as HTMLElement;
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    const track = view.container.querySelector("track[data-subtitle-id='subtitle-en']") as HTMLTrackElement;
+    Object.defineProperty(track, "track", {
+      configurable: true,
+      value: { mode: "disabled", cues: { 0: { startTime: 0, endTime: 120, text: "Persistent caption" }, length: 1 } },
+    });
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA });
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 1 });
+
+    fireEvent.load(track);
+    fireEvent.loadedMetadata(video);
+    fireEvent.play(video);
+    fireEvent.playing(video);
+    fireEvent.timeUpdate(video);
+    expect(screen.getByRole("region", { name: "Subtitles" }).textContent).toBe("Persistent caption");
+
+    fireEvent.mouseMove(root, { clientX: 20, clientY: 20 });
+    fireEvent.mouseMove(root, { clientX: 21, clientY: 20 });
+    act(() => vi.advanceTimersByTime(PLAYER_CONTROLS_IDLE_MS + 1));
+
+    expect(root.dataset.controlsVisible).toBe("false");
+    expect(screen.getByRole("region", { name: "Subtitles" }).textContent).toBe("Persistent caption");
+    view.unmount();
+  });
+
   it("autostarts when media becomes ready and accepts native and global playback controls", async () => {
     const view = render(
       <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
