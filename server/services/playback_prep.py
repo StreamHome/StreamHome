@@ -17,6 +17,7 @@ from typing import Any, Optional
 from config import settings
 from services.logger import logger
 from services.languages import language_label, normalize_language_tag
+from services.media_timing import canonical_audio_filter_chain
 from services.media_source import ResolvedMediaSource, playback_source_fingerprint, resolve_media_source
 from services.rclone import rclone_service
 from services.state import register_process, unregister_process
@@ -28,7 +29,7 @@ PLAYLIST_NAME = "playlist.m3u8"
 MASTER_NAME = "master.m3u8"
 COMPLETE_MARKER = ".complete"
 VIDEO_VERIFIED_MARKER = ".verified-v1"
-AUDIO_VERIFIED_MARKER = ".verified-audio-v3"
+AUDIO_VERIFIED_MARKER = ".verified-audio-v4"
 FOREGROUND_PRIORITY = 0
 BACKGROUND_PRIORITY = 100
 FAST_HLS_VIDEO_CODECS = {"avc", "avc1", "h264"}
@@ -1329,15 +1330,8 @@ class PlaybackPrepService:
         media_obj: Any,
     ) -> None:
         def normalized_audio_arguments(stream_map: str, timeline_offset: float = 0.0) -> list[str]:
-            filters: list[str] = []
-            if timeline_offset > 0:
-                filters.append(f"adelay={round(timeline_offset * 1000)}:all=1")
-            elif timeline_offset < 0:
-                filters.extend([f"atrim=start={abs(timeline_offset):.6f}", "asetpts=PTS-STARTPTS"])
-            filters.append("aresample=async=1:first_pts=0")
             media_duration = max(0.0, float(getattr(media_obj, "probed_duration", 0.0) or 0.0))
-            if media_duration > 0:
-                filters.extend(["apad", f"atrim=duration={media_duration:.6f}"])
+            filters = canonical_audio_filter_chain(timeline_offset, media_duration)
             return [
                 "-map", stream_map,
                 "-vn",
@@ -1359,7 +1353,7 @@ class PlaybackPrepService:
             if rendition.absolute_stream_index
             else f"0:a:{rendition.stream_index}"
         )
-        arguments = normalized_audio_arguments(stream_map)
+        arguments = normalized_audio_arguments(stream_map, rendition.timeline_offset)
         await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, source, arguments, media_obj)
 
     @staticmethod

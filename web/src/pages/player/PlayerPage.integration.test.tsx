@@ -311,6 +311,7 @@ describe("mounted player lifecycle", () => {
     });
     const play = vi.mocked(HTMLMediaElement.prototype.play);
     const pause = vi.mocked(HTMLMediaElement.prototype.pause);
+    const load = vi.mocked(HTMLMediaElement.prototype.load);
     play.mockImplementationOnce(() => pendingPlay).mockResolvedValue(undefined);
 
     const view = render(
@@ -328,14 +329,17 @@ describe("mounted player lifecycle", () => {
     Object.defineProperty(video, "paused", { configurable: true, value: false });
     Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 42 });
     fireEvent.timeUpdate(video);
+    const loadCountBeforePause = load.mock.calls.length;
+    const sourceBeforePause = video.getAttribute("src");
     fireEvent.click(screen.getByRole("button", { name: "Pause" }));
 
     await waitFor(() => {
       expect(root.dataset.playerPhase).toBe("paused");
-      expect(video.preload).toBe("none");
+      expect(video.preload).toBe("auto");
     });
-    video.currentTime = 0;
-    fireEvent.timeUpdate(video);
+    expect(load).toHaveBeenCalledTimes(loadCountBeforePause);
+    expect(video.getAttribute("src")).toBe(sourceBeforePause);
+    expect(video.currentTime).toBe(42);
     expect((screen.getByRole("slider", { name: "Playback position" }) as HTMLInputElement).value).toBe("42");
 
     await act(async () => {
@@ -353,14 +357,10 @@ describe("mounted player lifecycle", () => {
 
     Object.defineProperty(video, "paused", { configurable: true, value: true });
     fireEvent.click(screen.getByRole("button", { name: "Play" }));
-    expect(play).toHaveBeenCalledTimes(1);
-    fireEvent.loadedMetadata(video);
+    await waitFor(() => expect(play).toHaveBeenCalledTimes(2));
     expect(video.currentTime).toBe(42);
-    fireEvent.canPlay(video);
-    await waitFor(() => {
-      expect(video.preload).toBe("auto");
-      expect(play).toHaveBeenCalledTimes(2);
-    });
+    expect(video.getAttribute("src")).toBe(sourceBeforePause);
+    expect(load).toHaveBeenCalledTimes(loadCountBeforePause);
 
     view.unmount();
   });

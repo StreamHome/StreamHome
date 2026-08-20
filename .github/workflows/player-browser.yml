@@ -4,6 +4,11 @@ on:
   pull_request:
     paths:
       - "web/**"
+      - "server/services/ffmpeg.py"
+      - "server/services/media_timing.py"
+      - "server/services/media_probe.py"
+      - "server/services/playback_prep.py"
+      - "server/scratch/test_media_timing.py"
       - ".github/workflows/player-browser.yml"
   workflow_dispatch:
 
@@ -20,6 +25,11 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: PYTHONPATH=. python scratch/test_media_timing.py
+        working-directory: server
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run test:browser

@@ -24,7 +24,7 @@ The video element uses eager browser preloading. Local media is read directly fr
 
 ## Ready HLS quality switching
 
-If a protected HLS cache already contains a valid master, initialization fragments, playlists, and media fragments, the descriptor includes `/api/playback/manifest/{mediaId}`. A video rendition becomes ready only after FFprobe opens its completed playlist and confirms its stream. Adaptive audio is always normalized to AAC-LC, 48 kHz, stereo with repaired zero-based timestamps; FFprobe must confirm that exact contract, its start position must remain within 250 ms of a verified video rendition, and FFmpeg must decode the complete audio playlist before publication. Independently versioned audio verification invalidates legacy stream-copied audio without rebuilding verified video. The player uses hls.js or native HLS to select only verified variants.
+If a protected HLS cache already contains a valid master, initialization fragments, playlists, and media fragments, the descriptor includes `/api/playback/manifest/{mediaId}`. A video rendition becomes ready only after FFprobe opens its completed playlist and confirms its stream. Adaptive audio is always rebased to zero before one server-owned relative offset is applied, then normalized to AAC-LC, 48 kHz, stereo with asynchronous timestamp repair. FFprobe must confirm that exact contract, structural audio/video starts must remain within 100 ms, their ends must remain within 250 ms, and FFmpeg must decode the complete audio playlist before publication. The 100 ms structural allowance accommodates frame-quantized container starts; deterministic decoded content markers enforce the 80 ms semantic synchronization boundary. Independently versioned audio verification invalidates legacy audio without rebuilding verified video. The player uses hls.js or native HLS to select only verified variants.
 
 Quality clicks change the active ready HLS level. They never call a preparation endpoint and never start FFmpeg. If no ready HLS master exists, the source plays directly and unavailable qualities are not displayed.
 
@@ -40,7 +40,9 @@ Adaptive startup records transport initialization, media attachment, manifest, l
 
 Sibling files inside the title's `audio/` directory are direct playback assets. Each discovered external track receives a ticket-protected `/api/playback/source/{mediaId}?source_id=...` URL with the same range behavior as video.
 
-The web player keeps a hidden audio element synchronized with the visible video. Selecting dubbing does not replace or reload the video. Play, pause, resume, seek, playback rate, volume, mute, completion, recovery, and teardown preserve video ownership. Track activation, the newest confirmed user seek, and metadata readiness explicitly align the audio clock. Ordinary playback synchronization does not seek; severe drift of at least one second may receive one hard correction per five-second cooldown. If a sidecar cannot be decoded, the player restores the default embedded audio without changing the video position.
+The web player keeps a hidden audio element synchronized with the visible video. Selecting dubbing does not replace or reload the video. Ordinary Pause invalidates pending Play ownership and timers but does not call `load()`, change the source/preload contract, stop HLS loading, or reconstruct either media clock. Play, resume, seek, playback rate, volume, mute, completion, recovery, and teardown preserve video ownership. Track activation, the newest confirmed user seek, and metadata readiness explicitly align the audio clock. Persistent ordinary-playback drift at or above 80 ms may receive one hard correction per five-second cooldown. Every audio seek belongs to the active track, audio-source generation, transport generation, target, and deadline; stale or expired callbacks cannot settle or resume a newer transaction. If a sidecar cannot be decoded, the player restores the default embedded audio without changing the video position.
+
+Standalone dubbing files have independent container epochs. Their FFprobe `start_time` is retained only as diagnostic metadata and is not subtracted from the video's start time. Embedded streams in the same container may carry a server-owned video-relative offset. Adaptive generation rebases the selected audio once and applies that authoritative offset once.
 
 A ready HLS video can also use a direct external dubbing sidecar when that audio is not inside the manifest.
 
@@ -79,6 +81,8 @@ Playback coverage verifies:
 - concurrent startup requests, transport-stage diagnostics, and bandwidth-safe initial quality;
 - resume and source-fingerprint ticket invalidation;
 - direct external dubbing selection without video replacement;
+- content-level flash/impulse synchronization with a deliberately shifted control fixture on Linux;
+- source-stable Pause/Play and generation-owned external-audio seek settlement;
 - bounded forward buffering and stall recovery;
 - progress, close, subtitles, previews, fullscreen, and mounted player behavior; and
 - real prepared HLS video/audio compatibility for retained ready assets.

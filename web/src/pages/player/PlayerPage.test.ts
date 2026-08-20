@@ -14,6 +14,8 @@ import {
   clampGrowingPlaybackTime,
   clampPlaybackTime,
   externalAudioSyncPlan,
+  externalAudioSeekTransactionIsCurrent,
+  externalAudioSeekTransactionSettled,
   externalAudioShouldPlay,
   isMeaningfulPointerActivity,
   initialPlaybackMode,
@@ -409,6 +411,25 @@ describe("player interaction contracts", () => {
     expect(externalAudioShouldPlay(0.4, 0.478)).toBe(false);
     expect(externalAudioShouldPlay(0.478, 0.478)).toBe(true);
     expect(externalAudioShouldPlay(0, -0.478)).toBe(true);
+  });
+
+  it("rejects stale or expired external-audio seek transactions", () => {
+    const transaction = {
+      audioGeneration: 4,
+      transportGeneration: 7,
+      trackId: "external_tr",
+      target: 30,
+      recovery: true,
+      deadline: 2_500,
+    };
+
+    expect(externalAudioSeekTransactionIsCurrent(transaction, 4, 7, "external_tr", 2_499)).toBe(true);
+    expect(externalAudioSeekTransactionIsCurrent(transaction, 5, 7, "external_tr", 2_499)).toBe(false);
+    expect(externalAudioSeekTransactionIsCurrent(transaction, 4, 8, "external_tr", 2_499)).toBe(false);
+    expect(externalAudioSeekTransactionIsCurrent(transaction, 4, 7, "external_en", 2_499)).toBe(false);
+    expect(externalAudioSeekTransactionIsCurrent(transaction, 4, 7, "external_tr", 2_501)).toBe(false);
+    expect(externalAudioSeekTransactionSettled(transaction, 30.079)).toBe(true);
+    expect(externalAudioSeekTransactionSettled(transaction, 30.081)).toBe(false);
   });
 
   it("keeps the complete runtime stable while an adaptive playlist grows", () => {

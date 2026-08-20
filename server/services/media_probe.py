@@ -115,7 +115,10 @@ def merge_local_external_audio(
                 "startTime": start_time,
                 "duration": max(0.0, _finite_float(timing.get("duration"))),
                 "timeBase": str(timing.get("timeBase") or ""),
-                "timelineOffset": start_time - video_start_time,
+                # Standalone sidecars have an independent container epoch. Their
+                # stream start remains diagnostic metadata, not a playback offset.
+                "timelineOffset": 0.0,
+                "timelineOffsetSource": "standalone",
             }
             refreshed.append(external_item)
 
@@ -316,7 +319,9 @@ async def probe_media_stream(
         "audio_source_type": audio_res.get("source_type", normalize_source_type(audio_source_type)),
         "video_start_time": _finite_float(video_res.get("start_time")),
         "audio_start_time": _finite_float(audio_res.get("start_time")),
-        "audio_timeline_offset": _finite_float(audio_res.get("start_time")) - _finite_float(video_res.get("start_time")) if audio_url else 0.0,
+        # Independently supplied inputs do not share an authoritative timestamp
+        # epoch. Each stream is normalized to zero before the merge.
+        "audio_timeline_offset": 0.0,
         "video_duration": max(0.0, _finite_float(video_res.get("duration"))),
         "audio_duration": max(0.0, _finite_float(audio_res.get("duration"))),
         "failure": failure,
@@ -448,6 +453,7 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
                 "duration": max(0.0, _finite_float(a.get("duration"), duration)),
                 "timeBase": str(a.get("time_base") or ""),
                 "timelineOffset": start_time - video_start_time,
+                "timelineOffsetSource": "embedded",
             })
 
         # Explicit external dubbing coexists with embedded tracks. Presentation order
@@ -535,6 +541,7 @@ async def probe_cloud_external_audio(cloud_video_path: str, embedded_audio: list
             "duration": 0.0,
             "timeBase": "",
             "timelineOffset": 0.0,
+            "timelineOffsetSource": "standalone",
         })
     if merged and not any(item.get("default") for item in merged):
         merged[0]["default"] = True

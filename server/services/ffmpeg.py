@@ -14,6 +14,7 @@ from services.logger import logger
 from services.ingestion_errors import IngestionFailure, classify_failure, sanitize_url, write_task_diagnostics
 from services.ffmpeg_input import ffmpeg_network_input_options, is_http_media_source
 from services.ingest_preview import ingest_preview_service
+from services.media_timing import canonical_audio_filter_chain
 
 # Regular expressions for parsing FFmpeg stderr progress
 time_regex = re.compile(r"time=\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)")
@@ -259,14 +260,7 @@ async def download_and_merge(
     def build_command(include_preview: bool) -> list[str]:
         command = list(input_cmd)
         if audio_url:
-            audio_filters: list[str] = []
-            if audio_timeline_offset > 0:
-                audio_filters.append(f"adelay={round(audio_timeline_offset * 1000)}:all=1")
-            elif audio_timeline_offset < 0:
-                audio_filters.extend([f"atrim=start={abs(audio_timeline_offset):.6f}", "asetpts=PTS-STARTPTS"])
-            audio_filters.append("aresample=async=1:first_pts=0")
-            if duration_secs > 0:
-                audio_filters.extend(["apad", f"atrim=duration={duration_secs:.6f}"])
+            audio_filters = canonical_audio_filter_chain(audio_timeline_offset, duration_secs)
             split = "asplit=2[preview_external_audio][final_external_audio]" if include_preview and preview_dir is not None else "anull[final_external_audio]"
             command.extend(["-filter_complex", f"[1:a:0]{','.join(audio_filters)},{split}"])
         if include_preview and preview_dir is not None:

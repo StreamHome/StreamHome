@@ -124,6 +124,15 @@ interface PlayerAudioOption {
   duration: number;
 }
 
+export interface ExternalAudioSeekTransaction {
+  audioGeneration: number;
+  transportGeneration: number;
+  trackId: string;
+  target: number;
+  recovery: boolean;
+  deadline: number;
+}
+
 const DEFAULT_PREFERENCES: PlayerPreferences = {
   qualityHeight: "auto",
   audioTrackId: "",
@@ -149,6 +158,7 @@ export const PLAYBACK_STARTUP_MAX_PROGRESS_WAIT_MS = 30_000;
 export const PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS = 2_000;
 export const EXTERNAL_AUDIO_DRIFT_RECOVERY_SECONDS = 0.08;
 export const EXTERNAL_AUDIO_DRIFT_RECOVERY_COOLDOWN_MS = 5_000;
+export const EXTERNAL_AUDIO_SEEK_TRANSACTION_TIMEOUT_MS = 1_500;
 export const FORWARD_BUFFER_TARGET_SECONDS = 30;
 export const FORWARD_BUFFER_MAX_SECONDS = 60;
 export const STARTUP_QUALITY_MIN_BUFFER_SECONDS = 8;
@@ -320,6 +330,26 @@ export function externalAudioShouldPlay(videoTime: number, timelineOffset: numbe
   const globalTime = Math.max(0, Number.isFinite(videoTime) ? videoTime : 0);
   const offset = Number.isFinite(timelineOffset) ? timelineOffset : 0;
   return globalTime >= offset;
+}
+
+export function externalAudioSeekTransactionIsCurrent(
+  transaction: ExternalAudioSeekTransaction,
+  audioGeneration: number,
+  transportGeneration: number,
+  trackId: string,
+  now: number,
+): boolean {
+  return transaction.audioGeneration === audioGeneration
+    && transaction.transportGeneration === transportGeneration
+    && transaction.trackId === trackId
+    && now <= transaction.deadline;
+}
+
+export function externalAudioSeekTransactionSettled(
+  transaction: ExternalAudioSeekTransaction,
+  audioTime: number,
+): boolean {
+  return Math.abs(audioTime - transaction.target) <= EXTERNAL_AUDIO_DRIFT_RECOVERY_SECONDS;
 }
 
 export function isMeaningfulPointerActivity(
@@ -779,7 +809,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const runResponseRef = useRef<PlaybackRunResponse | null>(null);
   const transportResettingRef = useRef(false);
   const playbackIntentRef = useRef(true);
-  const playbackLoadingSuspendedRef = useRef(false);
   const staleVideoPlayEventRef = useRef(false);
   const videoPlayRequestRef = useRef(0);
   const pendingVideoPlayRequestRef = useRef<number | null>(null);
@@ -790,10 +819,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const pendingAudioSelectionRef = useRef<string | null>(null);
   const selectedAudioTrackIdRef = useRef("");
   const activeExternalAudioTrackIdRef = useRef<string | null>(null);
+  const externalAudioGenerationRef = useRef(0);
   const externalAudioBufferingRef = useRef(false);
   const externalAudioLastDriftRecoveryAtRef = useRef(Number.NEGATIVE_INFINITY);
-  const externalAudioPendingSeekTargetRef = useRef<number | null>(null);
-  const externalAudioPendingSeekIsRecoveryRef = useRef(false);
+  const externalAudioSeekTransactionRef = useRef<ExternalAudioSeekTransaction | null>(null);
   const activeExternalAudioTimelineOffsetRef = useRef(0);
   const volumeRef = useRef(initialPreferences.volume);
   const mutedRef = useRef(initialPreferences.muted);
@@ -859,7 +888,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [fullscreenError, setFullscreenError] = useState("");
   const [playerNotice, setPlayerNotice] = useState("");
   const [hasLastFrame, setHasLastFrame] = useState(false);
-  const [playbackLoadingSuspended, setPlaybackLoadingSuspended] = useState(false);
   const [mobilePlayer, setMobilePlayer] = useState(() => typeof window !== "undefined" && isPhonePlayerViewport(readMobileViewport(window)));
   const [forcedLandscape, setForcedLandscape] = useState(() => typeof window !== "undefined" && isForcedLandscape(window.innerWidth, window.innerHeight, isPhonePlayerViewport(readMobileViewport(window))));
   const [mobileSeekFeedback, setMobileSeekFeedback] = useState<{
@@ -1029,9 +1057,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         0,
       ));
       playbackIntentRef.current = playOnLoad;
-      playbackLoadingSuspendedRef.current = false;
       staleVideoPlayEventRef.current = false;
-      setPlaybackLoadingSuspended(false);
       const fixtureMode = initialPlaybackMode(
         visualFixture.runResponse,
         preferences.audioTrackId,
@@ -1095,9 +1121,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     transportGenerationRef.current += 1;
     transportResettingRef.current = false;
     playbackIntentRef.current = playOnLoad;
-    playbackLoadingSuspendedRef.current = false;
     staleVideoPlayEventRef.current = false;
-    setPlaybackLoadingSuspended(false);
     if (playbackStartupTimerRef.current !== null) window.clearTimeout(playbackStartupTimerRef.current);
     playbackStartupTimerRef.current = null;
     if (playbackClockAdvanceTimerRef.current !== null) window.clearTimeout(playbackClockAdvanceTimerRef.current);
@@ -1234,33 +1258,52 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const syncExternalAudio = useCallback((force = false, targetOverride: number | null = null) => {
     const video = videoRef.current;
     const audio = externalAudioRef.current;
-    if (!video || !audio || !activeExternalAudioTrackIdRef.current || audio.readyState < HTMLMediaElement.HAVE_METADATA) return false;
+    const trackId = activeExternalAudioTrackIdRef.current;
+    if (!video || !audio || !trackId || audio.readyState < HTMLMediaElement.HAVE_METADATA) return false;
     const globalTarget = Math.max(0, targetOverride ?? (
       pendingSeekTargetRef.current
       ?? (transportResettingRef.current ? resumePositionRef.current : video.currentTime)
     ));
     const target = Math.max(0, globalTarget - activeExternalAudioTimelineOffsetRef.current);
-    if (!force && externalAudioPendingSeekTargetRef.current !== null) return false;
+    const now = performance.now();
+    const pendingTransaction = externalAudioSeekTransactionRef.current;
+    if (pendingTransaction && !externalAudioSeekTransactionIsCurrent(
+      pendingTransaction,
+      externalAudioGenerationRef.current,
+      transportGenerationRef.current,
+      trackId,
+      now,
+    )) {
+      externalAudioSeekTransactionRef.current = null;
+    } else if (!force && pendingTransaction) {
+      return false;
+    }
+    if (force) externalAudioSeekTransactionRef.current = null;
     if (!force && (externalAudioBufferingRef.current || audio.seeking || audio.readyState < HTMLMediaElement.HAVE_FUTURE_DATA)) {
       return false;
     }
-    const now = performance.now();
     const recoveryAllowed = force
       || now - externalAudioLastDriftRecoveryAtRef.current >= EXTERNAL_AUDIO_DRIFT_RECOVERY_COOLDOWN_MS;
     const plan = externalAudioSyncPlan(target, audio.currentTime, video.playbackRate, force);
     if (plan.seekTime !== null) {
       if (!recoveryAllowed) return false;
       try {
-        externalAudioPendingSeekTargetRef.current = plan.seekTime;
-        externalAudioPendingSeekIsRecoveryRef.current = !force;
+        const transaction: ExternalAudioSeekTransaction = {
+          audioGeneration: externalAudioGenerationRef.current,
+          transportGeneration: transportGenerationRef.current,
+          trackId,
+          target: plan.seekTime,
+          recovery: !force,
+          deadline: now + EXTERNAL_AUDIO_SEEK_TRANSACTION_TIMEOUT_MS,
+        };
+        externalAudioSeekTransactionRef.current = transaction;
         audio.currentTime = plan.seekTime;
-        if (!audio.seeking && Math.abs(audio.currentTime - plan.seekTime) < EXTERNAL_AUDIO_DRIFT_RECOVERY_SECONDS) {
-          externalAudioPendingSeekTargetRef.current = null;
-          if (externalAudioPendingSeekIsRecoveryRef.current) externalAudioLastDriftRecoveryAtRef.current = now;
-          externalAudioPendingSeekIsRecoveryRef.current = false;
+        if (!audio.seeking && externalAudioSeekTransactionSettled(transaction, audio.currentTime)) {
+          externalAudioSeekTransactionRef.current = null;
+          if (transaction.recovery) externalAudioLastDriftRecoveryAtRef.current = now;
         }
       } catch {
-        externalAudioPendingSeekTargetRef.current = null;
+        externalAudioSeekTransactionRef.current = null;
         return false;
       }
     }
@@ -1306,6 +1349,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [syncExternalAudio]);
 
   const releaseExternalAudio = useCallback(() => {
+    externalAudioGenerationRef.current += 1;
+    externalAudioSeekTransactionRef.current = null;
     const audio = externalAudioRef.current;
     if (audio) {
       pauseExternalAudio();
@@ -1315,8 +1360,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     activeExternalAudioTrackIdRef.current = null;
     externalAudioBufferingRef.current = false;
     externalAudioLastDriftRecoveryAtRef.current = Number.NEGATIVE_INFINITY;
-    externalAudioPendingSeekTargetRef.current = null;
-    externalAudioPendingSeekIsRecoveryRef.current = false;
     activeExternalAudioTimelineOffsetRef.current = 0;
     const video = videoRef.current;
     if (video) {
@@ -1329,12 +1372,12 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     const video = videoRef.current;
     const audio = externalAudioRef.current;
     if (!video || !audio || !track.directUrl) return false;
+    externalAudioGenerationRef.current += 1;
+    externalAudioSeekTransactionRef.current = null;
     activeExternalAudioTrackIdRef.current = track.id;
     activeExternalAudioTimelineOffsetRef.current = track.timelineOffset;
     externalAudioBufferingRef.current = false;
     externalAudioLastDriftRecoveryAtRef.current = Number.NEGATIVE_INFINITY;
-    externalAudioPendingSeekTargetRef.current = null;
-    externalAudioPendingSeekIsRecoveryRef.current = false;
     if (audio.getAttribute("src") !== track.directUrl) {
       audio.src = track.directUrl;
       audio.load();
@@ -1530,7 +1573,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (!runResponse || !video) return;
     const transportReady = playbackTransportIsReady(runResponse, streamMode);
     if (!transportReady) return;
-    if (!playbackIntentRef.current || playbackLoadingSuspendedRef.current) {
+    if (!playbackIntentRef.current) {
       markPlaybackStartupReady();
       setPhase("paused");
       return;
@@ -1554,7 +1597,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       clearPlaybackStartupWatchdog();
       playbackStartupTimerRef.current = window.setTimeout(() => {
         playbackStartupTimerRef.current = null;
-        if (!playbackIntentRef.current || playbackLoadingSuspendedRef.current) {
+        if (!playbackIntentRef.current) {
           setPhase("paused");
           return;
         }
@@ -1690,7 +1733,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }
       } else if (resumePositionRef.current > 0 && (!runResponse.resumeReady || !applyResume(video))) {
         deferredResumeTargetRef.current = resumePositionRef.current;
-        if (!playbackIntentRef.current || playbackLoadingSuspendedRef.current) {
+        if (!playbackIntentRef.current) {
           markPlaybackStartupReady();
           setPhase("paused");
           return;
@@ -1919,7 +1962,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           detail: String(data.details || "unknown").replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 120),
           httpStatus: responseCode,
         };
-        if (!playbackIntentRef.current || playbackLoadingSuspendedRef.current) return;
+        if (!playbackIntentRef.current) return;
         if (!data.fatal) return;
         if (data.type === HlsRuntime.ErrorTypes.NETWORK_ERROR && networkRetriesRef.current < NETWORK_RETRY_LIMIT) {
           networkRetriesRef.current += 1;
@@ -1931,7 +1974,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             if (
               hlsRef.current === hls
               && playbackIntentRef.current
-              && !playbackLoadingSuspendedRef.current
             ) hls.startLoad(currentTimeRef.current);
           }, 500 * networkRetriesRef.current);
           return;
@@ -2398,10 +2440,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     }
   }, []);
 
-  const suspendPlaybackLoading = useCallback(() => {
-    if (playbackLoadingSuspendedRef.current) return;
-    playbackLoadingSuspendedRef.current = true;
-    setPlaybackLoadingSuspended(true);
+  const settlePausedPlayback = useCallback(() => {
     markPlaybackStartupReady();
     clearPlaybackClockAdvanceWatchdog();
     clearStallRecovery();
@@ -2409,60 +2448,14 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       window.clearTimeout(hlsRetryTimerRef.current);
       hlsRetryTimerRef.current = null;
     }
-    hlsRef.current?.stopLoad();
-    const video = videoRef.current;
-    if (video) {
-      const stablePosition = pendingSeekTargetRef.current ?? Math.max(
-        0,
-        confirmedTimeRef.current,
-        currentTimeRef.current,
-        video.currentTime || 0,
-      );
-      resumePositionRef.current = stablePosition;
-      currentTimeRef.current = stablePosition;
-      pendingSeekTargetRef.current = stablePosition > 0 ? stablePosition : null;
-      if (pendingPositionKindRef.current === null) {
-        pendingPositionKindRef.current = stablePosition > 0 ? "recovery" : null;
-      }
-      positionGenerationRef.current += 1;
-      resumeAppliedRef.current = false;
-      video.preload = "none";
-      if (!hlsRef.current && video.getAttribute("src")) {
-        transportResettingRef.current = true;
-        video.load();
-      }
-    }
-    const audio = externalAudioRef.current;
-    if (audio) {
-      audio.preload = "none";
-      if (audio.getAttribute("src")) audio.load();
-    }
     if (!completedRef.current) setPhase("paused");
   }, [clearPlaybackClockAdvanceWatchdog, clearStallRecovery, markPlaybackStartupReady]);
 
   const safePlay = useCallback(() => {
-    const wasSuspended = playbackLoadingSuspendedRef.current;
     playbackIntentRef.current = true;
-    playbackLoadingSuspendedRef.current = false;
     staleVideoPlayEventRef.current = false;
-    setPlaybackLoadingSuspended(false);
-    const video = videoRef.current;
-    const audio = externalAudioRef.current;
-    if (video) video.preload = "auto";
-    if (audio) audio.preload = "auto";
-    if (wasSuspended) setPhase("loading");
-    if (wasSuspended && hlsRef.current) hlsRef.current.startLoad(Math.max(0, currentTimeRef.current));
-    if (wasSuspended && video && !hlsRef.current) {
-      if (video.getAttribute("src")) {
-        transportResettingRef.current = true;
-        video.load();
-        return;
-      } else {
-        setPhase("loading");
-        setTransportRevision((value) => value + 1);
-        return;
-      }
-    }
+    setPhase("loading");
+    hlsRef.current?.startLoad(Math.max(0, currentTimeRef.current));
     requestVideoPlay();
   }, [requestVideoPlay]);
 
@@ -2471,8 +2464,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     cancelPendingVideoPlay();
     pauseExternalAudio();
     videoRef.current?.pause();
-    suspendPlaybackLoading();
-  }, [cancelPendingVideoPlay, pauseExternalAudio, suspendPlaybackLoading]);
+    settlePausedPlayback();
+  }, [cancelPendingVideoPlay, pauseExternalAudio, settlePausedPlayback]);
 
   const scheduleStallRecovery = useCallback((clockBaseline: number | null = null) => {
     if (!playbackIntentRef.current || stallRecoveryTimerRef.current !== null) return;
@@ -3356,7 +3349,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         ref={videoRef}
         className="player-video"
         crossOrigin="anonymous"
-        preload={playbackLoadingSuspended ? "none" : "auto"}
+        preload="auto"
         playsInline
         onLoadedMetadata={() => {
           const video = videoRef.current;
@@ -3387,11 +3380,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
               return;
             }
             playbackIntentRef.current = true;
-            playbackLoadingSuspendedRef.current = false;
-            setPlaybackLoadingSuspended(false);
-            video.preload = "auto";
-            if (externalAudioRef.current) externalAudioRef.current.preload = "auto";
-            hlsRef.current?.startLoad(Math.max(0, currentTimeRef.current));
           }
           if (!transportResettingRef.current) {
             setPhase("loading");
@@ -3407,7 +3395,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             playbackIntentRef.current = false;
             cancelPendingVideoPlay();
           }
-          suspendPlaybackLoading();
+          settlePausedPlayback();
           if (!completedRef.current) {
             setPhase("paused");
             reportProgress("pause");
@@ -3708,18 +3696,27 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       </video>
       <audio
         ref={externalAudioRef}
-        preload={playbackLoadingSuspended ? "none" : "auto"}
+        preload="auto"
         aria-hidden="true"
         onLoadedMetadata={() => syncExternalAudio(true)}
         onSeeked={() => {
           const audio = externalAudioRef.current;
-          const target = externalAudioPendingSeekTargetRef.current;
-          if (!audio || target === null) return;
-          if (Math.abs(audio.currentTime - target) < EXTERNAL_AUDIO_DRIFT_RECOVERY_SECONDS) {
-            externalAudioPendingSeekTargetRef.current = null;
-            if (externalAudioPendingSeekIsRecoveryRef.current) externalAudioLastDriftRecoveryAtRef.current = performance.now();
-            externalAudioPendingSeekIsRecoveryRef.current = false;
+          const transaction = externalAudioSeekTransactionRef.current;
+          const trackId = activeExternalAudioTrackIdRef.current;
+          const now = performance.now();
+          if (!audio || !transaction || !trackId || !externalAudioSeekTransactionIsCurrent(
+            transaction,
+            externalAudioGenerationRef.current,
+            transportGenerationRef.current,
+            trackId,
+            now,
+          )) {
+            externalAudioSeekTransactionRef.current = null;
+            return;
           }
+          if (!externalAudioSeekTransactionSettled(transaction, audio.currentTime)) return;
+          externalAudioSeekTransactionRef.current = null;
+          if (transaction.recovery) externalAudioLastDriftRecoveryAtRef.current = now;
           if (playbackIntentRef.current && !videoRef.current?.paused) {
             requestExternalAudioPlay("Press play once to allow the selected dubbing track.");
           }

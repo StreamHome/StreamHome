@@ -24,6 +24,7 @@ from routes.playback import (
 )
 from services.languages import normalize_language_tag
 from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
+from services.media_timing import canonical_audio_filter_chain
 from services.media_source import MediaSourceError, ResolvedMediaSource, canonicalize_catalog_path, clear_cloud_object_cache, is_safe_presentation_asset, resolve_media_source
 from services.playback_prep import (
     AUDIO_VERIFIED_MARKER,
@@ -529,6 +530,27 @@ class PlaybackPipelineRegression(unittest.TestCase):
             service.cache_dir = Path(directory)
             asyncio.run(exercise(service))
 
+    def test_canonical_audio_filters_rebase_before_applying_one_timeline_offset(self) -> None:
+        self.assertEqual(
+            canonical_audio_filter_chain(0.478, 12),
+            [
+                "asetpts=PTS-STARTPTS",
+                "adelay=478:all=1",
+                "aresample=async=1:first_pts=0",
+                "apad",
+                "atrim=duration=12.000000",
+            ],
+        )
+        self.assertEqual(
+            canonical_audio_filter_chain(-0.125),
+            [
+                "asetpts=PTS-STARTPTS",
+                "atrim=start=0.125000",
+                "asetpts=PTS-STARTPTS",
+                "aresample=async=1:first_pts=0",
+            ],
+        )
+
     def test_external_dubbing_coexists_with_embedded_language_and_invalidates_identity(self) -> None:
         ffmpeg = shutil.which("ffmpeg")
         self.assertIsNotNone(ffmpeg)
@@ -590,7 +612,8 @@ class PlaybackPipelineRegression(unittest.TestCase):
             if item.get("source") == "external" and item.get("fileName") == "eng.mp3"
         )
         self.assertGreaterEqual(timing_probe.call_count, 1)
-        self.assertAlmostEqual(english_external["timelineOffset"], 0.478, places=3)
+        self.assertEqual(english_external["timelineOffset"], 0.0)
+        self.assertEqual(english_external["timelineOffsetSource"], "standalone")
         with (audio_directory / "tur.mp3").open("ab") as handle:
             handle.write(b"\0")
         second_source = asyncio.run(resolve_media_source(catalog_path, check_cloud=False))
@@ -747,7 +770,8 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 (rendition / "init.mp4").write_bytes(b"init")
                 (rendition / "segment_00000.m4s").write_bytes(b"segment")
                 (rendition / ".complete").write_text("done", encoding="utf-8")
-                (rendition / VIDEO_VERIFIED_MARKER).write_text("1", encoding="utf-8")
+                legacy_marker = VIDEO_VERIFIED_MARKER if rendition_name.startswith("video_") else ".verified-audio-v3"
+                (rendition / legacy_marker).write_text("1", encoding="utf-8")
 
             self.assertTrue(service.rendition_complete(media_id, fingerprint, "video_original"))
             self.assertFalse(service.rendition_complete(media_id, fingerprint, "audio_embedded_0_contract_en"))
@@ -1070,11 +1094,19 @@ class PlaybackPipelineRegression(unittest.TestCase):
                     "codec": "aac",
                     "language": "eng",
                     "default": True,
+                    "timelineOffset": 0.25,
                 }]))[0]
                 await service._transcode_audio("m_fast", "abc", source, audio, media)
                 audio_arguments = run_job.await_args.args[4]
                 self.assertNotIn("copy", audio_arguments)
-                self.assertIn("aresample=async=1:first_pts=0", audio_arguments)
+                self.assertTrue(any(
+                    "asetpts=PTS-STARTPTS,adelay=250:all=1" in str(argument)
+                    for argument in audio_arguments
+                ))
+                self.assertTrue(any(
+                    "aresample=async=1:first_pts=0" in str(argument)
+                    for argument in audio_arguments
+                ))
                 self.assertIn("aac_low", audio_arguments)
                 self.assertIn("192k", audio_arguments)
                 self.assertIn("48000", audio_arguments)
