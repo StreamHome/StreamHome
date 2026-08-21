@@ -32,7 +32,7 @@ Powered by a high-performance ASGI Python backend and a modern React 19 frontend
 
 Your media remains under your control. StreamHome can store it locally, synchronize it with Google Drive, preserve portable recovery metadata alongside your media files, and maintain automatic local and cloud database backups.
 
-> [!IMPORTANT]>
+> [!IMPORTANT]
 > The platform is still under active development.
 >
 > Back up your StreamHome data before installing an update.
