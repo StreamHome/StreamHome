@@ -560,6 +560,42 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
 
         launch.assert_not_awaited()
 
+    async def test_update_housekeeping_never_releases_unrelated_maintenance(self) -> None:
+        for automatic_updates in (False, True):
+            for phase in ("idle", "failed", "succeeded", "rolled_back"):
+                with self.subTest(automatic_updates=automatic_updates, phase=phase):
+                    settings.AUTO_UPDATE_ENABLED = automatic_updates
+                    state.MAINTENANCE_MODE = True
+                    state.MAINTENANCE_REASON = "Restore owns maintenance."
+                    state.UPDATE_TRANSACTION_ID = ""
+                    update.write_update_state(
+                        phase=phase,
+                        message="Terminal update state",
+                        update_available=False,
+                        last_checked_at=time.time(),
+                    )
+                    stop = asyncio.Event()
+                    reconcile_calls = 0
+
+                    async def reconcile_once() -> bool:
+                        nonlocal reconcile_calls
+                        reconcile_calls += 1
+                        if reconcile_calls > 1:
+                            stop.set()
+                        return False
+
+                    with (
+                        patch.object(update, "reconcile_orphaned_update", AsyncMock(side_effect=reconcile_once)),
+                        patch.object(update, "check_for_update_details", AsyncMock()) as check,
+                        patch.object(update, "launch_queued_update_if_ready", AsyncMock()) as launch,
+                    ):
+                        await update.automatic_update_worker(stop, initial_delay_seconds=0)
+
+                    self.assertTrue(state.MAINTENANCE_MODE)
+                    self.assertEqual(state.MAINTENANCE_REASON, "Restore owns maintenance.")
+                    check.assert_not_awaited()
+                    launch.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

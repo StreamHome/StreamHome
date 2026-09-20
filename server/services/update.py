@@ -1018,9 +1018,6 @@ async def automatic_update_worker(stop_event: asyncio.Event, initial_delay_secon
                     pass
                 continue
             status = read_update_state()
-            if state.MAINTENANCE_MODE and not state.UPDATE_TRANSACTION_ID and status.get("phase") in TERMINAL_PHASES:
-                state.MAINTENANCE_MODE = False
-                state.MAINTENANCE_REASON = ""
             if status.get("phase") == "queued":
                 await launch_queued_update_if_ready()
             elif settings.SETUP_COMPLETE and settings.AUTO_UPDATE_ENABLED and status.get("phase") not in ACTIVE_PHASES:
