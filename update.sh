@@ -40,6 +40,15 @@ PUBLIC_ORIGIN_WAS_READY=false
 COMMIT_TOKEN=""
 COMMIT_FILE=""
 CANCEL_FILE=""
+LIFECYCLE_ENABLED=false
+LIFECYCLE_OPERATION_ID="${STREAMHOME_LIFECYCLE_OPERATION_ID:-}"
+LIFECYCLE_GENERATION="${STREAMHOME_LIFECYCLE_GENERATION:-}"
+LIFECYCLE_HANDOFF_REQUESTED=false
+if [[ -n "$LIFECYCLE_OPERATION_ID" || -n "$LIFECYCLE_GENERATION" ]]; then
+    LIFECYCLE_HANDOFF_REQUESTED=true
+fi
+LIFECYCLE_PHASE="reserved"
+LIFECYCLE_PRESERVE=false
 UPDATE_COMMAND_TIMEOUT_SECONDS="${STREAMHOME_UPDATE_COMMAND_TIMEOUT_SECONDS:-1800}"
 
 usage() {
@@ -113,7 +122,7 @@ maintenance_process_matches() {
 new_transaction_id() {
     python3 - <<'PY'
 import uuid
-print(uuid.uuid4().hex)
+print(uuid.uuid4())
 PY
 }
 
@@ -122,6 +131,176 @@ new_secret_token() {
 import secrets
 print(secrets.token_urlsafe(32))
 PY
+}
+
+lifecycle_cli() {
+    local python_bin="$ROOT_DIR/venv/bin/python"
+    [[ -x "$python_bin" ]] || python_bin="$(command -v python3)"
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+        "$python_bin" -m lifecycle.cli --root "$ROOT_DIR" "$@"
+}
+
+lifecycle_generation_from_json() {
+    local python_bin="$ROOT_DIR/venv/bin/python"
+    [[ -x "$python_bin" ]] || python_bin="$(command -v python3)"
+    "$python_bin" -c 'import json,sys; print(json.load(sys.stdin)["state"]["generation"])'
+}
+
+lifecycle_phase_from_json() {
+    local python_bin="$ROOT_DIR/venv/bin/python"
+    [[ -x "$python_bin" ]] || python_bin="$(command -v python3)"
+    "$python_bin" -c 'import json,sys; print(json.load(sys.stdin)["state"]["active_operation"]["phase"])'
+}
+
+installed_release_lifecycle_support() {
+    local listing state_present=false cli_present=false
+    if [[ ! "$OLD_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+        || ! git -C "$ROOT_DIR" cat-file -e "$OLD_COMMIT^{commit}" 2>/dev/null; then
+        printf '%s\n' "INDETERMINATE"
+        return 0
+    fi
+    if ! listing="$(git -C "$ROOT_DIR" ls-tree -r --name-only "$OLD_COMMIT" -- \
+        server/lifecycle/state.py server/lifecycle/cli.py 2>/dev/null)"; then
+        printf '%s\n' "INDETERMINATE"
+        return 0
+    fi
+    while IFS= read -r path; do
+        case "$path" in
+            server/lifecycle/state.py) state_present=true ;;
+            server/lifecycle/cli.py) cli_present=true ;;
+        esac
+    done <<< "$listing"
+    if [[ "$state_present" == true && "$cli_present" == true ]]; then
+        printf '%s\n' "PHASE1_CONFIRMED"
+    elif [[ "$state_present" == false && "$cli_present" == false ]]; then
+        printf '%s\n' "PRE_PHASE1_CONFIRMED"
+    else
+        printf '%s\n' "INDETERMINATE"
+    fi
+}
+
+record_lifecycle_phase_in_update_journal() {
+    local phase="$1"
+    python3 - "$STATUS_FILE" "$TRANSACTION_ID" "$LIFECYCLE_GENERATION" "$phase" <<'PY'
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+path = Path(sys.argv[1])
+transaction_id = sys.argv[2]
+generation = int(sys.argv[3])
+phase = sys.argv[4]
+lock_path = path.with_name("update-state.lock")
+with lock_path.open("a+b") as lock_file:
+    if os.name == "posix":
+        import fcntl
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit(1)
+    if payload.get("transaction_id") != transaction_id \
+            or payload.get("lifecycle_generation") != generation:
+        raise SystemExit(1)
+    payload["lifecycle_phase"] = phase
+    payload["updated_at"] = time.time()
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as state_file:
+            os.chmod(temporary, 0o600)
+            state_file.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            state_file.flush()
+            os.fsync(state_file.fileno())
+        os.replace(temporary, path)
+        if os.name == "posix":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+PY
+}
+
+initialize_lifecycle_authority() {
+    local claim_output support authoritative_phase
+    if [[ "$LIFECYCLE_HANDOFF_REQUESTED" == true ]]; then
+        [[ "$LIFECYCLE_OPERATION_ID" == "$TRANSACTION_ID" \
+            && "$LIFECYCLE_GENERATION" =~ ^[1-9][0-9]*$ ]] || return 1
+        lifecycle_cli validate-owner \
+            --operation-id "$LIFECYCLE_OPERATION_ID" \
+            --generation "$LIFECYCLE_GENERATION" \
+            --expected-phase "$LIFECYCLE_PHASE" >/dev/null || return 1
+        LIFECYCLE_ENABLED=true
+        return 0
+    fi
+    if [[ -n "$LIFECYCLE_OPERATION_ID" || -n "$LIFECYCLE_GENERATION" ]]; then
+        [[ "$LIFECYCLE_OPERATION_ID" == "$TRANSACTION_ID" \
+            && "$LIFECYCLE_GENERATION" =~ ^[1-9][0-9]*$ ]] || return 1
+        claim_output="$(lifecycle_cli validate-owner \
+            --operation-id "$LIFECYCLE_OPERATION_ID" \
+            --generation "$LIFECYCLE_GENERATION")" || return 1
+        authoritative_phase="$(printf '%s' "$claim_output" | lifecycle_phase_from_json)" || return 1
+        [[ -n "$authoritative_phase" ]] || return 1
+        LIFECYCLE_PHASE="$authoritative_phase"
+        LIFECYCLE_ENABLED=true
+        if ! record_lifecycle_phase_in_update_journal "$LIFECYCLE_PHASE"; then
+            log "Shared lifecycle ownership was recovered, but the update journal phase could not be reconciled."
+        fi
+        return 0
+    fi
+    support="$(installed_release_lifecycle_support)" || return 1
+    case "$support" in
+        PRE_PHASE1_CONFIRMED)
+            log "The installed release predates shared lifecycle authority; this adoption update remains protected by the existing update controller and writes no shared lifecycle state."
+            return 0
+            ;;
+        PHASE1_CONFIRMED) ;;
+        *)
+            log "Shared lifecycle support in the installed release could not be determined safely."
+            return 1
+            ;;
+    esac
+    claim_output="$(lifecycle_cli claim \
+        --operation-type update \
+        --owner-kind updater \
+        --operation-id "$TRANSACTION_ID")" || return 1
+    LIFECYCLE_OPERATION_ID="$TRANSACTION_ID"
+    LIFECYCLE_GENERATION="$(printf '%s' "$claim_output" | lifecycle_generation_from_json)" || return 1
+    [[ "$LIFECYCLE_GENERATION" =~ ^[1-9][0-9]*$ ]] || return 1
+    LIFECYCLE_ENABLED=true
+}
+
+release_lifecycle_authority() {
+    [[ "$LIFECYCLE_ENABLED" == true ]] || return 0
+    lifecycle_cli complete \
+        --operation-id "$LIFECYCLE_OPERATION_ID" \
+        --generation "$LIFECYCLE_GENERATION" \
+        --expected-phase "$LIFECYCLE_PHASE" >/dev/null || return 1
+    LIFECYCLE_ENABLED=false
+    LIFECYCLE_PRESERVE=false
+}
+
+mark_lifecycle_recovery_required() {
+    [[ "$LIFECYCLE_ENABLED" == true ]] || return 0
+    if [[ "$LIFECYCLE_PHASE" == "recovery_required" ]]; then
+        return 0
+    fi
+    lifecycle_cli transition \
+        --operation-id "$LIFECYCLE_OPERATION_ID" \
+        --generation "$LIFECYCLE_GENERATION" \
+        --expected-phase "$LIFECYCLE_PHASE" \
+        --next-phase recovery_required >/dev/null || return 1
+    LIFECYCLE_PHASE="recovery_required"
+    LIFECYCLE_PRESERVE=true
+    if ! record_lifecycle_phase_in_update_journal "$LIFECYCLE_PHASE"; then
+        log "Shared lifecycle recovery ownership is authoritative, but the update journal phase could not be reconciled."
+    fi
 }
 
 run_bounded() {
@@ -349,7 +528,7 @@ PY
 
 write_state() {
     local phase="$1" message="$2" error="${3:-}" failed_target="${4:-}" current_commit="${5:-$OLD_COMMIT}"
-    python3 - "$STATUS_FILE" "$phase" "$message" "$error" "$failed_target" "$current_commit" "$TARGET_COMMIT" "$AUTOMATIC" "$TRANSACTION_ID" "$STAGING_DIR" "$WEB_ARTIFACTS_SWAPPED" "$WEB_DEPENDENCIES_SWAPPED" "$PYTHON_DEPENDENCIES_CHANGED" "$WEB_DEPENDENCIES_CHANGED" "$WEB_BUILD_REQUIRED" "$$" "$CONTROLLER_START_TICKS" <<'PY'
+    python3 - "$STATUS_FILE" "$phase" "$message" "$error" "$failed_target" "$current_commit" "$TARGET_COMMIT" "$AUTOMATIC" "$TRANSACTION_ID" "$STAGING_DIR" "$WEB_ARTIFACTS_SWAPPED" "$WEB_DEPENDENCIES_SWAPPED" "$PYTHON_DEPENDENCIES_CHANGED" "$WEB_DEPENDENCIES_CHANGED" "$WEB_BUILD_REQUIRED" "$$" "$CONTROLLER_START_TICKS" "$LIFECYCLE_ENABLED" "$LIFECYCLE_GENERATION" "$LIFECYCLE_PHASE" <<'PY'
 import json
 import os
 import sys
@@ -376,6 +555,9 @@ lock_path = path.with_name("update-state.lock")
     web_build_required,
     controller_pid,
     controller_start_ticks,
+    lifecycle_enabled,
+    lifecycle_generation,
+    lifecycle_phase,
 ) = sys.argv[2:]
 with lock_path.open("a+b") as lock_file:
     if os.name == "posix":
@@ -421,6 +603,9 @@ with lock_path.open("a+b") as lock_file:
                 "controller_pid": int(controller_pid),
                 "controller_start_ticks": controller_start_ticks,
             })
+        if lifecycle_enabled == "true":
+            payload["lifecycle_generation"] = int(lifecycle_generation)
+            payload["lifecycle_phase"] = lifecycle_phase
         if phase in {"preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back", "recovering"}:
             payload["started_at"] = payload.get("started_at") or now
         if phase in {"succeeded", "failed", "rolled_back", "rollback_failed"}:
@@ -551,6 +736,19 @@ cleanup() {
         rm -rf -- "$STAGING_DIR"
     fi
     release_lock
+    if [[ "$LIFECYCLE_ENABLED" == true && "$LIFECYCLE_PRESERVE" == false ]]; then
+        if [[ "$RUNTIME_HEALTHY" == true && "$CUTOVER_STARTED" == false ]]; then
+            if ! release_lifecycle_authority; then
+                log "Exact shared lifecycle ownership could not be released; recovery remains operator-visible."
+                mark_lifecycle_recovery_required || true
+                PRESERVE_RECOVERY_ARTIFACTS=true
+                exit_code=1
+            fi
+        else
+            mark_lifecycle_recovery_required || true
+            PRESERVE_RECOVERY_ARTIFACTS=true
+        fi
+    fi
     if [[ "${BASH_SOURCE[0]}" == "$RUN_DIR"/update-controller.*.sh ]]; then
         rm -f -- "${BASH_SOURCE[0]}"
     fi
@@ -1065,19 +1263,23 @@ recover_unchanged_release() {
     RUNTIME_HEALTHY=false
     CUTOVER_STARTED=false
     ACTIVATION_STARTED=false
+    mark_lifecycle_recovery_required || true
     write_state "failed" "$message Automatic startup recovery remains available." "$error" "$TARGET_COMMIT" "$OLD_COMMIT"
     if start_maintenance; then
         PRESERVE_MAINTENANCE=true
     fi
+    LIFECYCLE_PRESERVE=true
     return 1
 }
 
 record_rollback_failure() {
     RECOVERY_IN_PROGRESS=true
+    mark_lifecycle_recovery_required || true
     write_state "rollback_failed" "The update and automatic rollback both failed. Review update.log." "rollback_failed" "$TARGET_COMMIT"
     start_maintenance || true
     PRESERVE_MAINTENANCE=true
     PRESERVE_RECOVERY_ARTIFACTS=true
+    LIFECYCLE_PRESERVE=true
 }
 
 runtime_endpoints_ready() {
@@ -1170,6 +1372,8 @@ print("true" if payload.get("python_dependencies_changed", True) else "false")
 print("true" if payload.get("web_dependencies_changed", True) else "false")
 print("true" if payload.get("web_build_required", True) else "false")
 print("true" if payload.get("runtime_committed", False) else "false")
+print(str(payload.get("lifecycle_generation") or ""))
+print(str(payload.get("lifecycle_phase") or ""))
 PY
     )
     phase="${recovery_state[0]:-}"
@@ -1183,7 +1387,10 @@ PY
     WEB_DEPENDENCIES_CHANGED="${recovery_state[8]:-true}"
     WEB_BUILD_REQUIRED="${recovery_state[9]:-true}"
     runtime_committed="${recovery_state[10]:-false}"
+    LIFECYCLE_GENERATION="${recovery_state[11]:-}"
+    LIFECYCLE_PHASE="${recovery_state[12]:-}"
     [[ -n "$TRANSACTION_ID" ]] || TRANSACTION_ID="$(new_transaction_id)"
+    LIFECYCLE_OPERATION_ID="$TRANSACTION_ID"
     COMMIT_FILE="$RUN_DIR/update-commit.${TRANSACTION_ID}.token"
     STAGING_DIR="$recovered_staging"
     WEB_ARTIFACTS_SWAPPED="$web_swapped"
@@ -1201,6 +1408,7 @@ PY
     if ! acquire_update_lock; then
         return 11
     fi
+    initialize_lifecycle_authority || return 1
     trap cleanup EXIT
     current_head="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
     if [[ "$current_head" == "$TARGET_COMMIT" ]] \
@@ -1281,6 +1489,7 @@ PY
         }
     fi
     write_state "recovering" "The previous release is restored and will now pass normal startup health checks." "update_interrupted" "$TARGET_COMMIT" "$OLD_COMMIT"
+    LIFECYCLE_PRESERVE=true
     return 0
 }
 
@@ -1315,6 +1524,8 @@ print("true" if web_dependencies_swapped else "false")
 print("true" if payload.get("python_dependencies_changed", True) else "false")
 print("true" if payload.get("web_dependencies_changed", True) else "false")
 print("true" if payload.get("web_build_required", True) else "false")
+print(str(payload.get("lifecycle_generation") or ""))
+print(str(payload.get("lifecycle_phase") or ""))
 PY
     )
     OLD_COMMIT="${recovery_state[0]:-}"
@@ -1326,6 +1537,9 @@ PY
     PYTHON_DEPENDENCIES_CHANGED="${recovery_state[6]:-true}"
     WEB_DEPENDENCIES_CHANGED="${recovery_state[7]:-true}"
     WEB_BUILD_REQUIRED="${recovery_state[8]:-true}"
+    LIFECYCLE_GENERATION="${recovery_state[9]:-}"
+    LIFECYCLE_PHASE="${recovery_state[10]:-}"
+    LIFECYCLE_OPERATION_ID="$TRANSACTION_ID"
     STAGING_DIR="$recovered_staging"
     WEB_ARTIFACTS_SWAPPED="$web_swapped"
     [[ "$OLD_COMMIT" =~ ^[0-9a-f]{40}$ && "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ && -n "$TRANSACTION_ID" ]] || return 1
@@ -1333,6 +1547,7 @@ PY
         STAGING_DIR=""
     fi
     acquire_update_lock || return 1
+    initialize_lifecycle_authority || return 1
     trap cleanup EXIT
     current_head="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
     [[ "$current_head" == "$OLD_COMMIT" ]] || return 1
@@ -1359,7 +1574,7 @@ execute_update() {
     LEASE_FILE="$RUN_DIR/update-lease.json"
     MAINTENANCE_PID_FILE="$RUN_DIR/maintenance.pid"
     MAINTENANCE_START_FILE="$RUN_DIR/maintenance.start"
-    TRANSACTION_ID="$(new_transaction_id)"
+    TRANSACTION_ID="${LIFECYCLE_OPERATION_ID:-$(new_transaction_id)}"
     COMMIT_FILE="$RUN_DIR/update-commit.${TRANSACTION_ID}.token"
     CANCEL_FILE="$RUN_DIR/update-cancel.${TRANSACTION_ID}.requested"
     if [[ "$MANUAL_CUTOVER" == false ]]; then
@@ -1387,6 +1602,10 @@ execute_update() {
 
     if ! acquire_update_lock; then
         write_state "failed" "Another update controller already owns the update lock." "update_in_progress" "$TARGET_COMMIT"
+        return 1
+    fi
+    if ! initialize_lifecycle_authority; then
+        write_state "failed" "Shared lifecycle ownership could not be established for this update." "lifecycle_unavailable" "$TARGET_COMMIT"
         return 1
     fi
     STAGING_DIR="$(mktemp -d "$(dirname "$ROOT_DIR")/.streamhome-update.XXXXXX")" || {

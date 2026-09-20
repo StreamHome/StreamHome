@@ -6,12 +6,14 @@ import os
 import tempfile
 import time
 import unittest
+import uuid
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from config import settings
+from lifecycle import state as lifecycle_state
 from routes import update as update_route
 from services import state
 from services import update
@@ -24,11 +26,19 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.status_path = self.run_dir / "update-state.json"
         self.status_lock_path = self.run_dir / "update-state.lock"
         self.log_path = Path(self.temporary.name) / "update.log"
+        self.workspace_root = Path(self.temporary.name) / "StreamHome"
+        (self.workspace_root / "server").mkdir(parents=True)
+        for script_name in ("start.sh", "update.sh"):
+            (self.workspace_root / script_name).write_text(
+                "#!/usr/bin/env bash\n",
+                encoding="utf-8",
+            )
         self.patches = [
             patch.object(update, "RUN_DIR", self.run_dir),
             patch.object(update, "STATUS_PATH", self.status_path),
             patch.object(update, "STATUS_LOCK_PATH", self.status_lock_path),
             patch.object(update, "LOG_PATH", self.log_path),
+            patch.object(update, "WORKSPACE_ROOT", self.workspace_root),
         ]
         for active_patch in self.patches:
             active_patch.start()
@@ -324,11 +334,209 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid_install_mode"):
             await update.queue_update(automatic=False, install_mode="force")
 
+    async def test_queue_reserves_exact_shared_lifecycle_ownership(self) -> None:
+        target = "d" * 40
+        update.write_update_state(
+            phase="update_available",
+            target_commit=target,
+            update_available=True,
+            previous_commit="f" * 40,
+            staging_dir="/stale/path",
+            diagnostic_id="stale-diagnostic",
+            recovery_requested_at=123.0,
+        )
+        queued = await update.queue_update(automatic=False)
+        authority = lifecycle_state.inspect_state(self.workspace_root)
+        operation = authority.active_operation
+        self.assertIsNotNone(operation)
+        self.assertEqual(operation.operation_type, lifecycle_state.OperationType.UPDATE)
+        self.assertEqual(operation.operation_id, queued["transaction_id"])
+        self.assertEqual(authority.generation, queued["lifecycle_generation"])
+        self.assertEqual(queued["lifecycle_phase"], "reserved")
+        self.assertEqual(queued["previous_commit"], "")
+        self.assertEqual(queued["staging_dir"], "")
+        self.assertEqual(queued["diagnostic_id"], "")
+        self.assertIsNone(queued["recovery_requested_at"])
+        credential = lifecycle_state.lifecycle_paths(self.workspace_root).credential_path(operation.operation_id)
+        raw_capability = credential.read_text(encoding="ascii").strip()
+        self.assertNotIn(raw_capability, self.status_path.read_text(encoding="utf-8"))
+
+    async def test_competing_lifecycle_operation_blocks_update_reservation(self) -> None:
+        lifecycle_state.claim_operation_with_credential(
+            self.workspace_root,
+            operation_type="update",
+            owner_kind="updater",
+        )
+        update.write_update_state(
+            phase="update_available",
+            target_commit="d" * 40,
+            update_available=True,
+        )
+        with self.assertRaisesRegex(RuntimeError, "lifecycle_conflict"):
+            await update.queue_update(automatic=False)
+
+    async def test_cancel_releases_only_its_exact_lifecycle_operation(self) -> None:
+        update.write_update_state(
+            phase="update_available",
+            target_commit="d" * 40,
+            update_available=True,
+        )
+        queued = await update.queue_update(automatic=False)
+        cancelled = await update.cancel_queued_update()
+        self.assertEqual(cancelled["phase"], "update_available")
+        authority = lifecycle_state.inspect_state(self.workspace_root)
+        self.assertIsNone(authority.active_operation)
+        self.assertEqual(authority.generation, queued["lifecycle_generation"])
+
+    def test_indeterminate_journal_write_preserves_an_adopted_claim(self) -> None:
+        claimed = update._reserve_update_lifecycle()
+        operation = claimed.active_operation
+        update.write_update_state(
+            transaction_id=operation.operation_id,
+            lifecycle_generation=claimed.generation,
+            lifecycle_phase="reserved",
+        )
+        update._release_unjournaled_update_claim(claimed)
+        self.assertEqual(
+            lifecycle_state.inspect_state(self.workspace_root).active_operation.operation_id,
+            operation.operation_id,
+        )
+
+    def test_unjournaled_claim_is_released_after_definite_write_failure(self) -> None:
+        claimed = update._reserve_update_lifecycle()
+        update.write_update_state(
+            transaction_id=str(uuid.uuid4()),
+            lifecycle_generation=999,
+            lifecycle_phase="reserved",
+        )
+        update._release_unjournaled_update_claim(claimed)
+        self.assertIsNone(lifecycle_state.inspect_state(self.workspace_root).active_operation)
+
+    def test_unreadable_or_corrupt_journal_preserves_unjournaled_claim(self) -> None:
+        for failure in ("unreadable", "corrupt"):
+            with self.subTest(failure=failure):
+                claimed = update._reserve_update_lifecycle()
+                if failure == "unreadable":
+                    context = patch.object(
+                        update,
+                        "_read_update_state_strict_unlocked",
+                        side_effect=update.UpdateJournalReadError("simulated read failure"),
+                    )
+                else:
+                    self.run_dir.mkdir(parents=True, exist_ok=True)
+                    self.status_path.write_text("{", encoding="utf-8")
+                    context = patch.object(
+                        update,
+                        "_read_update_state_strict_unlocked",
+                        wraps=update._read_update_state_strict_unlocked,
+                    )
+                with context:
+                    update._release_unjournaled_update_claim(claimed)
+                self.assertEqual(
+                    lifecycle_state.inspect_state(self.workspace_root).active_operation.operation_id,
+                    claimed.active_operation.operation_id,
+                )
+                lifecycle_state.complete_operation_with_credential(
+                    self.workspace_root,
+                    operation_id=claimed.active_operation.operation_id,
+                    generation=claimed.generation,
+                    expected_phase="reserved",
+                )
+                self.status_path.unlink(missing_ok=True)
+
+    def test_post_replace_journal_fsync_uncertainty_preserves_adopted_claim(self) -> None:
+        claimed = update._reserve_update_lifecycle()
+        operation = claimed.active_operation
+        with patch.object(update.os, "fsync", side_effect=[None, OSError("simulated directory fsync failure")]):
+            with self.assertRaises(OSError):
+                update.write_update_state(
+                    transaction_id=operation.operation_id,
+                    lifecycle_generation=claimed.generation,
+                    lifecycle_phase="reserved",
+                )
+        update._release_unjournaled_update_claim(claimed)
+        self.assertEqual(
+            lifecycle_state.inspect_state(self.workspace_root).active_operation.operation_id,
+            operation.operation_id,
+        )
+
+    async def test_wrong_generation_and_terminal_detail_never_clear_shared_authority(self) -> None:
+        update.write_update_state(
+            phase="update_available",
+            target_commit="d" * 40,
+            update_available=True,
+        )
+        queued = await update.queue_update(automatic=False)
+        update.write_update_state(phase="succeeded")
+        self.assertIsNotNone(lifecycle_state.inspect_state(self.workspace_root).active_operation)
+        wrong = dict(queued)
+        wrong["lifecycle_generation"] += 1
+        self.assertFalse(update._release_update_lifecycle({"phase": "succeeded"}))
+        partial = dict(queued)
+        partial["lifecycle_phase"] = ""
+        self.assertFalse(update._release_update_lifecycle(partial))
+        with self.assertRaises(lifecycle_state.LifecycleConflictError):
+            update._release_update_lifecycle(wrong)
+        self.assertIsNotNone(lifecycle_state.inspect_state(self.workspace_root).active_operation)
+
+    def test_recovery_required_update_releases_only_with_recorded_phase(self) -> None:
+        claimed = lifecycle_state.claim_operation_with_credential(
+            self.workspace_root,
+            operation_type="update",
+            owner_kind="updater",
+        )
+        operation = claimed.state.active_operation
+        lifecycle_state.transition_operation_with_credential(
+            self.workspace_root,
+            operation_id=operation.operation_id,
+            generation=claimed.state.generation,
+            expected_phase="reserved",
+            next_phase="recovery_required",
+        )
+        status = {
+            "transaction_id": operation.operation_id,
+            "lifecycle_generation": claimed.state.generation,
+            "lifecycle_phase": "recovery_required",
+        }
+        self.assertTrue(update._release_update_lifecycle(status))
+        self.assertIsNone(lifecycle_state.inspect_state(self.workspace_root).active_operation)
+
+    def test_cleanup_only_failure_does_not_make_lifecycle_release_fail(self) -> None:
+        claimed = lifecycle_state.claim_operation_with_credential(
+            self.workspace_root,
+            operation_type="update",
+            owner_kind="updater",
+        )
+        operation = claimed.state.active_operation
+        status = {
+            "transaction_id": operation.operation_id,
+            "lifecycle_generation": claimed.state.generation,
+            "lifecycle_phase": "reserved",
+        }
+        with patch.object(
+            lifecycle_state,
+            "_delete_credential",
+            side_effect=lifecycle_state.PersistenceError("simulated cleanup failure"),
+        ):
+            self.assertTrue(update._release_update_lifecycle(status))
+        self.assertIsNone(lifecycle_state.inspect_state(self.workspace_root).active_operation)
+
+    def test_first_phase_one_adoption_is_explicitly_legacy_protected(self) -> None:
+        script = (Path(__file__).resolve().parents[2] / "update.sh").read_text(encoding="utf-8")
+        self.assertIn("installed_release_lifecycle_support", script)
+        self.assertIn("PRE_PHASE1_CONFIRMED", script)
+        self.assertIn("PHASE1_CONFIRMED", script)
+        self.assertIn("INDETERMINATE", script)
+        self.assertIn("writes no shared lifecycle state", script)
+        self.assertIn('git -C "$ROOT_DIR" cat-file -e "$OLD_COMMIT^{commit}"', script)
+
     async def test_official_update_script_is_made_executable_and_launched_in_a_new_session(self) -> None:
         target = "e" * 40
         current = "a" * 40
         workspace = Path(self.temporary.name) / "StreamHome"
-        workspace.mkdir()
+        workspace.mkdir(exist_ok=True)
+        (workspace / "server").mkdir(exist_ok=True)
+        (workspace / "start.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
         update_script = workspace / "update.sh"
         update_script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8", newline="\n")
         update_script.chmod(0o644)
@@ -373,6 +581,14 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("STREAMHOME_SERVICE", detached_environment)
         self.assertNotIn("STREAMHOME_UPDATE_TRANSACTION", detached_environment)
         self.assertNotIn("STREAMHOME_UPDATE_COMMIT_TOKEN", detached_environment)
+        self.assertEqual(
+            detached_environment["STREAMHOME_LIFECYCLE_OPERATION_ID"],
+            update.read_update_state()["transaction_id"],
+        )
+        self.assertEqual(
+            detached_environment["STREAMHOME_LIFECYCLE_GENERATION"],
+            str(update.read_update_state()["lifecycle_generation"]),
+        )
         self.assertEqual(detached_environment["STREAMHOME_UPDATE_AUTOMATIC"], "false")
         self.assertEqual(detached_environment["STREAMHOME_UPDATE_INSTALL_MODE"], "now")
 

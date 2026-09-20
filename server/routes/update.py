@@ -160,6 +160,8 @@ def _runtime_error(exc: RuntimeError) -> HTTPException:
         "untrusted_origin": "The installation does not use the official StreamHome repository.",
         "invalid_install_mode": "Choose either immediate installation or installation when idle.",
         "update_script_unavailable": "The installation-root update.sh file is unavailable or could not be made executable.",
+        "lifecycle_conflict": "Another installation lifecycle operation is already active.",
+        "lifecycle_unavailable": "Shared lifecycle authority is unavailable and the update was blocked.",
     }
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
