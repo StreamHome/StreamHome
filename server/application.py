@@ -78,11 +78,13 @@ from lifecycle.coordination import (
     get_runtime_coordinator,
     runtime_work,
 )
+from lifecycle import state as lifecycle_state
 import services.state as state
 from routes.queue import router as queue_router
 from routes.auth import router as auth_router, health_router, get_current_session, get_current_user, require_recent_reauth
 from routes.backup import router as backup_router
 from routes.update import router as update_router
+from routes.lifecycle import router as lifecycle_router
 from routes.setup import router as setup_router
 from routes.playback import router as playback_router
 from routes.admin_profiles import router as admin_profiles_router
@@ -502,6 +504,85 @@ async def _promote_committed_update(
     )
 
 
+async def _promote_committed_restore(
+    runtime: _WorkerRuntime,
+    fence: DrainSnapshot | None,
+) -> None:
+    """Continue accepted restore/rollback through mandatory normal recovery."""
+
+    while not state.RESTORE_COMMIT_DECISION:
+        await asyncio.sleep(0.1)
+
+    async def revalidate_and_open_admission() -> None:
+        revalidate_startup_context(STARTUP_CONTEXT)
+        if fence is not None:
+            get_runtime_coordinator().release_fence(fence)
+
+    async def revalidate_after_recovery() -> None:
+        revalidate_startup_context(STARTUP_CONTEXT)
+
+    result = await run_mandatory_recovery(
+        STARTUP_CONTEXT,
+        (MandatoryRecoveryStep("lifecycle_authority", revalidate_and_open_admission),)
+        + _normal_recovery_steps()
+        + (MandatoryRecoveryStep("lifecycle_authority_final", revalidate_after_recovery),),
+    )
+    STARTUP_READINESS.record_recovery(result)
+    if not result.succeeded:
+        logger.error(f"[Lifespan Startup] Post-restore recovery failed: {result.error_code}")
+        return
+    if STARTUP_CONTEXT.operation_id is None or STARTUP_CONTEXT.generation is None:
+        STARTUP_READINESS.mark_worker_start_failed("restore_lifecycle_identity_missing")
+        return
+    try:
+        completion_fence = get_runtime_coordinator().close_admission(
+            list(EffectClass),
+            operation_id=STARTUP_CONTEXT.operation_id,
+            generation=STARTUP_CONTEXT.generation,
+        )
+    except Exception:
+        STARTUP_READINESS.mark_worker_start_failed("restore_completion_fence_failed")
+        logger.error("[Lifespan Startup] Restore completion fence could not be established.")
+        return
+    try:
+        await _start_runtime_workers(runtime)
+    except Exception:
+        STARTUP_READINESS.mark_worker_start_failed()
+        logger.error("[Lifespan Startup] Post-restore worker startup failed.")
+        return
+    STARTUP_READINESS.mark_workers_started()
+    STARTUP_READINESS.mark_general_ready()
+    while True:
+        try:
+            current = lifecycle_state.inspect_state(STARTUP_CONTEXT.installation_root)
+        except lifecycle_state.LifecycleError:
+            current = None
+        if (
+            current is not None
+            and current.active_operation is None
+            and current.generation == STARTUP_CONTEXT.generation
+        ):
+            get_runtime_coordinator().release_fence(completion_fence)
+            if state.MAINTENANCE_REASON == "StreamHome is completing guarded startup verification.":
+                state.MAINTENANCE_MODE = False
+                state.MAINTENANCE_REASON = ""
+            break
+        operation = current.active_operation if current is not None else None
+        if (
+            operation is None
+            or operation.operation_id != STARTUP_CONTEXT.operation_id
+            or current.generation != STARTUP_CONTEXT.generation
+            or operation.phase is lifecycle_state.LifecyclePhase.RECOVERY_REQUIRED
+        ):
+            STARTUP_READINESS.mark_worker_start_failed("restore_lifecycle_unresolved")
+            await _stop_runtime_workers(runtime)
+            return
+        await asyncio.sleep(0.1)
+    runtime.tasks.append(
+        asyncio.create_task(_optional_playback_baselines(), name="playback-baselines")
+    )
+
+
 async def _complete_normal_startup(runtime: _WorkerRuntime) -> None:
     async def revalidate_authority() -> None:
         revalidate_startup_context(STARTUP_CONTEXT)
@@ -566,6 +647,11 @@ async def lifespan(app: FastAPI):
                     _promote_committed_update(runtime, fence),
                     name="post-update-startup",
                 )
+            elif STARTUP_CONTEXT.mode is StartupMode.RESTORE_VERIFY:
+                startup_task = asyncio.create_task(
+                    _promote_committed_restore(runtime, fence),
+                    name="post-restore-startup",
+                )
         else:
             logger.error(f"[Lifespan Startup] Guarded recovery failed: {result.error_code}")
 
@@ -583,11 +669,23 @@ class StartupModeGateMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         readiness = STARTUP_READINESS.projection()
-        if readiness["generalReady"]:
+        public_ready = readiness["generalReady"]
+        if public_ready and STARTUP_CONTEXT.mode is StartupMode.RESTORE_VERIFY:
+            try:
+                current = lifecycle_state.inspect_state(STARTUP_CONTEXT.installation_root)
+                public_ready = (
+                    current.active_operation is None
+                    and current.generation == STARTUP_CONTEXT.generation
+                )
+            except lifecycle_state.LifecycleError:
+                public_ready = False
+        if public_ready:
             return await call_next(request)
         path = request.url.path
         allowed = path in {"/api/health", "/api/health/live", "/api/health/ready"}
         if STARTUP_CONTEXT.mode is StartupMode.UPDATE_VERIFY and path == "/api/update/commit":
+            allowed = True
+        if STARTUP_CONTEXT.mode is StartupMode.RESTORE_VERIFY and path == "/api/lifecycle/restore/commit":
             allowed = True
         if allowed:
             return await call_next(request)
@@ -609,6 +707,7 @@ class ActivityTrackingMiddleware(BaseHTTPMiddleware):
             state.MAINTENANCE_MODE
             and not request.url.path.startswith("/api/health")
             and request.url.path != "/api/update/commit"
+            and request.url.path != "/api/lifecycle/restore/commit"
             and (
                 bool(state.UPDATE_TRANSACTION_ID)
                 or not request.url.path.startswith("/api/backup/restore/")
@@ -644,6 +743,7 @@ class SetupGateMiddleware(BaseHTTPMiddleware):
             or path.startswith("/api/setup")
             or path.startswith("/api/health")
             or path == "/api/update/commit"
+            or path == "/api/lifecycle/restore/commit"
         )
         if not settings.SETUP_COMPLETE and not allowed:
             return JSONResponse(
@@ -767,6 +867,7 @@ app.include_router(playback_router)
 app.include_router(media_updates_router)
 app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
 app.include_router(update_router, prefix="/api/update", tags=["update"])
+app.include_router(lifecycle_router, prefix="/api/lifecycle", tags=["lifecycle"])
 app.include_router(setup_router)
 app.include_router(admin_profiles_router)
 

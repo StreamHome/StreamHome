@@ -164,6 +164,59 @@ def safe_public_status(
     }
 
 
+def safe_restore_status(root: Path, operation_id: str) -> dict[str, Any]:
+    """Project restore state without exposing artifact or credential details."""
+
+    try:
+        from lifecycle.restore_controller import public_restore_status
+
+        projection = public_restore_status(root, operation_id)
+    except Exception:
+        return {
+            "phase": "recovery_required",
+            "label": "Restore recovery needs attention",
+            "message": "StreamHome is preserving restore recovery state.",
+            "error": "restore_status_unavailable",
+            "diagnostic": "",
+            "transaction": operation_id[:12],
+            "target": "",
+            "elapsedSeconds": 0,
+            "controllerActive": False,
+            "terminal": False,
+        }
+    phase = str(projection.get("phase") or "recovery_required")
+    labels = {
+        "controller_owned": "Preparing protected restore",
+        "drained": "Draining active work",
+        "runtime_stopped": "StreamHome is offline for restore",
+        "checkpoint_ready": "Rollback checkpoint protected",
+        "candidate_staged": "Restore candidate staged",
+        "activation_started": "Activating restore candidate",
+        "activation_completed": "Restore candidate activated",
+        "verifying_candidate": "Verifying restored database",
+        "accepted": "Restore accepted",
+        "normal_recovery": "Completing mandatory recovery",
+        "rollback_started": "Restoring previous database",
+        "rollback_activated": "Previous database restored",
+        "verifying_rollback": "Verifying previous database",
+        "succeeded": "Restore completed",
+        "rolled_back": "Previous database restored",
+        "recovery_required": "Restore recovery needs attention",
+    }
+    return {
+        "phase": phase,
+        "label": labels.get(phase, "StreamHome restore maintenance"),
+        "message": "StreamHome is completing a protected offline database restore.",
+        "error": str(projection.get("errorCode") or "") if phase == "recovery_required" else "",
+        "diagnostic": "",
+        "transaction": operation_id[:12],
+        "target": "",
+        "elapsedSeconds": 0,
+        "controllerActive": bool(projection.get("controllerActive")),
+        "terminal": bool(projection.get("terminal")),
+    }
+
+
 def recovery_needed(status: dict[str, Any]) -> bool:
     phase = str(status.get("phase") or "")
     if status.get("controllerActive"):
@@ -262,6 +315,48 @@ class RecoveryCoordinator:
                 return
 
 
+class RestoreRecoveryCoordinator:
+    def __init__(self, root: Path, operation_id: str, server: ThreadingHTTPServer) -> None:
+        self.root = root
+        self.operation_id = operation_id
+        self.server = server
+        self.stop_event = threading.Event()
+        self.recovery_queued = False
+
+    def run(self) -> None:
+        while not self.stop_event.wait(2):
+            status = safe_restore_status(self.root, self.operation_id)
+            if (
+                status.get("controllerActive")
+                or status.get("terminal")
+                or status.get("phase") == "recovery_required"
+                or self.recovery_queued
+            ):
+                continue
+            try:
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "lifecycle.restore_controller",
+                        "recover",
+                        "--root",
+                        str(self.root),
+                    ],
+                    cwd=str(self.root / "server"),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                    env={**os.environ, "PYTHONPATH": str(self.root / "server")},
+                )
+            except OSError:
+                return
+            self.recovery_queued = True
+            return
+
+
 def maintenance_page(status: dict[str, Any]) -> bytes:
     phase = html.escape(str(status["phase"]))
     label = html.escape(str(status["label"]))
@@ -322,6 +417,8 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
     server: "MaintenanceServer"
 
     def _status(self) -> dict[str, Any]:
+        if self.server.operation_type == "restore":
+            return safe_restore_status(self.server.root, self.server.transaction_id)
         return safe_public_status(
             self.server.state_path,
             self.server.lease_path,
@@ -345,7 +442,7 @@ class MaintenanceHandler(BaseHTTPRequestHandler):
     def _respond(self, include_body: bool) -> None:
         path = urlsplit(self.path).path
         status = self._status()
-        if path == "/__streamhome/update-status":
+        if path in {"/__streamhome/update-status", "/__streamhome/restore-status"}:
             body = (json.dumps(status, separators=(",", ":")) + "\n").encode("utf-8")
             self._send_headers(HTTPStatus.OK, "application/json; charset=utf-8", len(body))
         else:
@@ -376,12 +473,14 @@ class MaintenanceServer(ThreadingHTTPServer):
         lease_path: Path,
         transaction_id: str,
         silence_seconds: float,
+        operation_type: str = "update",
     ) -> None:
         self.root = root
         self.state_path = state_path
         self.lease_path = lease_path
         self.transaction_id = transaction_id
         self.silence_seconds = silence_seconds
+        self.operation_type = operation_type
         super().__init__(address, MaintenanceHandler)
 
 
@@ -394,6 +493,8 @@ def main() -> None:
     parser.add_argument("--lease-file", type=Path)
     parser.add_argument("--transaction-id", default="")
     parser.add_argument("--controller-silence-seconds", type=float, default=30.0)
+    parser.add_argument("--operation-type", choices=("update", "restore"), default="update")
+    parser.add_argument("--operation-id", default="")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         raise SystemExit("port must be between 1 and 65535")
@@ -403,7 +504,9 @@ def main() -> None:
     state_path = (args.state_file or root / ".run" / "update-state.json").resolve()
     lease_path = (args.lease_file or root / ".run" / "update-lease.json").resolve()
     state = read_json(state_path)
-    transaction_id = args.transaction_id or str(state.get("transaction_id") or "")
+    transaction_id = args.operation_id or args.transaction_id or str(state.get("transaction_id") or "")
+    if args.operation_type == "restore" and not transaction_id:
+        raise SystemExit("restore operation id is required")
     server = MaintenanceServer(
         ("0.0.0.0", args.port),
         root,
@@ -411,9 +514,14 @@ def main() -> None:
         lease_path,
         transaction_id,
         args.controller_silence_seconds,
+        args.operation_type,
     )
-    coordinator = RecoveryCoordinator(root, state_path, lease_path, transaction_id, args.controller_silence_seconds, server)
-    monitor = threading.Thread(target=coordinator.run, name="streamhome-update-recovery", daemon=True)
+    coordinator = (
+        RestoreRecoveryCoordinator(root, transaction_id, server)
+        if args.operation_type == "restore"
+        else RecoveryCoordinator(root, state_path, lease_path, transaction_id, args.controller_silence_seconds, server)
+    )
+    monitor = threading.Thread(target=coordinator.run, name="streamhome-maintenance-recovery", daemon=True)
     monitor.start()
     try:
         server.serve_forever(poll_interval=0.5)

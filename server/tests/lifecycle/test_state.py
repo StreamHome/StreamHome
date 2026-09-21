@@ -574,6 +574,91 @@ class LifecycleStateTests(unittest.TestCase):
         ) as recovered:
             self.assertEqual(recovered.lease.pid, os.getpid())
 
+    def test_successive_controller_takeovers_have_exactly_one_current_owner(self) -> None:
+        claimed = state.claim_operation_with_credential(
+            self.root,
+            operation_type="restore",
+            owner_kind="restore_controller",
+        )
+        operation = claimed.state.active_operation
+        self.assertIsNotNone(operation)
+        first_handle, first = state.acquire_transferred_controller_lease(
+            self.root,
+            operation_id=operation.operation_id,
+            generation=claimed.state.generation,
+            expected_phase="reserved",
+            owner_capability=claimed.owner_capability,
+            next_owner_kind="restore_controller",
+        )
+        self.assertEqual(first.state.generation, claimed.state.generation + 1)
+        self.assertNotEqual(first.owner_capability, claimed.owner_capability)
+        with self.assertRaises(state.LifecycleConflictError):
+            state.validate_operation_owner_current_phase(
+                self.root,
+                operation_id=operation.operation_id,
+                generation=claimed.state.generation,
+                owner_capability=claimed.owner_capability,
+            )
+        with self.assertRaises(state.ControllerLockError):
+            state.acquire_transferred_controller_lease(
+                self.root,
+                operation_id=operation.operation_id,
+                generation=first.state.generation,
+                expected_phase="reserved",
+                owner_capability=first.owner_capability,
+                next_owner_kind="restore_controller",
+            )
+        first_handle.release()
+
+        second_handle, second = state.acquire_transferred_controller_lease(
+            self.root,
+            operation_id=operation.operation_id,
+            generation=first.state.generation,
+            expected_phase="reserved",
+            owner_capability=first.owner_capability,
+            next_owner_kind="restore_controller",
+        )
+        try:
+            self.assertEqual(second.state.generation, first.state.generation + 1)
+            self.assertNotEqual(second.owner_capability, first.owner_capability)
+            with self.assertRaises(state.LifecycleConflictError):
+                state.validate_operation_owner_current_phase(
+                    self.root,
+                    operation_id=operation.operation_id,
+                    generation=first.state.generation,
+                    owner_capability=first.owner_capability,
+                )
+        finally:
+            second_handle.release()
+
+    def test_controller_transfer_recovers_orphaned_pre_cas_credential(self) -> None:
+        claimed = state.claim_operation_with_credential(
+            self.root,
+            operation_type="restore",
+            owner_kind="restore_controller",
+        )
+        operation = claimed.state.active_operation
+        self.assertIsNotNone(operation)
+        paths = state.lifecycle_paths(self.root)
+        orphan = paths.generation_credential_path(
+            operation.operation_id,
+            claimed.state.generation + 1,
+        )
+        state._write_credential_path(paths, orphan, "z" * 43)
+        handle, transferred = state.acquire_transferred_controller_lease(
+            self.root,
+            operation_id=operation.operation_id,
+            generation=claimed.state.generation,
+            expected_phase="reserved",
+            owner_capability=claimed.owner_capability,
+            next_owner_kind="restore_controller",
+        )
+        try:
+            self.assertEqual(transferred.state.generation, claimed.state.generation + 1)
+            self.assertNotEqual(orphan.read_text(encoding="ascii").strip(), "z" * 43)
+        finally:
+            handle.release()
+
 
 if __name__ == "__main__":
     unittest.main()

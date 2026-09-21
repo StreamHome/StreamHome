@@ -32,6 +32,8 @@ def _parser() -> argparse.ArgumentParser:
 
     commands.add_parser("inspect")
     commands.add_parser("startup-decision")
+    commands.add_parser("startup-allowed")
+    commands.add_parser("restore-recovery-needed")
 
     claim = commands.add_parser("claim")
     claim.add_argument("--operation-type", required=True, choices=[item.value for item in state.OperationType])
@@ -88,6 +90,22 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
             "command": "startup-decision",
             **public_startup_projection(context),
         }
+    if arguments.command == "startup-allowed":
+        state.inspect_state(root)
+        from .bootstrap import StartupMode, evaluate_startup, public_startup_projection
+
+        context = evaluate_startup(root, install=False)
+        if context.mode not in {StartupMode.NORMAL, StartupMode.UPDATE_VERIFY}:
+            raise state.LifecycleConflictError("normal startup is not authorized")
+        return {"ok": True, "command": "startup-allowed", **public_startup_projection(context)}
+    if arguments.command == "restore-recovery-needed":
+        current = state.inspect_state(root)
+        operation = current.active_operation
+        if operation is None or operation.operation_type is not state.OperationType.RESTORE:
+            raise state.LifecycleConflictError("restore recovery is not active")
+        if operation.phase is state.LifecyclePhase.RECOVERY_REQUIRED:
+            raise state.LifecycleConflictError("restore recovery requires operator action")
+        return _success("restore-recovery-needed", current)
     if arguments.command == "claim":
         result = state.claim_operation_with_credential(
             root,

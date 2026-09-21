@@ -204,6 +204,39 @@ class LifecycleCliTests(unittest.TestCase):
         self.assertEqual(json.loads(idle.stdout)["decision"], "normal")
         self.assertFalse((self.root / ".run").exists())
 
+    def test_shell_authorization_commands_delegate_restore_decision_to_python(self) -> None:
+        self.assertEqual(self._run("startup-allowed").returncode, cli.EXIT_OK)
+        self.assertEqual(
+            self._run("restore-recovery-needed").returncode,
+            cli.EXIT_CONFLICT,
+        )
+        claimed = state.claim_operation_with_credential(
+            self.root,
+            operation_type="restore",
+            owner_kind="restore_controller",
+        )
+        operation = claimed.state.active_operation
+        self.assertIsNotNone(operation)
+        self.assertEqual(
+            self._run("restore-recovery-needed").returncode,
+            cli.EXIT_OK,
+        )
+        state.transition_operation_with_credential(
+            self.root,
+            operation_id=operation.operation_id,
+            generation=claimed.state.generation,
+            expected_phase="reserved",
+            next_phase="recovery_required",
+        )
+        self.assertEqual(
+            self._run("restore-recovery-needed").returncode,
+            cli.EXIT_CONFLICT,
+        )
+        self.assertEqual(
+            self._run("startup-allowed").returncode,
+            cli.EXIT_CONFLICT,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

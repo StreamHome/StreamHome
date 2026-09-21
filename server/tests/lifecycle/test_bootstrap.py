@@ -10,7 +10,7 @@ import tempfile
 import unittest
 import uuid
 
-from lifecycle import bootstrap, state
+from lifecycle import bootstrap, coordination, state
 
 
 class BootstrapTests(unittest.IsolatedAsyncioTestCase):
@@ -317,6 +317,61 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(projection["guardedReady"])
         self.assertFalse(projection["generalReady"])
         self.assertFalse(projection["workersStarted"])
+
+    async def test_restore_general_readiness_remains_private_until_lifecycle_completion(self) -> None:
+        claimed = self._claim("restore", "restore_controller")
+        operation = claimed.state.active_operation
+        environment = self._environment(
+            STREAMHOME_LIFECYCLE_STARTUP_MODE="restore_verify",
+            STREAMHOME_LIFECYCLE_OPERATION_ID=operation.operation_id,
+            STREAMHOME_LIFECYCLE_GENERATION=str(claimed.state.generation),
+        )
+        context = bootstrap.evaluate_startup(self.root, environment, install=False)
+        readiness = bootstrap.StartupReadiness(context)
+
+        async def success() -> None:
+            return None
+
+        result = await bootstrap.run_mandatory_recovery(
+            context,
+            (bootstrap.MandatoryRecoveryStep("normal_recovery", success),),
+        )
+        readiness.record_recovery(result)
+        readiness.mark_workers_started()
+        readiness.mark_general_ready()
+        pending = bootstrap.current_readiness_projection(readiness, environment)
+        self.assertFalse(pending["generalReady"])
+        self.assertEqual(pending["errorCode"], "restore_lifecycle_pending")
+
+        state.transition_operation_with_credential(
+            self.root,
+            operation_id=operation.operation_id,
+            generation=claimed.state.generation,
+            expected_phase="reserved",
+            next_phase="recovery_required",
+        )
+        failed = bootstrap.current_readiness_projection(readiness, environment)
+        self.assertFalse(failed["generalReady"])
+        coordinator = coordination.RuntimeCoordinator()
+        completion_fence = coordinator.close_admission(
+            list(coordination.EffectClass),
+            operation_id=operation.operation_id,
+            generation=claimed.state.generation,
+        )
+        with self.assertRaises(coordination.AdmissionClosedError):
+            coordinator.admit("post-restore.writer", [coordination.EffectClass.DB_WRITE])
+
+        state.complete_operation_with_credential(
+            self.root,
+            operation_id=operation.operation_id,
+            generation=claimed.state.generation,
+            expected_phase="recovery_required",
+        )
+        completed = bootstrap.current_readiness_projection(readiness, environment)
+        self.assertTrue(completed["generalReady"])
+        coordinator.release_fence(completion_fence)
+        lease = coordinator.admit("post-restore.writer", [coordination.EffectClass.DB_WRITE])
+        lease.release()
 
     async def test_guarded_projection_fails_closed_when_authority_changes(self) -> None:
         claimed = self._claim("restore", "restore_controller")

@@ -234,31 +234,39 @@ generate_runtime_token() {
     [[ -n "$RUNTIME_TOKEN" ]] || fail "A runtime ownership token could not be generated."
 }
 
-lifecycle_startup_decision() {
+lifecycle_startup_allowed() {
     PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
-        "$BACKEND_PYTHON" -m lifecycle.cli --root "$ROOT_DIR" startup-decision
+        "$BACKEND_PYTHON" -m lifecycle.cli --root "$ROOT_DIR" startup-allowed >/dev/null
+}
+
+restore_recovery_needed() {
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+        "$BACKEND_PYTHON" -m lifecycle.cli --root "$ROOT_DIR" restore-recovery-needed >/dev/null 2>&1
+}
+
+launch_restore_recovery() {
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+        "$BACKEND_PYTHON" -m lifecycle.restore_controller recover --root "$ROOT_DIR"
 }
 
 authorize_lifecycle_startup() {
-    local output decision
-    output="$(lifecycle_startup_decision)" \
-        || fail "Lifecycle authority could not be inspected safely. Startup remains blocked."
-    decision="$(printf '%s' "$output" | "$BACKEND_PYTHON" -c \
-        'import json,sys; print(str(json.load(sys.stdin).get("decision") or "fail_closed"))')" \
-        || fail "Lifecycle startup decision could not be decoded safely."
-    case "$decision" in
-        normal|update_verify)
-            ;;
-        restore_verify)
-            fail "Restore verification requires the Phase 4 offline controller and cannot be launched by normal startup."
-            ;;
-        recovery_only)
-            fail "Lifecycle recovery is required before normal startup can continue."
-            ;;
-        *)
-            fail "Lifecycle authority rejected startup (${decision})."
-            ;;
-    esac
+    local recovery_status=0
+    if restore_recovery_needed; then
+        if launch_restore_recovery; then
+            START_SUCCEEDED=true
+            printf '[StreamHome] The protected restore controller owns recovery.\n'
+            exit 0
+        else
+            recovery_status=$?
+        fi
+        if [[ "$recovery_status" -eq 10 ]]; then
+            printf '[StreamHome] An abandoned pre-destructive restore reservation was released safely.\n'
+        else
+            fail "Restore recovery could not establish controller ownership. Startup remains blocked."
+        fi
+    fi
+    lifecycle_startup_allowed \
+        || fail "Lifecycle authority could not authorize normal startup. Startup remains blocked."
 }
 
 start_backend() {

@@ -336,7 +336,7 @@ async def require_recent_reauth(session: AuthSession = Depends(get_current_sessi
 
 @health_router.get("/api/health/live")
 async def health_live():
-    projection = get_startup_readiness().projection()
+    projection = current_readiness_projection(get_startup_readiness())
     return {
         "status": "live",
         "version": settings.APP_VERSION,
@@ -344,6 +344,7 @@ async def health_live():
         "serverTime": now(),
         "mode": projection["mode"],
         "generalReady": projection["generalReady"],
+        "workersStarted": projection["workersStarted"],
         "recoveryCompleted": projection["recoveryCompleted"],
         "recoverySucceeded": projection["recoverySucceeded"],
         "errorCode": projection["errorCode"],

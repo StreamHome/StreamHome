@@ -480,6 +480,24 @@ def current_readiness_projection(
             projection = dict(projection)
             projection["guardedReady"] = False
             projection["errorCode"] = StartupAuthorityChangedError.code
+    if projection["generalReady"] and readiness.context.mode is StartupMode.RESTORE_VERIFY:
+        try:
+            current = state.inspect_state(readiness.context.installation_root)
+            restore_completed = (
+                current.active_operation is None
+                and current.generation == readiness.context.generation
+            )
+        except state.LifecycleError:
+            restore_completed = False
+        if not restore_completed:
+            projection = dict(projection)
+            projection["generalReady"] = False
+            projection["capabilities"] = [
+                capability
+                for capability in projection["capabilities"]
+                if capability != ReadinessCapability.BACKGROUND_WORK.value
+            ]
+            projection["errorCode"] = "restore_lifecycle_pending"
     return projection
 
 

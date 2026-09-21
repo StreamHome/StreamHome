@@ -343,6 +343,48 @@ def terminate_owned_processes(root: Path) -> tuple[set[str], dict[int, str]]:
     return stopped_services, remaining
 
 
+def terminate_owned_service(root: Path, service: str) -> bool:
+    """Terminate one exact owned service without weakening other runtime owners."""
+
+    if service not in SERVICE_NAMES:
+        raise ValueError(f"Unsupported service: {service}")
+
+    def selected() -> tuple[dict[int, ProcessInfo], dict[int, str]]:
+        snapshot = process_snapshot()
+        owned = discover_owned(snapshot, root)
+        return snapshot, {pid: name for pid, name in owned.items() if name == service}
+
+    for selected_signal, timeout in (
+        (signal.SIGTERM, TERM_TIMEOUT_SECONDS),
+        (signal.SIGKILL, KILL_TIMEOUT_SECONDS),
+    ):
+        snapshot, owned = selected()
+        if not owned:
+            cleanup_service_records(root, {service})
+            return True
+        groups = safe_owned_groups(snapshot, owned)
+        for pgid in sorted(groups):
+            try:
+                os.killpg(pgid, selected_signal)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        for pid in sorted(owned, reverse=True):
+            info = snapshot.get(pid)
+            if info is None or info.pgid in groups:
+                continue
+            try:
+                os.kill(pid, selected_signal)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not selected()[1]:
+                cleanup_service_records(root, {service})
+                return True
+            time.sleep(POLL_INTERVAL_SECONDS)
+    return not selected()[1]
+
+
 def port_is_available(port: int) -> bool:
     if listening_socket_inodes(port):
         return False

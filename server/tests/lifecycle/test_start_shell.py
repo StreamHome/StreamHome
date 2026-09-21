@@ -81,6 +81,21 @@ class StartShellRecoveryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "false")
 
+    def test_recovery_required_never_launches_automatic_restore_controller(self) -> None:
+        result = self._shell(
+            "\n".join(
+                (
+                    "restore_recovery_needed() { return 1; }",
+                    "launch_restore_recovery() { printf 'unexpected-launch\\n'; return 0; }",
+                    "lifecycle_startup_allowed() { return 1; }",
+                    "fail() { printf 'blocked\\n'; return 1; }",
+                    "if authorize_lifecycle_startup; then exit 9; fi",
+                )
+            )
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "blocked")
+
 
 if __name__ == "__main__":
     unittest.main()

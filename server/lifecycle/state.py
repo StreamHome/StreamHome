@@ -48,6 +48,8 @@ ALLOWED_TRANSITIONS: Mapping[LifecyclePhase, frozenset[LifecyclePhase]] = {
         {LifecyclePhase.VERIFYING, LifecyclePhase.RECOVERY_REQUIRED}
     ),
     LifecyclePhase.VERIFYING: frozenset({LifecyclePhase.RECOVERY_REQUIRED}),
+    # Update's existing protected recovery bridge still performs this transition.
+    # Restore automatic recovery deliberately refuses it in restore_controller.py.
     LifecyclePhase.RECOVERY_REQUIRED: frozenset({LifecyclePhase.EXCLUSIVE}),
 }
 
@@ -113,6 +115,13 @@ class CompletionResult:
 
 
 @dataclass(frozen=True)
+class OwnershipTransferResult:
+    state: LifecycleState
+    owner_capability: str = field(repr=False)
+    credential_cleanup_error: str | None = None
+
+
+@dataclass(frozen=True)
 class LifecyclePaths:
     root: Path
     run_dir: Path
@@ -125,6 +134,11 @@ class LifecyclePaths:
 
     def credential_path(self, operation_id: str) -> Path:
         return self.credentials_dir / f"{_validate_operation_id(operation_id)}.cap"
+
+    def generation_credential_path(self, operation_id: str, generation: int) -> Path:
+        canonical_id = _validate_operation_id(operation_id)
+        canonical_generation = _validate_generation(generation, positive=True)
+        return self.credentials_dir / f"{canonical_id}.{canonical_generation}.cap"
 
 
 @dataclass(frozen=True)
@@ -679,6 +693,85 @@ def transfer_operation_owner(
         return updated
 
 
+def _transfer_operation_owner_with_credential(
+    root: str | os.PathLike[str] | None,
+    *,
+    operation_id: str,
+    generation: int,
+    expected_phase: LifecyclePhase | str,
+    owner_capability: str,
+    next_owner_kind: OwnerKind | str,
+) -> OwnershipTransferResult:
+    """Fence an owner transfer with a fresh generation-scoped capability.
+
+    The new credential is durable before the authority references it. If state
+    persistence reports an indeterminate post-replace failure, the authoritative
+    state is re-read and accepted only when it exactly names the new capability.
+    The caller must hold controller.lock for the complete call.
+    """
+
+    paths = lifecycle_paths(root)
+    next_owner = _enum_value(OwnerKind, next_owner_kind, "next_owner_kind")
+    validated_generation = _validate_generation(generation, positive=True)
+    next_generation = validated_generation + 1
+    next_capability = new_owner_capability()
+    next_path = paths.generation_credential_path(operation_id, next_generation)
+    previous_path = _credential_path_for_generation(paths, operation_id, validated_generation)
+    validate_operation_owner(
+        paths.root,
+        operation_id=operation_id,
+        generation=validated_generation,
+        expected_phase=expected_phase,
+        owner_capability=owner_capability,
+    )
+    if next_path.exists() or next_path.is_symlink():
+        # controller.lock proves no competing transfer can own this path. With
+        # authority still at the old generation, it is an orphan from a crash
+        # before the prior transfer's state CAS.
+        _delete_credential_path(paths, next_path)
+    _write_credential_path(paths, next_path, next_capability)
+    try:
+        try:
+            updated = transfer_operation_owner(
+                paths.root,
+                operation_id=operation_id,
+                generation=validated_generation,
+                expected_phase=expected_phase,
+                owner_capability=owner_capability,
+                next_owner_kind=next_owner,
+                next_owner_capability=next_capability,
+            )
+        except LifecycleError:
+            current = inspect_state(paths.root)
+            operation = current.active_operation
+            if not (
+                operation is not None
+                and operation.operation_id == operation_id
+                and current.generation == next_generation
+                and operation.owner_kind is next_owner
+                and hmac.compare_digest(
+                    operation.owner_nonce_hash,
+                    hash_owner_capability(next_capability),
+                )
+            ):
+                raise
+            updated = current
+    except Exception:
+        try:
+            _delete_credential_path(paths, next_path)
+        except LifecycleError:
+            pass
+        raise
+
+    cleanup_error: str | None = None
+    if previous_path != next_path:
+        try:
+            _delete_credential_path(paths, previous_path)
+        except LifecycleError as exc:
+            cleanup_error = exc.code
+    return OwnershipTransferResult(updated, next_capability, cleanup_error)
+
+
 def complete_operation(
     root: str | os.PathLike[str] | None,
     *,
@@ -702,9 +795,8 @@ def complete_operation(
         return completed
 
 
-def _write_credential(paths: LifecyclePaths, operation_id: str, capability: str) -> Path:
+def _write_credential_path(paths: LifecyclePaths, path: Path, capability: str) -> Path:
     _ensure_lifecycle_directories(paths, credentials=True)
-    path = paths.credential_path(operation_id)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     created = False
     try:
@@ -735,10 +827,30 @@ def _write_credential(paths: LifecyclePaths, operation_id: str, capability: str)
         raise PersistenceError("operation credential could not be persisted") from exc
 
 
-def _read_credential(paths: LifecyclePaths, operation_id: str) -> str:
+def _write_credential(paths: LifecyclePaths, operation_id: str, capability: str) -> Path:
+    return _write_credential_path(paths, paths.credential_path(operation_id), capability)
+
+
+def _credential_path_for_generation(
+    paths: LifecyclePaths,
+    operation_id: str,
+    generation: int | None,
+) -> Path:
+    if generation is not None:
+        generation_path = paths.generation_credential_path(operation_id, generation)
+        if generation_path.exists() or generation_path.is_symlink():
+            return generation_path
+    return paths.credential_path(operation_id)
+
+
+def _read_credential(
+    paths: LifecyclePaths,
+    operation_id: str,
+    generation: int | None = None,
+) -> str:
     _validate_read_path(paths)
     _validate_directory(paths.credentials_dir, "lifecycle credential directory")
-    path = paths.credential_path(operation_id)
+    path = _credential_path_for_generation(paths, operation_id, generation)
     descriptor: int | None = None
     try:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -761,10 +873,9 @@ def _read_credential(paths: LifecyclePaths, operation_id: str) -> str:
             os.close(descriptor)
 
 
-def _delete_credential(paths: LifecyclePaths, operation_id: str) -> None:
+def _delete_credential_path(paths: LifecyclePaths, path: Path) -> None:
     _validate_read_path(paths)
     _validate_directory(paths.credentials_dir, "lifecycle credential directory")
-    path = paths.credential_path(operation_id)
     try:
         path.unlink()
         _fsync_directory(paths.credentials_dir)
@@ -772,6 +883,17 @@ def _delete_credential(paths: LifecyclePaths, operation_id: str) -> None:
         return
     except OSError as exc:
         raise PersistenceError("operation credential could not be removed") from exc
+
+
+def _delete_credential(
+    paths: LifecyclePaths,
+    operation_id: str,
+    generation: int | None = None,
+) -> None:
+    _delete_credential_path(
+        paths,
+        _credential_path_for_generation(paths, operation_id, generation),
+    )
 
 
 def claim_operation_with_credential(
@@ -824,7 +946,7 @@ def validate_operation_with_credential(
     expected_phase: LifecyclePhase | str | None = None,
 ) -> LifecycleState:
     paths = lifecycle_paths(root)
-    capability = _read_credential(paths, operation_id)
+    capability = _read_credential(paths, operation_id, generation)
     if expected_phase is None:
         return validate_operation_owner_current_phase(
             paths.root,
@@ -841,6 +963,30 @@ def validate_operation_with_credential(
     )
 
 
+def load_controller_capability(
+    root: str | os.PathLike[str] | None,
+    *,
+    operation_id: str,
+    generation: int,
+) -> str:
+    """Load the fixed-path owner credential for an offline lifecycle controller.
+
+    The capability is deliberately unavailable through the lifecycle CLI or public
+    projections.  This narrow API exists so a replacement controller can resume an
+    orphaned operation without placing the secret in argv or the environment.
+    """
+
+    paths = lifecycle_paths(root)
+    capability = _read_credential(paths, operation_id, generation)
+    validate_operation_owner_current_phase(
+        paths.root,
+        operation_id=operation_id,
+        generation=generation,
+        owner_capability=capability,
+    )
+    return capability
+
+
 def transition_operation_with_credential(
     root: str | os.PathLike[str] | None,
     *,
@@ -850,7 +996,7 @@ def transition_operation_with_credential(
     next_phase: LifecyclePhase | str,
 ) -> LifecycleState:
     paths = lifecycle_paths(root)
-    capability = _read_credential(paths, operation_id)
+    capability = _read_credential(paths, operation_id, generation)
     return transition_operation(
         paths.root,
         operation_id=operation_id,
@@ -869,7 +1015,7 @@ def complete_operation_with_credential(
     expected_phase: LifecyclePhase | str,
 ) -> CompletionResult:
     paths = lifecycle_paths(root)
-    capability = _read_credential(paths, operation_id)
+    capability = _read_credential(paths, operation_id, generation)
     completed = complete_operation(
         paths.root,
         operation_id=operation_id,
@@ -878,7 +1024,7 @@ def complete_operation_with_credential(
         owner_capability=capability,
     )
     try:
-        _delete_credential(paths, operation_id)
+        _delete_credential(paths, operation_id, generation)
     except LifecycleError as exc:
         return CompletionResult(completed, exc.code)
     return CompletionResult(completed)
@@ -1048,6 +1194,50 @@ def acquire_controller_lease(
         )
         _atomic_write_json(paths.lease_path, _lease_payload(lease))
         return ControllerLeaseHandle(paths, descriptor, lease)
+    except Exception:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+        raise
+
+
+def acquire_transferred_controller_lease(
+    root: str | os.PathLike[str] | None,
+    *,
+    operation_id: str,
+    generation: int,
+    expected_phase: LifecyclePhase | str,
+    owner_capability: str,
+    next_owner_kind: OwnerKind | str,
+) -> tuple[ControllerLeaseHandle, OwnershipTransferResult]:
+    """Acquire process ownership and durably fence the prior lifecycle owner."""
+
+    paths = lifecycle_paths(root)
+    _ensure_lifecycle_directories(paths)
+    descriptor = _open_locked_file(paths.controller_lock_path, nonblocking=True)
+    try:
+        transferred = _transfer_operation_owner_with_credential(
+            paths.root,
+            operation_id=operation_id,
+            generation=generation,
+            expected_phase=expected_phase,
+            owner_capability=owner_capability,
+            next_owner_kind=next_owner_kind,
+        )
+        operation = transferred.state.active_operation
+        if operation is None:  # pragma: no cover - transfer guarantees an operation
+            raise LifecycleConflictError("no lifecycle operation is active")
+        lease = ControllerLease(
+            SCHEMA_VERSION,
+            operation.operation_id,
+            transferred.state.generation,
+            operation.owner_kind,
+            os.getpid(),
+            _process_start_identity(os.getpid()),
+        )
+        _atomic_write_json(paths.lease_path, _lease_payload(lease))
+        return ControllerLeaseHandle(paths, descriptor, lease), transferred
     except Exception:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)

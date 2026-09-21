@@ -1,10 +1,8 @@
 import os
 import sqlite3
-import shutil
 import asyncio
 import time
 import re
-import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta
 from sqlmodel import select
@@ -16,13 +14,13 @@ from models import PlaybackRun, PlaybackSession
 from services.logger import logger
 from services.queue import queue_manager
 from services.rclone import rclone_service
-import services.state as state
 from lifecycle.coordination import (
     AdmissionClosedError,
     EffectClass,
     run_cancellation_safe_thread,
     runtime_work,
 )
+from lifecycle.restore_controller import RestoreValidationError, validate_sqlite_database
 
 BACKUP_FILENAME_RE = re.compile(r"^backup_\d{8}_\d{6}\.db$")
 BACKUP_LOCK = asyncio.Lock()
@@ -49,20 +47,10 @@ def resolve_backup_file(filename: str, *, must_exist: bool = False) -> Path | No
 
 
 def validate_backup_database(path: Path) -> None:
-    with path.open("rb") as handle:
-        if handle.read(16) != b"SQLite format 3\x00":
-            raise ValueError("Backup does not contain a SQLite database.")
-    connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
     try:
-        result = connection.execute("PRAGMA integrity_check").fetchone()
-        if not result or result[0] != "ok":
-            raise ValueError("Backup database integrity validation failed.")
-        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        required = {"user", "movie", "authsession"}
-        if not required.issubset(tables):
-            raise ValueError("Backup database schema is not compatible with StreamHome.")
-    finally:
-        connection.close()
+        validate_sqlite_database(path)
+    except RestoreValidationError as exc:
+        raise ValueError("Backup database validation failed.") from exc
 
 async def is_database_idle() -> bool:
     """
@@ -220,78 +208,3 @@ async def sync_backups_to_cloud() -> bool:
     if result.error_code == "rclone_unavailable":
         logger.error("[Backup Service] Rclone binary not found. Cannot sync to cloud.")
     return False
-
-async def restore_backup(filename: str) -> bool:
-    """
-    Safely restore a database backup file to database.db.
-    Disposes active sessions/connections to prevent locking.
-    """
-    async with BACKUP_LOCK:
-        backup_file_path = resolve_backup_file(filename, must_exist=True)
-        active_db_path = Path(settings.db_path).resolve()
-
-        if not backup_file_path:
-            logger.error(f"[Backup Service] Restore failed: Backup file '{filename}' does not exist.")
-            return False
-        if not await is_database_idle():
-            logger.warning("[Backup Service] Restore refused while downloads or playback are active.")
-            return False
-
-        state.MAINTENANCE_MODE = True
-        deadline = time.monotonic() + 5
-        while state.ACTIVE_HTTP_REQUESTS > 1 and time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-        if state.ACTIVE_HTTP_REQUESTS > 1:
-            state.MAINTENANCE_MODE = False
-            logger.warning("[Backup Service] Restore refused because other requests did not quiesce.")
-            return False
-
-        temporary_path: Path | None = None
-        queue_stopped = False
-        try:
-            validate_backup_database(backup_file_path)
-            logger.warning(f"[Backup Service] Restoring database to: {filename}")
-
-            with tempfile.NamedTemporaryFile(
-                dir=active_db_path.parent,
-                prefix=".database-restore-",
-                suffix=".db",
-                delete=False,
-            ) as handle:
-                temporary_path = Path(handle.name)
-            shutil.copy2(backup_file_path, temporary_path)
-            validate_backup_database(temporary_path)
-
-            rollback_time = datetime.now()
-            while True:
-                rollback_path = Path(get_backup_dir()) / f"backup_{rollback_time.strftime('%Y%m%d_%H%M%S')}.db"
-                if not rollback_path.exists() and rollback_path != backup_file_path:
-                    break
-                rollback_time += timedelta(seconds=1)
-            source = sqlite3.connect(active_db_path)
-            rollback = sqlite3.connect(rollback_path)
-            try:
-                source.backup(rollback)
-            finally:
-                rollback.close()
-                source.close()
-            validate_backup_database(rollback_path)
-
-            await queue_manager.stop()
-            queue_stopped = True
-            await engine.dispose()
-            for suffix in ("-wal", "-shm"):
-                Path(f"{active_db_path}{suffix}").unlink(missing_ok=True)
-            os.replace(temporary_path, active_db_path)
-            temporary_path = None
-            logger.info("[Backup Service] Database restored; server remains in maintenance mode until restart.")
-            return True
-        except Exception as e:
-            state.MAINTENANCE_MODE = False
-            if queue_stopped:
-                queue_manager.start()
-            logger.error(f"[Backup Service] Restore error: {e}")
-            return False
-        finally:
-            if temporary_path:
-                temporary_path.unlink(missing_ok=True)
