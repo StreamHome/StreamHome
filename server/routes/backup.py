@@ -12,8 +12,9 @@ from services.logger import logger
 from services.backup import (
     create_backup,
     prune_old_backups,
-    get_local_backups,
+    get_local_backups_async,
     sync_backups_to_cloud,
+    delete_backup,
 )
 from lifecycle import state as lifecycle_state
 from lifecycle.coordination import (
@@ -97,7 +98,7 @@ async def run_backup_endpoint(session: AuthSession = Depends(require_recent_reau
         logger.info("[API] Manual backup triggered via API.")
         async with runtime_work("backup.run", [EffectClass.DATABASE_SNAPSHOT]):
             backup_path = await create_backup()
-            prune_old_backups(keep_count=7)
+            await prune_old_backups(keep_count=7)
 
             cloud_synced = False
             if settings.STORAGE_ENGINE == "CLOUD":
@@ -130,7 +131,7 @@ async def list_backups_endpoint(session: AuthSession = Depends(require_recent_re
     """Retrieve metadata of all local backup files."""
     del session
     try:
-        return get_local_backups()
+        return await get_local_backups_async()
     except Exception as e:
         logger.error(f"[API] Error retrieving backup list: {e}")
         raise HTTPException(
@@ -307,7 +308,7 @@ async def delete_backup_endpoint(filename: str, session: AuthSession = Depends(r
                 detail=f"Backup file '{filename}' not found."
             )
         async with runtime_work("backup.delete", [EffectClass.DATABASE_SNAPSHOT]):
-            file_path.unlink()
+            await delete_backup(file_path)
         logger.info(f"[API] Backup file deleted: {filename}")
         return {
             "status": "success",

@@ -173,6 +173,61 @@ class WriterCoordinationContractTests(unittest.TestCase):
             with self.subTest(path=path, function=function):
                 self.assertIn("run_cancellation_safe_thread", called_names(path, function))
 
+    def test_backup_verification_listing_and_pair_mutations_use_threaded_lock_boundary(self) -> None:
+        admitted = function_node("services/backup.py", "_create_admitted_backup")
+        self.assertIn(
+            "run_cancellation_safe_thread",
+            called_names("services/backup.py", "_create_admitted_backup"),
+        )
+        finalizer = next(
+            child
+            for child in ast.walk(admitted)
+            if isinstance(child, ast.FunctionDef) and child.name == "run_backup"
+        )
+        finalizer_calls = {
+            child.func.attr
+            for child in ast.walk(finalizer)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+        } | {
+            child.func.id
+            for child in ast.walk(finalizer)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+        }
+        self.assertIn("fsync", finalizer_calls)
+        self.assertIn("validate_backup_database", finalizer_calls)
+        self.assertIn("create_manifest", finalizer_calls)
+        for function in (
+            "delete_backup",
+            "prune_old_backups",
+            "get_local_backups_async",
+            "sync_backups_to_cloud",
+        ):
+            with self.subTest(function=function):
+                source = function_node("services/backup.py", function)
+                self.assertTrue(
+                    any(
+                        isinstance(child, ast.Name) and child.id == "BACKUP_LOCK"
+                        for child in ast.walk(source)
+                    )
+                )
+        self.assertIn(
+            "run_cancellation_safe_thread",
+            called_names("services/backup.py", "get_local_backups_async"),
+        )
+        daily_calls = called_names("application.py", "_daily_backup_worker")
+        self.assertIn("get_local_backups_async", daily_calls)
+        self.assertIn("prune_old_backups", daily_calls)
+
+    def test_authority_sensitive_update_reads_use_canonical_strict_parser(self) -> None:
+        self.assertIn(
+            "read_update_journal",
+            called_names("services/update.py", "_read_update_state_strict_unlocked"),
+        )
+        self.assertIn(
+            "read_update_journal",
+            called_names("lifecycle/recovery.py", "_update_plan"),
+        )
+
     def test_playback_prepare_admits_cache_before_mutating_helper(self) -> None:
         calls = called_names("services/playback_prep.py", "prepare")
         self.assertIn("runtime_work", calls)

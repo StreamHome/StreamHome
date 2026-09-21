@@ -201,6 +201,7 @@ class UpdateControllerTests(unittest.TestCase):
         )
         journal = json.loads(self.journal.read_text(encoding="utf-8"))
         journal["lifecycle_phase"] = "recovery_required"
+        journal["transaction_id"] = "private-source-secret"
         self.journal.write_text(json.dumps(journal), encoding="utf-8")
         status = maintenance_server.safe_public_status(
             self.journal,
@@ -210,6 +211,11 @@ class UpdateControllerTests(unittest.TestCase):
             30,
         )
         self.assertEqual(status["phase"], "recovery_required")
+        self.assertTrue(status["operatorActionRequired"])
+        self.assertEqual(status["error"], "operator_action_required")
+        self.assertEqual(status["target"], "")
+        self.assertEqual(status["transaction"], operation.operation_id[:12])
+        self.assertNotIn("private-source-secret", json.dumps(status))
         self.assertFalse(maintenance_server.recovery_needed(status))
         coordinator = maintenance_server.RecoveryCoordinator(
             self.root,
@@ -222,6 +228,42 @@ class UpdateControllerTests(unittest.TestCase):
         with patch.object(maintenance_server.subprocess, "Popen") as launch:
             self.assertFalse(coordinator._queue_recovery(status))
         launch.assert_not_called()
+
+    def test_public_maintenance_projection_never_emits_subordinate_private_values(self) -> None:
+        private_values = (
+            "/srv/private/database.db",
+            "token-super-secret",
+            "https://user:secret@example.invalid/release",
+            "traceback private line",
+            "f" * 40,
+            "transaction-private-identifier",
+        )
+        payload = json.loads(self.journal.read_text(encoding="utf-8"))
+        payload.update(
+            phase="failed",
+            message=private_values[0],
+            error=private_values[1],
+            diagnostic_id=private_values[3],
+            target_commit=private_values[4],
+            transaction_id=private_values[5],
+            source_url=private_values[2],
+        )
+        self.journal.write_text(json.dumps(payload), encoding="utf-8")
+        status = maintenance_server.safe_public_status(
+            self.journal,
+            self.root / ".run" / "update-lease.json",
+            self.root,
+            self.claimed.state.active_operation.operation_id,
+            30,
+        )
+        public = json.dumps(status)
+        for private in private_values:
+            self.assertNotIn(private, public)
+        self.assertEqual(
+            status["transaction"], self.claimed.state.active_operation.operation_id[:12]
+        )
+        self.assertEqual(status["target"], "")
+        self.assertEqual(status["diagnostic"], "")
 
     def test_ambiguous_recovery_journal_enters_recovery_required(self) -> None:
         journal = json.loads(self.journal.read_text(encoding="utf-8"))
@@ -349,6 +391,23 @@ class UpdateControllerTests(unittest.TestCase):
                 )
         self.assertEqual(self.journal.read_bytes(), before)
 
+    def test_authority_sensitive_journal_rejects_duplicate_and_nonfinite_json(self) -> None:
+        original = json.loads(self.journal.read_text(encoding="utf-8"))
+        cases = (
+            json.dumps(original)[:-1] + ',"runtime_committed":true}',
+            json.dumps(original)[:-1]
+            + f',"lifecycle_generation":{self.claimed.state.generation}}}',
+            json.dumps(original)[:-1] + ',"phase":"queued"}',
+            json.dumps({**original, "unexpected_number": float("nan")}),
+            json.dumps({**original, "unexpected_number": float("inf")}),
+            json.dumps({**original, "unexpected_number": -float("inf")}),
+        )
+        for raw in cases:
+            with self.subTest(raw=raw[-48:]):
+                self.journal.write_text(raw, encoding="utf-8")
+                with self.assertRaises(update_controller.UpdateControllerPersistenceError):
+                    update_controller._read_update_journal(self.journal)
+
     def test_committed_journal_short_writes_complete_without_losing_boundary(self) -> None:
         operation_id, generation = self._move_to_verifying()
         original_write = os.write
@@ -434,6 +493,7 @@ class UpdateControllerTests(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             "setsid sleep 20 </dev/null >/dev/null 2>&1 &\n"
             f"printf '%s\\n' \"$!\" > {str(child_pid_path)!r}\n"
+            "sleep 1\n"
             "exit 0\n",
             encoding="utf-8",
         )

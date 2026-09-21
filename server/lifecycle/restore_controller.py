@@ -30,13 +30,15 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 import uuid
 
-from . import state
+from . import backup_manifest, state
 
 
 JOURNAL_SCHEMA_VERSION = 1
 MAX_JOURNAL_BYTES = 32 * 1024
 REQUIRED_TABLES = frozenset({"user", "movie", "authsession"})
-BACKUP_NAME_RE = re.compile(r"^backup_\d{8}_\d{6}\.db$")
+BACKUP_NAME_RE = re.compile(
+    rf"(?:{backup_manifest.LEGACY_BACKUP_RE.pattern}|{backup_manifest.MANIFEST_BACKUP_RE.pattern})"
+)
 ERROR_CODE_RE = re.compile(r"^[a-z0-9_]{1,80}$")
 
 
@@ -222,6 +224,25 @@ def _object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _decode_journal(raw: bytes) -> dict[str, Any]:
+    def reject_constant(_value: str) -> None:
+        raise RestorePersistenceError("restore journal contains a non-finite number")
+
+    try:
+        payload = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_object_pairs,
+            parse_constant=reject_constant,
+        )
+    except RestoreError:
+        raise
+    except (UnicodeError, ValueError, TypeError) as exc:
+        raise RestorePersistenceError("restore journal cannot be read") from exc
+    if not isinstance(payload, dict):
+        raise RestorePersistenceError("restore journal must be an object")
+    return payload
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         st = path.lstat()
@@ -231,13 +252,11 @@ def _read_json(path: Path) -> dict[str, Any]:
             raise RestorePersistenceError("restore journal has unexpected ownership")
         if stat.S_IMODE(st.st_mode) & 0o077:
             raise RestorePersistenceError("restore journal permissions are not private")
-        payload = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_object_pairs)
+        payload = _decode_journal(path.read_bytes())
     except RestoreError:
         raise
     except (OSError, UnicodeError, ValueError, TypeError) as exc:
         raise RestorePersistenceError("restore journal cannot be read") from exc
-    if not isinstance(payload, dict):
-        raise RestorePersistenceError("restore journal must be an object")
     return payload
 
 
@@ -599,6 +618,54 @@ def read_restore_journal(root: str | os.PathLike[str], operation_id: str) -> dic
         os.close(descriptor)
 
 
+def inspect_restore_journal(
+    root: str | os.PathLike[str], operation_id: str
+) -> dict[str, Any]:
+    """Read a restore journal without creating its directory or lock file."""
+
+    paths = restore_paths(root, operation_id)
+    descriptor: int | None = None
+    try:
+        before = paths.journal_path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or paths.journal_path.is_symlink()
+            or before.st_size > MAX_JOURNAL_BYTES
+            or (hasattr(os, "geteuid") and before.st_uid != os.geteuid())
+            or stat.S_IMODE(before.st_mode) & 0o077
+        ):
+            raise RestorePersistenceError("restore journal is not a trusted file")
+        descriptor = os.open(
+            paths.journal_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NOATIME", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise RestorePersistenceError("restore journal changed during inspection")
+        chunks: list[bytes] = []
+        remaining = MAX_JOURNAL_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_JOURNAL_BYTES:
+            raise RestorePersistenceError("restore journal exceeds its size limit")
+        return _validate_journal(_decode_journal(raw), paths)
+    except RestoreError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        raise RestorePersistenceError("restore journal cannot be inspected") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def update_restore_journal(
     root: str | os.PathLike[str], operation_id: str, **changes: Any
 ) -> dict[str, Any]:
@@ -723,6 +790,14 @@ def prevalidate_candidate(root: str | os.PathLike[str], filename: str) -> Candid
     if configured_backup_root.is_symlink() or not configured_backup_root.is_dir():
         raise RestoreValidationError("restore backup directory is not trusted")
     backup_root = configured_backup_root.resolve()
+    try:
+        state.qualify_local_filesystem(
+            backup_root,
+            require_private=False,
+            description="backup directory",
+        )
+    except state.LifecycleError as exc:
+        raise RestoreValidationError("restore backup filesystem is unsupported") from exc
     candidate = backup_root / filename
     try:
         st = candidate.lstat()
@@ -734,9 +809,16 @@ def prevalidate_candidate(root: str | os.PathLike[str], filename: str) -> Candid
         raise RestoreValidationError("restore candidate is not a trusted regular file")
     if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
         raise RestoreValidationError("restore candidate has unexpected ownership")
+    try:
+        evidence = backup_manifest.validate_backup_pair(resolved)
+    except backup_manifest.BackupManifestError as exc:
+        raise RestoreValidationError(exc.code) from exc
     validate_sqlite_database(resolved, standalone=True)
-    size, digest = artifact_identity(resolved)
-    return CandidateIdentity(filename, size, digest)
+    return CandidateIdentity(
+        filename,
+        evidence.database.size_bytes,
+        evidence.database.sha256,
+    )
 
 
 def _copy_sqlite(source: Path, destination: Path, *, source_standalone: bool = True) -> None:
@@ -1553,6 +1635,12 @@ def _run_controller(
     gate_fd: int | None,
 ) -> int:
     paths = restore_paths(root, operation_id)
+    state.qualify_lifecycle_filesystem(root)
+    state.qualify_local_filesystem(
+        paths.database_path.parent,
+        require_private=False,
+        description="canonical database directory",
+    )
     current = _verify_authority(root, operation_id, generation, capability)
     expected_phase = current.active_operation.phase if current.active_operation else state.LifecyclePhase.RESERVED
     if expected_phase is state.LifecyclePhase.RECOVERY_REQUIRED:

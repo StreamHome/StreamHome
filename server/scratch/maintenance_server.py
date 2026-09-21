@@ -40,6 +40,65 @@ PUBLIC_PHASE_LABELS = {
     "rollback_failed": "Automatic recovery needs attention",
     "recovery_required": "Update recovery needs operator attention",
 }
+PUBLIC_PHASE_MESSAGES = {
+    "preflight": "StreamHome is validating a protected update.",
+    "waiting_for_idle": "StreamHome is waiting for a safe update cutover.",
+    "stopping": "StreamHome is stopping managed services for an update.",
+    "installing": "StreamHome is activating a validated update.",
+    "starting": "StreamHome is starting the guarded updated runtime.",
+    "rolling_back": "StreamHome is restoring the previous validated release.",
+    "recovering": "StreamHome is recovering an interrupted protected update.",
+    "succeeded": "The protected update completed.",
+    "rolled_back": "The previous validated release was restored.",
+    "failed": "The protected update stopped safely.",
+    "rollback_failed": "Automatic update recovery needs operator attention.",
+    "recovery_required": (
+        "StreamHome is preserving unresolved update recovery evidence; "
+        "explicit operator action is required."
+    ),
+}
+PUBLIC_REASON_CODES = frozenset(
+    {
+        "controller_lost",
+        "dirty_worktree",
+        "failed_target_suppressed",
+        "git_history_unavailable",
+        "invalid_update_branch",
+        "invalid_update_state",
+        "lifecycle_unavailable",
+        "local_commit_unavailable",
+        "operator_action_required",
+        "recovery_handoff_failed",
+        "signature_verification_failed",
+        "target_unavailable",
+        "untrusted_origin",
+        "unsupported_update_platform",
+        "update_controller_handoff_failed",
+        "update_fetch_failed",
+        "update_interrupted_rolled_back",
+        "update_not_fast_forward",
+        "update_recovery_required",
+        "update_script_unavailable",
+    }
+)
+RESTORE_REASON_CODES = frozenset(
+    {
+        "normal_recovery_failed",
+        "operator_action_required",
+        "restore_recovery_required",
+        "restore_rollback_failed",
+        "restore_status_unavailable",
+    }
+)
+
+
+def sanitized_reason(
+    value: Any,
+    fallback: str = "operator_action_required",
+    *,
+    allowed: frozenset[str] = PUBLIC_REASON_CODES,
+) -> str:
+    return value if isinstance(value, str) and value in allowed else fallback
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -138,10 +197,10 @@ def safe_public_status(
     transaction_id: str,
     silence_seconds: float,
 ) -> dict[str, Any]:
-    state = read_json(state_path)
-    state_transaction = str(state.get("transaction_id") or transaction_id or "")
+    update_state = read_json(state_path)
+    operation_reference = ""
     lease = read_json(lease_path) or legacy_lease(root)
-    active = controller_is_current(lease, state_transaction, silence_seconds)
+    active = False
     lifecycle_phase = ""
     try:
         from lifecycle import state as lifecycle_state
@@ -153,10 +212,12 @@ def safe_public_status(
             and operation.operation_type is lifecycle_state.OperationType.UPDATE
         ):
             lifecycle_phase = operation.phase.value
+            operation_reference = operation.operation_id[:12]
+            active = controller_is_current(
+                lease, operation.operation_id, silence_seconds
+            )
             controller_lease = lifecycle_state.read_controller_lease(root)
             if (
-                (not state_transaction or operation.operation_id == state_transaction)
-                and
                 controller_lease is not None
                 and controller_lease.operation_id == operation.operation_id
                 and controller_lease.generation == authority.generation
@@ -165,35 +226,63 @@ def safe_public_status(
                 active = True
     except Exception:
         lifecycle_phase = "unavailable"
-    phase = str(state.get("phase") or "recovering")
+        operation_reference = ""
+        active = False
+    raw_phase = update_state.get("phase")
+    phase = (
+        raw_phase
+        if isinstance(raw_phase, str) and raw_phase in PUBLIC_PHASE_LABELS
+        else "recovering"
+    )
     if lifecycle_phase == "recovery_required":
         phase = "recovery_required"
     if phase in ACTIVE_PHASES and not active:
         phase = "recovering"
-    started_at = state.get("started_at") or state.get("updated_at") or time.time()
+    started_at = update_state.get("started_at") or update_state.get("updated_at") or time.time()
     try:
         elapsed_seconds = max(0, int(time.time() - float(started_at)))
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         elapsed_seconds = 0
-    error = str(state.get("error") or "")
+    error = (
+        sanitized_reason(
+            update_state.get("error"),
+            "operator_action_required",
+        )
+        if phase in FAILURE_PHASES or phase == "recovery_required"
+        else ""
+    )
     return {
         "phase": phase,
         "label": PUBLIC_PHASE_LABELS.get(phase, "StreamHome maintenance"),
-        "message": str(state.get("message") or "StreamHome is completing a protected update."),
-        "error": error if phase in FAILURE_PHASES else "",
-        "diagnostic": str(state.get("diagnostic_id") or "") if phase in FAILURE_PHASES else "",
-        "transaction": state_transaction[:12],
-        "target": str(state.get("target_commit") or "")[:12],
+        "message": PUBLIC_PHASE_MESSAGES.get(
+            phase, "StreamHome is completing protected lifecycle maintenance."
+        ),
+        "error": error,
+        "diagnostic": "",
+        "transaction": operation_reference,
+        "target": "",
         "elapsedSeconds": elapsed_seconds,
         "controllerActive": active,
         "terminal": phase in SUCCESS_PHASES | FAILURE_PHASES,
+        "operatorActionRequired": phase == "recovery_required",
     }
 
 
 def safe_restore_status(root: Path, operation_id: str) -> dict[str, Any]:
     """Project restore state without exposing artifact or credential details."""
 
+    operation_reference = ""
     try:
+        from lifecycle import state as lifecycle_state
+
+        authority = lifecycle_state.inspect_state(root)
+        operation = authority.active_operation
+        if (
+            operation is not None
+            and operation.operation_type is lifecycle_state.OperationType.RESTORE
+            and operation.operation_id == operation_id
+        ):
+            operation_reference = operation.operation_id[:12]
         from lifecycle.restore_controller import public_restore_status
 
         projection = public_restore_status(root, operation_id)
@@ -204,11 +293,12 @@ def safe_restore_status(root: Path, operation_id: str) -> dict[str, Any]:
             "message": "StreamHome is preserving restore recovery state.",
             "error": "restore_status_unavailable",
             "diagnostic": "",
-            "transaction": operation_id[:12],
+            "transaction": operation_reference,
             "target": "",
             "elapsedSeconds": 0,
             "controllerActive": False,
             "terminal": False,
+            "operatorActionRequired": True,
         }
     phase = str(projection.get("phase") or "recovery_required")
     labels = {
@@ -232,14 +322,23 @@ def safe_restore_status(root: Path, operation_id: str) -> dict[str, Any]:
     return {
         "phase": phase,
         "label": labels.get(phase, "StreamHome restore maintenance"),
-        "message": "StreamHome is completing a protected offline database restore.",
-        "error": str(projection.get("errorCode") or "") if phase == "recovery_required" else "",
+        "message": (
+            "StreamHome is preserving unresolved restore recovery evidence; explicit operator action is required."
+            if phase == "recovery_required"
+            else "StreamHome is completing a protected offline database restore."
+        ),
+        "error": sanitized_reason(
+            projection.get("errorCode"),
+            "restore_recovery_required",
+            allowed=RESTORE_REASON_CODES,
+        ) if phase == "recovery_required" else "",
         "diagnostic": "",
-        "transaction": operation_id[:12],
+        "transaction": operation_reference,
         "target": "",
         "elapsedSeconds": 0,
         "controllerActive": bool(projection.get("controllerActive")),
         "terminal": bool(projection.get("terminal")),
+        "operatorActionRequired": phase == "recovery_required",
     }
 
 
@@ -408,11 +507,20 @@ def maintenance_page(status: dict[str, Any]) -> bytes:
     error = html.escape(str(status.get("error") or ""))
     diagnostic = html.escape(str(status.get("diagnostic") or ""))
     elapsed = int(status.get("elapsedSeconds") or 0)
-    detail = (
-        f'<p class="error">Recovery code: <strong>{error}</strong>{f" · diagnostic {diagnostic}" if diagnostic else ""}. Run <code>./start.sh</code> from the StreamHome directory if automatic recovery does not complete.</p>'
-        if error and status.get("terminal")
-        else ""
-    )
+    if status.get("operatorActionRequired"):
+        detail = (
+            f'<p class="error">Recovery code: <strong>{error or "operator_action_required"}</strong>. '
+            "Automatic destructive recovery is stopped. Use the local read-only recovery planner "
+            "before any operator action.</p>"
+        )
+    elif error and status.get("terminal"):
+        detail = (
+            f'<p class="error">Recovery code: <strong>{error}</strong>'
+            f'{f" · diagnostic {diagnostic}" if diagnostic else ""}. '
+            "Run <code>./start.sh</code> from the StreamHome directory if automatic recovery does not complete.</p>"
+        )
+    else:
+        detail = ""
     return f"""<!doctype html>
 <html lang="en">
 <head>

@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from lifecycle import coordination, restore_controller, state
+from lifecycle import backup_manifest, coordination, restore_controller, state
 from scratch import maintenance_server, runtime_control
 
 
@@ -80,6 +80,34 @@ class RestoreControllerTests(unittest.TestCase):
 
     def test_candidate_with_sqlite_sidecar_is_rejected(self) -> None:
         Path(f"{self.backup}-wal").write_bytes(b"unrecorded-wal")
+        with self.assertRaises(restore_controller.RestoreValidationError):
+            restore_controller.prevalidate_candidate(self.root, self.backup.name)
+
+    def test_manifest_backed_candidate_is_validated_before_restore(self) -> None:
+        candidate = self.root / "server" / "backup" / "backup_v1_20260921_120001.db"
+        create_database(candidate, "manifest-candidate")
+        candidate.chmod(0o600)
+        backup_manifest.create_manifest(candidate, application_build_id="build123")
+        identity = restore_controller.prevalidate_candidate(self.root, candidate.name)
+        self.assertEqual(identity.filename, candidate.name)
+        self.assertEqual(identity.size, candidate.stat().st_size)
+
+        with candidate.open("ab") as handle:
+            handle.write(b"changed")
+        with self.assertRaises(restore_controller.RestoreValidationError):
+            restore_controller.prevalidate_candidate(self.root, candidate.name)
+
+    def test_new_candidate_missing_manifest_cannot_downgrade_to_legacy(self) -> None:
+        candidate = self.root / "server" / "backup" / "backup_v1_20260921_120002.db"
+        create_database(candidate, "missing-manifest")
+        candidate.chmod(0o600)
+        with self.assertRaises(restore_controller.RestoreValidationError):
+            restore_controller.prevalidate_candidate(self.root, candidate.name)
+
+    def test_legacy_candidate_with_corrupt_manifest_is_rejected(self) -> None:
+        manifest = backup_manifest.manifest_path_for(self.backup)
+        manifest.write_text("{", encoding="utf-8")
+        manifest.chmod(0o600)
         with self.assertRaises(restore_controller.RestoreValidationError):
             restore_controller.prevalidate_candidate(self.root, self.backup.name)
 

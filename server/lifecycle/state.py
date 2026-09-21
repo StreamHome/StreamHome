@@ -12,6 +12,9 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import subprocess
+import sys
+import threading
 from typing import Any, Iterator, Mapping
 import uuid
 
@@ -87,6 +90,10 @@ class ControllerLockError(LifecycleConflictError):
     code = "controller_conflict"
 
 
+class UnsupportedFilesystemError(PersistenceError):
+    code = "unsupported_filesystem"
+
+
 @dataclass(frozen=True)
 class ActiveOperation:
     operation_id: str
@@ -152,6 +159,31 @@ class ControllerLease:
     process_start_identity: str
 
 
+_UNSUPPORTED_FILESYSTEM_TYPES = frozenset(
+    {
+        "9p",
+        "afs",
+        "ceph",
+        "cifs",
+        "coda",
+        "gfs",
+        "gfs2",
+        "glusterfs",
+        "gpfs",
+        "lustre",
+        "ncpfs",
+        "nfs",
+        "nfs4",
+        "ocfs2",
+        "orangefs",
+        "pvfs2",
+        "smb2",
+        "smb3",
+        "virtiofs",
+    }
+)
+_QUALIFIED_FILESYSTEMS: set[tuple[Any, ...]] = set()
+_QUALIFICATION_LOCK = threading.Lock()
 def _enum_value(enum_type: type[Enum], value: Enum | str, field: str) -> Any:
     raw = value.value if isinstance(value, Enum) else value
     if not isinstance(raw, str):
@@ -211,6 +243,206 @@ def _assert_owned(st: os.stat_result, description: str) -> None:
 def _assert_private_mode(st: os.stat_result, description: str) -> None:
     if stat.S_IMODE(st.st_mode) & 0o077:
         raise CorruptStateError(f"{description} permissions are not private")
+
+
+def _decode_mount_field(value: str) -> str:
+    return re.sub(
+        r"\\([0-7]{3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
+    )
+
+
+def _filesystem_mount_identity(path: Path) -> tuple[str, ...]:
+    """Return the exact current Linux mount identity owning *path*."""
+
+    if sys.platform != "linux":
+        raise UnsupportedFilesystemError("lifecycle storage requires Linux")
+    try:
+        resolved = path.resolve(strict=True)
+        file_state = resolved.stat()
+        device = f"{os.major(file_state.st_dev)}:{os.minor(file_state.st_dev)}"
+        candidates: list[tuple[int, int, tuple[str, ...]]] = []
+        for line in Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines():
+            fields = line.split()
+            separator = fields.index("-")
+            mount_point = Path(_decode_mount_field(fields[4]))
+            try:
+                resolved.relative_to(mount_point)
+            except ValueError:
+                continue
+            if fields[2] != device:
+                continue
+            identity = (
+                fields[0],
+                fields[1],
+                fields[2],
+                _decode_mount_field(fields[3]),
+                str(mount_point),
+                fields[5],
+                ",".join(fields[6:separator]),
+                fields[separator + 1].lower(),
+                _decode_mount_field(fields[separator + 2]),
+                fields[separator + 3],
+            )
+            candidates.append((len(mount_point.parts), int(fields[0]), identity))
+    except (OSError, UnicodeError, ValueError, IndexError) as exc:
+        raise UnsupportedFilesystemError("lifecycle filesystem cannot be classified") from exc
+    if not candidates:
+        raise UnsupportedFilesystemError("lifecycle filesystem mount is unavailable")
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def _filesystem_type(path: Path) -> str:
+    """Return the Linux mount type owning *path* without mutating it."""
+
+    identity = _filesystem_mount_identity(path)
+    return identity[7]
+
+
+def _probe_filesystem_primitives(directory: Path) -> None:
+    token = f"{os.getpid()}.{secrets.token_hex(8)}"
+    source = directory / f".streamhome-fs-probe.{token}.tmp"
+    target = directory / f".streamhome-fs-probe.{token}.ready"
+    lock_path = directory / f".streamhome-fs-probe.{token}.lock"
+    descriptor: int | None = None
+    lock_descriptor: int | None = None
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(source, flags, 0o600)
+        os.fchmod(descriptor, 0o600)
+        if os.write(descriptor, b"streamhome-filesystem-probe\n") <= 0:
+            raise OSError("filesystem probe write made no progress")
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(source, target)
+        _fsync_directory(directory)
+        if target.read_bytes() != b"streamhome-filesystem-probe\n":
+            raise OSError("filesystem atomic replacement was not observable")
+
+        lock_descriptor = os.open(
+            lock_path,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        os.fchmod(lock_descriptor, 0o600)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl,os,sys; "
+                    "fd=os.open(sys.argv[1], os.O_RDWR); "
+                    "\ntry:\n fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+                    "except BlockingIOError:\n sys.exit(0)\n"
+                    "else:\n sys.exit(1)\n"
+                ),
+                str(lock_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            timeout=5,
+            check=False,
+        )
+        if probe.returncode != 0:
+            raise OSError("cross-process flock exclusion is unavailable")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise UnsupportedFilesystemError(
+            "lifecycle filesystem does not provide required durability primitives"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if lock_descriptor is not None:
+            try:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_descriptor)
+        cleanup_failed = False
+        for path in (source, target, lock_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                cleanup_failed = True
+        try:
+            _fsync_directory(directory)
+        except OSError:
+            cleanup_failed = True
+        if cleanup_failed and sys.exc_info()[0] is None:
+            raise UnsupportedFilesystemError("filesystem probe cleanup could not be synchronized")
+
+
+def qualify_local_filesystem(
+    directory: str | os.PathLike[str],
+    *,
+    require_private: bool,
+    description: str = "lifecycle directory",
+) -> str:
+    """Fail closed unless a directory supplies the supported local-Linux contract."""
+
+    path = Path(directory)
+    try:
+        st = path.lstat()
+    except OSError as exc:
+        raise UnsupportedFilesystemError(f"{description} cannot be inspected") from exc
+    if not stat.S_ISDIR(st.st_mode) or path.is_symlink():
+        raise UnsupportedFilesystemError(f"{description} is not a trusted directory")
+    _assert_owned(st, description)
+    if require_private:
+        _assert_private_mode(st, description)
+    mount_identity = _filesystem_mount_identity(path)
+    filesystem_type = mount_identity[7]
+    if (
+        filesystem_type in _UNSUPPORTED_FILESYSTEM_TYPES
+        or filesystem_type == "fuse"
+        or filesystem_type.startswith("fuse.")
+    ):
+        raise UnsupportedFilesystemError("network or FUSE lifecycle storage is unsupported")
+    # Trust checks above always run. The active semantic probe is reusable only
+    # for this exact directory inode on this exact mount/options identity.
+    identity = (
+        str(path.resolve(strict=True)),
+        st.st_dev,
+        st.st_ino,
+        stat.S_IMODE(st.st_mode),
+        st.st_uid,
+        st.st_gid,
+        filesystem_type,
+        mount_identity,
+    )
+    with _QUALIFICATION_LOCK:
+        if identity not in _QUALIFIED_FILESYSTEMS:
+            _probe_filesystem_primitives(path)
+            _QUALIFIED_FILESYSTEMS.add(identity)
+    return filesystem_type
+
+
+def qualify_lifecycle_filesystem(
+    root: str | os.PathLike[str] | None = None,
+) -> str:
+    paths = lifecycle_paths(root)
+    _ensure_lifecycle_directories(paths)
+    return qualify_local_filesystem(
+        paths.lifecycle_dir,
+        require_private=True,
+        description="lifecycle authority directory",
+    )
 
 
 def resolve_installation_root(root: str | os.PathLike[str] | None = None) -> Path:
@@ -338,6 +570,11 @@ def _open_locked_file(path: Path, *, nonblocking: bool = False) -> int:
 @contextmanager
 def _state_lock(paths: LifecyclePaths) -> Iterator[None]:
     _ensure_lifecycle_directories(paths)
+    qualify_local_filesystem(
+        paths.lifecycle_dir,
+        require_private=True,
+        description="lifecycle authority directory",
+    )
     descriptor = _open_locked_file(paths.state_lock_path)
     try:
         yield
@@ -849,6 +1086,11 @@ def complete_operation(
 
 def _write_credential_path(paths: LifecyclePaths, path: Path, capability: str) -> Path:
     _ensure_lifecycle_directories(paths, credentials=True)
+    qualify_local_filesystem(
+        paths.lifecycle_dir,
+        require_private=True,
+        description="lifecycle authority directory",
+    )
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     created = False
     try:
@@ -1225,6 +1467,11 @@ def acquire_controller_lease(
 ) -> ControllerLeaseHandle:
     paths = lifecycle_paths(root)
     _ensure_lifecycle_directories(paths)
+    qualify_local_filesystem(
+        paths.lifecycle_dir,
+        require_private=True,
+        description="lifecycle authority directory",
+    )
     # Installation lock order is controller.lock -> state.lock. Never reverse it.
     descriptor = _open_locked_file(paths.controller_lock_path, nonblocking=True)
     try:
@@ -1269,6 +1516,11 @@ def acquire_transferred_controller_lease(
 
     paths = lifecycle_paths(root)
     _ensure_lifecycle_directories(paths)
+    qualify_local_filesystem(
+        paths.lifecycle_dir,
+        require_private=True,
+        description="lifecycle authority directory",
+    )
     descriptor = _open_locked_file(paths.controller_lock_path, nonblocking=True)
     try:
         transferred = _transfer_operation_owner_with_credential(

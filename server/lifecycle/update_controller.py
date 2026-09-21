@@ -222,6 +222,21 @@ def _update_paths(root: str | os.PathLike[str], operation_id: str, generation: i
 
 
 def _read_update_journal(path: Path) -> dict[str, Any]:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in payload:
+                raise UpdateControllerPersistenceError(
+                    "update journal contains duplicate fields"
+                )
+            payload[key] = value
+        return payload
+
+    def reject_nonfinite(_value: str) -> None:
+        raise UpdateControllerPersistenceError(
+            "update journal contains a non-finite number"
+        )
+
     try:
         file_state = path.lstat()
         if (
@@ -230,7 +245,11 @@ def _read_update_journal(path: Path) -> dict[str, Any]:
             or file_state.st_size > MAX_UPDATE_JOURNAL_BYTES
         ):
             raise UpdateControllerPersistenceError("update journal is not a trusted file")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_nonfinite,
+        )
     except UpdateControllerError:
         raise
     except (OSError, UnicodeError, ValueError, TypeError) as exc:
@@ -238,6 +257,12 @@ def _read_update_journal(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise UpdateControllerPersistenceError("update journal must be an object")
     return payload
+
+
+def read_update_journal(path: Path) -> dict[str, Any]:
+    """Strictly decode one authority-sensitive update journal."""
+
+    return _read_update_journal(path)
 
 
 def _validate_update_journal_semantics(
@@ -686,6 +711,12 @@ def _run_controller(
     acknowledgement_fd: int | None,
     recovery: bool,
 ) -> int:
+    state.qualify_lifecycle_filesystem(root)
+    state.qualify_local_filesystem(
+        root,
+        require_private=False,
+        description="installation directory",
+    )
     current = state.inspect_state(root)
     operation = current.active_operation
     if (

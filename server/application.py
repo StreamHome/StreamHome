@@ -296,12 +296,12 @@ async def _daily_backup_worker() -> None:
             if settings.BACKUP_ENABLED:
                 from services.backup import (
                     create_backup,
-                    get_local_backups,
+                    get_local_backups_async,
                     prune_old_backups,
                     sync_backups_to_cloud,
                 )
 
-                backups = get_local_backups()
+                backups = await get_local_backups_async()
                 should_backup = not backups
                 if backups:
                     newest_time = datetime.fromisoformat(backups[0]["timestamp"])
@@ -310,7 +310,7 @@ async def _daily_backup_worker() -> None:
                     logger.info("[Backup Worker] Initiating online daily database backup...")
                     async with runtime_work("backup.daily", [EffectClass.DATABASE_SNAPSHOT]):
                         backup_path = await create_backup()
-                        prune_old_backups(keep_count=7)
+                        await prune_old_backups(keep_count=7)
                         cloud_synced = None
                         if settings.STORAGE_ENGINE == "CLOUD":
                             cloud_synced = await sync_backups_to_cloud()

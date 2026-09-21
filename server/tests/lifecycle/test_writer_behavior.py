@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 import importlib.util
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import types
@@ -329,6 +330,139 @@ class WriterBehaviorTests(unittest.IsolatedAsyncioTestCase):
             cache.assert_awaited_once_with(latest_payload, "poster-2", "backdrop-2")
             self.assertEqual(client._direct_cache_deferred, {})
             self.assertEqual(client._direct_cache_retry_tasks, {})
+
+    def backup_stubs(
+        self, temporary: str, rclone_service: object
+    ) -> dict[str, types.ModuleType]:
+        services = module_stub("services")
+        services.__path__ = []
+        sqlmodel = module_stub("sqlmodel", select=lambda *args, **kwargs: None)
+        sqlmodel.__path__ = []
+        sqlmodel_ext = module_stub("sqlmodel.ext")
+        sqlmodel_ext.__path__ = []
+        sqlmodel_asyncio = module_stub("sqlmodel.ext.asyncio")
+        sqlmodel_asyncio.__path__ = []
+        return {
+            "config": module_stub(
+                "config",
+                settings=SimpleNamespace(
+                    db_path=str(Path(temporary) / "database.db"),
+                    BUILD_ID="test-build",
+                    RCLONE_REMOTE_PATH="remote:streamhome",
+                    STORAGE_ENGINE="CLOUD",
+                ),
+            ),
+            "db": module_stub("db", engine=object()),
+            "models": module_stub(
+                "models", PlaybackRun=object, PlaybackSession=object
+            ),
+            "services": services,
+            "services.logger": module_stub("services.logger", logger=_Logger()),
+            "services.queue": module_stub(
+                "services.queue", queue_manager=SimpleNamespace(active_tasks=[])
+            ),
+            "services.rclone": module_stub(
+                "services.rclone", rclone_service=rclone_service
+            ),
+            "sqlmodel": sqlmodel,
+            "sqlmodel.ext": sqlmodel_ext,
+            "sqlmodel.ext.asyncio": sqlmodel_asyncio,
+            "sqlmodel.ext.asyncio.session": module_stub(
+                "sqlmodel.ext.asyncio.session", AsyncSession=object
+            ),
+        }
+
+    @staticmethod
+    def _backup_database(path: Path, marker: str) -> None:
+        connection = sqlite3.connect(path)
+        try:
+            for table in ("user", "movie", "authsession"):
+                connection.execute(f"CREATE TABLE {table} (id TEXT PRIMARY KEY, value TEXT)")
+            connection.execute("INSERT INTO user VALUES ('marker', ?)", (marker,))
+            connection.commit()
+        finally:
+            connection.close()
+        path.chmod(0o600)
+
+    async def test_cloud_snapshot_selects_only_valid_logical_backups_and_serializes_delete(self) -> None:
+        class Rclone:
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+                self.sources: list[Path] = []
+
+            def cloud_write_available(self) -> bool:
+                return True
+
+            def cloud_health(self) -> dict[str, str]:
+                return {}
+
+            async def run(self, _command: str, source: str, *_args: object, **_kwargs: object):
+                self.sources.append(Path(source))
+                self.started.set()
+                await self.release.wait()
+                return SimpleNamespace(ok=True, error_code=None, stderr="")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            rclone = Rclone()
+            with loaded_module(
+                "services/backup.py",
+                "phase6_backup_cloud_test",
+                self.backup_stubs(temporary, rclone),
+            ) as module:
+                backup_dir = Path(temporary) / "backup"
+                backup_dir.mkdir(mode=0o700)
+                manifest_db = backup_dir / "backup_v1_20260921_120000.db"
+                legacy_db = backup_dir / "backup_20260920_120000.db"
+                self._backup_database(manifest_db, "manifest")
+                self._backup_database(legacy_db, "legacy")
+                module.backup_manifest.create_manifest(
+                    manifest_db, application_build_id="test-build"
+                )
+                with mock.patch.object(module, "get_backup_dir", return_value=str(backup_dir)):
+                    sync = asyncio.create_task(module.sync_backups_to_cloud())
+                    await asyncio.wait_for(rclone.started.wait(), timeout=5)
+                    source = rclone.sources[0]
+                    self.assertEqual(
+                        {path.name for path in source.iterdir()},
+                        {
+                            manifest_db.name,
+                            f"{manifest_db.name}.manifest.json",
+                            legacy_db.name,
+                        },
+                    )
+                    delete = asyncio.create_task(module.delete_backup(manifest_db))
+                    await asyncio.sleep(0.05)
+                    self.assertFalse(delete.done())
+                    rclone.release.set()
+                    self.assertTrue(await sync)
+                    await delete
+                    self.assertFalse(manifest_db.exists())
+
+    async def test_cloud_snapshot_rejects_missing_or_corrupt_manifest(self) -> None:
+        rclone = SimpleNamespace(
+            cloud_write_available=lambda: True,
+            cloud_health=lambda: {},
+            run=mock.AsyncMock(),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with loaded_module(
+                "services/backup.py",
+                "phase6_backup_cloud_invalid_test",
+                self.backup_stubs(temporary, rclone),
+            ) as module:
+                backup_dir = Path(temporary) / "backup"
+                backup_dir.mkdir(mode=0o700)
+                database = backup_dir / "backup_v1_20260921_120000.db"
+                self._backup_database(database, "candidate")
+                with mock.patch.object(module, "get_backup_dir", return_value=str(backup_dir)):
+                    self.assertFalse(await module.sync_backups_to_cloud())
+                    rclone.run.assert_not_awaited()
+                    manifest = module.backup_manifest.manifest_path_for(database)
+                    manifest.write_text("{", encoding="utf-8")
+                    manifest.chmod(0o600)
+                    self.assertFalse(await module.sync_backups_to_cloud())
+                    rclone.run.assert_not_awaited()
 
 
 if __name__ == "__main__":

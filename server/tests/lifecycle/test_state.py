@@ -5,6 +5,8 @@ import multiprocessing
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -91,6 +93,15 @@ class LifecycleStateTests(unittest.TestCase):
         paths.state_path.chmod(0o600)
         return paths.state_path
 
+    def _prime_lifecycle_filesystem_qualification(self) -> None:
+        paths = state.lifecycle_paths(self.root)
+        state._ensure_lifecycle_directories(paths, credentials=True)
+        state.qualify_local_filesystem(
+            paths.lifecycle_dir,
+            require_private=True,
+            description="lifecycle authority directory",
+        )
+
     def test_import_does_not_load_application_modules(self) -> None:
         import sys
 
@@ -116,6 +127,92 @@ class LifecycleStateTests(unittest.TestCase):
         current = state.inspect_state(self.root)
         self.assertEqual(current, state.LifecycleState(1, 0, None))
         self.assertFalse((self.root / ".run").exists())
+
+    def test_filesystem_qualification_accepts_supported_local_fixture(self) -> None:
+        filesystem_type = state.qualify_local_filesystem(
+            self.root,
+            require_private=False,
+            description="test installation",
+        )
+        self.assertIsInstance(filesystem_type, str)
+        self.assertTrue(filesystem_type)
+
+    def test_filesystem_qualification_rejects_symlink_and_unsupported_mount(self) -> None:
+        linked = Path(self.temporary.name) / "filesystem-link"
+        linked.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaises(state.UnsupportedFilesystemError):
+            state.qualify_local_filesystem(linked, require_private=False)
+        with patch.object(
+            state,
+            "_filesystem_mount_identity",
+            return_value=("1", "0", "0:1", "/", "/", "rw", "", "nfs4", "server", "rw"),
+        ):
+            with self.assertRaises(state.UnsupportedFilesystemError):
+                state.qualify_local_filesystem(self.root, require_private=False)
+
+    def test_filesystem_qualification_cache_is_exact_to_path_mount_and_options(self) -> None:
+        sibling = Path(self.temporary.name) / "other"
+        sibling.mkdir()
+        identity_one = (
+            "101", "1", "0:1", "/", str(self.root), "rw", "", "ext4", "/dev/test", "rw"
+        )
+        identity_two = (
+            "102", "1", "0:1", "/", str(sibling), "rw", "", "ext4", "/dev/test", "rw"
+        )
+        identity_remounted = (
+            "101", "1", "0:1", "/", str(self.root), "ro", "", "ext4", "/dev/test", "ro"
+        )
+        with (
+            patch.object(
+                state,
+                "_filesystem_mount_identity",
+                side_effect=(identity_one, identity_two, identity_remounted),
+            ),
+            patch.object(state, "_probe_filesystem_primitives") as probe,
+        ):
+            state.qualify_local_filesystem(self.root, require_private=False)
+            state.qualify_local_filesystem(sibling, require_private=False)
+            state.qualify_local_filesystem(self.root, require_private=False)
+        self.assertEqual(probe.call_count, 3)
+
+        linked = Path(self.temporary.name) / "linked-other"
+        linked.symlink_to(sibling, target_is_directory=True)
+        with self.assertRaises(state.UnsupportedFilesystemError):
+            state.qualify_local_filesystem(linked, require_private=False)
+
+    def test_filesystem_probe_fails_closed_for_flock_file_and_directory_fsync(self) -> None:
+        with patch.object(
+            state.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1),
+        ):
+            with self.assertRaises(state.UnsupportedFilesystemError):
+                state._probe_filesystem_primitives(self.root)
+        with patch.object(state.os, "fsync", side_effect=OSError("file fsync failed")):
+            with self.assertRaises(state.UnsupportedFilesystemError):
+                state._probe_filesystem_primitives(self.root)
+        with patch.object(
+            state,
+            "_fsync_directory",
+            side_effect=OSError("directory fsync failed"),
+        ):
+            with self.assertRaises(state.UnsupportedFilesystemError):
+                state._probe_filesystem_primitives(self.root)
+
+    def test_import_does_not_run_active_filesystem_probe(self) -> None:
+        script = (
+            "from pathlib import Path; import lifecycle.state; "
+            "print(int(Path('.run').exists()))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=self.root,
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(result.stdout.strip(), "0")
 
     def test_update_restore_exclusion_persists_through_recovery_required(self) -> None:
         claimed = self._claim()
@@ -352,6 +449,11 @@ class LifecycleStateTests(unittest.TestCase):
         paths = state.lifecycle_paths(self.root)
         paths.run_dir.mkdir(mode=0o700)
         paths.lifecycle_dir.mkdir(mode=0o700)
+        state.qualify_local_filesystem(
+            paths.lifecycle_dir,
+            require_private=True,
+            description="lifecycle authority directory",
+        )
         original = state._fsync_directory
 
         def fail_lifecycle_directory(directory: Path) -> None:
@@ -371,6 +473,11 @@ class LifecycleStateTests(unittest.TestCase):
         paths.run_dir.mkdir(mode=0o700)
         paths.lifecycle_dir.mkdir(mode=0o700)
         paths.credentials_dir.mkdir(mode=0o700)
+        state.qualify_local_filesystem(
+            paths.lifecycle_dir,
+            require_private=True,
+            description="lifecycle authority directory",
+        )
         operation_id = str(uuid.uuid4())
         original = state._fsync_directory
 
@@ -438,6 +545,7 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertFalse(credential.exists())
 
     def test_credential_write_retries_short_writes_until_payload_is_complete(self) -> None:
+        self._prime_lifecycle_filesystem_qualification()
         original_write = os.write
         requested_sizes: list[int] = []
 
@@ -459,6 +567,7 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertEqual(state.hash_owner_capability(capability), operation.owner_nonce_hash)
 
     def test_credential_zero_write_or_exception_fails_before_authority_claim(self) -> None:
+        self._prime_lifecycle_filesystem_qualification()
         for failure in ("zero", "exception"):
             with self.subTest(failure=failure):
                 operation_id = str(uuid.uuid4())

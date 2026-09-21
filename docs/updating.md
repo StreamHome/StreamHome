@@ -46,6 +46,20 @@ The maintenance response is never a cacheable static success claim. It reports t
 
 An interrupted update has only two accepted healthy terminal states: the target release passes both health gates, or the previous release is restored and passes both gates. Recovery artifacts and the database checkpoint are retained until one of those states is verified. They are not removed merely because the original controller exited.
 
+The protected commit establishes the durable `runtime_committed` boundary only
+after exact lifecycle authority, guarded readiness, transaction identity, and
+target build identity are revalidated. Before that boundary, verified automatic
+rollback remains possible. After it, the marker is monotonic and automatic
+code/database rollback is disabled; long mandatory recovery continues while
+normal traffic remains lifecycle-gated.
+
+`recovery_required` is deliberately terminal for automatic destructive retry.
+`start.sh`, discovery, and the automatic update worker do not clear or resume it.
+Preserve the journal, staging area, checkpoint, and lifecycle records. The local
+Phase 6A recovery planner described in [Backup and Recovery](backup-and-recovery.md)
+can inspect exact retained evidence, but it is read-only and does not execute a
+recovery action.
+
 ## Command-line fallback
 
 If the admin panel is unavailable, inspect `update.log`, `.run/update-state.json`, and the private `.run/update-diagnostics.json` snapshot. A reviewed manual update remains available:
@@ -56,6 +70,6 @@ curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.
 
 Do not stop StreamHome first. For an existing installation, the installer verifies the official origin, refuses a dirty checkout, preflights the fetched release while the current services remain online, and hands the exact fast-forward to the same health-gated cutover and rollback controller. The command does not return successfully until both services are healthy again. A concurrent `./start.sh` waits for the active updater and reports its phase instead of fighting the cutover.
 
-If a host was left on the legacy indefinite maintenance responder by an older release, run the same installer command without deleting the installation. The fetched controller performs the new transaction-aware recovery. `./start.sh` is also safe: it waits for a live controller, rejects stale ownership, and recovers an interrupted transaction before ordinary startup.
+If a host was left on the legacy indefinite maintenance responder by an older release, run the same installer command without deleting the installation. The fetched controller performs the compatibility recovery supported for that legacy state. `./start.sh` waits for a live controller and may resume a provably safe orphaned in-progress transaction; it remains fail closed for deliberate `recovery_required` state.
 
 Do not delete `server/database.db`, `server/media`, `.env`, `server/.env`, `server/backup`, or `server/rclone`.

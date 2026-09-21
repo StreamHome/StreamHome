@@ -66,6 +66,15 @@ installed manually and the installer is run with `--skip-system-packages`.
 Windows server scripts, container images, Kubernetes manifests, NAS app-store
 packages, and multi-node deployment are not release-gated for this alpha.
 
+Lifecycle-critical state, the installation database, and local backups require
+local Linux filesystem semantics: working cross-process `flock`, atomic
+same-directory replacement, file and directory `fsync`, and the existing
+same-device activation rules. StreamHome probes these primitives before
+lifecycle mutation or destructive controller work and fails closed when it
+cannot establish them. Network, distributed, remote, and FUSE filesystems are
+unsupported for lifecycle-critical paths; do not place the installation or its
+database on NFS, SMB/CIFS, Ceph, GlusterFS, or similar mounts.
+
 ## Runtime requirements
 
 The setup script requires:

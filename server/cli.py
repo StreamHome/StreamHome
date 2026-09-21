@@ -1526,9 +1526,10 @@ async def manage_database_backups():
     from services.backup import (
         create_backup,
         prune_old_backups,
-        get_local_backups,
+        get_local_backups_async,
         sync_backups_to_cloud,
-        restore_backup
+        delete_backup,
+        resolve_backup_file,
     )
     
     sub_options = [
@@ -1559,7 +1560,7 @@ async def manage_database_backups():
             print_centered("Creating secure database online backup...")
             try:
                 backup_path = await create_backup()
-                prune_old_backups(keep_count=7)
+                await prune_old_backups(keep_count=7)
                 print_centered(f"[bold green][✓] Backup created locally: {os.path.basename(backup_path)}[/bold green]")
                 
                 if settings.STORAGE_ENGINE == "CLOUD":
@@ -1587,7 +1588,7 @@ async def manage_database_backups():
                 print_centered("─" * 68)
                 console.print()
                 
-                backups = get_local_backups()
+                backups = await get_local_backups_async()
                 if not backups:
                     print_centered("[dim]No database backups found inside server/backup/.[/dim]")
                 else:
@@ -1601,60 +1602,18 @@ async def manage_database_backups():
                     break
                     
         elif choice == 2:
-            # Restore Database from Backup
+            # The old in-process restore was intentionally retired.  Supported
+            # restore is authenticated and lifecycle-controlled by the web app.
             clear_screen()
             console.print(f"[bright_cyan]{'═' * console.width}[/bright_cyan]")
             print_centered_block(LITTLEBANNER)
             console.print()
-            print_centered("[bold white]↩️   RESTORE DATABASE FROM BACKUP[/bold white]")
+            print_centered("[bold white]↩️   DATABASE RESTORE[/bold white]")
             print_centered("─" * 68)
             console.print()
-            
-            backups = get_local_backups()
-            if not backups:
-                print_centered("[dim]No database backups available to restore.[/dim]")
-                console.print()
-                print_centered("[dim]Press Enter to continue...[/dim]")
-                get_text_input("", default_val="")
-                continue
-                
-            print_centered("Select a backup to restore:")
-            options_list = [b["filename"] for b in backups] + ["Cancel Restore"]
-            icons_list = ["📄"] * len(backups) + ["❌"]
-            
-            sel = arrow_menu(options_list, icons_list, is_sub_menu=True)
-            if sel == -1 or sel == len(backups):
-                continue
-                
-            selected_backup = backups[sel]["filename"]
-            
-            # Double safety confirmation
-            clear_screen()
-            console.print(f"[bright_cyan]{'═' * console.width}[/bright_cyan]")
-            print_centered_block(LITTLEBANNER)
-            console.print()
-            print_centered("[bold bright_red]⚠️   WARNING: DATABASE OVERWRITE ACTION[/bold bright_red]")
-            print_centered("─" * 68)
-            console.print()
-            print_centered(f"You are about to restore: [bold white]{selected_backup}[/bold white]")
-            print_centered("This will OVERWRITE all current database records and streaming sessions!")
-            console.print()
-            
-            print_centered("[bold yellow]Are you sure? Press ENTER to restore, or ESC to cancel...[/bold yellow]")
-            key = get_key()
-            if key == "ENTER":
-                print_centered("Restoring database...")
-                try:
-                    success = await restore_backup(selected_backup)
-                    if success:
-                        print_centered("[bold green][✓] Database successfully restored![/bold green]")
-                    else:
-                        print_centered("[bold bright_red][✗] Database restore failed.[/bold bright_red]")
-                except Exception as e:
-                    print_centered(f"[bold bright_red][✗] Restore failed: {e}[/bold bright_red]")
-            else:
-                print_centered("[dim]Restore cancelled.[/dim]")
-                
+            print_centered("[bold yellow]Restore is unavailable in this legacy CLI.[/bold yellow]")
+            print_centered("Use the authenticated Backup & Recovery controls in StreamHome.")
+            print_centered("The supported restore runs offline under lifecycle protection.")
             console.print()
             print_centered("[dim]Press Enter to continue...[/dim]")
             get_text_input("", default_val="")
@@ -1669,7 +1628,7 @@ async def manage_database_backups():
             print_centered("─" * 68)
             console.print()
             
-            backups = get_local_backups()
+            backups = await get_local_backups_async()
             if not backups:
                 print_centered("[dim]No database backups available to delete.[/dim]")
                 console.print()
@@ -1686,7 +1645,6 @@ async def manage_database_backups():
                 continue
                 
             selected_backup = backups[sel]["filename"]
-            selected_path = backups[sel]["path"]
             
             clear_screen()
             console.print(f"[bright_cyan]{'═' * console.width}[/bright_cyan]")
@@ -1698,7 +1656,10 @@ async def manage_database_backups():
             key = get_key()
             if key == "ENTER":
                 try:
-                    os.remove(selected_path)
+                    selected_path = resolve_backup_file(selected_backup, must_exist=True)
+                    if selected_path is None:
+                        raise ValueError("Backup file is no longer available.")
+                    await delete_backup(selected_path)
                     print_centered("[bold green][✓] Backup file successfully deleted.[/bold green]")
                 except Exception as e:
                     print_centered(f"[bold bright_red][✗] Deletion failed: {e}[/bold bright_red]")

@@ -13,7 +13,13 @@ cat .run/update-diagnostics.json 2>/dev/null || true
 ./start.sh
 ```
 
-`./start.sh` does not compete with a live updater. It waits for verified controller ownership; if that ownership is stale, it restores the recorded previous release and starts both services through the normal health gates. Do not delete `.run`, the staging checkout, `server/database.db`, `server/media`, `web/dist`, or `web/node_modules` while recovery is active, because they may contain the verified checkpoint and rollback artifacts.
+`./start.sh` does not compete with a live updater. It waits for verified controller ownership and may resume a provably safe orphaned in-progress transaction. A deliberate `recovery_required` state is different: automatic destructive recovery stops and startup remains fail closed until explicit supported operator recovery is available. Do not delete `.run`, the staging checkout, `server/database.db`, `server/media`, `web/dist`, or `web/node_modules` while recovery is active, because they may contain the verified checkpoint and rollback artifacts.
+
+Phase 6A includes a local read-only recovery planner. It can inspect an exact
+operation and generation and report sanitized evidence-supported action names,
+but it cannot resume, roll back, abandon, or clear an operation. See
+[Backup and Recovery](backup-and-recovery.md) for the command and retention
+rules.
 
 For an installation still running the legacy updater, use the current installer without deleting the StreamHome directory:
 

@@ -28,6 +28,7 @@ from lifecycle.coordination import (
 from lifecycle.update_controller import (
     UpdateControllerError,
     mutate_update_journal,
+    read_update_journal,
     spawn_update_controller,
     validate_cutover_permit,
 )
@@ -134,14 +135,12 @@ class UpdateJournalReadError(RuntimeError):
 
 
 def _read_update_state_strict_unlocked() -> dict[str, Any]:
-    try:
-        payload = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+    if not STATUS_PATH.exists() and not STATUS_PATH.is_symlink():
         return {}
-    except (OSError, ValueError, TypeError) as exc:
+    try:
+        payload = read_update_journal(STATUS_PATH)
+    except UpdateControllerError as exc:
         raise UpdateJournalReadError("update journal is unreadable") from exc
-    if not isinstance(payload, dict):
-        raise UpdateJournalReadError("update journal is not an object")
     transaction_id = payload.get("transaction_id", "")
     generation = payload.get("lifecycle_generation")
     phase = payload.get("lifecycle_phase", "")
