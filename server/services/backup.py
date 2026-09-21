@@ -17,6 +17,12 @@ from services.logger import logger
 from services.queue import queue_manager
 from services.rclone import rclone_service
 import services.state as state
+from lifecycle.coordination import (
+    AdmissionClosedError,
+    EffectClass,
+    run_cancellation_safe_thread,
+    runtime_work,
+)
 
 BACKUP_FILENAME_RE = re.compile(r"^backup_\d{8}_\d{6}\.db$")
 BACKUP_LOCK = asyncio.Lock()
@@ -24,9 +30,7 @@ BACKUP_LOCK = asyncio.Lock()
 def get_backup_dir() -> str:
     """Resolve absolute path to server/backup folder."""
     config_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    backup_path = os.path.join(config_dir, "backup")
-    os.makedirs(backup_path, exist_ok=True)
-    return backup_path
+    return os.path.join(config_dir, "backup")
 
 
 def resolve_backup_file(filename: str, *, must_exist: bool = False) -> Path | None:
@@ -108,8 +112,14 @@ async def create_backup() -> str:
     Perform a secure online backup of database.db using SQLite Backup API.
     Creates backup in server/backup/backup_YYYYMMDD_HHMMSS.db.
     """
+    async with runtime_work("backup.snapshot", [EffectClass.DATABASE_SNAPSHOT]):
+        return await _create_admitted_backup()
+
+
+async def _create_admitted_backup() -> str:
     async with BACKUP_LOCK:
         backup_dir = get_backup_dir()
+        os.makedirs(backup_dir, exist_ok=True)
         candidate_time = datetime.now()
         while True:
             backup_filename = f"backup_{candidate_time.strftime('%Y%m%d_%H%M%S')}.db"
@@ -131,7 +141,7 @@ async def create_backup() -> str:
                 dest_conn.close()
                 src_conn.close()
 
-        await asyncio.get_running_loop().run_in_executor(None, run_backup)
+        await run_cancellation_safe_thread(run_backup)
         validate_backup_database(Path(dest_path))
         logger.info(f"[Backup Service] Backup successfully created: {backup_filename}")
         return dest_path
@@ -194,7 +204,11 @@ async def sync_backups_to_cloud() -> bool:
     target_remote = f"{settings.RCLONE_REMOTE_PATH}/backup"
 
     logger.info(f"[Backup Service] Syncing backup folder with cloud: {backup_dir} -> {target_remote}")
-    result = await rclone_service.run("sync", backup_dir, target_remote, "--retries", "3", timeout=60 * 60)
+    try:
+        result = await rclone_service.run("sync", backup_dir, target_remote, "--retries", "3", timeout=60 * 60)
+    except AdmissionClosedError:
+        logger.info("[Backup Service] Cloud synchronization deferred by runtime admission.")
+        return False
     if result.ok:
         logger.info("[Backup Service] Cloud synchronization complete.")
         return True

@@ -35,6 +35,7 @@ from services.ingestion_security import UnsafeIngestionSource, validate_headers,
 from services.profile_security import require_profile_access
 from services.rclone import rclone_service
 from services.recommendation import record_playback_progress
+from lifecycle.coordination import EffectClass, WorkLease, get_runtime_coordinator, runtime_work
 
 
 router = APIRouter(prefix="/api/playback", tags=["Playback"])
@@ -45,6 +46,40 @@ SAFE_SUBTITLE_FILE_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,180}\.vtt$", re.IGNORECAS
 ACTIVE_REPAIR_STATUSES = {"PENDING", "DOWNLOADING", "MERGING", "MOVING_CLOUD"}
 CLOUD_AUDIO_PROBE_TTL_SECONDS = 300
 _cloud_audio_probe_times: dict[str, float] = {}
+
+
+class LeaseBoundPlaybackResponse(Response):
+    """Keep an explicit playback lease through the ASGI response body lifetime."""
+
+    def __init__(self, response: Response, lease: WorkLease):
+        super().__init__(
+            content=b"",
+            status_code=response.status_code,
+            media_type=response.media_type,
+            background=response.background,
+        )
+        self.raw_headers = response.raw_headers
+        self._response = response
+        self._lease = lease
+
+    async def __call__(self, scope, receive, send) -> None:
+        coordinator = get_runtime_coordinator()
+        try:
+            with coordinator.bind(self._lease):
+                await self._response(scope, receive, send)
+        finally:
+            self._lease.release()
+
+
+def playback_response_lease(
+    owner: str,
+    *,
+    disposable_cache: bool = False,
+) -> WorkLease:
+    effects = {EffectClass.PLAYBACK_STREAM}
+    if disposable_cache:
+        effects.add(EffectClass.DISPOSABLE_CACHE_WRITE)
+    return get_runtime_coordinator().admit(owner, effects)
 
 
 class PlaybackRunRequest(APIModel):
@@ -263,9 +298,10 @@ async def clear_preview_task_reference(
 ) -> None:
     if str(getattr(media_obj, "preview_task_id", None) or "") != task_id:
         return
-    media_obj.preview_task_id = None
-    db.add(media_obj)
-    await db.commit()
+    async with runtime_work("playback.catalog-repair", [EffectClass.DB_WRITE]):
+        media_obj.preview_task_id = None
+        db.add(media_obj)
+        await db.commit()
     logger.info(f"[Playback Run] Cleared stale preview task {task_id} for {media_obj.id}: {reason}.")
 
 
@@ -305,6 +341,17 @@ async def queue_media_repair(
     reason_code: str,
 ) -> Optional[DownloadTask]:
     """Queue one verified replacement from retained ingestion intent, without deleting the catalog row."""
+
+    async with runtime_work("playback.catalog-repair", [EffectClass.DB_WRITE]):
+        return await _queue_media_repair_admitted(db, movie, media_obj, reason_code)
+
+
+async def _queue_media_repair_admitted(
+    db: AsyncSession,
+    movie: Movie,
+    media_obj: Any,
+    reason_code: str,
+) -> Optional[DownloadTask]:
 
     filters = [DownloadTask.tmdb_id == int(movie.tmdb_id or 0)]
     if media_obj is movie:
@@ -392,6 +439,19 @@ async def synchronize_source_fingerprint(db: AsyncSession, media_obj: Any, sourc
     fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
     if media_obj.source_fingerprint == fingerprint:
         return
+    async with runtime_work(
+        "playback.metadata-repair",
+        [EffectClass.DB_WRITE, EffectClass.DURABLE_MEDIA_WRITE],
+    ):
+        await _synchronize_source_fingerprint_admitted(db, media_obj, source, fingerprint)
+
+
+async def _synchronize_source_fingerprint_admitted(
+    db: AsyncSession,
+    media_obj: Any,
+    source: ResolvedMediaSource,
+    fingerprint: str,
+) -> None:
     if media_obj.source_fingerprint:
         playback_prep_service.cancel_media(media_obj.id, media_obj.source_fingerprint)
     media_obj.source_fingerprint = fingerprint
@@ -417,6 +477,25 @@ async def synchronize_source_fingerprint(db: AsyncSession, media_obj: Any, sourc
 
 
 async def ensure_source_metadata(
+    db: AsyncSession,
+    media_obj: Any,
+    source: ResolvedMediaSource,
+    *,
+    refresh_sidecars: bool = False,
+) -> None:
+    async with runtime_work(
+        "playback.metadata-repair",
+        [EffectClass.DB_WRITE, EffectClass.DURABLE_MEDIA_WRITE],
+    ):
+        await _ensure_source_metadata_admitted(
+            db,
+            media_obj,
+            source,
+            refresh_sidecars=refresh_sidecars,
+        )
+
+
+async def _ensure_source_metadata_admitted(
     db: AsyncSession,
     media_obj: Any,
     source: ResolvedMediaSource,
@@ -974,8 +1053,9 @@ async def get_playback_run(
                 run.source_task_id = repair_task.id
                 run.source_fingerprint = ingest_preview_service.fingerprint(repair_task.id)
                 run.updated_at = time.time()
-                db.add(run)
-                await db.commit()
+                async with runtime_work("playback.catalog-repair", [EffectClass.DB_WRITE]):
+                    db.add(run)
+                    await db.commit()
     position = 0 if run.source_kind == "ingest_preview" else await run_resume_position(db, run, media_obj)
     return await build_run_response(db, request, user, run, media_obj, initial_resume_position=position)
 
@@ -1254,7 +1334,7 @@ async def serve_ingest_preview_manifest(
     media_id: str,
     ticket: str = Query(...),
     db: AsyncSession = Depends(get_session),
-) -> PlainTextResponse:
+) -> Response:
     _, task_id = await preview_run_from_ticket(media_id, ticket, db)
     preview_status = ingest_preview_service.status(task_id)
     if preview_status["phase"] == "error":
@@ -1266,14 +1346,22 @@ async def serve_ingest_preview_manifest(
     playlist = ingest_preview_service.playlist_path(task_id)
     if preview_status["phase"] != "ready" or not playlist.is_file():
         raise playback_error(status.HTTP_425_TOO_EARLY, "PREVIEW_PREPARING", "The play-while-downloading buffer is still preparing.")
-    ingest_preview_service.touch(task_id)
-    content = rewrite_ingest_preview_playlist(
-        playlist.read_text(encoding="utf-8"),
-        media_id,
-        ticket,
-        PurePosixPath(),
-    )
-    return PlainTextResponse(content, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
+    lease = playback_response_lease("playback.preview-manifest", disposable_cache=True)
+    try:
+        ingest_preview_service.touch(task_id)
+        content = rewrite_ingest_preview_playlist(
+            playlist.read_text(encoding="utf-8"),
+            media_id,
+            ticket,
+            PurePosixPath(),
+        )
+        return LeaseBoundPlaybackResponse(
+            PlainTextResponse(content, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"}),
+            lease,
+        )
+    except Exception:
+        lease.release()
+        raise
 
 
 @router.get("/preview/{media_id}/{path:path}")
@@ -1299,9 +1387,17 @@ async def serve_ingest_preview_asset(
                 preview_status["error_message"] or "The play-while-downloading stream failed.",
             )
         raise playback_error(status.HTTP_404_NOT_FOUND, "PREVIEW_ASSET_NOT_READY", "The requested ingestion preview segment is not ready.")
-    ingest_preview_service.touch(task_id)
-    media_type = "video/iso.segment" if target.suffix.lower() == ".m4s" else mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-    return FileResponse(target, media_type=media_type, headers={"Cache-Control": "private, max-age=900"})
+    lease = playback_response_lease("playback.preview-segment", disposable_cache=True)
+    try:
+        ingest_preview_service.touch(task_id)
+        media_type = "video/iso.segment" if target.suffix.lower() == ".m4s" else mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        return LeaseBoundPlaybackResponse(
+            FileResponse(target, media_type=media_type, headers={"Cache-Control": "private, max-age=900"}),
+            lease,
+        )
+    except Exception:
+        lease.release()
+        raise
 
 
 @router.get("/manifest/{media_id}")
@@ -1309,7 +1405,7 @@ async def serve_master_manifest(
     media_id: str,
     ticket: str = Query(...),
     db: AsyncSession = Depends(get_session),
-) -> PlainTextResponse:
+) -> Response:
     payload, _, media_obj = await validate_playback_ticket(ticket, media_id, db)
     cache_root = playback_prep_service.cache_path(media_id, str(payload["fingerprint"]))
     master_path = safe_hls_file(cache_root, "master.m3u8")
@@ -1318,9 +1414,17 @@ async def serve_master_manifest(
         if failure:
             raise playback_error(status.HTTP_503_SERVICE_UNAVAILABLE, failure["code"], failure["message"])
         raise playback_error(status.HTTP_425_TOO_EARLY, "PLAYBACK_PREPARING", "The adaptive stream is still preparing.")
-    playback_prep_service.touch(media_id, str(payload["fingerprint"]))
-    content = rewrite_hls_playlist(master_path.read_text(encoding="utf-8"), media_id, ticket, PurePosixPath())
-    return PlainTextResponse(content, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
+    lease = playback_response_lease("playback.hls-manifest", disposable_cache=True)
+    try:
+        playback_prep_service.touch(media_id, str(payload["fingerprint"]))
+        content = rewrite_hls_playlist(master_path.read_text(encoding="utf-8"), media_id, ticket, PurePosixPath())
+        return LeaseBoundPlaybackResponse(
+            PlainTextResponse(content, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"}),
+            lease,
+        )
+    except Exception:
+        lease.release()
+        raise
 
 
 @router.get("/hls/{media_id}/{path:path}")
@@ -1335,12 +1439,19 @@ async def serve_hls_asset(
     target = safe_hls_file(cache_root, path)
     if not target.is_file():
         raise playback_error(status.HTTP_404_NOT_FOUND, "HLS_ASSET_NOT_READY", "The requested playback rendition is not ready.")
-    playback_prep_service.touch(media_id, str(payload["fingerprint"]))
-    if target.suffix.lower() == ".m3u8":
-        content = rewrite_hls_playlist(target.read_text(encoding="utf-8"), media_id, ticket, PurePosixPath(path).parent)
-        return PlainTextResponse(content, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
-    media_type = "video/iso.segment" if target.suffix.lower() == ".m4s" else "video/mp4"
-    return FileResponse(target, media_type=media_type, headers={"Cache-Control": "private, max-age=900"})
+    lease = playback_response_lease("playback.hls-asset", disposable_cache=True)
+    try:
+        playback_prep_service.touch(media_id, str(payload["fingerprint"]))
+        if target.suffix.lower() == ".m3u8":
+            content = rewrite_hls_playlist(target.read_text(encoding="utf-8"), media_id, ticket, PurePosixPath(path).parent)
+            response = PlainTextResponse(content, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
+        else:
+            media_type = "video/iso.segment" if target.suffix.lower() == ".m4s" else "video/mp4"
+            response = FileResponse(target, media_type=media_type, headers={"Cache-Control": "private, max-age=900"})
+        return LeaseBoundPlaybackResponse(response, lease)
+    except Exception:
+        lease.release()
+        raise
 
 
 def parse_byte_range(range_header: Optional[str], file_size: int) -> tuple[int, int, bool]:
@@ -1440,12 +1551,27 @@ async def seekable_source_response(reader: Any, request: Request):
     response_status = 206 if partial else 200
     if request.method == "HEAD":
         return Response(status_code=response_status, headers=headers, media_type=source_stat.content_type)
-    return StreamingResponse(
-        reader.open_range(start, length),
-        status_code=response_status,
-        media_type=source_stat.content_type,
-        headers=headers,
-    )
+    coordinator = get_runtime_coordinator()
+    lease = coordinator.admit("playback.progressive-stream", [EffectClass.PLAYBACK_STREAM])
+
+    async def coordinated_chunks() -> AsyncIterator[bytes]:
+        try:
+            with coordinator.bind(lease):
+                async for chunk in reader.open_range(start, length):
+                    yield chunk
+        finally:
+            lease.release()
+
+    try:
+        return StreamingResponse(
+            coordinated_chunks(),
+            status_code=response_status,
+            media_type=source_stat.content_type,
+            headers=headers,
+        )
+    except Exception:
+        lease.release()
+        raise
 
 
 @router.api_route("/source/{media_id}", methods=["GET", "HEAD"])
@@ -1506,12 +1632,20 @@ async def serve_playback_subtitles(
         raise playback_error(status.HTTP_404_NOT_FOUND, "SUBTITLE_NOT_FOUND", "The requested subtitle track is unavailable.")
     source = await require_available_source(media_obj)
     subtitle_path = source.local_path.parent / file_name
-    if not subtitle_path.is_file() and source.cloud_path:
-        remote_subtitle = f"{source.cloud_path.rsplit('/', 1)[0]}/{file_name}"
-        cache_path = Path(settings.TEMP_DIR) / "subtitle_cache" / media_id / str(media_obj.source_fingerprint) / f"subtitle_{track_id}.vtt"
-        result = await rclone_service.copyto_atomic(remote_subtitle, str(cache_path), timeout=60)
-        if result.ok:
-            subtitle_path = cache_path
-    if not subtitle_path.is_file():
-        raise playback_error(status.HTTP_404_NOT_FOUND, "SUBTITLE_NOT_FOUND", "The requested subtitle track is unavailable.")
-    return FileResponse(subtitle_path, media_type="text/vtt", headers={"Cache-Control": "private, max-age=900"})
+    lease = playback_response_lease("playback.subtitle", disposable_cache=True)
+    try:
+        if not subtitle_path.is_file() and source.cloud_path:
+            remote_subtitle = f"{source.cloud_path.rsplit('/', 1)[0]}/{file_name}"
+            cache_path = Path(settings.TEMP_DIR) / "subtitle_cache" / media_id / str(media_obj.source_fingerprint) / f"subtitle_{track_id}.vtt"
+            result = await rclone_service.copyto_atomic(remote_subtitle, str(cache_path), timeout=60)
+            if result.ok:
+                subtitle_path = cache_path
+        if not subtitle_path.is_file():
+            raise playback_error(status.HTTP_404_NOT_FOUND, "SUBTITLE_NOT_FOUND", "The requested subtitle track is unavailable.")
+        return LeaseBoundPlaybackResponse(
+            FileResponse(subtitle_path, media_type="text/vtt", headers={"Cache-Control": "private, max-age=900"}),
+            lease,
+        )
+    except Exception:
+        lease.release()
+        raise

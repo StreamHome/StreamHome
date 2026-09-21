@@ -19,6 +19,7 @@ from typing import Any
 
 from config import settings
 from lifecycle import state as lifecycle_state
+from lifecycle.coordination import get_runtime_coordinator
 from services.backup import BACKUP_LOCK, is_database_idle
 from services.logger import logger
 from services.queue import queue_manager
@@ -623,6 +624,11 @@ async def idle_blockers() -> list[str]:
     media_work = active_media_work_count()
     if media_work:
         blockers.append(f"{media_work} active media operation{'s' if media_work != 1 else ''}")
+    coordinated_work = len(get_runtime_coordinator().active_work())
+    if coordinated_work:
+        blockers.append(
+            f"{coordinated_work} lifecycle-coordinated operation{'s' if coordinated_work != 1 else ''} active"
+        )
     if BACKUP_LOCK.locked():
         blockers.append("a backup or restore operation is active")
     if not await is_database_idle():
@@ -640,6 +646,11 @@ async def protected_cutover_blockers() -> list[str]:
     media_work = active_media_work_count()
     if media_work:
         blockers.append(f"{media_work} active media operation{'s' if media_work != 1 else ''}")
+    coordinated_work = len(get_runtime_coordinator().active_work())
+    if coordinated_work:
+        blockers.append(
+            f"{coordinated_work} lifecycle-coordinated operation{'s' if coordinated_work != 1 else ''} active"
+        )
     if BACKUP_LOCK.locked():
         blockers.append("a backup or restore operation is active")
     if queue_manager.active_tasks:

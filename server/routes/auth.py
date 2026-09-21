@@ -41,6 +41,7 @@ from services.totp_enrollment import (
     render_qr_svg,
     verify_enrollment_code,
 )
+from lifecycle.coordination import AdmissionClosedError, EffectClass, runtime_work
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 health_router = APIRouter(tags=["System"])
@@ -290,9 +291,15 @@ async def resolve_auth(request: Request, credentials: Optional[HTTPAuthorization
         if not user or not auth_session or auth_session.user_id != user.id or auth_session.revoked_at or auth_session.expires_at <= now():
             raise ValueError("Inactive session")
         if now() - auth_session.last_seen_at >= SESSION_ACTIVITY_WRITE_INTERVAL:
-            auth_session.last_seen_at = now()
-            db.add(auth_session)
-            await db.commit()
+            try:
+                async with runtime_work("auth.session-refresh", [EffectClass.DB_WRITE]):
+                    auth_session.last_seen_at = now()
+                    db.add(auth_session)
+                    await db.commit()
+            except AdmissionClosedError:
+                # Session activity refresh is optional; authenticated reads remain usable.
+                await db.rollback()
+                await db.refresh(auth_session)
         request.state.auth_session = auth_session
         return user, auth_session
     except HTTPException:
@@ -575,6 +582,20 @@ async def update_password(req: UpdatePasswordRequest, request: Request, user: Us
 
 @router.put("/security/session-policy")
 async def update_session_policy(req: SessionPolicyRequest, request: Request, user: User = Depends(get_current_user), current: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    async with runtime_work(
+        "auth.session-policy",
+        [EffectClass.CONFIG_WRITE, EffectClass.DB_WRITE],
+    ):
+        return await _update_session_policy_admitted(req, request, user, current, db)
+
+
+async def _update_session_policy_admitted(
+    req: SessionPolicyRequest,
+    request: Request,
+    user: User,
+    current: AuthSession,
+    db: AsyncSession,
+):
     if req.session_lifetime_days < 1 or req.session_lifetime_days > 365:
         raise HTTPException(status_code=422, detail={"code": "invalid_session_lifetime", "message": "Session lifetime must be between 1 and 365 days."})
     previous_days = settings.SESSION_LIFETIME_DAYS

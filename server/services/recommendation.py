@@ -38,6 +38,7 @@ from models import (
 )
 from services.logger import logger
 from services.vibe_analysis import VIBE_ANALYSIS_VERSION, crew_names
+from lifecycle.coordination import AdmissionClosedError, EffectClass, runtime_work
 
 TASTE_HALF_LIFE_DAYS = 90.0
 DECAY_RATE = math.log(2.0) / TASTE_HALF_LIFE_DAYS
@@ -942,6 +943,25 @@ async def build_recommendation_payload(
     limit: int,
     offset: int,
 ) -> Dict[str, Any]:
+    async with runtime_work("recommendation.payload", [EffectClass.DB_WRITE]):
+        return await _build_recommendation_payload_admitted(
+            db,
+            profile_id,
+            scope,
+            category,
+            limit,
+            offset,
+        )
+
+
+async def _build_recommendation_payload_admitted(
+    db: AsyncSession,
+    profile_id: str,
+    scope: str,
+    category: str,
+    limit: int,
+    offset: int,
+) -> Dict[str, Any]:
     now = time.time()
     movie_result = await db.exec(select(Movie))
     all_movies = list(movie_result.all())
@@ -1162,24 +1182,31 @@ async def recommendation_worker(stop_event) -> None:
                 pass
             continue
         backfilled = 0
+        admission_deferred = False
         try:
-            from services.vibe_analysis import backfill_catalog_vibes
-            backfilled = await backfill_catalog_vibes(limit=24)
-            async with AsyncSession(engine) as db:
-                profile_result = await db.exec(select(Profile))
-                profile_ids = [profile.id for profile in profile_result.all()]
-                state_result = await db.exec(select(RecommendationRefreshState))
-                states = {state.profile_id: state for state in state_result.all()}
-            now = time.time()
-            for profile_id in profile_ids:
-                state = states.get(profile_id)
-                stale = not state or not state.last_tmdb_refresh_at or now - state.last_tmdb_refresh_at >= TMDB_STALE_SECONDS
-                if stale or (state and state.refresh_requested):
-                    await refresh_profile_cache(profile_id)
+            async with runtime_work(
+                "recommendation.worker",
+                [EffectClass.DB_WRITE, EffectClass.DURABLE_MEDIA_WRITE],
+            ):
+                from services.vibe_analysis import backfill_catalog_vibes
+                backfilled = await backfill_catalog_vibes(limit=24)
+                async with AsyncSession(engine) as db:
+                    profile_result = await db.exec(select(Profile))
+                    profile_ids = [profile.id for profile in profile_result.all()]
+                    state_result = await db.exec(select(RecommendationRefreshState))
+                    states = {state.profile_id: state for state in state_result.all()}
+                now = time.time()
+                for profile_id in profile_ids:
+                    state = states.get(profile_id)
+                    stale = not state or not state.last_tmdb_refresh_at or now - state.last_tmdb_refresh_at >= TMDB_STALE_SECONDS
+                    if stale or (state and state.refresh_requested):
+                        await refresh_profile_cache(profile_id)
+        except AdmissionClosedError:
+            admission_deferred = True
         except Exception as exc:
             logger.error(f"[Recommendation] Background worker error: {exc}")
         try:
-            delay = 15 if backfilled >= 24 else 3600
+            delay = 5 if admission_deferred else 15 if backfilled >= 24 else 3600
             await __import__("asyncio").wait_for(stop_event.wait(), timeout=delay)
         except __import__("asyncio").TimeoutError:
             pass

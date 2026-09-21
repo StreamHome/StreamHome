@@ -15,6 +15,7 @@ from services.ingestion_errors import IngestionFailure, classify_failure, saniti
 from services.ffmpeg_input import ffmpeg_network_input_options, is_http_media_source
 from services.ingest_preview import ingest_preview_service
 from services.media_timing import canonical_audio_filter_chain
+from lifecycle.coordination import run_cancellation_safe_thread
 
 # Regular expressions for parsing FFmpeg stderr progress
 time_regex = re.compile(r"time=\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)")
@@ -211,6 +212,16 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float, preview_enab
             process.stderr.close()
         unregister_process(task_id)
 
+
+def _cancel_registered_process(task_id: str) -> None:
+    process = ACTIVE_PROCESSES.get(task_id)
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.kill()
+    except OSError:
+        pass
+
 async def download_and_merge(
     task_id: str,
     video_url: str,
@@ -320,18 +331,17 @@ async def download_and_merge(
     # Initialize metrics immediately to show 0.0% progress in CLI TUI
     update_task_metrics(task_id, 0.0, speed="Connecting...", eta="00:00:00", size="0 MB", force_write=True)
 
-    loop = asyncio.get_running_loop()
     logger.info(f"[FFmpeg Service] Starting task {task_id} from {sanitize_url(video_url)}")
     
     try:
         # Senkron FFmpeg fonksiyonunu sunucuyu bloke etmemesi için ayrı bir iş parçacığına yolluyoruz
-        success, diagnostics = await loop.run_in_executor(
-            None,
+        success, diagnostics = await run_cancellation_safe_thread(
             _run_ffmpeg_sync,
             task_id,
             build_command(preview_enabled),
             duration_secs,
             preview_enabled,
+            cancellation_callback=lambda: _cancel_registered_process(task_id),
         )
         preview_succeeded = bool(preview_enabled and success)
 
@@ -341,13 +351,13 @@ async def download_and_merge(
             if os.path.exists(temp_output_path):
                 os.remove(temp_output_path)
             logger.warning(f"[FFmpeg Service] Preview branch failed for {task_id}; retrying ingestion without play-while-downloading output.")
-            success, diagnostics = await loop.run_in_executor(
-                None,
+            success, diagnostics = await run_cancellation_safe_thread(
                 _run_ffmpeg_sync,
                 task_id,
                 build_command(False),
                 duration_secs,
                 False,
+                cancellation_callback=lambda: _cancel_registered_process(task_id),
             )
         
         if success:
@@ -371,7 +381,7 @@ async def download_and_merge(
             try:
                 process.kill()
                 if isinstance(process, subprocess.Popen):
-                    await loop.run_in_executor(None, process.wait)
+                    await run_cancellation_safe_thread(process.wait)
                 else:
                     await process.wait()
             except Exception:

@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional
 from services.logger import logger
 from services.languages import language_label, normalize_language_tag
 from services.state import register_process, unregister_process
+from lifecycle.coordination import run_cancellation_safe_thread
 
 def get_ffmpeg_path() -> str:
     return shutil.which("ffmpeg") or r"C:\ffmpeg\bin\ffmpeg.exe"
@@ -117,7 +118,13 @@ async def repair_completed_ingestion_languages() -> int:
     for media_id, video_url, languages, audio_metadata in repaired:
         playback_prep_service.cancel_media(media_id)
         shutil.rmtree(playback_prep_service.cache_dir / re.sub(r"[^a-zA-Z0-9_.-]", "_", media_id), ignore_errors=True)
-        await asyncio.to_thread(_repair_portable_metadata, video_url, languages[0], languages, audio_metadata)
+        await run_cancellation_safe_thread(
+            _repair_portable_metadata,
+            video_url,
+            languages[0],
+            languages,
+            audio_metadata,
+        )
     if repaired:
         logger.info(f"[Audio Language Repair] Corrected {len(repaired)} completed catalog item(s).")
     return len(repaired)

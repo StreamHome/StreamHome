@@ -16,9 +16,18 @@ from services.media_updates import (
     validate_remote_input,
 )
 from services.request_security import client_ip
+from config import settings
+from lifecycle.coordination import EffectClass, runtime_work
 
 
 router = APIRouter(prefix="/api/media", tags=["media-sender"])
+
+
+def media_mutation_effects() -> set[EffectClass]:
+    effects = {EffectClass.DB_WRITE, EffectClass.DURABLE_MEDIA_WRITE}
+    if settings.STORAGE_ENGINE == "CLOUD":
+        effects.add(EffectClass.CLOUD_WRITE)
+    return effects
 
 
 def update_error(exc: MediaUpdateFailure) -> HTTPException:
@@ -42,7 +51,8 @@ async def patch_media_metadata(
         for name, values in payload.skip_markers.items()
     }
     try:
-        return await update_skip_markers(media_id, markers, db)
+        async with runtime_work("media-sender.sidecar", media_mutation_effects()):
+            return await update_skip_markers(media_id, markers, db)
     except MediaUpdateFailure as exc:
         await db.rollback()
         raise update_error(exc) from exc
@@ -61,16 +71,17 @@ async def put_media_subtitle(
     del credential
     try:
         headers = await validate_remote_input(payload.url, payload.headers, client_ip(request))
-        return await upsert_subtitle(
-            media_id,
-            track_id,
-            language=payload.language,
-            label=payload.label,
-            url=payload.url,
-            headers=headers,
-            client_address=client_ip(request),
-            db=db,
-        )
+        async with runtime_work("media-sender.sidecar", media_mutation_effects()):
+            return await upsert_subtitle(
+                media_id,
+                track_id,
+                language=payload.language,
+                label=payload.label,
+                url=payload.url,
+                headers=headers,
+                client_address=client_ip(request),
+                db=db,
+            )
     except MediaUpdateFailure as exc:
         await db.rollback()
         raise update_error(exc) from exc
@@ -86,7 +97,8 @@ async def delete_media_subtitle(
     """Remove one application-owned subtitle track and its sidecar."""
     del credential
     try:
-        return await remove_subtitle(media_id, track_id, db)
+        async with runtime_work("media-sender.sidecar", media_mutation_effects()):
+            return await remove_subtitle(media_id, track_id, db)
     except MediaUpdateFailure as exc:
         await db.rollback()
         raise update_error(exc) from exc
@@ -105,15 +117,16 @@ async def put_media_audio(
     del credential
     try:
         headers = await validate_remote_input(payload.url, payload.headers, client_ip(request))
-        return await upsert_audio(
-            media_id,
-            language,
-            url=payload.url,
-            headers=headers,
-            client_address=client_ip(request),
-            source_type=payload.source_type,
-            db=db,
-        )
+        async with runtime_work("media-sender.sidecar", media_mutation_effects()):
+            return await upsert_audio(
+                media_id,
+                language,
+                url=payload.url,
+                headers=headers,
+                client_address=client_ip(request),
+                source_type=payload.source_type,
+                db=db,
+            )
     except MediaUpdateFailure as exc:
         await db.rollback()
         raise update_error(exc) from exc
@@ -129,7 +142,8 @@ async def delete_media_audio(
     """Remove one application-owned dubbing sidecar."""
     del credential
     try:
-        return await remove_audio(media_id, language, db)
+        async with runtime_work("media-sender.sidecar", media_mutation_effects()):
+            return await remove_audio(media_id, language, db)
     except MediaUpdateFailure as exc:
         await db.rollback()
         raise update_error(exc) from exc

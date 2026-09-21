@@ -35,6 +35,12 @@ from services.media_source import (
 )
 from services.vibe_analysis import VIBE_ANALYSIS_VERSION, compute_trope_vectors, vibe_analysis_manager
 from services.audio_extractor import apply_primary_audio_language, extract_audio_and_strip_video, normalize_language_code
+from lifecycle.coordination import (
+    AdmissionClosedError,
+    EffectClass,
+    run_cancellation_safe_thread,
+    runtime_work,
+)
 
 
 def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
@@ -205,11 +211,6 @@ class DownloadQueueManager:
                     
                     if not task:
                         continue
-                    
-                    task.status = "DOWNLOADING"
-                    db.add(task)
-                    await db.commit()
-                    await db.refresh(task)
                     
                     task_id = task.id
                 
@@ -438,6 +439,28 @@ class DownloadQueueManager:
         shutil.rmtree(Path(settings.TEMP_DIR).resolve() / "replacement-backups" / task_id, ignore_errors=True)
 
     async def _process_task(self, task_id: str):
+        effects = {
+            EffectClass.DB_WRITE,
+            EffectClass.DURABLE_MEDIA_WRITE,
+            EffectClass.DISPOSABLE_CACHE_WRITE,
+        }
+        if settings.STORAGE_ENGINE == "CLOUD":
+            effects.add(EffectClass.CLOUD_WRITE)
+        try:
+            async with runtime_work("ingestion.worker", effects):
+                async with AsyncSession(engine) as db:
+                    task = await db.get(DownloadTask, task_id)
+                    if not task or task.status != "PENDING":
+                        return
+                    task.status = "DOWNLOADING"
+                    db.add(task)
+                    await db.commit()
+                await self._process_admitted_task(task_id)
+        except AdmissionClosedError:
+            # The durable PENDING row remains available for a future admission reopen.
+            logger.info(f"[Queue Manager] Deferred task {task_id} because runtime admission is closed.")
+
+    async def _process_admitted_task(self, task_id: str):
         logger.info(f"[Queue Manager] Processing task: {task_id}")
         output_abs_path: Optional[str] = None
         catalog_abs_path: Optional[str] = None
@@ -803,7 +826,7 @@ class DownloadQueueManager:
                     logger.warning(f"[Queue Manager] Cloud upload failed for task {task_id}; falling back to local storage.")
                     try:
                         dest_dir = os.path.dirname(str(catalog_abs_path))
-                        replacement_backup = await asyncio.to_thread(
+                        replacement_backup = await run_cancellation_safe_thread(
                             self._publish_local_directory,
                             local_dir,
                             dest_dir,
@@ -824,7 +847,7 @@ class DownloadQueueManager:
             else:
                 dest_dir = os.path.dirname(str(catalog_abs_path))
                 try:
-                    replacement_backup = await asyncio.to_thread(
+                    replacement_backup = await run_cancellation_safe_thread(
                         self._publish_local_directory,
                         local_dir,
                         dest_dir,
@@ -878,7 +901,7 @@ class DownloadQueueManager:
                 created_artifacts.clear()
                 task_completed = True
 
-            await asyncio.to_thread(self._finalize_local_publication, task_id)
+            await run_cancellation_safe_thread(self._finalize_local_publication, task_id)
             await self._finalize_cloud_publication(cloud_replacement_backup)
 
             await self._schedule_playback_baseline(finalized_media_id, finalized_media_type)
@@ -910,7 +933,7 @@ class DownloadQueueManager:
         finally:
             if published_local_dir and not task_completed:
                 try:
-                    await asyncio.to_thread(
+                    await run_cancellation_safe_thread(
                         self._rollback_local_publication,
                         published_local_dir,
                         replacement_backup,
@@ -942,7 +965,7 @@ class DownloadQueueManager:
                 self._remove_empty_parents(os.path.dirname(output_abs_path))
             if staging_task_root.exists():
                 try:
-                    await asyncio.to_thread(shutil.rmtree, staging_task_root)
+                    await run_cancellation_safe_thread(shutil.rmtree, staging_task_root)
                 except OSError as staging_cleanup_error:
                     logger.warning(
                         f"[Queue Manager] Could not remove staging directory for task {task_id}: "

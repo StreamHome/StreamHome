@@ -9,6 +9,7 @@ from urllib.parse import unquote, urlparse
 from config import settings
 from services.logger import logger
 from services.vibe_analysis import compute_trope_vectors, relevant_crew
+from lifecycle.coordination import AdmissionClosedError, EffectClass, runtime_work
 
 GENRES_MAP = {
     28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime",
@@ -32,6 +33,8 @@ class TMDBClient:
         self._cache_pending: set[str] = set()
         self._cache_workers: List[asyncio.Task] = []
         self._cache_retry_tasks: set[asyncio.Task] = set()
+        self._direct_cache_deferred: Dict[str, tuple[Dict[str, Any], str, str]] = {}
+        self._direct_cache_retry_tasks: Dict[str, asyncio.Task] = {}
 
     @staticmethod
     def _local_artwork_exists(url: Optional[str]) -> bool:
@@ -133,6 +136,13 @@ class TMDBClient:
             task.cancel()
         if retry_tasks:
             await asyncio.gather(*retry_tasks, return_exceptions=True)
+        direct_retry_tasks = list(self._direct_cache_retry_tasks.values())
+        self._direct_cache_retry_tasks.clear()
+        for task in direct_retry_tasks:
+            task.cancel()
+        if direct_retry_tasks:
+            await asyncio.gather(*direct_retry_tasks, return_exceptions=True)
+        self._direct_cache_deferred.clear()
         self._cache_pending.clear()
         self._cache_queue = None
 
@@ -155,23 +165,34 @@ class TMDBClient:
         assert self._cache_queue is not None
         while True:
             movie_id = await self._cache_queue.get()
+            deferred = False
             try:
-                for attempt in range(3):
-                    try:
-                        await self._cache_movie_record(movie_id)
-                        break
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as error:
-                        if attempt == 2:
-                            retry_delay = await self._mark_cache_error(movie_id, error)
-                            if retry_delay is not None:
-                                self._schedule_cache_retry(movie_id, retry_delay)
-                            logger.error(f"[TMDB Cache Worker {worker_index}] {movie_id} failed: {error}")
-                        else:
-                            await asyncio.sleep(0.75 * (2 ** attempt))
+                try:
+                    async with runtime_work(
+                        "tmdb.cache-worker",
+                        [EffectClass.DB_WRITE, EffectClass.DURABLE_MEDIA_WRITE],
+                    ):
+                        for attempt in range(3):
+                            try:
+                                await self._cache_movie_record(movie_id)
+                                break
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as error:
+                                if attempt == 2:
+                                    retry_delay = await self._mark_cache_error(movie_id, error)
+                                    if retry_delay is not None:
+                                        self._schedule_cache_retry(movie_id, retry_delay)
+                                    logger.error(f"[TMDB Cache Worker {worker_index}] {movie_id} failed: {error}")
+                                else:
+                                    await asyncio.sleep(0.75 * (2 ** attempt))
+                except AdmissionClosedError:
+                    deferred = True
+                    await self._cache_queue.put(movie_id)
+                    await asyncio.sleep(1.0)
             finally:
-                self._cache_pending.discard(movie_id)
+                if not deferred:
+                    self._cache_pending.discard(movie_id)
                 self._cache_queue.task_done()
 
     async def _mark_cache_error(self, movie_id: str, error: Exception) -> Optional[float]:
@@ -460,6 +481,73 @@ class TMDBClient:
 
     async def cache_media_locally(self, item_dict: Dict[str, Any], raw_poster_url: str, raw_backdrop_url: str):
         """Cache truthful title metadata/artwork in the existing media tree, never video."""
+        try:
+            async with runtime_work(
+                "tmdb.catalog-cache",
+                [EffectClass.DB_WRITE, EffectClass.DURABLE_MEDIA_WRITE],
+            ):
+                return await self._cache_media_locally_admitted(
+                    item_dict,
+                    raw_poster_url,
+                    raw_backdrop_url,
+                )
+        except AdmissionClosedError:
+            # Discovery results remain usable while the expected durable cache
+            # population is retried at a bounded rate after admission reopens.
+            self._defer_direct_cache(item_dict, raw_poster_url, raw_backdrop_url)
+            return None
+
+    def _defer_direct_cache(
+        self,
+        item_dict: Dict[str, Any],
+        raw_poster_url: str,
+        raw_backdrop_url: str,
+    ) -> None:
+        tmdb_id = int(item_dict.get("tmdb_id"))
+        media_type = "series" if item_dict.get("type") in ("series", "tv") else "movie"
+        movie_id = f"tv_{tmdb_id}" if media_type == "series" else f"m_{tmdb_id}"
+        self._direct_cache_deferred[movie_id] = (
+            dict(item_dict),
+            raw_poster_url,
+            raw_backdrop_url,
+        )
+        if movie_id in self._direct_cache_retry_tasks:
+            return
+
+        async def retry() -> None:
+            delay = 1.0
+            try:
+                while payload := self._direct_cache_deferred.get(movie_id):
+                    await asyncio.sleep(delay)
+                    try:
+                        async with runtime_work(
+                            "tmdb.catalog-cache",
+                            [EffectClass.DB_WRITE, EffectClass.DURABLE_MEDIA_WRITE],
+                        ):
+                            await self._cache_media_locally_admitted(*payload)
+                    except AdmissionClosedError:
+                        delay = min(30.0, delay * 2.0)
+                        continue
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        logger.error(
+                            f"[TMDB Client] Deferred cache failed for {movie_id}: "
+                            f"{type(error).__name__}"
+                        )
+                    self._direct_cache_deferred.pop(movie_id, None)
+                    return
+            finally:
+                current = self._direct_cache_retry_tasks.get(movie_id)
+                if current is asyncio.current_task():
+                    self._direct_cache_retry_tasks.pop(movie_id, None)
+
+        self._direct_cache_retry_tasks[movie_id] = asyncio.create_task(
+            retry(),
+            name=f"tmdb-direct-cache-retry-{movie_id}",
+        )
+
+    async def _cache_media_locally_admitted(self, item_dict: Dict[str, Any], raw_poster_url: str, raw_backdrop_url: str):
         async with self._cache_semaphore:
             try:
                 import time
@@ -855,6 +943,10 @@ class TMDBClient:
         return await self._upsert_search_results(items)
 
     async def _upsert_search_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        async with runtime_work("tmdb.search-catalog", [EffectClass.DB_WRITE]):
+            return await self._upsert_search_results_admitted(results)
+
+    async def _upsert_search_results_admitted(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         import time
         from sqlmodel.ext.asyncio.session import AsyncSession
         from db import engine

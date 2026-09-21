@@ -14,6 +14,7 @@ from config import settings
 from db import get_session
 from models import APIModel, AuthSession, User
 from routes.auth import add_event, get_current_session, get_current_user, require_recent_reauth
+from lifecycle.coordination import EffectClass, runtime_work
 from services import state
 from services.update import (
     ACTIVE_PHASES,
@@ -312,21 +313,22 @@ async def install_update(
         launched = await launch_queued_update_if_ready()
     except RuntimeError as exc:
         raise _runtime_error(exc) from exc
-    await add_event(
-        db,
-        request,
-        "update_queued",
-        "success",
-        user.id,
-        session.id,
-        {
-            "target": str(queued.get("target_commit") or "")[:12],
-            "launched": launched,
-            "retryFailedTarget": payload.retry_failed_target,
-            "installMode": payload.mode,
-        },
-    )
-    await db.commit()
+    async with runtime_work("update.audit", [EffectClass.DB_WRITE]):
+        await add_event(
+            db,
+            request,
+            "update_queued",
+            "success",
+            user.id,
+            session.id,
+            {
+                "target": str(queued.get("target_commit") or "")[:12],
+                "launched": launched,
+                "retryFailedTarget": payload.retry_failed_target,
+                "installMode": payload.mode,
+            },
+        )
+        await db.commit()
     return await _status_response()
 
 
@@ -341,6 +343,7 @@ async def cancel_pending_update(
         await cancel_queued_update()
     except RuntimeError as exc:
         raise _runtime_error(exc) from exc
-    await add_event(db, request, "update_cancelled", "success", user.id, session.id)
-    await db.commit()
+    async with runtime_work("update.audit", [EffectClass.DB_WRITE]):
+        await add_event(db, request, "update_cancelled", "success", user.id, session.id)
+        await db.commit()
     return await _status_response()

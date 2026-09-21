@@ -21,6 +21,12 @@ from services.media_timing import canonical_audio_filter_chain
 from services.media_source import ResolvedMediaSource, playback_source_fingerprint, resolve_media_source
 from services.rclone import rclone_service
 from services.state import register_process, unregister_process
+from lifecycle.coordination import (
+    AdmissionClosedError,
+    EffectClass,
+    run_cancellation_safe_thread,
+    runtime_work,
+)
 
 
 STANDARD_HEIGHTS = (1080, 720, 480, 360, 240, 144)
@@ -682,6 +688,35 @@ class PlaybackPrepService:
         fingerprint = getattr(media_obj, "source_fingerprint", None) or source.fingerprint
         if self._update_quiesced:
             return self.preparation_state(media_id, fingerprint, media_obj)
+        try:
+            async with runtime_work(
+                "playback.preparation-request",
+                [EffectClass.DISPOSABLE_CACHE_WRITE],
+            ):
+                return await self._prepare_admitted(
+                    media_id,
+                    media_obj,
+                    source,
+                    fingerprint=fingerprint,
+                    include_remaining=include_remaining,
+                    retry_errors=retry_errors,
+                    foreground=foreground,
+                )
+        except AdmissionClosedError:
+            # Cache preparation is disposable and may be requested again later.
+            return self.preparation_state(media_id, fingerprint, media_obj)
+
+    async def _prepare_admitted(
+        self,
+        media_id: str,
+        media_obj: Any,
+        source: ResolvedMediaSource,
+        *,
+        fingerprint: str,
+        include_remaining: bool,
+        retry_errors: bool,
+        foreground: bool,
+    ) -> str:
         cache_path = self.cache_path(media_id, fingerprint)
         cache_path.mkdir(parents=True, exist_ok=True)
         self.touch(media_id, fingerprint)
@@ -845,29 +880,37 @@ class PlaybackPrepService:
             return
 
         await asyncio.sleep(1)
-        baseline_height = self.baseline_video(media_obj).height
-        remaining_video = [item for item in self.video_renditions(media_obj) if item.height != baseline_height]
-        remaining_video.sort(key=lambda item: (item.height > baseline_height, -item.height if item.height < baseline_height else item.height))
-        for audio in self.audio_renditions(media_obj):
-            self._schedule_audio(
-                media_id,
-                fingerprint,
-                source,
-                audio,
-                media_obj,
-                BACKGROUND_PRIORITY,
-                retry_errors=retry_errors,
-            )
-        for rendition in remaining_video:
-            self._schedule_video(
-                media_id,
-                fingerprint,
-                source,
-                rendition,
-                media_obj,
-                BACKGROUND_PRIORITY,
-                retry_errors=retry_errors,
-            )
+        try:
+            async with runtime_work(
+                "playback.remaining-renditions",
+                [EffectClass.DISPOSABLE_CACHE_WRITE],
+            ):
+                baseline_height = self.baseline_video(media_obj).height
+                remaining_video = [item for item in self.video_renditions(media_obj) if item.height != baseline_height]
+                remaining_video.sort(key=lambda item: (item.height > baseline_height, -item.height if item.height < baseline_height else item.height))
+                for audio in self.audio_renditions(media_obj):
+                    self._schedule_audio(
+                        media_id,
+                        fingerprint,
+                        source,
+                        audio,
+                        media_obj,
+                        BACKGROUND_PRIORITY,
+                        retry_errors=retry_errors,
+                    )
+                for rendition in remaining_video:
+                    self._schedule_video(
+                        media_id,
+                        fingerprint,
+                        source,
+                        rendition,
+                        media_obj,
+                        BACKGROUND_PRIORITY,
+                        retry_errors=retry_errors,
+                    )
+        except AdmissionClosedError:
+            # Remaining renditions are disposable and can be scheduled again.
+            return
 
     def _schedule_video(
         self,
@@ -1046,13 +1089,13 @@ class PlaybackPrepService:
         target_dir: Path,
     ) -> None:
         stall_seconds = max(1, int(settings.PLAYBACK_JOB_STALL_SECONDS))
-        last_signature = await asyncio.to_thread(self._output_signature, target_dir)
+        last_signature = await run_cancellation_safe_thread(self._output_signature, target_dir)
         last_activity = time.monotonic()
         wait_task = asyncio.create_task(process.wait())
         try:
             while not wait_task.done():
                 await asyncio.wait({wait_task}, timeout=1)
-                signature = await asyncio.to_thread(self._output_signature, target_dir)
+                signature = await run_cancellation_safe_thread(self._output_signature, target_dir)
                 if signature != last_signature:
                     last_signature = signature
                     last_activity = time.monotonic()
@@ -1083,6 +1126,32 @@ class PlaybackPrepService:
         return bytes(tail)
 
     async def _run_ffmpeg_job(
+        self,
+        media_id: str,
+        fingerprint: str,
+        rendition_name: str,
+        source: ResolvedMediaSource,
+        arguments: list[str],
+        media_obj: Any,
+    ) -> None:
+        try:
+            async with runtime_work(
+                "playback.preparation",
+                [EffectClass.DISPOSABLE_CACHE_WRITE],
+            ):
+                await self._run_admitted_ffmpeg_job(
+                    media_id,
+                    fingerprint,
+                    rendition_name,
+                    source,
+                    arguments,
+                    media_obj,
+                )
+        except AdmissionClosedError:
+            # Cache preparation is disposable and may be scheduled again later.
+            return
+
+    async def _run_admitted_ffmpeg_job(
         self,
         media_id: str,
         fingerprint: str,
@@ -1169,14 +1238,14 @@ class PlaybackPrepService:
                     )
                 if not self.playlist_ready(media_id, fingerprint, rendition_name):
                     raise PlaybackPreparationError("EMPTY_RENDITION", "FFmpeg completed without producing playable HLS segments.")
-                await asyncio.to_thread(self._verify_rendition_output, target_dir, rendition_name)
+                await run_cancellation_safe_thread(self._verify_rendition_output, target_dir, rendition_name)
                 (target_dir / COMPLETE_MARKER).write_text(str(time.time()), encoding="utf-8")
                 (target_dir / self._verified_marker_name(rendition_name)).write_text("1", encoding="utf-8")
                 self._clear_preparation_error(media_id, fingerprint)
                 self._clear_rendition_error(media_id, fingerprint, rendition_name)
                 self.touch(media_id, fingerprint)
                 await self.rebuild_master(media_id, fingerprint, media_obj)
-                await asyncio.to_thread(self.enforce_lru_limits)
+                await run_cancellation_safe_thread(self.enforce_lru_limits)
                 elapsed = max(0.0, time.monotonic() - self.job_started_at.get(job_key, time.monotonic()))
                 logger.info(
                     f"[Playback Prep] Prepared {media_id}/{rendition_name} in {elapsed:.2f}s; "
@@ -1446,13 +1515,13 @@ class PlaybackPrepService:
             if not videos:
                 (cache_path / MASTER_NAME).unlink(missing_ok=True)
                 return None
-            await asyncio.to_thread(self._verify_master_timeline, cache_path, videos, audios)
+            await run_cancellation_safe_thread(self._verify_master_timeline, cache_path, videos, audios)
 
             lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
             measured_audio = [
                 measurement
                 for audio in audios
-                if (measurement := await asyncio.to_thread(
+                if (measurement := await run_cancellation_safe_thread(
                     self._measured_playlist_bandwidth,
                     cache_path / audio.name / PLAYLIST_NAME,
                 )) is not None
@@ -1472,7 +1541,7 @@ class PlaybackPrepService:
                     ]
                     lines.append(f"#EXT-X-MEDIA:{','.join(attributes)}")
             for video in videos:
-                measured = await asyncio.to_thread(
+                measured = await run_cancellation_safe_thread(
                     self._measured_playlist_bandwidth,
                     cache_path / video.name / PLAYLIST_NAME,
                 )

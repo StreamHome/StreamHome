@@ -21,6 +21,12 @@ from config import settings
 from db import engine
 from models import Episode, Movie
 from services.logger import logger
+from lifecycle.coordination import (
+    AdmissionClosedError,
+    EffectClass,
+    run_cancellation_safe_thread,
+    runtime_work,
+)
 
 VIBE_ANALYSIS_VERSION = 1
 _REGISTRY_PATH = Path(__file__).resolve().parent.parent / "data" / "trope_clusters.json"
@@ -269,17 +275,30 @@ class VibeAnalysisManager:
         assert self._queue is not None
         while True:
             key = await self._queue.get()
+            deferred = False
             try:
                 await self.analyze_entity(*key)
+            except AdmissionClosedError:
+                deferred = True
+                await self._queue.put(key)
+                await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.error(f"[Vibe Analysis Worker {worker_index}] {key[0]} {key[1]} failed: {exc}")
             finally:
-                self._pending.discard(key)
+                if not deferred:
+                    self._pending.discard(key)
                 self._queue.task_done()
 
     async def analyze_entity(self, entity_type: str, entity_id: str) -> Optional[DialogueMetrics]:
+        async with runtime_work(
+            "vibe.analysis",
+            [EffectClass.DB_WRITE, EffectClass.DURABLE_MEDIA_WRITE],
+        ):
+            return await self._analyze_entity_admitted(entity_type, entity_id)
+
+    async def _analyze_entity_admitted(self, entity_type: str, entity_id: str) -> Optional[DialogueMetrics]:
         model = Movie if entity_type == "movie" else Episode
         async with AsyncSession(engine, expire_on_commit=False) as db:
             entity = await db.get(model, entity_id)
@@ -298,7 +317,7 @@ class VibeAnalysisManager:
                 return None
             subtitle, language = _subtitle_candidate(entity, folder)
             runtime = _runtime_seconds(entity.probed_duration, entity.duration)
-            metrics = await asyncio.to_thread(analyze_webvtt, subtitle, runtime, language) if subtitle else None
+            metrics = await run_cancellation_safe_thread(analyze_webvtt, subtitle, runtime, language) if subtitle else None
             entity.dialogue_wpm = metrics.wpm if metrics else None
             entity.dialogue_word_count = metrics.word_count if metrics else 0
             entity.dialogue_language = metrics.language if metrics else language
@@ -323,7 +342,7 @@ class VibeAnalysisManager:
                     series.vibe_analyzed_at = time.time()
                     db.add(series)
             await db.commit()
-            await asyncio.to_thread(_update_metadata_file, folder, entity)
+            await run_cancellation_safe_thread(_update_metadata_file, folder, entity)
             return metrics
 
 
@@ -332,6 +351,14 @@ vibe_analysis_manager = VibeAnalysisManager()
 
 async def backfill_catalog_vibes(limit: int = 24) -> int:
     """Incrementally enrich legacy catalog records without blocking startup or moving media."""
+    async with runtime_work(
+        "vibe.catalog-backfill",
+        [EffectClass.DB_WRITE, EffectClass.DURABLE_MEDIA_WRITE],
+    ):
+        return await _backfill_catalog_vibes_admitted(limit)
+
+
+async def _backfill_catalog_vibes_admitted(limit: int = 24) -> int:
     from services.tmdb import tmdb_client
 
     if not tmdb_client.api_key and not tmdb_client.read_access_token:

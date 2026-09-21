@@ -14,6 +14,7 @@ from services.backup import (
     restore_backup,
     get_backup_dir
 )
+from lifecycle.coordination import AdmissionClosedError, EffectClass, runtime_work
 
 router = APIRouter()
 
@@ -23,12 +24,13 @@ async def run_backup_endpoint(session: AuthSession = Depends(require_recent_reau
     del session
     try:
         logger.info("[API] Manual backup triggered via API.")
-        backup_path = await create_backup()
-        prune_old_backups(keep_count=7)
-        
-        cloud_synced = False
-        if settings.STORAGE_ENGINE == "CLOUD":
-            cloud_synced = await sync_backups_to_cloud()
+        async with runtime_work("backup.run", [EffectClass.DATABASE_SNAPSHOT]):
+            backup_path = await create_backup()
+            prune_old_backups(keep_count=7)
+
+            cloud_synced = False
+            if settings.STORAGE_ENGINE == "CLOUD":
+                cloud_synced = await sync_backups_to_cloud()
             
         cloud_required = settings.STORAGE_ENGINE == "CLOUD"
         return {
@@ -43,6 +45,8 @@ async def run_backup_endpoint(session: AuthSession = Depends(require_recent_reau
             "backup_file": os.path.basename(backup_path),
             "cloud_synced": cloud_synced
         }
+    except AdmissionClosedError:
+        raise
     except Exception as e:
         logger.error(f"[API] Error running manual backup: {e}")
         raise HTTPException(
@@ -101,13 +105,16 @@ async def delete_backup_endpoint(filename: str, session: AuthSession = Depends(r
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Backup file '{filename}' not found."
             )
-        file_path.unlink()
+        async with runtime_work("backup.delete", [EffectClass.DATABASE_SNAPSHOT]):
+            file_path.unlink()
         logger.info(f"[API] Backup file deleted: {filename}")
         return {
             "status": "success",
             "message": f"Backup file '{filename}' successfully deleted."
         }
     except HTTPException:
+        raise
+    except AdmissionClosedError:
         raise
     except Exception as e:
         logger.error(f"[API] Error deleting backup file '{filename}': {e}")

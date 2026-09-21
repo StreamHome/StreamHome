@@ -59,6 +59,7 @@ from services.playback_prep import playback_prep_service
 from services.ingest_preview import ingest_preview_service
 from services.vibe_analysis import vibe_analysis_manager
 from services.update import automatic_update_worker
+from lifecycle.coordination import AdmissionClosedError, EffectClass, runtime_work
 import services.state as state
 from routes.queue import router as queue_router
 from routes.auth import router as auth_router, health_router, get_current_session, get_current_user, require_recent_reauth
@@ -80,17 +81,20 @@ async def playback_run_reaper():
     while True:
         try:
             await asyncio.sleep(300)  # Check every 5 minutes
-            async with AsyncSession(engine) as db:
-                cutoff = time.time() - 24 * 60 * 60
-                stmt = select(PlaybackRun).where(PlaybackRun.lifecycle_state == "active", PlaybackRun.last_seen_at < cutoff)
-                result = await db.exec(stmt)
-                expired_runs = result.all()
-                if expired_runs:
-                    logger.info(f"[Lifespan Reaper] Found {len(expired_runs)} inactive playback runs. Marking as expired.")
-                    for run in expired_runs:
-                        run.lifecycle_state = "expired"
-                        db.add(run)
-                    await db.commit()
+            async with runtime_work("playback.run-reaper", [EffectClass.DB_WRITE]):
+                async with AsyncSession(engine) as db:
+                    cutoff = time.time() - 24 * 60 * 60
+                    stmt = select(PlaybackRun).where(PlaybackRun.lifecycle_state == "active", PlaybackRun.last_seen_at < cutoff)
+                    result = await db.exec(stmt)
+                    expired_runs = result.all()
+                    if expired_runs:
+                        logger.info(f"[Lifespan Reaper] Found {len(expired_runs)} inactive playback runs. Marking as expired.")
+                        for run in expired_runs:
+                            run.lifecycle_state = "expired"
+                            db.add(run)
+                        await db.commit()
+        except AdmissionClosedError:
+            continue
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -235,14 +239,25 @@ async def lifespan(app: FastAPI):
     async def recover_catalog_and_playback() -> None:
         try:
             await wait_for_update_commit()
-            try:
-                await queue_manager.sync_media_from_disk()
-                from services.audio_extractor import repair_completed_ingestion_languages
-                await repair_completed_ingestion_languages()
-            finally:
-                catalog_recovery_complete.set()
-            await vibe_analysis_manager.start()
-            await playback_prep_service.schedule_catalog_baselines()
+            async with runtime_work(
+                "catalog.startup-recovery",
+                [
+                    EffectClass.DB_WRITE,
+                    EffectClass.DURABLE_MEDIA_WRITE,
+                    EffectClass.DISPOSABLE_CACHE_WRITE,
+                ],
+            ):
+                try:
+                    await queue_manager.sync_media_from_disk()
+                    from services.audio_extractor import repair_completed_ingestion_languages
+                    await repair_completed_ingestion_languages()
+                finally:
+                    catalog_recovery_complete.set()
+                await vibe_analysis_manager.start()
+                await playback_prep_service.schedule_catalog_baselines()
+        except AdmissionClosedError:
+            catalog_recovery_complete.set()
+            logger.info("[Lifespan Startup] Catalog/playback recovery deferred by runtime admission.")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -294,11 +309,12 @@ async def lifespan(app: FastAPI):
                     
                     if should_backup:
                         logger.info("[Backup Worker] Initiating online daily database backup...")
-                        backup_path = await create_backup()
-                        prune_old_backups(keep_count=7)
-                        cloud_synced = None
-                        if settings.STORAGE_ENGINE == "CLOUD":
-                            cloud_synced = await sync_backups_to_cloud()
+                        async with runtime_work("backup.daily", [EffectClass.DATABASE_SNAPSHOT]):
+                            backup_path = await create_backup()
+                            prune_old_backups(keep_count=7)
+                            cloud_synced = None
+                            if settings.STORAGE_ENGINE == "CLOUD":
+                                cloud_synced = await sync_backups_to_cloud()
                         if cloud_synced is False:
                             logger.error(
                                 f"[Backup Worker] Local daily backup completed but cloud synchronization failed: "
@@ -437,6 +453,48 @@ class SecurityBoundaryMiddleware(BaseHTTPMiddleware):
         response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
         return response
 
+
+class RuntimeWriteCoordinationMiddleware(BaseHTTPMiddleware):
+    """Register normal HTTP mutation lifetimes without leasing read-only traffic."""
+
+    async def dispatch(self, request: Request, call_next):
+        hidden_setup_write = request.url.path in {
+            "/api/setup/readiness",
+            "/api/setup/rclone/drive/callback",
+        }
+        if request.method not in {"POST", "PUT", "PATCH", "DELETE"} and not hidden_setup_write:
+            return await call_next(request)
+        path = request.url.path
+        if path.startswith("/api/backup") or path in {
+            "/api/update/commit",
+            "/api/update/install",
+            "/api/update/pending",
+            "/api/update/presence",
+        }:
+            # Exact update ownership/release remains the Phase 1 bridge; backup
+            # operations declare their narrower effects in the backup service.
+            return await call_next(request)
+        effects = {EffectClass.DB_WRITE}
+        if path.startswith("/api/setup") or path in {
+            "/api/system/settings",
+            "/api/update/policy",
+        }:
+            effects.add(EffectClass.CONFIG_WRITE)
+        try:
+            async with runtime_work("http.mutation", effects):
+                return await call_next(request)
+        except AdmissionClosedError:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": {
+                        "code": "lifecycle_work_blocked",
+                        "message": "StreamHome is not accepting this type of work during maintenance.",
+                    }
+                },
+                headers={"Retry-After": "5"},
+            )
+
 app = FastAPI(title="StreamHome Media Server", version=settings.APP_VERSION, lifespan=lifespan)
 
 
@@ -458,7 +516,23 @@ async def database_operational_error_handler(request: Request, exc: OperationalE
         headers={"Retry-After": "5"},
     )
 
+
+@app.exception_handler(AdmissionClosedError)
+async def runtime_admission_error_handler(request: Request, exc: AdmissionClosedError):
+    del request, exc
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": {
+                "code": "lifecycle_work_blocked",
+                "message": "StreamHome is not accepting this type of work during maintenance.",
+            }
+        },
+        headers={"Retry-After": "5"},
+    )
+
 app.add_middleware(ActivityTrackingMiddleware)
+app.add_middleware(RuntimeWriteCoordinationMiddleware)
 app.add_middleware(SetupGateMiddleware)
 app.add_middleware(SecurityBoundaryMiddleware)
 app.add_middleware(

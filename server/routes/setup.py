@@ -42,6 +42,7 @@ from services.totp_enrollment import (
 from services.rate_limit import clear as clear_rate_limit
 from services.rate_limit import enforce as enforce_rate_limit
 from services.rate_limit import fail as fail_rate_limit
+from lifecycle.coordination import EffectClass, runtime_work
 
 router = APIRouter(prefix="/api/setup", tags=["Setup"])
 SETUP_COOKIE = "streamhome_setup"
@@ -270,13 +271,17 @@ async def _drive_job(db: AsyncSession, request: Request, job_id: str, *, allow_t
     if not job or not session_id or not hmac.compare_digest(job.session_hash, _hash_value(session_id)):
         raise HTTPException(status_code=404, detail={"code": "drive_job_not_found", "message": "This Google Drive setup job was not found."})
     if job.expires_at < time.time() and job.status not in {"cancelled", "failed", "expired"}:
-        job.status = "expired"
-        job.error_code = "drive_job_expired"
-        job.progress = "Google Drive setup expired. Start again."
-        job.updated_at = time.time()
-        db.add(job)
-        await db.commit()
-        rclone_service.cleanup_job(job.id)
+        async with runtime_work(
+            "setup.drive-expiry",
+            [EffectClass.DB_WRITE, EffectClass.CONFIG_WRITE],
+        ):
+            job.status = "expired"
+            job.error_code = "drive_job_expired"
+            job.progress = "Google Drive setup expired. Start again."
+            job.updated_at = time.time()
+            db.add(job)
+            await db.commit()
+            rclone_service.cleanup_job(job.id)
     if not allow_terminal and job.status in {"cancelled", "failed", "expired"}:
         raise HTTPException(status_code=409, detail={"code": job.error_code or "drive_job_unavailable", "message": job.progress})
     return job

@@ -4,6 +4,13 @@ import subprocess
 import time
 from typing import Any, Dict, Union
 
+from lifecycle.coordination import (
+    ChildProcessIdentity,
+    LeaseStateError,
+    get_runtime_coordinator,
+    run_cancellation_safe_thread,
+)
+
 # In-memory dictionary storing active download transient metrics:
 # task_id -> {"progress": float, "speed": str, "eta": str}
 ACTIVE_DOWNLOAD_METRICS: Dict[str, Dict[str, Any]] = {}
@@ -12,6 +19,7 @@ ACTIVE_DOWNLOAD_METRICS: Dict[str, Dict[str, Any]] = {}
 # and Rclone. Update cutover must fail closed while any registered process exists.
 # task_id -> asyncio.subprocess.Process or subprocess.Popen object reference
 ACTIVE_PROCESSES: Dict[str, Union[asyncio.subprocess.Process, subprocess.Popen]] = {}
+ACTIVE_PROCESS_LEASES: Dict[str, tuple[object, ChildProcessIdentity]] = {}
 
 # Active HTTP traffic metrics for update idle detection
 ACTIVE_HTTP_REQUESTS: int = 0
@@ -84,15 +92,40 @@ def remove_task_metrics(task_id: str):
 def register_process(task_id: str, process: Union[asyncio.subprocess.Process, subprocess.Popen]):
     """Register an active media subprocess for cancellation and update safety."""
     ACTIVE_PROCESSES[task_id] = process
+    lease = get_runtime_coordinator().current_lease()
+    if lease is not None and getattr(process, "pid", None):
+        try:
+            identity = lease.attach_child(int(process.pid))
+            ACTIVE_PROCESS_LEASES[task_id] = (lease, identity)
+        except (LeaseStateError, TypeError, ValueError):
+            pass
 
-def unregister_process(task_id: str):
-    """Removes a finished or cancelled subprocess from the registry."""
+def unregister_process(task_id: str) -> bool:
+    """Remove a subprocess only after its termination is observable."""
+    process = ACTIVE_PROCESSES.get(task_id)
+    if process is not None and getattr(process, "returncode", None) is None:
+        return False
     ACTIVE_PROCESSES.pop(task_id, None)
+    association = ACTIVE_PROCESS_LEASES.pop(task_id, None)
+    if association is not None:
+        lease, identity = association
+        try:
+            lease.detach_child(identity)
+        except LeaseStateError:
+            pass
+    return True
 
 async def cancel_and_kill_process(task_id: str) -> bool:
     """Explicitly terminates or kills a running OS process registered to a task."""
     process = ACTIVE_PROCESSES.pop(task_id, None)
+    association = ACTIVE_PROCESS_LEASES.pop(task_id, None)
     if not process:
+        if association is not None:
+            lease, identity = association
+            try:
+                lease.detach_child(identity)
+            except LeaseStateError:
+                pass
         return False
         
     try:
@@ -100,7 +133,7 @@ async def cancel_and_kill_process(task_id: str) -> bool:
         process.terminate()
         try:
             if isinstance(process, subprocess.Popen):
-                await asyncio.to_thread(process.wait, 2.0)
+                await run_cancellation_safe_thread(process.wait, 2.0)
             else:
                 await asyncio.wait_for(process.wait(), timeout=2.0)
             logger.info(f"[Process Registry] Process for task {task_id} exited gracefully.")
@@ -108,11 +141,22 @@ async def cancel_and_kill_process(task_id: str) -> bool:
             logger.warning(f"[Process Registry] Process did not respond to SIGTERM. Killing task {task_id}...")
             process.kill()
             if isinstance(process, subprocess.Popen):
-                await asyncio.to_thread(process.wait)
+                await run_cancellation_safe_thread(process.wait)
             else:
                 await process.wait()
             logger.info(f"[Process Registry] Process for task {task_id} killed successfully.")
         return True
     except Exception as e:
         logger.error(f"[Process Registry] Error trying to kill process for task {task_id}: {type(e).__name__}")
+        if getattr(process, "returncode", None) is None:
+            ACTIVE_PROCESSES[task_id] = process
+            if association is not None:
+                ACTIVE_PROCESS_LEASES[task_id] = association
         return False
+    finally:
+        if association is not None and getattr(process, "returncode", None) is not None:
+            lease, identity = association
+            try:
+                lease.detach_child(identity)
+            except LeaseStateError:
+                pass

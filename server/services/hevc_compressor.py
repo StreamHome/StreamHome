@@ -17,6 +17,7 @@ from services.logger import logger
 from services.media_probe import probe_completed_media
 from services.media_source import MediaSourceError, resolve_media_source
 from services.state import register_process, unregister_process
+from lifecycle.coordination import AdmissionClosedError, EffectClass, WorkLease, runtime_work
 
 
 class HEVCCompressorWorker:
@@ -166,6 +167,8 @@ class HEVCCompressorWorker:
         while self.is_running:
             temporary_file: Optional[Path] = None
             rollback_file: Optional[Path] = None
+            work_scope = None
+            active_lease: Optional[WorkLease] = None
             try:
                 await asyncio.sleep(60.0)
                 mode = getattr(settings, "HEVC_COMPRESSION_MODE", "auto")
@@ -183,6 +186,20 @@ class HEVCCompressorWorker:
                     logger.warning(f"[HEVC Compressor] Invalid catalog path for {item_id}: {error}")
                     continue
                 if not source.local_exists:
+                    continue
+
+                work_scope = runtime_work(
+                    "hevc.compressor",
+                    [
+                        EffectClass.DB_WRITE,
+                        EffectClass.DURABLE_MEDIA_WRITE,
+                        EffectClass.DISPOSABLE_CACHE_WRITE,
+                    ],
+                )
+                try:
+                    active_lease = await work_scope.__aenter__()
+                except AdmissionClosedError:
+                    work_scope = None
                     continue
 
                 file_path = source.local_path
@@ -235,7 +252,7 @@ class HEVCCompressorWorker:
                 try:
                     while self.active_process.returncode is None:
                         await asyncio.sleep(15.0)
-                        if not await self._is_server_idle():
+                        if active_lease.cancellation_requested or not await self._is_server_idle():
                             self.active_process.kill()
                             killed_for_activity = True
                             break
@@ -244,6 +261,9 @@ class HEVCCompressorWorker:
                     unregister_process(process_key)
                     self.active_process = None
                 if killed_for_activity:
+                    await work_scope.__aexit__(None, None, None)
+                    work_scope = None
+                    active_lease = None
                     await asyncio.sleep(5 * 60)
                     continue
                 if return_code != 0 or not temporary_file.exists():
@@ -298,6 +318,8 @@ class HEVCCompressorWorker:
                     temporary_file.unlink(missing_ok=True)
                 if rollback_file:
                     rollback_file.unlink(missing_ok=True)
+                if work_scope is not None:
+                    await work_scope.__aexit__(None, None, None)
 
 
 hevc_compressor = HEVCCompressorWorker()

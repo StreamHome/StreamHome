@@ -13,6 +13,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from config import settings
 from db import get_session
 from models import IntegrationCredential
+from lifecycle.coordination import AdmissionClosedError, EffectClass, runtime_work
 
 
 security = HTTPBearer(auto_error=False)
@@ -86,9 +87,14 @@ async def authenticate_integration_token(
             },
         )
     if credential.last_used_at is None or current_time - credential.last_used_at >= 300:
-        credential.last_used_at = current_time
-        db.add(credential)
-        await db.commit()
+        try:
+            async with runtime_work("auth.integration-refresh", [EffectClass.DB_WRITE]):
+                credential.last_used_at = current_time
+                db.add(credential)
+                await db.commit()
+        except AdmissionClosedError:
+            await db.rollback()
+            await db.refresh(credential)
     request.state.integration_credential = credential
     return credential
 

@@ -30,6 +30,7 @@ from services.integration_auth import (
 )
 from services.media_source import local_catalog_source_exists
 from services.request_security import address_is_loopback, client_ip
+from lifecycle.coordination import EffectClass, runtime_work
 
 router = APIRouter()
 queue_security = HTTPBearer(auto_error=False)
@@ -430,6 +431,14 @@ async def delete_download(
 ):
     """Cancels the worker and child process before deleting its database record."""
     del access
+    async with runtime_work(
+        "ingestion.delete",
+        [EffectClass.DB_WRITE, EffectClass.DISPOSABLE_CACHE_WRITE],
+    ):
+        return await _delete_download_admitted(task_id)
+
+
+async def _delete_download_admitted(task_id: str):
     async with AsyncSession(engine) as db:
         task = await db.get(DownloadTask, task_id)
         if not task:

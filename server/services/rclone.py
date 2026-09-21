@@ -17,6 +17,7 @@ from config import settings
 from services.logger import logger
 from services.secret_crypto import protect_secret, reveal_secret
 from services.state import register_process, unregister_process
+from lifecycle.coordination import EffectClass, runtime_work
 
 
 REMOTE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
@@ -162,6 +163,68 @@ class RcloneService:
         }
 
     async def run(
+        self,
+        *arguments: str,
+        config_path: Optional[Path] = None,
+        timeout: float = 60,
+        input_data: Optional[bytes] = None,
+        output_limit: Optional[int] = 8000,
+        password_command: bool = False,
+    ) -> RcloneResult:
+        normalized = tuple(map(str, arguments))
+        if self._mutates_cloud_remote(normalized):
+            async with runtime_work("rclone.cloud-mutation", [EffectClass.CLOUD_WRITE]):
+                return await self._run_command(
+                    *normalized,
+                    config_path=config_path,
+                    timeout=timeout,
+                    input_data=input_data,
+                    output_limit=output_limit,
+                    password_command=password_command,
+                )
+        return await self._run_command(
+            *normalized,
+            config_path=config_path,
+            timeout=timeout,
+            input_data=input_data,
+            output_limit=output_limit,
+            password_command=password_command,
+        )
+
+    @staticmethod
+    def _remote_path(value: str) -> bool:
+        if not value or value.startswith(("/", "./", "../")):
+            return False
+        prefix, separator, _ = value.partition(":")
+        return bool(separator and REMOTE_NAME_RE.fullmatch(prefix))
+
+    def _mutates_cloud_remote(
+        self,
+        arguments: tuple[str, ...],
+    ) -> bool:
+        if not arguments:
+            return False
+        command = arguments[0].casefold()
+        paths = [value for value in arguments[1:] if not value.startswith("-")]
+        if command in {"copy", "copyto", "sync"}:
+            return len(paths) >= 2 and self._remote_path(paths[1])
+        if command in {"move", "moveto"}:
+            return any(self._remote_path(path) for path in paths[:2])
+        if command in {
+            "delete",
+            "deletefile",
+            "purge",
+            "mkdir",
+            "rmdir",
+            "rmdirs",
+            "touch",
+            "cleanup",
+            "rcat",
+        }:
+            return bool(paths and self._remote_path(paths[0]))
+        return False
+
+    async def _run_command(
         self,
         *arguments: str,
         config_path: Optional[Path] = None,
