@@ -56,9 +56,12 @@ normal traffic remains lifecycle-gated.
 `recovery_required` is deliberately terminal for automatic destructive retry.
 `start.sh`, discovery, and the automatic update worker do not clear or resume it.
 Preserve the journal, staging area, checkpoint, and lifecycle records. The local
-Phase 6A recovery planner described in [Backup and Recovery](backup-and-recovery.md)
-can inspect exact retained evidence, but it is read-only and does not execute a
-recovery action.
+recovery planner and explicit operator execution described in
+[Backup and Recovery](backup-and-recovery.md) require the exact current operation,
+generation, permitted action, and evidence identity. Execution fences ownership
+again before delegating to the existing update controller. It never runs
+automatically, and update rollback is not offered without an exact
+transaction-bound checkpoint identity.
 
 ## Command-line fallback
 

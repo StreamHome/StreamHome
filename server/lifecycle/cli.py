@@ -109,6 +109,16 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         operation = current.active_operation
         if operation is None or operation.operation_type is not state.OperationType.RESTORE:
             raise state.LifecycleConflictError("restore recovery is not active")
+        from . import recovery as operator_recovery
+
+        if operator_recovery.operator_action_blocks_automatic_recovery(
+            root, operation.operation_id, current.generation
+        ):
+            operator_recovery.normalize_interrupted_operator(
+                root, operation.operation_id, current.generation
+            )
+            current = state.inspect_state(root)
+            operation = current.active_operation
         if operation.phase is state.LifecyclePhase.RECOVERY_REQUIRED:
             raise state.LifecycleConflictError("restore recovery requires operator action")
         return _success("restore-recovery-needed", current)
@@ -117,12 +127,33 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         operation = current.active_operation
         if operation is None or operation.operation_type is not state.OperationType.UPDATE:
             raise state.LifecycleConflictError("update recovery is not active")
+        from . import recovery as operator_recovery
+
+        if operator_recovery.operator_action_blocks_automatic_recovery(
+            root, operation.operation_id, current.generation
+        ):
+            operator_recovery.normalize_interrupted_operator(
+                root, operation.operation_id, current.generation
+            )
+            current = state.inspect_state(root)
+            operation = current.active_operation
         if operation.phase is state.LifecyclePhase.RECOVERY_REQUIRED:
             raise state.LifecycleConflictError("update recovery requires operator action")
         return _success("update-recovery-needed", current)
     if arguments.command == "update-recovery-required":
         current = state.inspect_state(root)
         operation = current.active_operation
+        if operation is not None and operation.operation_type is state.OperationType.UPDATE:
+            from . import recovery as operator_recovery
+
+            if operator_recovery.operator_action_blocks_automatic_recovery(
+                root, operation.operation_id, current.generation
+            ):
+                operator_recovery.normalize_interrupted_operator(
+                    root, operation.operation_id, current.generation
+                )
+                current = state.inspect_state(root)
+                operation = current.active_operation
         if (
             operation is None
             or operation.operation_type is not state.OperationType.UPDATE

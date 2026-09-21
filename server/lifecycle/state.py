@@ -15,7 +15,7 @@ import stat
 import subprocess
 import sys
 import threading
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 import uuid
 
 
@@ -1511,6 +1511,7 @@ def acquire_transferred_controller_lease(
     expected_phase: LifecyclePhase | str,
     owner_capability: str,
     next_owner_kind: OwnerKind | str,
+    pre_transfer_check: Callable[[], None] | None = None,
 ) -> tuple[ControllerLeaseHandle, OwnershipTransferResult]:
     """Acquire process ownership and durably fence the prior lifecycle owner."""
 
@@ -1523,6 +1524,8 @@ def acquire_transferred_controller_lease(
     )
     descriptor = _open_locked_file(paths.controller_lock_path, nonblocking=True)
     try:
+        if pre_transfer_check is not None:
+            pre_transfer_check()
         transferred = _transfer_operation_owner_with_credential(
             paths.root,
             operation_id=operation_id,

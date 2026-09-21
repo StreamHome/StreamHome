@@ -25,7 +25,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from urllib import error as urlerror
 from urllib import request as urlrequest
 import uuid
@@ -684,18 +684,128 @@ def update_restore_journal(
         os.close(descriptor)
 
 
+def record_restore_completion_intent(
+    paths: RestorePaths, *, generation: int, outcome: str
+) -> None:
+    """Persist verified terminal evidence before releasing shared authority."""
+
+    journal = read_restore_journal(paths.root, paths.operation_id)
+    current = state.inspect_state(paths.root)
+    operation = current.active_operation
+    expected = (
+        (journal.get("staged_size"), journal.get("staged_sha256"))
+        if outcome == "succeeded"
+        else (journal.get("rollback_activation_size"), journal.get("rollback_activation_sha256"))
+    )
+    if (
+        operation is None
+        or operation.operation_id != paths.operation_id
+        or operation.operation_type is not state.OperationType.RESTORE
+        or current.generation != generation
+        or journal["generation"] != generation
+        or journal["progress"] != RestoreProgress.NORMAL_RECOVERY.value
+        or not journal["accepted"]
+        or journal["outcome"] != ("accepted" if outcome == "succeeded" else "rolled_back")
+        or outcome not in {"succeeded", "rolled_back"}
+        or expected[1] is None
+        or artifact_identity(paths.database_path) != expected
+    ):
+        raise RestoreConflictError("restore completion evidence is not exact")
+    marker = {
+        "schema_version": 1,
+        "operation_id": paths.operation_id,
+        "generation": generation,
+        "outcome": outcome,
+        "canonical_size": expected[0],
+        "canonical_sha256": expected[1],
+    }
+    _atomic_write_json(paths.operation_dir / "completion-intent.json", marker)
+
+
+def reconcile_restore_completion_intent(
+    root: str | os.PathLike[str], operation_id: str, generation: int
+) -> bool:
+    """Finalize only a verified, already-completed restore journal."""
+
+    paths = restore_paths(root, operation_id)
+    try:
+        current = state.inspect_state(paths.root)
+        # A later completed operation may advance the global generation; the
+        # marker and restore journal must still agree on this exact restore.
+        if current.active_operation is not None or current.generation < generation:
+            return False
+        marker = _read_json(paths.operation_dir / "completion-intent.json")
+        if set(marker) != {
+            "schema_version", "operation_id", "generation", "outcome",
+            "canonical_size", "canonical_sha256",
+        } or (
+            type(marker["schema_version"]) is not int
+            or marker["schema_version"] != 1
+            or marker["operation_id"] != operation_id
+            or type(marker["generation"]) is not int
+            or marker["generation"] != generation
+            or marker["outcome"] not in {"succeeded", "rolled_back"}
+            or type(marker["canonical_size"]) is not int
+            or marker["canonical_size"] <= 0
+            or not isinstance(marker["canonical_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", marker["canonical_sha256"])
+        ):
+            return False
+        journal = inspect_restore_journal(paths.root, operation_id)
+        expected = (
+            (journal.get("staged_size"), journal.get("staged_sha256"))
+            if marker["outcome"] == "succeeded"
+            else (journal.get("rollback_activation_size"), journal.get("rollback_activation_sha256"))
+        )
+        if (
+            journal["generation"] != generation
+            or journal["progress"] != RestoreProgress.NORMAL_RECOVERY.value
+            or not journal["accepted"]
+            or journal["outcome"] != (
+                "accepted" if marker["outcome"] == "succeeded" else "rolled_back"
+            )
+            or expected != (marker["canonical_size"], marker["canonical_sha256"])
+            or artifact_identity(paths.database_path) != expected
+        ):
+            return False
+        update_restore_journal(
+            paths.root,
+            operation_id,
+            progress=(
+                RestoreProgress.SUCCEEDED.value
+                if marker["outcome"] == "succeeded"
+                else RestoreProgress.ROLLED_BACK.value
+            ),
+            outcome=marker["outcome"],
+        )
+        return True
+    except (RestoreError, state.LifecycleError, OSError, TypeError, ValueError):
+        return False
+
+
 def transfer_restore_journal_generation(
     root: str | os.PathLike[str],
     operation_id: str,
     *,
     expected_generation: int,
     next_generation: int,
+    journal_generation: int | None = None,
 ) -> dict[str, Any]:
     paths = restore_paths(root, operation_id)
     descriptor = _journal_lock(paths)
     try:
         payload = _validate_journal(_read_json(paths.journal_path), paths)
-        if payload["generation"] != expected_generation or next_generation != expected_generation + 1:
+        expected_journal_generation = (
+            expected_generation
+            if journal_generation is None
+            else journal_generation
+        )
+        if (
+            payload["generation"] != expected_journal_generation
+            or expected_journal_generation
+            not in {expected_generation, expected_generation - 1}
+            or next_generation != expected_generation + 1
+        ):
             raise RestoreConflictError("restore journal generation transfer does not match")
         current = state.inspect_state(paths.root)
         operation = current.active_operation
@@ -707,6 +817,76 @@ def transfer_restore_journal_generation(
         ):
             raise RestoreConflictError("restore authority generation transfer does not match")
         payload["generation"] = next_generation
+        payload["updated_at"] = time.time()
+        validated = _validate_journal(payload, paths)
+        _atomic_write_json(paths.journal_path, validated)
+        return validated
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def resume_restore_journal_for_operator(
+    root: str | os.PathLike[str],
+    operation_id: str,
+    *,
+    generation: int,
+    action: str,
+) -> dict[str, Any]:
+    """Re-enter the canonical journal state machine from explicit recovery."""
+
+    paths = restore_paths(root, operation_id)
+    descriptor = _journal_lock(paths)
+    try:
+        payload = _validate_journal(_read_json(paths.journal_path), paths)
+        current = state.inspect_state(paths.root)
+        operation = current.active_operation
+        if (
+            operation is None
+            or operation.operation_id != operation_id
+            or operation.operation_type is not state.OperationType.RESTORE
+            or operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED
+            or current.generation != generation
+            or payload["generation"] != generation
+            or payload["progress"] != RestoreProgress.RECOVERY_REQUIRED.value
+        ):
+            raise RestoreConflictError("operator restore evidence no longer matches")
+        if action == "safe_abort":
+            return payload
+        activation = ActivationState(payload["activation_state"])
+        if action == "rollback":
+            if (
+                payload["accepted"]
+                or activation is not ActivationState.NOT_STARTED
+                or not payload.get("rollback_sha256")
+            ):
+                raise RestoreConflictError("operator rollback evidence no longer matches")
+            progress = RestoreProgress.CHECKPOINT_READY
+        elif action == "continue_recovery":
+            if payload["accepted"]:
+                progress = (
+                    RestoreProgress.NORMAL_RECOVERY
+                    if payload.get("outcome") == "rolled_back"
+                    else RestoreProgress.ACCEPTED
+                )
+            elif activation is ActivationState.ROLLBACK_STARTED:
+                progress = RestoreProgress.ROLLBACK_STARTED
+            elif activation is ActivationState.ROLLBACK_COMPLETED:
+                progress = RestoreProgress.ROLLBACK_ACTIVATED
+            elif activation is ActivationState.STARTED:
+                progress = RestoreProgress.ACTIVATION_STARTED
+            elif activation is ActivationState.COMPLETED:
+                progress = RestoreProgress.ACTIVATION_COMPLETED
+            elif payload.get("staged_sha256"):
+                progress = RestoreProgress.CANDIDATE_STAGED
+            elif payload.get("rollback_sha256"):
+                progress = RestoreProgress.CHECKPOINT_READY
+            else:
+                progress = RestoreProgress.CONTROLLER_OWNED
+        else:
+            raise RestoreConflictError("operator restore action is unsupported")
+        payload["progress"] = progress.value
+        payload["error_code"] = None
         payload["updated_at"] = time.time()
         validated = _validate_journal(payload, paths)
         _atomic_write_json(paths.journal_path, validated)
@@ -1609,6 +1789,7 @@ def _complete_automatic_rollback(
         raise RestoreRecoveryRequired("maintenance responder could not be stopped")
     _start_web(root, web_port, build)
     _verify_authority(root, operation_id, generation, capability)
+    record_restore_completion_intent(paths, generation=generation, outcome="rolled_back")
     result = state.complete_operation_with_credential(
         root,
         operation_id=operation_id,
@@ -1633,6 +1814,10 @@ def _run_controller(
     *,
     acknowledgement_fd: int | None,
     gate_fd: int | None,
+    operator_action: str | None = None,
+    operator_journal_generation: int | None = None,
+    pre_transfer_check: Callable[[], None] | None = None,
+    on_transfer: Callable[[int], None] | None = None,
 ) -> int:
     paths = restore_paths(root, operation_id)
     state.qualify_lifecycle_filesystem(root)
@@ -1643,8 +1828,12 @@ def _run_controller(
     )
     current = _verify_authority(root, operation_id, generation, capability)
     expected_phase = current.active_operation.phase if current.active_operation else state.LifecyclePhase.RESERVED
-    if expected_phase is state.LifecyclePhase.RECOVERY_REQUIRED:
+    if expected_phase is state.LifecyclePhase.RECOVERY_REQUIRED and operator_action is None:
         raise RestoreRecoveryRequired("recovery-required restore needs explicit operator action")
+    if operator_action not in {None, "safe_abort", "continue_recovery", "rollback"}:
+        raise RestoreConflictError("operator restore action is unsupported")
+    if operator_action is not None and expected_phase is not state.LifecyclePhase.RECOVERY_REQUIRED:
+        raise RestoreConflictError("operator restore action requires recovery-required authority")
     lease, transferred = state.acquire_transferred_controller_lease(
         root,
         operation_id=operation_id,
@@ -1652,6 +1841,7 @@ def _run_controller(
         expected_phase=expected_phase,
         owner_capability=capability,
         next_owner_kind=state.OwnerKind.RESTORE_CONTROLLER,
+        pre_transfer_check=pre_transfer_check,
     )
     previous_generation = generation
     generation = transferred.state.generation
@@ -1663,11 +1853,24 @@ def _run_controller(
                 operation_id,
                 expected_generation=previous_generation,
                 next_generation=generation,
+                journal_generation=operator_journal_generation,
             )
         except Exception:
             _mark_recovery_required(paths, generation, "restore_handoff_persistence_failed")
             raise
-        if RestoreProgress(journal["progress"]) is RestoreProgress.RECOVERY_REQUIRED:
+        if on_transfer is not None:
+            on_transfer(generation)
+        if operator_action is not None:
+            journal = resume_restore_journal_for_operator(
+                root,
+                operation_id,
+                generation=generation,
+                action=operator_action,
+            )
+        if (
+            RestoreProgress(journal["progress"]) is RestoreProgress.RECOVERY_REQUIRED
+            and operator_action is None
+        ):
             _mark_recovery_required(paths, generation, str(journal["error_code"]))
             return 1
         if RestoreProgress(journal["progress"]) in {
@@ -1698,8 +1901,48 @@ def _run_controller(
         try:
             current = _verify_authority(root, operation_id, generation, capability)
             phase = current.active_operation.phase if current.active_operation else None
-            if phase is state.LifecyclePhase.RECOVERY_REQUIRED:
+            if phase is state.LifecyclePhase.RECOVERY_REQUIRED and operator_action is None:
                 raise RestoreRecoveryRequired("recovery-required restore needs explicit operator action")
+            if phase is state.LifecyclePhase.RECOVERY_REQUIRED and operator_action == "safe_abort":
+                if (
+                    journal["accepted"]
+                    or ActivationState(journal["activation_state"])
+                    is not ActivationState.NOT_STARTED
+                    or journal.get("staged_sha256")
+                    or journal.get("rollback_sha256")
+                    or paths.candidate_path.exists()
+                    or paths.candidate_path.is_symlink()
+                    or paths.rollback_path.exists()
+                    or paths.rollback_path.is_symlink()
+                ):
+                    raise RestoreConflictError("restore abort evidence is no longer safe")
+                state.complete_operation_with_credential(
+                    root,
+                    operation_id=operation_id,
+                    generation=generation,
+                    expected_phase=state.LifecyclePhase.RECOVERY_REQUIRED,
+                    expected_operation_type=state.OperationType.RESTORE,
+                )
+                return 0
+            if phase is state.LifecyclePhase.RECOVERY_REQUIRED and operator_action is not None:
+                state.transition_operation_with_credential(
+                    root,
+                    operation_id=operation_id,
+                    generation=generation,
+                    expected_phase=state.LifecyclePhase.RECOVERY_REQUIRED,
+                    next_phase=state.LifecyclePhase.EXCLUSIVE,
+                )
+                phase = state.LifecyclePhase.EXCLUSIVE
+            if operator_action == "rollback":
+                try:
+                    return _complete_automatic_rollback(
+                        paths, generation, capability, web_port
+                    )
+                except Exception:
+                    _enter_fail_closed(
+                        paths, generation, "restore_rollback_failed", web_port
+                    )
+                    return 1
             elif phase is state.LifecyclePhase.RESERVED:
                 state.transition_operation_with_credential(
                     root,
@@ -1844,6 +2087,11 @@ def _run_controller(
             if _runtime_control().port_is_available(web_port):
                 _start_web(root, web_port, build)
             _verify_authority(root, operation_id, generation, capability)
+            record_restore_completion_intent(
+                paths,
+                generation=generation,
+                outcome=("rolled_back" if accepted_decision == "rollback" else "succeeded"),
+            )
             result = state.complete_operation_with_credential(
                 root,
                 operation_id=operation_id,
@@ -1899,6 +2147,33 @@ def _run_controller(
                     RestoreProgress.ROLLED_BACK.value,
                 }:
                     maintenance.terminate()
+
+
+def run_operator_recovery(
+    root: str | os.PathLike[str],
+    *,
+    operation_id: str,
+    generation: int,
+    owner_capability: str,
+    action: str,
+    journal_generation: int | None,
+    pre_transfer_check: Callable[[], None],
+    on_transfer: Callable[[int], None],
+) -> int:
+    """Execute one freshly authorized operator action through the restore controller."""
+
+    return _run_controller(
+        state.resolve_installation_root(root),
+        operation_id,
+        generation,
+        owner_capability,
+        acknowledgement_fd=None,
+        gate_fd=None,
+        operator_action=action,
+        operator_journal_generation=journal_generation,
+        pre_transfer_check=pre_transfer_check,
+        on_transfer=on_transfer,
+    )
 
 
 RECOVERY_RESERVATION_ABORTED = 10
@@ -1957,6 +2232,15 @@ def recover_restore(root: str | os.PathLike[str]) -> int:
     operation = lifecycle_state.active_operation
     if operation is None or operation.operation_type is not state.OperationType.RESTORE:
         return 2
+    from . import recovery as operator_recovery
+
+    if operator_recovery.operator_action_blocks_automatic_recovery(
+        installation, operation.operation_id, lifecycle_state.generation
+    ):
+        operator_recovery.normalize_interrupted_operator(
+            installation, operation.operation_id, lifecycle_state.generation
+        )
+        return 3
     if operation.phase is state.LifecyclePhase.RECOVERY_REQUIRED:
         return 3
     capability = state.load_controller_capability(
