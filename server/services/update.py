@@ -19,7 +19,18 @@ from typing import Any
 
 from config import settings
 from lifecycle import state as lifecycle_state
-from lifecycle.coordination import get_runtime_coordinator
+from lifecycle.coordination import (
+    CoordinationError,
+    DrainSnapshot,
+    EffectClass,
+    get_runtime_coordinator,
+)
+from lifecycle.update_controller import (
+    UpdateControllerError,
+    mutate_update_journal,
+    spawn_update_controller,
+    validate_cutover_permit,
+)
 from services.backup import BACKUP_LOCK, is_database_idle
 from services.logger import logger
 from services.queue import queue_manager
@@ -48,6 +59,7 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 UPDATE_CHECK_LOCK = asyncio.Lock()
 UPDATE_QUEUE_LOCK = asyncio.Lock()
+UPDATE_CUTOVER_LOCK = asyncio.Lock()
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 RUN_DIR = WORKSPACE_ROOT / ".run"
 STATUS_PATH = RUN_DIR / "update-state.json"
@@ -56,6 +68,7 @@ LOG_PATH = WORKSPACE_ROOT / "update.log"
 START_SCRIPT = WORKSPACE_ROOT / "start.sh"
 UPDATE_SCRIPT = WORKSPACE_ROOT / "update.sh"
 ORPHANED_CONTROLLER_SECONDS = 30
+UPDATE_CUTOVER_DRAIN_SECONDS = 10.0
 RUNTIME_IDENTITY_ENV_KEYS = {
     "STREAMHOME_INSTANCE_ROOT",
     "STREAMHOME_INSTANCE_TOKEN",
@@ -85,6 +98,7 @@ def _default_status() -> dict[str, Any]:
         "update_available": False,
         "automatic": False,
         "install_mode": "when_idle",
+        "update_branch": "",
         "queued_at": None,
         "started_at": None,
         "finished_at": None,
@@ -150,6 +164,11 @@ def _read_update_state_strict_unlocked() -> dict[str, Any]:
     return payload
 
 
+def read_update_state_strict() -> dict[str, Any]:
+    with _update_state_lock():
+        return _read_update_state_strict_unlocked()
+
+
 @contextmanager
 def _update_state_lock():
     RUN_DIR.mkdir(parents=True, exist_ok=True)
@@ -180,22 +199,107 @@ def _update_state_lock():
 
 def write_update_state(**changes: Any) -> dict[str, Any]:
     with _update_state_lock():
-        result = read_update_state()
-        result.update(changes)
-        result["updated_at"] = time.time()
-        temporary = STATUS_PATH.with_name(f"{STATUS_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
-        with temporary.open("w", encoding="utf-8", newline="\n") as state_file:
-            state_file.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
-            state_file.flush()
-            os.fsync(state_file.fileno())
-        os.replace(temporary, STATUS_PATH)
-        if sys.platform != "win32":
-            directory_fd = os.open(RUN_DIR, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        return result
+        result = (
+            _read_update_state_strict_unlocked()
+            if STATUS_PATH.exists() or STATUS_PATH.is_symlink()
+            else _default_status()
+        )
+        committed = result.get("runtime_committed") is True
+        committed_at = result.get("runtime_committed_at")
+        previous_transaction = str(result.get("transaction_id") or "")
+        next_transaction = str(changes.get("transaction_id") or previous_transaction)
+        replacing_transaction = bool(
+            next_transaction and next_transaction != previous_transaction
+        )
+        generation = changes.get("lifecycle_generation")
+        lifecycle_phase = changes.get("lifecycle_phase")
+        guarded_replacement = replacing_transaction and generation is not None
+        authority_guard = (
+            lifecycle_state.hold_operation_with_credential(
+                WORKSPACE_ROOT,
+                operation_id=next_transaction,
+                generation=generation,
+                expected_phase=lifecycle_phase,
+                expected_operation_type=lifecycle_state.OperationType.UPDATE,
+            )
+            if guarded_replacement
+            else lifecycle_state.hold_idle_authority(WORKSPACE_ROOT)
+        )
+        try:
+            with authority_guard as authority:
+                operation = authority.active_operation
+                if guarded_replacement and (
+                    operation is None
+                    or operation.owner_kind is not lifecycle_state.OwnerKind.UPDATER
+                    or operation.phase is not lifecycle_state.LifecyclePhase.RESERVED
+                ):
+                    raise UpdateJournalReadError(
+                        "update journal transaction replacement is not authorized"
+                    )
+                if committed and changes.get("runtime_committed") is False and not replacing_transaction:
+                    raise UpdateJournalReadError("runtime_committed cannot be reverted")
+                result.update(changes)
+                if committed and not replacing_transaction:
+                    result["runtime_committed"] = True
+                    result["runtime_committed_at"] = committed_at
+                result["updated_at"] = time.time()
+                temporary = STATUS_PATH.with_name(
+                    f"{STATUS_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp"
+                )
+                try:
+                    descriptor = os.open(
+                        temporary,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                    )
+                    with os.fdopen(
+                        descriptor, "w", encoding="utf-8", newline="\n"
+                    ) as state_file:
+                        state_file.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
+                        state_file.flush()
+                        os.fsync(state_file.fileno())
+                    os.replace(temporary, STATUS_PATH)
+                    os.chmod(STATUS_PATH, 0o600, follow_symlinks=False)
+                    if sys.platform != "win32":
+                        directory_fd = os.open(RUN_DIR, os.O_RDONLY)
+                        try:
+                            os.fsync(directory_fd)
+                        finally:
+                            os.close(directory_fd)
+                finally:
+                    try:
+                        temporary.unlink()
+                    except FileNotFoundError:
+                        pass
+                return result
+        except (TypeError, ValueError, lifecycle_state.LifecycleError) as exc:
+            raise UpdateJournalReadError(
+                "update journal mutation is not authorized"
+            ) from exc
+
+
+def write_authoritative_update_state(
+    *,
+    operation_id: str,
+    generation: int,
+    expected_lifecycle_phase: lifecycle_state.LifecyclePhase | str,
+    expected_detail_phases: frozenset[str] | None = None,
+    **changes: Any,
+) -> dict[str, Any]:
+    """Mutate lifecycle-critical update detail through the canonical strict path."""
+
+    return mutate_update_journal(
+        WORKSPACE_ROOT,
+        operation_id=operation_id,
+        generation=generation,
+        expected_lifecycle_phase=expected_lifecycle_phase,
+        expected_detail_phases=expected_detail_phases,
+        changes=changes,
+    )
 
 
 def _reserve_update_lifecycle() -> lifecycle_state.LifecycleState:
@@ -232,6 +336,7 @@ def _release_unjournaled_update_claim(claimed: lifecycle_state.LifecycleState) -
                 operation_id=operation.operation_id,
                 generation=claimed.generation,
                 expected_phase=lifecycle_state.LifecyclePhase.RESERVED,
+                expected_operation_type=lifecycle_state.OperationType.UPDATE,
             )
             if result.credential_cleanup_error:
                 logger.warning(
@@ -277,6 +382,7 @@ def _release_update_lifecycle(status: dict[str, Any]) -> bool:
         operation_id=operation_id,
         generation=generation,
         expected_phase=phase,
+        expected_operation_type=lifecycle_state.OperationType.UPDATE,
     )
     if result.credential_cleanup_error:
         logger.warning(
@@ -291,7 +397,7 @@ def _ensure_update_lifecycle(status: dict[str, Any]) -> dict[str, Any]:
     if identity is not None:
         operation_id, generation, phase = identity
         try:
-            lifecycle_state.validate_operation_with_credential(
+            current = lifecycle_state.validate_operation_with_credential(
                 WORKSPACE_ROOT,
                 operation_id=operation_id,
                 generation=generation,
@@ -301,6 +407,9 @@ def _ensure_update_lifecycle(status: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("lifecycle_conflict") from exc
         except lifecycle_state.LifecycleError as exc:
             raise RuntimeError("lifecycle_unavailable") from exc
+        operation = current.active_operation
+        if operation is None or operation.operation_type is not lifecycle_state.OperationType.UPDATE:
+            raise RuntimeError("lifecycle_conflict")
         return status
     claimed = _reserve_update_lifecycle()
     operation = claimed.active_operation
@@ -311,6 +420,8 @@ def _ensure_update_lifecycle(status: dict[str, Any]) -> dict[str, Any]:
             transaction_id=operation.operation_id,
             lifecycle_generation=claimed.generation,
             lifecycle_phase=lifecycle_state.LifecyclePhase.RESERVED.value,
+            runtime_committed=False,
+            runtime_committed_at=None,
             recovery_requested_at=None,
             diagnostic_id="",
             previous_commit="",
@@ -326,11 +437,77 @@ def _ensure_update_lifecycle(status: dict[str, Any]) -> dict[str, Any]:
 
 
 def _record_terminal_update(status: dict[str, Any], **changes: Any) -> dict[str, Any]:
-    result = write_update_state(**changes)
+    identity = _lifecycle_identity(status)
+    if identity is None:
+        result = write_update_state(**changes)
+    else:
+        result = write_authoritative_update_state(
+            operation_id=identity[0],
+            generation=identity[1],
+            expected_lifecycle_phase=identity[2],
+            expected_detail_phases=frozenset({str(status.get("phase") or "")}),
+            **changes,
+        )
     try:
         _release_update_lifecycle(status)
     except lifecycle_state.LifecycleError as exc:
         logger.error(f"[Update Service] Exact lifecycle release failed: {exc.code}")
+    return result
+
+
+def _shared_lifecycle_state() -> lifecycle_state.LifecycleState | None:
+    try:
+        return lifecycle_state.inspect_state(WORKSPACE_ROOT)
+    except lifecycle_state.LifecycleError:
+        return None
+
+
+def _require_lifecycle_idle_for_discovery() -> None:
+    try:
+        current = lifecycle_state.inspect_state(WORKSPACE_ROOT)
+    except lifecycle_state.LifecycleError as exc:
+        raise RuntimeError("lifecycle_unavailable") from exc
+    if current.active_operation is not None:
+        raise RuntimeError("update_in_progress")
+
+
+def _write_discovery_update_state(**changes: Any) -> dict[str, Any]:
+    _require_lifecycle_idle_for_discovery()
+    return write_update_state(**changes)
+
+
+def update_lifecycle_projection(status: dict[str, Any]) -> dict[str, Any]:
+    """Project update detail without allowing it to override shared authority."""
+
+    result = dict(status)
+    current = _shared_lifecycle_state()
+    if current is None:
+        result["lifecycle_status"] = "unavailable"
+        return result
+    operation = current.active_operation
+    if operation is None:
+        result["lifecycle_status"] = "idle"
+        return result
+    result["lifecycle_status"] = "active"
+    result["authoritative_operation_type"] = operation.operation_type.value
+    result["authoritative_lifecycle_phase"] = operation.phase.value
+    identity = _lifecycle_identity(status)
+    matches_update = bool(
+        operation.operation_type is lifecycle_state.OperationType.UPDATE
+        and identity is not None
+        and identity[0] == operation.operation_id
+        and identity[1] == current.generation
+    )
+    if matches_update:
+        result["lifecycle_phase"] = operation.phase.value
+        if str(result.get("phase") or "") in TERMINAL_PHASES:
+            result["phase"] = "recovering"
+            result["message"] = "Shared update lifecycle ownership remains unresolved."
+            result["error"] = "lifecycle_state_mismatch"
+    else:
+        result["phase"] = "lifecycle_blocked"
+        result["message"] = "Another installation lifecycle operation is active."
+        result["error"] = "lifecycle_conflict"
     return result
 
 
@@ -455,9 +632,10 @@ async def verify_update_commit_range(current: str, target: str) -> tuple[bool, s
 
 async def check_for_update_details() -> dict[str, Any]:
     async with UPDATE_CHECK_LOCK:
+        _require_lifecycle_idle_for_discovery()
         checked_at = time.time()
         current = await current_commit()
-        write_update_state(
+        _write_discovery_update_state(
             phase="checking",
             message="Checking the official StreamHome repository.",
             current_commit=current,
@@ -467,7 +645,7 @@ async def check_for_update_details() -> dict[str, Any]:
             runtime_committed_at=None,
         )
         if not current:
-            return write_update_state(
+            return _write_discovery_update_state(
                 phase="failed",
                 message="The installed StreamHome commit could not be identified.",
                 current_commit="",
@@ -476,7 +654,7 @@ async def check_for_update_details() -> dict[str, Any]:
                 last_checked_at=checked_at,
             )
         if not await initialize_remote():
-            return write_update_state(
+            return _write_discovery_update_state(
                 phase="failed",
                 message="The Git origin is not the official StreamHome repository.",
                 current_commit=current,
@@ -485,7 +663,7 @@ async def check_for_update_details() -> dict[str, Any]:
                 last_checked_at=checked_at,
             )
         if not await is_git_clean():
-            return write_update_state(
+            return _write_discovery_update_state(
                 phase="failed",
                 message="Local source changes must be committed or moved before updating.",
                 current_commit=current,
@@ -495,7 +673,7 @@ async def check_for_update_details() -> dict[str, Any]:
             )
         branch = settings.UPDATE_BRANCH
         if not BRANCH_RE.fullmatch(branch) or ".." in branch:
-            return write_update_state(
+            return _write_discovery_update_state(
                 phase="failed",
                 message="The configured update branch is invalid.",
                 current_commit=current,
@@ -506,7 +684,7 @@ async def check_for_update_details() -> dict[str, Any]:
         shallow_code, shallow_value, shallow_error = await run_git_cmd(["rev-parse", "--is-shallow-repository"])
         if shallow_code != 0:
             logger.error(f"[Update Service] Shallow-check failed: {shallow_error}")
-            return write_update_state(
+            return _write_discovery_update_state(
                 phase="failed",
                 message="The installation's Git history could not be inspected.",
                 current_commit=current,
@@ -522,7 +700,7 @@ async def check_for_update_details() -> dict[str, Any]:
         code, _, error = await run_git_cmd(fetch_args)
         if code != 0:
             logger.error(f"[Update Service] Fetch failed: {error}")
-            return write_update_state(
+            return _write_discovery_update_state(
                 phase="failed",
                 message="The official update source could not be reached.",
                 current_commit=current,
@@ -533,7 +711,7 @@ async def check_for_update_details() -> dict[str, Any]:
         code, target, error = await run_git_cmd(["rev-parse", f"origin/{branch}"])
         if code != 0 or not COMMIT_RE.fullmatch(target):
             logger.error(f"[Update Service] Target resolution failed: {error}")
-            return write_update_state(
+            return _write_discovery_update_state(
                 phase="failed",
                 message=f"The configured update branch '{branch}' could not be resolved.",
                 current_commit=current,
@@ -542,7 +720,7 @@ async def check_for_update_details() -> dict[str, Any]:
                 last_checked_at=checked_at,
             )
         if current == target:
-            return write_update_state(
+            return _write_discovery_update_state(
                 phase="up_to_date",
                 message="StreamHome is up to date.",
                 current_commit=current,
@@ -555,7 +733,7 @@ async def check_for_update_details() -> dict[str, Any]:
             signatures_valid, signature_error = await verify_update_commit_range(current, target)
             if not signatures_valid:
                 logger.error(f"[Update Service] Signature verification failed: {signature_error}")
-                return write_update_state(
+                return _write_discovery_update_state(
                     phase="failed",
                     message="The available commit range does not satisfy signed-update policy.",
                     current_commit=current,
@@ -566,7 +744,7 @@ async def check_for_update_details() -> dict[str, Any]:
                 )
         code, _, _ = await run_git_cmd(["merge-base", "--is-ancestor", current, target])
         if code != 0:
-            return write_update_state(
+            return _write_discovery_update_state(
                 phase="failed",
                 message="The available commit is not a fast-forward from this installation.",
                 current_commit=current,
@@ -578,7 +756,7 @@ async def check_for_update_details() -> dict[str, Any]:
         previous = read_update_state()
         failed_target = str(previous.get("failed_target") or "")
         blocked = failed_target == target
-        return write_update_state(
+        return _write_discovery_update_state(
             phase="failed" if blocked else "update_available",
             message=(
                 "This update previously failed and will not be retried automatically."
@@ -728,6 +906,23 @@ def update_lock_active() -> bool:
         script in command and mode in command
         for script in ("update.sh", "update-controller")
         for mode in ("--execute", "--manual-execute", "--recover-interrupted", "--finalize-recovery")
+    )
+
+
+def shared_update_controller_active(status: dict[str, Any]) -> bool:
+    identity = _lifecycle_identity(status)
+    if identity is None:
+        return False
+    operation_id, generation, _ = identity
+    try:
+        lease = lifecycle_state.read_controller_lease(WORKSPACE_ROOT)
+    except lifecycle_state.LifecycleError:
+        return True
+    return bool(
+        lease is not None
+        and lease.operation_id == operation_id
+        and lease.generation == generation
+        and lifecycle_state.controller_lease_is_current(lease)
     )
 
 
@@ -884,19 +1079,65 @@ def cleanup_reconciled_transaction(status: dict[str, Any]) -> None:
 
     # Keep shared lifecycle exclusion until update-owned artifacts are reconciled.
     # Release remains exact-owner/generation guarded and fails closed on mismatch.
-    _release_update_lifecycle(status)
+    current = lifecycle_state.inspect_state(WORKSPACE_ROOT)
+    operation = current.active_operation
+    if (
+        operation is None
+        or operation.operation_type is not lifecycle_state.OperationType.UPDATE
+        or operation.operation_id != str(status.get("transaction_id") or "")
+    ):
+        return
+    exact_status = dict(status)
+    exact_status["transaction_id"] = operation.operation_id
+    exact_status["lifecycle_generation"] = current.generation
+    exact_status["lifecycle_phase"] = operation.phase.value
+    _release_update_lifecycle(exact_status)
 
 
 async def reconcile_orphaned_update() -> bool:
     status = read_update_state()
     phase = str(status.get("phase") or "")
-    if update_lock_active():
+    if update_lock_active() or shared_update_controller_active(status):
+        return False
+    try:
+        authority = lifecycle_state.inspect_state(WORKSPACE_ROOT)
+    except lifecycle_state.LifecycleError:
+        return False
+    operation = authority.active_operation
+    identity = _lifecycle_identity(status)
+    if operation is not None:
+        if operation.operation_type is not lifecycle_state.OperationType.UPDATE:
+            return False
+        if operation.phase is lifecycle_state.LifecyclePhase.RECOVERY_REQUIRED:
+            return False
+        if (
+            identity is None
+            or identity[0] != operation.operation_id
+            or identity[1] != authority.generation
+        ):
+            return False
+        if identity[2] is not operation.phase:
+            try:
+                status = write_authoritative_update_state(
+                    operation_id=operation.operation_id,
+                    generation=authority.generation,
+                    expected_lifecycle_phase=operation.phase,
+                    expected_detail_phases=frozenset({phase}),
+                )
+                phase = str(status.get("phase") or "")
+            except Exception:
+                return False
+    elif identity is not None and phase in ACTIVE_PHASES:
+        # A lifecycle-aware active journal without authority is ambiguous. Do
+        # not recreate ownership from subordinate update detail.
         return False
     installed = await current_commit()
     target = str(status.get("target_commit") or "")
     previous = str(status.get("previous_commit") or "")
     error = str(status.get("error") or "")
     if phase in TERMINAL_PHASES and error in RECOVERABLE_TARGET_ERRORS:
+        if operation is not None:
+            return False
         transaction = str(status.get("transaction_id") or "")
         runtime_committed = bool(status.get("runtime_committed"))
         if (
@@ -922,7 +1163,8 @@ async def reconcile_orphaned_update() -> bool:
         )
         cleanup_reconciled_transaction(status)
         return True
-    if phase not in BUSY_PHASES or not orphaned_controller_stale(status):
+    resumable_detail = BUSY_PHASES | {"succeeded", "rolled_back"}
+    if phase not in resumable_detail or not orphaned_controller_stale(status):
         return False
     transaction = str(status.get("transaction_id") or "")
     runtime_committed = bool(status.get("runtime_committed"))
@@ -931,10 +1173,10 @@ async def reconcile_orphaned_update() -> bool:
         "" if runtime_committed else transaction,
     )
     previous_ready = installed == previous and await local_runtime_ready(previous)
-    if target_ready:
+    if target_ready and operation is None:
         if transaction and not runtime_committed and not await commit_guarded_runtime(transaction, target):
             target_ready = False
-    if target_ready:
+    if target_ready and operation is None:
         write_update_state(
             phase="succeeded",
             message="The updated release is healthy; interrupted controller bookkeeping was reconciled.",
@@ -949,7 +1191,7 @@ async def reconcile_orphaned_update() -> bool:
         )
         cleanup_reconciled_transaction(status)
         return True
-    if previous_ready:
+    if previous_ready and operation is None:
         write_update_state(
             phase="rolled_back",
             message="The previous release is healthy; interrupted controller bookkeeping was reconciled.",
@@ -976,12 +1218,30 @@ async def reconcile_orphaned_update() -> bool:
     except OSError as exc:
         logger.error(f"[Update Service] Could not reserve orphaned-update recovery: {exc}")
         return False
-    write_update_state(
-        phase="recovering",
-        message="The update controller stopped unexpectedly. Automatic recovery is starting.",
-        error="controller_lost",
-        recovery_requested_at=time.time(),
-    )
+    if operation is not None:
+        try:
+            status = write_authoritative_update_state(
+                operation_id=operation.operation_id,
+                generation=authority.generation,
+                expected_lifecycle_phase=operation.phase,
+                expected_detail_phases=frozenset({phase}),
+                phase="recovering",
+                message=(
+                    "The update controller stopped unexpectedly. Controlled recovery will "
+                    "replace any surviving fenced runtime before lifecycle completion."
+                ),
+                error="controller_lost",
+                recovery_requested_at=time.time(),
+            )
+        except Exception:
+            return False
+    else:
+        status = write_update_state(
+            phase="recovering",
+            message="The update controller stopped unexpectedly. Automatic recovery is starting.",
+            error="controller_lost",
+            recovery_requested_at=time.time(),
+        )
     try:
         with LOG_PATH.open("ab", buffering=0) as log_handle:
             await asyncio.create_subprocess_exec(
@@ -995,12 +1255,35 @@ async def reconcile_orphaned_update() -> bool:
             )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.error(f"[Update Service] Orphaned-update recovery handoff failed: {exc}")
-        write_update_state(
-            phase="rollback_failed",
-            message="Automatic recovery could not be queued. Run ./start.sh from the StreamHome directory.",
-            error="recovery_handoff_failed",
-            finished_at=time.time(),
-        )
+        if operation is not None:
+            try:
+                lifecycle_state.transition_operation_with_credential(
+                    WORKSPACE_ROOT,
+                    operation_id=operation.operation_id,
+                    generation=authority.generation,
+                    expected_phase=operation.phase,
+                    next_phase=lifecycle_state.LifecyclePhase.RECOVERY_REQUIRED,
+                )
+                write_authoritative_update_state(
+                    operation_id=operation.operation_id,
+                    generation=authority.generation,
+                    expected_lifecycle_phase=lifecycle_state.LifecyclePhase.RECOVERY_REQUIRED,
+                    expected_detail_phases=frozenset({"recovering"}),
+                    phase="rollback_failed",
+                    message="Automatic recovery could not be queued. Run ./start.sh from the StreamHome directory.",
+                    error="recovery_handoff_failed",
+                    failed_target=target,
+                    finished_at=time.time(),
+                )
+            except Exception:
+                pass
+        else:
+            write_update_state(
+                phase="rollback_failed",
+                message="Automatic recovery could not be queued. Run ./start.sh from the StreamHome directory.",
+                error="recovery_handoff_failed",
+                finished_at=time.time(),
+            )
         return False
     return True
 
@@ -1052,6 +1335,7 @@ async def queue_update(
                 ),
                 automatic=automatic,
                 install_mode=resolved_mode,
+                update_branch=settings.UPDATE_BRANCH,
                 queued_at=time.time(),
                 started_at=None,
                 finished_at=None,
@@ -1077,28 +1361,58 @@ async def queue_update(
 
 async def cancel_queued_update() -> dict[str, Any]:
     async with UPDATE_QUEUE_LOCK:
-        status = read_update_state()
-        phase = str(status.get("phase") or "")
-        if phase == "queued":
-            return _record_terminal_update(
-                status,
-                phase="update_available",
-                message="The pending update was cancelled.",
-                automatic=False,
-                queued_at=None,
-                error="",
+        async with UPDATE_CUTOVER_LOCK:
+            try:
+                with _update_state_lock():
+                    status = _read_update_state_strict_unlocked()
+            except UpdateJournalReadError as exc:
+                raise RuntimeError("update_not_cancellable") from exc
+            phase = str(status.get("phase") or "")
+            identity = _lifecycle_identity(status)
+            if identity is None:
+                raise RuntimeError("update_not_cancellable")
+            operation_id, generation, journal_phase = identity
+            if journal_phase is not lifecycle_state.LifecyclePhase.RESERVED:
+                raise RuntimeError("update_not_cancellable")
+            try:
+                current = lifecycle_state.validate_operation_with_credential(
+                    WORKSPACE_ROOT,
+                    operation_id=operation_id,
+                    generation=generation,
+                    expected_phase=lifecycle_state.LifecyclePhase.RESERVED,
+                )
+            except lifecycle_state.LifecycleError as exc:
+                raise RuntimeError("update_not_cancellable") from exc
+            operation = current.active_operation
+            if operation is None or operation.operation_type is not lifecycle_state.OperationType.UPDATE:
+                raise RuntimeError("update_not_cancellable")
+            if phase == "queued" and not shared_update_controller_active(status):
+                return _record_terminal_update(
+                    status,
+                    phase="update_available",
+                    message="The pending update was cancelled.",
+                    automatic=False,
+                    queued_at=None,
+                    error="",
+                )
+            if phase not in {"queued", "preflight", "waiting_for_idle"}:
+                raise RuntimeError("update_not_queued")
+            request_path = RUN_DIR / f"update-cancel.{operation_id}.requested"
+            request_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            descriptor = os.open(
+                request_path,
+                os.O_WRONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
             )
-        if phase not in {"preflight", "waiting_for_idle"}:
-            raise RuntimeError("update_not_queued")
-        transaction = str(status.get("transaction_id") or "")
-        if not transaction or not transaction.replace("-", "").isalnum():
-            raise RuntimeError("update_not_cancellable")
-        request_path = RUN_DIR / f"update-cancel.{transaction}.requested"
-        request_path.parent.mkdir(parents=True, exist_ok=True)
-        request_path.touch(exist_ok=True)
-        return write_update_state(
-            message="Cancellation requested. The updater will stop before protected cutover.",
-        )
+            os.close(descriptor)
+            os.chmod(request_path, 0o600)
+            return write_authoritative_update_state(
+                operation_id=operation_id,
+                generation=generation,
+                expected_lifecycle_phase=lifecycle_state.LifecyclePhase.RESERVED,
+                expected_detail_phases=frozenset({phase}),
+                message="Cancellation requested. The updater will stop before protected cutover.",
+            )
 
 
 def prepare_official_update_script() -> Path:
@@ -1121,28 +1435,190 @@ def prepare_official_update_script() -> Path:
         raise RuntimeError("update_script_unavailable") from exc
 
 
+async def prepare_update_cutover(
+    *,
+    operation_id: str,
+    generation: int,
+    cutover_token: str,
+) -> DrainSnapshot:
+    """Close process-local admission and advance the exact update to cutover."""
+
+    async with UPDATE_CUTOVER_LOCK:
+        validate_cutover_permit(
+            WORKSPACE_ROOT,
+            operation_id=operation_id,
+            generation=generation,
+            supplied_token=cutover_token,
+        )
+        with _update_state_lock():
+            journal = _read_update_state_strict_unlocked()
+        if (
+            journal.get("transaction_id") != operation_id
+            or journal.get("lifecycle_generation") != generation
+            or journal.get("lifecycle_phase") != lifecycle_state.LifecyclePhase.RESERVED.value
+            or str(journal.get("phase") or "") not in {"preflight", "waiting_for_idle"}
+        ):
+            raise RuntimeError("lifecycle_conflict")
+        cancellation_path = RUN_DIR / f"update-cancel.{operation_id}.requested"
+        if cancellation_path.exists() or cancellation_path.is_symlink():
+            raise RuntimeError("update_cancelled")
+        current = lifecycle_state.validate_operation_with_credential(
+            WORKSPACE_ROOT,
+            operation_id=operation_id,
+            generation=generation,
+            expected_phase=lifecycle_state.LifecyclePhase.RESERVED,
+        )
+        operation = current.active_operation
+        if operation is None or operation.operation_type is not lifecycle_state.OperationType.UPDATE:
+            raise RuntimeError("lifecycle_conflict")
+        coordinator = get_runtime_coordinator()
+        snapshot = coordinator.close_admission(
+            list(EffectClass),
+            operation_id=operation_id,
+            generation=generation,
+        )
+        try:
+            drained = await coordinator.drain(snapshot, timeout=UPDATE_CUTOVER_DRAIN_SECONDS)
+            if not drained.complete:
+                coordinator.release_fence(snapshot)
+                raise RuntimeError("cutover_busy")
+            if cancellation_path.exists() or cancellation_path.is_symlink():
+                coordinator.release_fence(snapshot)
+                raise RuntimeError("update_cancelled")
+            lifecycle_state.transition_operation_with_credential(
+                WORKSPACE_ROOT,
+                operation_id=operation_id,
+                generation=generation,
+                expected_phase=lifecycle_state.LifecyclePhase.RESERVED,
+                next_phase=lifecycle_state.LifecyclePhase.EXCLUSIVE,
+            )
+        except Exception:
+            try:
+                authoritative = lifecycle_state.inspect_state(WORKSPACE_ROOT)
+                active = authoritative.active_operation
+                still_reserved = bool(
+                    active is not None
+                    and active.operation_id == operation_id
+                    and authoritative.generation == generation
+                    and active.phase is lifecycle_state.LifecyclePhase.RESERVED
+                )
+            except lifecycle_state.LifecycleError:
+                still_reserved = False
+            if still_reserved:
+                try:
+                    coordinator.release_fence(snapshot)
+                except CoordinationError:
+                    pass
+            raise
+        try:
+            write_authoritative_update_state(
+                operation_id=operation_id,
+                generation=generation,
+                expected_lifecycle_phase=lifecycle_state.LifecyclePhase.EXCLUSIVE,
+                expected_detail_phases=frozenset({"preflight", "waiting_for_idle"}),
+                phase="stopping",
+                message="Prepared release is ready. Stopping StreamHome for protected activation.",
+            )
+        except Exception:
+            # Authority is already exclusive. Keep admission closed and let
+            # controller/startup recovery reconcile the subordinate journal.
+            raise RuntimeError("update_journal_unavailable")
+        return snapshot
+
+
+def _record_controller_launch_failure(
+    status: dict[str, Any],
+    *,
+    operation_id: str,
+    generation: int,
+) -> None:
+    """Release only a definitely untransferred claim; otherwise preserve it."""
+
+    try:
+        current = lifecycle_state.inspect_state(WORKSPACE_ROOT)
+    except lifecycle_state.LifecycleError:
+        logger.error(
+            "[Update Service] Update controller handoff failed while lifecycle authority "
+            "was unavailable; the journal was preserved unchanged."
+        )
+        return
+    operation = current.active_operation
+    if (
+        operation is not None
+        and operation.operation_id == operation_id
+        and current.generation == generation
+        and operation.phase is lifecycle_state.LifecyclePhase.RESERVED
+    ):
+        _record_terminal_update(
+            status,
+            phase="failed",
+            message="The managed update controller could not be launched.",
+            error="update_controller_handoff_failed",
+            finished_at=time.time(),
+        )
+        return
+    if (
+        operation is not None
+        and operation.operation_type is lifecycle_state.OperationType.UPDATE
+        and operation.operation_id == operation_id
+    ):
+        try:
+            write_authoritative_update_state(
+                operation_id=operation.operation_id,
+                generation=current.generation,
+                expected_lifecycle_phase=operation.phase,
+                expected_detail_phases=frozenset({str(status.get("phase") or "")}),
+                phase="recovering",
+                message=(
+                    "Update controller handoff became indeterminate; lifecycle ownership "
+                    "remains fail-closed."
+                ),
+                error="update_controller_handoff_failed",
+                finished_at=time.time(),
+            )
+        except Exception:
+            logger.error(
+                "[Update Service] Update controller handoff became indeterminate; "
+                "authority and journal were preserved for fail-closed recovery."
+            )
+
+
 async def launch_queued_update_if_ready() -> bool:
     async with UPDATE_QUEUE_LOCK:
         status = read_update_state()
         if status.get("phase") != "queued":
             return False
         if install_lock_active():
-            write_update_state(message="Waiting for the active public installer to finish.")
+            identity = _lifecycle_identity(status)
+            if identity is not None:
+                write_authoritative_update_state(
+                    operation_id=identity[0],
+                    generation=identity[1],
+                    expected_lifecycle_phase=identity[2],
+                    expected_detail_phases=frozenset({"queued"}),
+                    message="Waiting for the active public installer to finish.",
+                )
             return False
         if status.get("automatic") and not maintenance_window_open():
             return False
         blockers = await queued_launch_blockers(status)
         if blockers:
-            write_update_state(message=f"Waiting for idle: {blockers[0]}.")
+            identity = _lifecycle_identity(status)
+            if identity is not None:
+                write_authoritative_update_state(
+                    operation_id=identity[0],
+                    generation=identity[1],
+                    expected_lifecycle_phase=identity[2],
+                    expected_detail_phases=frozenset({"queued"}),
+                    message=f"Waiting for idle: {blockers[0]}.",
+                )
             return False
         try:
             status = _ensure_update_lifecycle(status)
         except RuntimeError as exc:
-            write_update_state(
-                phase="failed",
-                message="Shared lifecycle ownership could not be established for the queued update.",
-                error=str(exc),
-                finished_at=time.time(),
+            logger.error(
+                "[Update Service] Queued update lifecycle validation failed; "
+                f"journal preserved unchanged: {exc}"
             )
             return False
         target = str(status.get("target_commit") or "")
@@ -1189,9 +1665,6 @@ async def launch_queued_update_if_ready() -> bool:
                 finished_at=time.time(),
             )
             return False
-        environment = detached_lifecycle_environment()
-        environment["STREAMHOME_UPDATE_AUTOMATIC"] = "true" if status.get("automatic") else "false"
-        environment["STREAMHOME_UPDATE_INSTALL_MODE"] = str(status.get("install_mode") or "when_idle")
         lifecycle_identity = _lifecycle_identity(status)
         if lifecycle_identity is None:
             _record_terminal_update(
@@ -1202,35 +1675,43 @@ async def launch_queued_update_if_ready() -> bool:
                 finished_at=time.time(),
             )
             return False
-        environment["STREAMHOME_LIFECYCLE_OPERATION_ID"] = lifecycle_identity[0]
-        environment["STREAMHOME_LIFECYCLE_GENERATION"] = str(lifecycle_identity[1])
         try:
             with LOG_PATH.open("ab", buffering=0) as log_handle:
-                updater = await asyncio.create_subprocess_exec(
-                    str(update_script),
-                    cwd=str(WORKSPACE_ROOT),
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=log_handle,
-                    stderr=asyncio.subprocess.STDOUT,
-                    start_new_session=True,
-                    env=environment,
+                handoff = await asyncio.to_thread(
+                    spawn_update_controller,
+                    WORKSPACE_ROOT,
+                    operation_id=lifecycle_identity[0],
+                    generation=lifecycle_identity[1],
+                    target_commit=target,
+                    previous_commit=current,
+                    automatic=bool(status.get("automatic")),
+                    install_mode=str(status.get("install_mode") or "when_idle"),
+                    update_branch=str(status.get("update_branch") or settings.UPDATE_BRANCH),
+                    log_handle=log_handle,
                 )
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.error(f"[Update Service] Could not launch the official update.sh process: {exc}")
-            _record_terminal_update(
+        except (
+            ValueError,
+            OSError,
+            subprocess.SubprocessError,
+            UpdateControllerError,
+            lifecycle_state.LifecycleError,
+        ) as exc:
+            logger.error(f"[Update Service] Could not establish the managed update controller: {type(exc).__name__}")
+            _record_controller_launch_failure(
                 status,
-                phase="failed",
-                message="The installation-root update.sh process could not be launched.",
-                error="update_script_launch_failed",
-                finished_at=time.time(),
+                operation_id=lifecycle_identity[0],
+                generation=lifecycle_identity[1],
             )
             return False
-        write_update_state(
-            message="The official update.sh process is running and now owns the StreamHome lifecycle.",
-            started_at=time.time(),
-            updater_pid=updater.pid,
-            error="",
-        )
+        authoritative = lifecycle_state.inspect_state(WORKSPACE_ROOT)
+        authoritative_operation = authoritative.active_operation
+        if (
+            authoritative_operation is None
+            or authoritative_operation.operation_id != handoff.operation_id
+            or authoritative.generation != handoff.generation
+            or authoritative_operation.operation_type is not lifecycle_state.OperationType.UPDATE
+        ):
+            raise RuntimeError("lifecycle_conflict")
         return True
 
 

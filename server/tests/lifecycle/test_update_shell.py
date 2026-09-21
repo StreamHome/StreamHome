@@ -117,16 +117,28 @@ class UpdateShellLifecycleTests(unittest.TestCase):
         (root / "start.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
         return root
 
-    def _journal(self, root: Path, operation_id: str, generation: int, phase: str = "reserved") -> Path:
+    def _journal(
+        self,
+        root: Path,
+        operation_id: str,
+        generation: int,
+        phase: str = "reserved",
+        detail_phase: str = "queued",
+    ) -> Path:
         run_dir = root / ".run"
         run_dir.mkdir(mode=0o700, exist_ok=True)
         path = run_dir / "update-state.json"
         path.write_text(
             json.dumps(
                 {
+                    "phase": detail_phase,
                     "transaction_id": operation_id,
                     "lifecycle_generation": generation,
                     "lifecycle_phase": phase,
+                    "target_commit": "a" * 40,
+                    "previous_commit": "b" * 40,
+                    "runtime_committed": False,
+                    "runtime_committed_at": None,
                 }
             ),
             encoding="utf-8",
@@ -187,7 +199,7 @@ class UpdateShellLifecycleTests(unittest.TestCase):
             state.LifecyclePhase.RECOVERY_REQUIRED,
         )
 
-    def test_recovery_uses_authoritative_phase_and_never_moves_it_backward(self) -> None:
+    def test_recovery_required_is_terminal_for_automatic_shell_recovery(self) -> None:
         root = self._make_lifecycle_installation()
         claimed = state.claim_operation_with_credential(
             root, operation_type="update", owner_kind="updater"
@@ -203,12 +215,11 @@ class UpdateShellLifecycleTests(unittest.TestCase):
         journal = self._journal(root, operation.operation_id, claimed.state.generation)
         result = self._shell(
             self._lifecycle_variables(root, operation.operation_id, claimed.state.generation, journal)
-            + "\ninitialize_lifecycle_authority\n"
+            + "\ninitialize_lifecycle_authority || exit $?\n"
             + 'printf "phase=%s enabled=%s\\n" "$LIFECYCLE_PHASE" "$LIFECYCLE_ENABLED"',
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("phase=recovery_required enabled=true", result.stdout)
-        self.assertEqual(json.loads(journal.read_text())["lifecycle_phase"], "recovery_required")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(journal.read_text())["lifecycle_phase"], "reserved")
         self.assertEqual(
             state.inspect_state(root).active_operation.phase,
             state.LifecyclePhase.RECOVERY_REQUIRED,
@@ -233,7 +244,19 @@ class UpdateShellLifecycleTests(unittest.TestCase):
             encoding="utf-8",
         )
         (root / "start.sh").chmod(0o755)
-        transaction = str(uuid.uuid4())
+        claimed = state.claim_operation_with_credential(
+            root,
+            operation_type="update",
+            owner_kind="updater",
+        )
+        operation = claimed.state.active_operation
+        transaction = operation.operation_id
+        journal = self._journal(
+            root,
+            transaction,
+            claimed.state.generation,
+            detail_phase="starting",
+        )
         result = self._shell(
             "\n".join(
                 (
@@ -241,8 +264,9 @@ class UpdateShellLifecycleTests(unittest.TestCase):
                     f"RUN_DIR={shlex_quote(str(root / '.run'))}",
                     f"TRANSACTION_ID={shlex_quote(transaction)}",
                     f"LIFECYCLE_OPERATION_ID={shlex_quote(transaction)}",
-                    "LIFECYCLE_GENERATION=17",
+                    f"LIFECYCLE_GENERATION={claimed.state.generation}",
                     "LIFECYCLE_ENABLED=true",
+                    f"STATUS_FILE={shlex_quote(str(journal))}",
                     "COMMIT_TOKEN=guarded-token",
                     "COMMIT_FILE=",
                     "start_installed_update_runtime",
@@ -253,7 +277,7 @@ class UpdateShellLifecycleTests(unittest.TestCase):
         payload = json.loads(captured.read_text(encoding="utf-8"))
         self.assertEqual(payload["mode"], "update_verify")
         self.assertEqual(payload["operation"], transaction)
-        self.assertEqual(payload["generation"], "17")
+        self.assertEqual(payload["generation"], str(claimed.state.generation))
         self.assertEqual(payload["first_adoption"], "false")
         self.assertEqual(payload["transaction"], transaction)
 
@@ -296,7 +320,7 @@ class UpdateShellLifecycleTests(unittest.TestCase):
         self.assertEqual(payload["operation"], "")
         self.assertEqual(payload["generation"], "")
 
-    def test_recovery_required_is_exactly_reacquired_before_guarded_start(self) -> None:
+    def test_recovery_required_cannot_be_reacquired_by_guarded_start(self) -> None:
         root = self._make_lifecycle_installation()
         (root / "start.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         (root / "start.sh").chmod(0o755)
@@ -331,12 +355,12 @@ class UpdateShellLifecycleTests(unittest.TestCase):
             + "COMMIT_FILE=\n"
             + "start_installed_update_runtime",
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0)
         self.assertEqual(
             state.inspect_state(root).active_operation.phase,
-            state.LifecyclePhase.EXCLUSIVE,
+            state.LifecyclePhase.RECOVERY_REQUIRED,
         )
-        self.assertEqual(json.loads(journal.read_text())["lifecycle_phase"], "exclusive")
+        self.assertEqual(json.loads(journal.read_text())["lifecycle_phase"], "recovery_required")
 
     def test_successful_protected_commit_establishes_no_rollback_boundary(self) -> None:
         root = self.temp / "commit-boundary"
@@ -421,6 +445,22 @@ class UpdateShellLifecycleTests(unittest.TestCase):
         self.assertIn('"post_commit_recovery_failed"', failure)
         self.assertIn("NO_ROLLBACK_BOUNDARY=true", failure)
         self.assertNotIn("rollback_release", failure)
+
+    def test_phase_five_cutover_and_recovery_use_canonical_boundaries(self) -> None:
+        source = (self.repository_root / "update.sh").read_text(encoding="utf-8")
+        validate = source[
+            source.index("validate_lifecycle_authority()"):
+            source.index("advance_lifecycle_phase()")
+        ]
+        self.assertIn("validate-controller", validate)
+        self.assertIn("request_process_local_cutover", source)
+        wait = source[
+            source.index("wait_for_committed_runtime()"):
+            source.index("record_post_commit_recovery_failure()")
+        ]
+        self.assertIn('"http://127.0.0.1:8000/api/health/live"', wait)
+        self.assertIn('live.get("recoverySucceeded") is True', wait)
+        self.assertNotIn('"http://127.0.0.1:8000/api/health"', wait)
 
 
 def shlex_quote(value: str) -> str:

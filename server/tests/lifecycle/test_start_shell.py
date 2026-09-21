@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
+
+from lifecycle import state
 
 
 class StartShellRecoveryTests(unittest.TestCase):
@@ -95,6 +98,46 @@ class StartShellRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "blocked")
+
+    def test_recovery_required_update_blocks_real_start_path_without_relaunch(self) -> None:
+        root = self.temp / "StreamHome"
+        (root / "server").mkdir(parents=True)
+        shutil.copytree(self.repository_root / "server" / "lifecycle", root / "server" / "lifecycle")
+        shutil.copy2(self.repository_root / "start.sh", root / "start.sh")
+        marker = root / "update-launched"
+        (root / "update.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$*\" > {str(marker)!r}\n",
+            encoding="utf-8",
+        )
+        (root / "start.sh").chmod(0o700)
+        (root / "update.sh").chmod(0o700)
+        claimed = state.claim_operation_with_credential(
+            root,
+            operation_type="update",
+            owner_kind="updater",
+        )
+        operation = claimed.state.active_operation
+        state.transition_operation_with_credential(
+            root,
+            operation_id=operation.operation_id,
+            generation=claimed.state.generation,
+            expected_phase="reserved",
+            next_phase="recovery_required",
+        )
+        result = subprocess.run(
+            [str(root / "start.sh")],
+            cwd=root,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("explicit operator action", result.stderr)
+        # cleanup may invoke only the maintenance projection mode; the canonical
+        # destructive recovery launcher must not have been selected.
+        self.assertEqual(marker.read_text(encoding="utf-8").strip(), f"--serve-maintenance {root}")
 
 
 if __name__ == "__main__":

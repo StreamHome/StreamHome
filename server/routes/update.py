@@ -17,6 +17,8 @@ from routes.auth import add_event, get_current_session, get_current_user, requir
 from lifecycle.coordination import EffectClass, runtime_work
 from lifecycle.bootstrap import (
     StartupAuthorityChangedError,
+    current_readiness_projection,
+    get_startup_readiness,
     require_current_guarded_authority,
     require_startup_context,
 )
@@ -32,10 +34,14 @@ from services.update import (
     launch_queued_update_if_ready,
     maintenance_window_open,
     protected_cutover_blockers,
+    prepare_update_cutover,
     queue_update,
     read_update_log,
     read_update_state,
+    read_update_state_strict,
     update_lock_active,
+    update_lifecycle_projection,
+    write_authoritative_update_state,
     write_update_state,
 )
 
@@ -64,6 +70,11 @@ class BrowserPresenceRequest(BaseModel):
 class UpdateCommitRequest(BaseModel):
     transaction_id: str
     target_commit: str
+
+
+class UpdateCutoverRequest(BaseModel):
+    operation_id: str
+    generation: int
 
 
 class UpdatePolicyResponse(APIModel):
@@ -115,7 +126,7 @@ def _policy_response() -> UpdatePolicyResponse:
 
 
 async def _status_response() -> UpdateStatusResponse:
-    persisted = read_update_state()
+    persisted = update_lifecycle_projection(read_update_state())
     installed_commit = await current_commit() or str(persisted.get("current_commit") or "")
     install_mode = str(persisted.get("install_mode") or "when_idle")
     if install_mode not in {"automatic", "when_idle", "now"}:
@@ -148,6 +159,8 @@ async def _status_response() -> UpdateStatusResponse:
             persisted.get("phase") in ACTIVE_PHASES
             or update_lock_active()
             or install_lock_active()
+            or persisted.get("lifecycle_status") == "active"
+            or persisted.get("lifecycle_status") == "unavailable"
         ),
         log_tail=read_update_log(),
         policy=_policy_response(),
@@ -202,8 +215,9 @@ async def commit_updated_runtime(
         or not hmac.compare_digest(payload.transaction_id, state.UPDATE_TRANSACTION_ID)
     ):
         raise HTTPException(status_code=403, detail={"code": "commit_forbidden", "message": "Update commit authorization failed."})
+    startup_context = require_startup_context()
     try:
-        require_current_guarded_authority(require_startup_context())
+        require_current_guarded_authority(startup_context)
     except StartupAuthorityChangedError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -212,19 +226,58 @@ async def commit_updated_runtime(
                 "message": "The guarded lifecycle authority no longer matches this runtime.",
             },
         ) from exc
-    persisted = read_update_state()
+    readiness = current_readiness_projection(get_startup_readiness())
+    if not readiness.get("guardedReady"):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "guarded_recovery_incomplete",
+                "message": "The guarded runtime has not completed candidate verification.",
+            },
+        )
+    try:
+        persisted = read_update_state_strict()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "update_journal_unavailable",
+                "message": "The protected update journal is unavailable.",
+            },
+        ) from exc
     persisted_phase = str(persisted.get("phase") or "")
     expected_build = str(persisted.get("target_commit") or "")
     if persisted_phase in {"failed", "rolled_back"}:
         expected_build = str(persisted.get("current_commit") or "")
     if (
         str(persisted.get("transaction_id") or "") != payload.transaction_id
+        or persisted.get("lifecycle_generation") != startup_context.generation
+        or persisted.get("lifecycle_phase") != startup_context.lifecycle_phase
+        or startup_context.operation_type != "update"
+        or startup_context.owner_kind != "updater"
+        or (
+            startup_context.generation is not None
+            and startup_context.lifecycle_phase != "verifying"
+        )
         or expected_build != payload.target_commit
         or settings.BUILD_ID != payload.target_commit[:12]
     ):
         raise HTTPException(status_code=403, detail={"code": "commit_forbidden", "message": "Update commit authorization failed."})
     try:
-        write_update_state(runtime_committed=True, runtime_committed_at=time.time())
+        if startup_context.generation is None:
+            # Positively confirmed pre-Phase-1 first adoption has no shared
+            # authority. The strict generic writer still preserves the commit
+            # boundary monotonically for rollback compatibility.
+            write_update_state(runtime_committed=True, runtime_committed_at=time.time())
+        else:
+            write_authoritative_update_state(
+                operation_id=payload.transaction_id,
+                generation=startup_context.generation,
+                expected_lifecycle_phase="verifying",
+                expected_detail_phases=frozenset({persisted_phase}),
+                runtime_committed=True,
+                runtime_committed_at=time.time(),
+            )
     except Exception as exc:
         # Atomic replacement can become indeterminate after the rename.  Keep
         # the guarded process closed and force the controller to preserve the
@@ -245,6 +298,48 @@ async def commit_updated_runtime(
     }
 
 
+@router.post("/cutover", include_in_schema=False)
+async def prepare_managed_update_cutover(
+    payload: UpdateCutoverRequest,
+    request: Request,
+    token: str = Header(default="", alias="X-StreamHome-Update-Cutover"),
+):
+    """Close process-local admission for the exact detached update controller."""
+
+    try:
+        peer = ipaddress.ip_address(request.client.host if request.client else "")
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail={"code": "cutover_forbidden", "message": "Update cutover is local only."}) from exc
+    if not peer.is_loopback:
+        raise HTTPException(status_code=403, detail={"code": "cutover_forbidden", "message": "Update cutover is local only."})
+    try:
+        await prepare_update_cutover(
+            operation_id=payload.operation_id,
+            generation=payload.generation,
+            cutover_token=token,
+        )
+    except RuntimeError as exc:
+        code = str(exc)
+        status_code = status.HTTP_409_CONFLICT if code == "cutover_busy" else status.HTTP_503_SERVICE_UNAVAILABLE
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "code": code,
+                "message": (
+                    "Lifecycle-relevant work is still active; cutover remains deferred."
+                    if code == "cutover_busy"
+                    else "Update cutover authority could not be established."
+                ),
+            },
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "cutover_forbidden", "message": "Update cutover authority could not be established."},
+        ) from exc
+    return {"accepted": True, "generation": payload.generation, "phase": "exclusive"}
+
+
 @router.get("/status", response_model=UpdateStatusResponse)
 async def get_update_status(session: AuthSession = Depends(require_recent_reauth)):
     del session
@@ -261,7 +356,10 @@ async def check_for_updates(
     existing = read_update_state()
     if existing.get("phase") in ACTIVE_PHASES or update_lock_active() or install_lock_active():
         raise _runtime_error(RuntimeError("update_in_progress"))
-    result = await check_for_update_details()
+    try:
+        result = await check_for_update_details()
+    except RuntimeError as exc:
+        raise _runtime_error(exc) from exc
     await add_event(
         db,
         request,
@@ -346,9 +444,9 @@ async def install_update(
             allow_failed_target=payload.retry_failed_target,
             install_mode=payload.mode,
         )
-        launched = await launch_queued_update_if_ready()
     except RuntimeError as exc:
         raise _runtime_error(exc) from exc
+    launched = False
     async with runtime_work("update.audit", [EffectClass.DB_WRITE]):
         await add_event(
             db,
@@ -365,6 +463,10 @@ async def install_update(
             },
         )
         await db.commit()
+    try:
+        launched = await launch_queued_update_if_ready()
+    except RuntimeError as exc:
+        raise _runtime_error(exc) from exc
     return await _status_response()
 
 

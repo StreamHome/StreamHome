@@ -38,6 +38,7 @@ PUBLIC_PHASE_LABELS = {
     "rolled_back": "Previous release restored",
     "failed": "Update stopped safely",
     "rollback_failed": "Automatic recovery needs attention",
+    "recovery_required": "Update recovery needs operator attention",
 }
 
 
@@ -141,7 +142,32 @@ def safe_public_status(
     state_transaction = str(state.get("transaction_id") or transaction_id or "")
     lease = read_json(lease_path) or legacy_lease(root)
     active = controller_is_current(lease, state_transaction, silence_seconds)
+    lifecycle_phase = ""
+    try:
+        from lifecycle import state as lifecycle_state
+
+        authority = lifecycle_state.inspect_state(root)
+        operation = authority.active_operation
+        if (
+            operation is not None
+            and operation.operation_type is lifecycle_state.OperationType.UPDATE
+        ):
+            lifecycle_phase = operation.phase.value
+            controller_lease = lifecycle_state.read_controller_lease(root)
+            if (
+                (not state_transaction or operation.operation_id == state_transaction)
+                and
+                controller_lease is not None
+                and controller_lease.operation_id == operation.operation_id
+                and controller_lease.generation == authority.generation
+                and lifecycle_state.controller_lease_is_current(controller_lease)
+            ):
+                active = True
+    except Exception:
+        lifecycle_phase = "unavailable"
     phase = str(state.get("phase") or "recovering")
+    if lifecycle_phase == "recovery_required":
+        phase = "recovery_required"
     if phase in ACTIVE_PHASES and not active:
         phase = "recovering"
     started_at = state.get("started_at") or state.get("updated_at") or time.time()
@@ -221,7 +247,9 @@ def recovery_needed(status: dict[str, Any]) -> bool:
     phase = str(status.get("phase") or "")
     if status.get("controllerActive"):
         return False
-    return phase in ACTIVE_PHASES or phase in SUCCESS_PHASES or phase == "failed"
+    return phase != "recovery_required" and (
+        phase in ACTIVE_PHASES or phase in SUCCESS_PHASES or phase == "failed"
+    )
 
 
 class RecoveryCoordinator:
@@ -251,6 +279,20 @@ class RecoveryCoordinator:
         if self.recovery_queued:
             return False
         transaction_id = str(status.get("transaction") or self.transaction_id or "legacy")
+        try:
+            from lifecycle import state as lifecycle_state
+
+            authority = lifecycle_state.inspect_state(self.root)
+            operation = authority.active_operation
+            if operation is not None:
+                if (
+                    operation.operation_type is not lifecycle_state.OperationType.UPDATE
+                    or operation.operation_id != transaction_id
+                    or operation.phase is lifecycle_state.LifecyclePhase.RECOVERY_REQUIRED
+                ):
+                    return False
+        except Exception:
+            return False
         request_path = self._request_path(transaction_id)
         try:
             descriptor = os.open(request_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)

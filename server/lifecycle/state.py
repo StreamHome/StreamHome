@@ -48,8 +48,9 @@ ALLOWED_TRANSITIONS: Mapping[LifecyclePhase, frozenset[LifecyclePhase]] = {
         {LifecyclePhase.VERIFYING, LifecyclePhase.RECOVERY_REQUIRED}
     ),
     LifecyclePhase.VERIFYING: frozenset({LifecyclePhase.RECOVERY_REQUIRED}),
-    # Update's existing protected recovery bridge still performs this transition.
-    # Restore automatic recovery deliberately refuses it in restore_controller.py.
+    # The transition remains a low-level primitive for future explicit operator
+    # recovery and rollback compatibility. Automatic restore/update launchers
+    # deliberately refuse recovery_required.
     LifecyclePhase.RECOVERY_REQUIRED: frozenset({LifecyclePhase.EXCLUSIVE}),
 }
 
@@ -511,6 +512,7 @@ def _require_expected_operation(
     generation: int,
     expected_phase: LifecyclePhase | str,
     owner_capability: str,
+    expected_operation_type: OperationType | str | None = None,
 ) -> ActiveOperation:
     operation = _require_operation_identity_owner(
         state,
@@ -521,6 +523,14 @@ def _require_expected_operation(
     phase = _enum_value(LifecyclePhase, expected_phase, "expected_phase")
     if operation.phase is not phase:
         raise LifecycleConflictError("operation phase does not match")
+    if expected_operation_type is not None:
+        operation_type = _enum_value(
+            OperationType,
+            expected_operation_type,
+            "expected_operation_type",
+        )
+        if operation.operation_type is not operation_type:
+            raise LifecycleConflictError("operation type does not match")
     return operation
 
 
@@ -617,6 +627,46 @@ def validate_operation_owner_current_phase(
             owner_capability=owner_capability,
         )
         return current
+
+
+@contextmanager
+def hold_idle_authority(
+    root: str | os.PathLike[str] | None,
+) -> Iterator[LifecycleState]:
+    """Hold the short-lived authority lock while a subordinate idle write commits."""
+
+    paths = lifecycle_paths(root)
+    with _state_lock(paths):
+        current = _read_state_unlocked(paths)
+        if current.active_operation is not None:
+            raise LifecycleConflictError("another lifecycle operation is active")
+        yield current
+
+
+@contextmanager
+def hold_operation_with_credential(
+    root: str | os.PathLike[str] | None,
+    *,
+    operation_id: str,
+    generation: int,
+    expected_phase: LifecyclePhase | str,
+    expected_operation_type: OperationType | str | None = None,
+) -> Iterator[LifecycleState]:
+    """Hold exact authority while one bounded subordinate atomic write commits."""
+
+    paths = lifecycle_paths(root)
+    capability = _read_credential(paths, operation_id, generation)
+    with _state_lock(paths):
+        current = _read_state_unlocked(paths)
+        _require_expected_operation(
+            current,
+            operation_id=operation_id,
+            generation=generation,
+            expected_phase=expected_phase,
+            owner_capability=capability,
+            expected_operation_type=expected_operation_type,
+        )
+        yield current
 
 
 def transition_operation(
@@ -779,6 +829,7 @@ def complete_operation(
     generation: int,
     expected_phase: LifecyclePhase | str,
     owner_capability: str,
+    expected_operation_type: OperationType | str | None = None,
 ) -> LifecycleState:
     paths = lifecycle_paths(root)
     with _state_lock(paths):
@@ -789,6 +840,7 @@ def complete_operation(
             generation=generation,
             expected_phase=expected_phase,
             owner_capability=owner_capability,
+            expected_operation_type=expected_operation_type,
         )
         completed = LifecycleState(SCHEMA_VERSION, current.generation, None)
         _write_state_unlocked(paths, completed)
@@ -1013,6 +1065,7 @@ def complete_operation_with_credential(
     operation_id: str,
     generation: int,
     expected_phase: LifecyclePhase | str,
+    expected_operation_type: OperationType | str | None = None,
 ) -> CompletionResult:
     paths = lifecycle_paths(root)
     capability = _read_credential(paths, operation_id, generation)
@@ -1022,6 +1075,7 @@ def complete_operation_with_credential(
         generation=generation,
         expected_phase=expected_phase,
         owner_capability=capability,
+        expected_operation_type=expected_operation_type,
     )
     try:
         _delete_credential(paths, operation_id, generation)

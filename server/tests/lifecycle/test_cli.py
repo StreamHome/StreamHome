@@ -237,6 +237,35 @@ class LifecycleCliTests(unittest.TestCase):
             cli.EXIT_CONFLICT,
         )
 
+    def test_update_recovery_commands_distinguish_resumable_and_terminal_authority(self) -> None:
+        claimed = state.claim_operation_with_credential(
+            self.root,
+            operation_type="update",
+            owner_kind="updater",
+        )
+        operation = claimed.state.active_operation
+        self.assertIsNotNone(operation)
+        self.assertEqual(self._run("update-recovery-needed").returncode, cli.EXIT_OK)
+        self.assertEqual(
+            self._run("update-recovery-required").returncode,
+            cli.EXIT_CONFLICT,
+        )
+        state.transition_operation_with_credential(
+            self.root,
+            operation_id=operation.operation_id,
+            generation=claimed.state.generation,
+            expected_phase="reserved",
+            next_phase="recovery_required",
+        )
+        self.assertEqual(
+            self._run("update-recovery-needed").returncode,
+            cli.EXIT_CONFLICT,
+        )
+        self.assertEqual(
+            self._run("update-recovery-required").returncode,
+            cli.EXIT_OK,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

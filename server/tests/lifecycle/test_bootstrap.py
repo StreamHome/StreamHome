@@ -373,6 +373,40 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
         lease = coordinator.admit("post-restore.writer", [coordination.EffectClass.DB_WRITE])
         lease.release()
 
+    async def test_update_general_readiness_remains_private_until_lifecycle_completion(self) -> None:
+        claimed = self._claim("update", "updater")
+        operation = claimed.state.active_operation
+        environment = self._environment(
+            STREAMHOME_LIFECYCLE_STARTUP_MODE="update_verify",
+            STREAMHOME_LIFECYCLE_OPERATION_ID=operation.operation_id,
+            STREAMHOME_LIFECYCLE_GENERATION=str(claimed.state.generation),
+        )
+        context = bootstrap.evaluate_startup(self.root, environment, install=False)
+        readiness = bootstrap.StartupReadiness(context)
+
+        async def success() -> None:
+            return None
+
+        result = await bootstrap.run_mandatory_recovery(
+            context,
+            (bootstrap.MandatoryRecoveryStep("normal_recovery", success),),
+        )
+        readiness.record_recovery(result)
+        readiness.mark_workers_started()
+        readiness.mark_general_ready()
+        pending = bootstrap.current_readiness_projection(readiness, environment)
+        self.assertFalse(pending["generalReady"])
+        self.assertEqual(pending["errorCode"], "update_lifecycle_pending")
+
+        state.complete_operation_with_credential(
+            self.root,
+            operation_id=operation.operation_id,
+            generation=claimed.state.generation,
+            expected_phase="reserved",
+        )
+        completed = bootstrap.current_readiness_projection(readiness, environment)
+        self.assertTrue(completed["generalReady"])
+
     async def test_guarded_projection_fails_closed_when_authority_changes(self) -> None:
         claimed = self._claim("restore", "restore_controller")
         operation = claimed.state.active_operation

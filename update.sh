@@ -47,8 +47,9 @@ LIFECYCLE_HANDOFF_REQUESTED=false
 if [[ -n "$LIFECYCLE_OPERATION_ID" || -n "$LIFECYCLE_GENERATION" ]]; then
     LIFECYCLE_HANDOFF_REQUESTED=true
 fi
-LIFECYCLE_PHASE="reserved"
+LIFECYCLE_PHASE="${STREAMHOME_LIFECYCLE_PHASE:-reserved}"
 LIFECYCLE_PRESERVE=false
+LIFECYCLE_CONTROLLER_OWNED="${STREAMHOME_LIFECYCLE_CONTROLLER_OWNED:-false}"
 NO_ROLLBACK_BOUNDARY=false
 UPDATE_COMMAND_TIMEOUT_SECONDS="${STREAMHOME_UPDATE_COMMAND_TIMEOUT_SECONDS:-1800}"
 
@@ -141,6 +142,13 @@ lifecycle_cli() {
         "$python_bin" -m lifecycle.cli --root "$ROOT_DIR" "$@"
 }
 
+update_controller_cli() {
+    local python_bin="$ROOT_DIR/venv/bin/python"
+    [[ -x "$python_bin" ]] || python_bin="$(command -v python3)"
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+        "$python_bin" -m lifecycle.update_controller "$@"
+}
+
 lifecycle_generation_from_json() {
     local python_bin="$ROOT_DIR/venv/bin/python"
     [[ -x "$python_bin" ]] || python_bin="$(command -v python3)"
@@ -182,17 +190,37 @@ installed_release_lifecycle_support() {
 
 record_lifecycle_phase_in_update_journal() {
     local phase="$1"
-    python3 - "$STATUS_FILE" "$TRANSACTION_ID" "$LIFECYCLE_GENERATION" "$phase" <<'PY'
+    if [[ -f "$ROOT_DIR/server/lifecycle/update_controller.py" ]]; then
+        printf '{}\n' | update_controller_cli write-journal \
+            --root "$ROOT_DIR" \
+            --operation-id "$TRANSACTION_ID" \
+            --generation "$LIFECYCLE_GENERATION" \
+            --expected-lifecycle-phase "$phase"
+        return
+    fi
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+        python3 - "$STATUS_FILE" "$ROOT_DIR" "$TRANSACTION_ID" "$LIFECYCLE_GENERATION" "$phase" <<'PY'
 import json
 import os
 import sys
 import time
 from pathlib import Path
+from lifecycle import state
 
 path = Path(sys.argv[1])
-transaction_id = sys.argv[2]
-generation = int(sys.argv[3])
-phase = sys.argv[4]
+root = Path(sys.argv[2])
+transaction_id = sys.argv[3]
+generation = int(sys.argv[4])
+phase = sys.argv[5]
+authority = state.validate_operation_with_credential(
+    root,
+    operation_id=transaction_id,
+    generation=generation,
+    expected_phase=phase,
+)
+if authority.active_operation is None \
+        or authority.active_operation.operation_type is not state.OperationType.UPDATE:
+    raise SystemExit(1)
 lock_path = path.with_name("update-state.lock")
 with lock_path.open("a+b") as lock_file:
     if os.name == "posix":
@@ -237,6 +265,7 @@ initialize_lifecycle_authority() {
             --operation-id "$LIFECYCLE_OPERATION_ID" \
             --generation "$LIFECYCLE_GENERATION" \
             --expected-phase "$LIFECYCLE_PHASE" >/dev/null || return 1
+        [[ "$LIFECYCLE_PHASE" != "recovery_required" ]] || return 1
         LIFECYCLE_ENABLED=true
         return 0
     fi
@@ -248,6 +277,7 @@ initialize_lifecycle_authority() {
             --generation "$LIFECYCLE_GENERATION")" || return 1
         authoritative_phase="$(printf '%s' "$claim_output" | lifecycle_phase_from_json)" || return 1
         [[ -n "$authoritative_phase" ]] || return 1
+        [[ "$authoritative_phase" != "recovery_required" ]] || return 1
         LIFECYCLE_PHASE="$authoritative_phase"
         LIFECYCLE_ENABLED=true
         if ! record_lifecycle_phase_in_update_journal "$LIFECYCLE_PHASE"; then
@@ -279,10 +309,37 @@ initialize_lifecycle_authority() {
 
 release_lifecycle_authority() {
     [[ "$LIFECYCLE_ENABLED" == true ]] || return 0
-    lifecycle_cli complete \
-        --operation-id "$LIFECYCLE_OPERATION_ID" \
-        --generation "$LIFECYCLE_GENERATION" \
-        --expected-phase "$LIFECYCLE_PHASE" >/dev/null || return 1
+    if grep -q -- "--expected-operation-type" "$ROOT_DIR/server/lifecycle/cli.py" 2>/dev/null; then
+        lifecycle_cli complete \
+            --operation-id "$LIFECYCLE_OPERATION_ID" \
+            --generation "$LIFECYCLE_GENERATION" \
+            --expected-phase "$LIFECYCLE_PHASE" \
+            --expected-operation-type update >/dev/null || return 1
+    else
+        # Positively confirmed older lifecycle releases lack the typed-complete
+        # adapter. Prove the exact current operation type through their canonical
+        # Python state API before the exact generation/phase completion CAS.
+        PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+            python3 - "$ROOT_DIR" "$LIFECYCLE_OPERATION_ID" "$LIFECYCLE_GENERATION" "$LIFECYCLE_PHASE" <<'PY' || return 1
+import sys
+from pathlib import Path
+from lifecycle import state
+
+current = state.validate_operation_with_credential(
+    Path(sys.argv[1]),
+    operation_id=sys.argv[2],
+    generation=int(sys.argv[3]),
+    expected_phase=sys.argv[4],
+)
+if current.active_operation is None \
+        or current.active_operation.operation_type is not state.OperationType.UPDATE:
+    raise SystemExit(1)
+PY
+        lifecycle_cli complete \
+            --operation-id "$LIFECYCLE_OPERATION_ID" \
+            --generation "$LIFECYCLE_GENERATION" \
+            --expected-phase "$LIFECYCLE_PHASE" >/dev/null || return 1
+    fi
     LIFECYCLE_ENABLED=false
     LIFECYCLE_PRESERVE=false
 }
@@ -302,6 +359,116 @@ mark_lifecycle_recovery_required() {
     if ! record_lifecycle_phase_in_update_journal "$LIFECYCLE_PHASE"; then
         log "Shared lifecycle recovery ownership is authoritative, but the update journal phase could not be reconciled."
     fi
+}
+
+validate_lifecycle_authority() {
+    [[ "$LIFECYCLE_ENABLED" == true ]] || return 0
+    if [[ "$LIFECYCLE_CONTROLLER_OWNED" == true ]]; then
+        if [[ -f "$ROOT_DIR/server/lifecycle/update_controller.py" ]]; then
+            update_controller_cli validate-controller \
+                --root "$ROOT_DIR" \
+                --operation-id "$LIFECYCLE_OPERATION_ID" \
+                --generation "$LIFECYCLE_GENERATION" \
+                --expected-phase "$LIFECYCLE_PHASE" \
+                --supervisor-pid "$PPID" >/dev/null
+            return
+        fi
+        lifecycle_cli validate-owner \
+            --operation-id "$LIFECYCLE_OPERATION_ID" \
+            --generation "$LIFECYCLE_GENERATION" \
+            --expected-phase "$LIFECYCLE_PHASE" >/dev/null || return 1
+        PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+            python3 - "$ROOT_DIR" "$LIFECYCLE_OPERATION_ID" "$LIFECYCLE_GENERATION" "$PPID" <<'PY'
+import fcntl
+import os
+import sys
+from pathlib import Path
+from lifecycle import state
+
+root = Path(sys.argv[1])
+operation_id = sys.argv[2]
+generation = int(sys.argv[3])
+supervisor_pid = int(sys.argv[4])
+current = state.inspect_state(root)
+if current.active_operation is None \
+        or current.active_operation.operation_id != operation_id \
+        or current.generation != generation \
+        or current.active_operation.operation_type is not state.OperationType.UPDATE:
+    raise SystemExit(1)
+lease = state.read_controller_lease(root)
+if lease is None \
+        or lease.operation_id != operation_id \
+        or lease.generation != generation \
+        or lease.pid != supervisor_pid \
+        or not state.controller_lease_is_current(lease):
+    raise SystemExit(1)
+descriptor = os.open(state.lifecycle_paths(root).controller_lock_path, os.O_RDWR | os.O_CLOEXEC)
+try:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(0)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        raise SystemExit(1)
+finally:
+    os.close(descriptor)
+PY
+        return
+    fi
+    lifecycle_cli validate-owner \
+        --operation-id "$LIFECYCLE_OPERATION_ID" \
+        --generation "$LIFECYCLE_GENERATION" \
+        --expected-phase "$LIFECYCLE_PHASE" >/dev/null
+}
+
+advance_lifecycle_phase() {
+    local next_phase="$1"
+    [[ "$LIFECYCLE_ENABLED" == true ]] || return 0
+    [[ "$LIFECYCLE_PHASE" != "recovery_required" ]] || return 1
+    if [[ "$LIFECYCLE_PHASE" == "$next_phase" ]]; then
+        validate_lifecycle_authority
+        return
+    fi
+    lifecycle_cli transition \
+        --operation-id "$LIFECYCLE_OPERATION_ID" \
+        --generation "$LIFECYCLE_GENERATION" \
+        --expected-phase "$LIFECYCLE_PHASE" \
+        --next-phase "$next_phase" >/dev/null || return 1
+    LIFECYCLE_PHASE="$next_phase"
+    record_lifecycle_phase_in_update_journal "$LIFECYCLE_PHASE"
+}
+
+request_process_local_cutover() {
+    local result python_bin="$ROOT_DIR/venv/bin/python"
+    [[ "$LIFECYCLE_CONTROLLER_OWNED" == true ]] || return 0
+    [[ "$LIFECYCLE_ENABLED" == true && "$LIFECYCLE_PHASE" == "reserved" ]] || return 1
+    [[ -x "$python_bin" ]] || python_bin="$(command -v python3)"
+    for _ in {1..15}; do
+        cancellation_requested && return 20
+        if PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+            "$python_bin" -m lifecycle.update_controller request-cutover \
+                --root "$ROOT_DIR" \
+                --operation-id "$LIFECYCLE_OPERATION_ID" \
+                --generation "$LIFECYCLE_GENERATION" 198>&-; then
+            result=0
+        else
+            result=$?
+        fi
+        case "$result" in
+            0)
+                LIFECYCLE_PHASE="exclusive"
+                validate_lifecycle_authority
+                return
+                ;;
+            10)
+                sleep 2
+                cancellation_requested && return 20
+                ;;
+            *) return 1 ;;
+        esac
+    done
+    return 1
 }
 
 run_bounded() {
@@ -383,9 +550,9 @@ PY
 }
 
 record_diagnostics() {
-    local phase="$1" error="$2"
+    local phase="$1" error="$2" diagnostic_id
     [[ -n "$RUN_DIR" ]] || return 0
-    python3 - "$RUN_DIR/update-diagnostics.json" "$STATUS_FILE" "$ROOT_DIR" "$phase" "$error" "$WEB_PORT" <<'PY'
+    diagnostic_id="$(python3 - "$RUN_DIR/update-diagnostics.json" "$STATUS_FILE" "$ROOT_DIR" "$phase" "$error" "$WEB_PORT" <<'PY'
 import json
 import os
 import sys
@@ -436,23 +603,81 @@ destination.parent.mkdir(parents=True, exist_ok=True)
 temporary = destination.with_name(f"{destination.name}.{os.getpid()}.tmp")
 temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 os.replace(temporary, destination)
-lock_path = state_path.with_name("update-state.lock")
+print(diagnostic_id)
+PY
+    )" || return 1
+    if [[ "$LIFECYCLE_ENABLED" == true && -f "$ROOT_DIR/server/lifecycle/update_controller.py" ]]; then
+        python3 - "$diagnostic_id" <<'PY' \
+            | update_controller_cli write-journal \
+                --root "$ROOT_DIR" \
+                --operation-id "$TRANSACTION_ID" \
+                --generation "$LIFECYCLE_GENERATION" \
+                --expected-lifecycle-phase "$LIFECYCLE_PHASE"
+import json
+import sys
+
+print(json.dumps({"diagnostic_id": sys.argv[1]}, separators=(",", ":")))
+PY
+        return
+    fi
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+        python3 - "$STATUS_FILE" "$diagnostic_id" "$TRANSACTION_ID" "$LIFECYCLE_ENABLED" "$LIFECYCLE_GENERATION" "$LIFECYCLE_PHASE" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+diagnostic_id = sys.argv[2]
+transaction_id = sys.argv[3]
+lifecycle_enabled = sys.argv[4]
+lifecycle_generation = sys.argv[5]
+lifecycle_phase = sys.argv[6]
+lock_path = path.with_name("update-state.lock")
 with lock_path.open("a+b") as lock_file:
     if os.name == "posix":
         import fcntl
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
     try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("transaction_id") != transaction_id:
+            raise SystemExit(1)
+        if lifecycle_enabled == "true":
+            from lifecycle import state
+            authority = state.validate_operation_with_credential(
+                path.parent.parent,
+                operation_id=transaction_id,
+                generation=int(lifecycle_generation),
+                expected_phase=lifecycle_phase,
+            )
+            operation = authority.active_operation
+            if operation is None or operation.operation_type is not state.OperationType.UPDATE:
+                raise SystemExit(1)
+            if payload.get("lifecycle_generation") != int(lifecycle_generation):
+                raise SystemExit(1)
+        payload["diagnostic_id"] = diagnostic_id
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.diagnostic.tmp")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
         try:
-            latest_state = json.loads(state_path.read_text(encoding="utf-8"))
-        except (OSError, TypeError, ValueError):
-            latest_state = state
-        latest_state["diagnostic_id"] = diagnostic_id
-        state_temporary = state_path.with_name(f"{state_path.name}.{os.getpid()}.diagnostic.tmp")
-        with state_temporary.open("w", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(latest_state, indent=2, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(state_temporary, state_path)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
     finally:
         if os.name == "posix":
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -529,7 +754,59 @@ PY
 
 write_state() {
     local phase="$1" message="$2" error="${3:-}" failed_target="${4:-}" current_commit="${5:-$OLD_COMMIT}"
-    python3 - "$STATUS_FILE" "$phase" "$message" "$error" "$failed_target" "$current_commit" "$TARGET_COMMIT" "$AUTOMATIC" "$TRANSACTION_ID" "$STAGING_DIR" "$WEB_ARTIFACTS_SWAPPED" "$WEB_DEPENDENCIES_SWAPPED" "$PYTHON_DEPENDENCIES_CHANGED" "$WEB_DEPENDENCIES_CHANGED" "$WEB_BUILD_REQUIRED" "$$" "$CONTROLLER_START_TICKS" "$LIFECYCLE_ENABLED" "$LIFECYCLE_GENERATION" "$LIFECYCLE_PHASE" <<'PY'
+    if [[ "$LIFECYCLE_ENABLED" == true && -f "$ROOT_DIR/server/lifecycle/update_controller.py" ]]; then
+        python3 - "$phase" "$message" "$error" "$failed_target" "$current_commit" "$TARGET_COMMIT" "$AUTOMATIC" "$STAGING_DIR" "$WEB_ARTIFACTS_SWAPPED" "$WEB_DEPENDENCIES_SWAPPED" "$PYTHON_DEPENDENCIES_CHANGED" "$WEB_DEPENDENCIES_CHANGED" "$WEB_BUILD_REQUIRED" "$$" "$CONTROLLER_START_TICKS" <<'PY' \
+            | update_controller_cli write-journal \
+                --root "$ROOT_DIR" \
+                --operation-id "$TRANSACTION_ID" \
+                --generation "$LIFECYCLE_GENERATION" \
+                --expected-lifecycle-phase "$LIFECYCLE_PHASE"
+import json
+import sys
+
+(
+    phase,
+    message,
+    error,
+    failed_target,
+    current,
+    target,
+    automatic,
+    staging_dir,
+    web_artifacts_swapped,
+    web_dependencies_swapped,
+    python_dependencies_changed,
+    web_dependencies_changed,
+    web_build_required,
+    controller_pid,
+    controller_start_ticks,
+) = sys.argv[1:]
+print(json.dumps({
+    "phase": phase,
+    "message": message,
+    "error": error,
+    "failed_target": failed_target,
+    "current_commit": current,
+    "target_commit": target,
+    "automatic": automatic == "true",
+    "update_available": phase in {"update_available", "queued"} and not failed_target,
+    "staging_dir": staging_dir,
+    "web_artifacts_swapped": web_artifacts_swapped == "true",
+    "web_dependencies_swapped": web_dependencies_swapped == "true",
+    "python_dependencies_changed": python_dependencies_changed == "true",
+    "web_dependencies_changed": web_dependencies_changed == "true",
+    "web_build_required": web_build_required == "true",
+    "controller_pid": int(controller_pid),
+    "controller_start_ticks": controller_start_ticks,
+}, separators=(",", ":")))
+PY
+        if [[ -n "$error" && ( "$phase" == "failed" || "$phase" == "rolled_back" || "$phase" == "rollback_failed" ) ]]; then
+            record_diagnostics "$phase" "$error" || true
+        fi
+        return
+    fi
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+        python3 - "$STATUS_FILE" "$phase" "$message" "$error" "$failed_target" "$current_commit" "$TARGET_COMMIT" "$AUTOMATIC" "$TRANSACTION_ID" "$STAGING_DIR" "$WEB_ARTIFACTS_SWAPPED" "$WEB_DEPENDENCIES_SWAPPED" "$PYTHON_DEPENDENCIES_CHANGED" "$WEB_DEPENDENCIES_CHANGED" "$WEB_BUILD_REQUIRED" "$$" "$CONTROLLER_START_TICKS" "$LIFECYCLE_ENABLED" "$LIFECYCLE_GENERATION" "$LIFECYCLE_PHASE" <<'PY'
 import json
 import os
 import sys
@@ -568,10 +845,14 @@ with lock_path.open("a+b") as lock_file:
         try:
             payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
         except (OSError, ValueError, TypeError):
-            payload = {}
+            raise SystemExit(1)
+        if not isinstance(payload, dict):
+            raise SystemExit(1)
         now = time.time()
         previous_transaction = str(payload.get("transaction_id") or "")
         if transaction_id and transaction_id != previous_transaction:
+            if payload.get("runtime_committed") is True:
+                raise SystemExit(1)
             payload.update({
                 "started_at": now,
                 "finished_at": None,
@@ -605,8 +886,20 @@ with lock_path.open("a+b") as lock_file:
                 "controller_start_ticks": controller_start_ticks,
             })
         if lifecycle_enabled == "true":
+            from lifecycle import state
+            authority = state.validate_operation_with_credential(
+                path.parent.parent,
+                operation_id=transaction_id,
+                generation=int(lifecycle_generation),
+                expected_phase=lifecycle_phase,
+            )
+            if authority.active_operation is None \
+                    or authority.active_operation.operation_type is not state.OperationType.UPDATE:
+                raise SystemExit(1)
             payload["lifecycle_generation"] = int(lifecycle_generation)
             payload["lifecycle_phase"] = lifecycle_phase
+        if payload.get("runtime_committed") is True:
+            payload["runtime_committed"] = True
         if phase in {"preflight", "waiting_for_idle", "stopping", "installing", "starting", "rolling_back", "recovering"}:
             payload["started_at"] = payload.get("started_at") or now
         if phase in {"succeeded", "failed", "rolled_back", "rollback_failed"}:
@@ -737,6 +1030,12 @@ cleanup() {
     if [[ "$PRESERVE_RECOVERY_ARTIFACTS" == false && -n "$STAGING_DIR" && -d "$STAGING_DIR" ]]; then
         rm -rf -- "$STAGING_DIR"
     fi
+    if [[ "$LIFECYCLE_CONTROLLER_OWNED" == true && "$LIFECYCLE_ENABLED" == true ]]; then
+        update_controller_cli remove-permit \
+                --root "$ROOT_DIR" \
+                --operation-id "$LIFECYCLE_OPERATION_ID" \
+                --generation "$LIFECYCLE_GENERATION" 198>&- >/dev/null 2>&1 || true
+    fi
     release_lock
     if [[ "$LIFECYCLE_ENABLED" == true && "$LIFECYCLE_PRESERVE" == false ]]; then
         if [[ "$RUNTIME_HEALTHY" == true && "$CUTOVER_STARTED" == false ]]; then
@@ -852,7 +1151,7 @@ start_maintenance() {
         --lease-file "$LEASE_FILE" \
         --transaction-id "$TRANSACTION_ID" \
         --controller-silence-seconds 30 \
-        >> "$UPDATE_LOG" 2>&1 < /dev/null &
+        >> "$UPDATE_LOG" 2>&1 < /dev/null 198>&- &
     MAINTENANCE_PID=$!
     cd "$previous_directory" || return 1
     printf '%s\n' "$MAINTENANCE_PID" > "$MAINTENANCE_PID_FILE"
@@ -905,32 +1204,6 @@ print(str(payload.get("transaction_id") or "recovery"))
 PY
     )"
     TRANSACTION_ID="$recovered_transaction"
-    python3 - "$STATUS_FILE" <<'PY'
-import json
-import os
-import sys
-import time
-from pathlib import Path
-
-path = Path(sys.argv[1])
-try:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-except (OSError, TypeError, ValueError):
-    payload = {}
-payload.update(
-    {
-        "phase": "rollback_failed",
-        "message": "The recovered release did not pass startup health checks. Run ./start.sh after reviewing the lifecycle logs.",
-        "error": "recovery_start_failed",
-        "finished_at": time.time(),
-        "updated_at": time.time(),
-    }
-)
-path.parent.mkdir(parents=True, exist_ok=True)
-temporary = path.with_name(f"{path.name}.{os.getpid()}.recovery.tmp")
-temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-os.replace(temporary, path)
-PY
     start_maintenance || return 1
     PRESERVE_MAINTENANCE=true
 }
@@ -1221,6 +1494,7 @@ PY
 }
 
 rollback_release() {
+    validate_lifecycle_authority || return 1
     log "Rolling back to known-working commit ${OLD_COMMIT:0:12}."
     write_state "rolling_back" "The update failed. Restoring the previous StreamHome release." "update_failed" "$TARGET_COMMIT"
     if ! stop_installed_runtime_with_target_lifecycle; then
@@ -1229,8 +1503,10 @@ rollback_release() {
     fi
     start_maintenance || true
     preserve_unexpected_worktree_changes || return 1
+    validate_lifecycle_authority || return 1
     git -C "$ROOT_DIR" reset --hard "$OLD_COMMIT" || return 1
     if [[ -f "$RUN_DIR/pre-update-database.db" ]]; then
+        validate_lifecycle_authority || return 1
         restore_database_checkpoint || return 1
     fi
     restore_previous_web || return 1
@@ -1343,6 +1619,7 @@ PY
 
 commit_updated_runtime() {
     local expected_commit="${1:-$TARGET_COMMIT}" code
+    validate_lifecycle_authority || return 1
     if [[ -z "$COMMIT_TOKEN" && -n "$COMMIT_FILE" ]]; then
         COMMIT_TOKEN="$(cat "$COMMIT_FILE" 2>/dev/null || true)"
     fi
@@ -1399,7 +1676,9 @@ while True:
         ):
             raise OSError("unexpected guarded runtime identity")
         unavailable = 0
-        if live.get("errorCode"):
+        if live.get("recoverySucceeded") is True and live.get("workersStarted") is True:
+            raise SystemExit(0)
+        if live.get("recoveryCompleted") and not live.get("recoverySucceeded"):
             raise SystemExit(2)
     except Exception:
         unavailable += 1
@@ -1408,26 +1687,6 @@ while True:
         time.sleep(1)
         continue
 
-    try:
-        with opener.open("http://127.0.0.1:8000/api/health", timeout=2) as response:
-            ready = json.loads(response.read().decode("utf-8"))
-        if (
-            response.status < 400
-            and ready.get("status") == "ready"
-            and ready.get("readyKind") == "general"
-            and str(ready.get("buildId") or "") == expected
-        ):
-            raise SystemExit(0)
-    except urllib.error.HTTPError as exc:
-        try:
-            body = json.loads(exc.read().decode("utf-8"))
-            code = str((body.get("detail") or {}).get("code") or "")
-        except Exception:
-            code = ""
-        if code and code not in {"startup_not_ready", "server_busy"}:
-            raise SystemExit(2)
-    except (OSError, ValueError, TypeError):
-        pass
     time.sleep(1)
 PY
 }
@@ -1454,16 +1713,15 @@ installed_release_has_guarded_bootstrap() {
 
 prepare_lifecycle_for_guarded_start() {
     [[ "$LIFECYCLE_ENABLED" == true ]] || return 0
-    if [[ "$LIFECYCLE_PHASE" != "recovery_required" ]]; then
-        return 0
+    [[ "$LIFECYCLE_PHASE" != "recovery_required" ]] || return 1
+    if [[ "$LIFECYCLE_PHASE" == "reserved" ]]; then
+        advance_lifecycle_phase exclusive || return 1
     fi
-    lifecycle_cli transition \
-        --operation-id "$LIFECYCLE_OPERATION_ID" \
-        --generation "$LIFECYCLE_GENERATION" \
-        --expected-phase recovery_required \
-        --next-phase exclusive >/dev/null || return 1
-    LIFECYCLE_PHASE="exclusive"
-    record_lifecycle_phase_in_update_journal "$LIFECYCLE_PHASE" || return 1
+    if [[ "$LIFECYCLE_PHASE" == "exclusive" ]]; then
+        advance_lifecycle_phase verifying || return 1
+    fi
+    [[ "$LIFECYCLE_PHASE" == "verifying" ]] || return 1
+    validate_lifecycle_authority
 }
 
 ensure_guarded_commit_token() {
@@ -1477,7 +1735,7 @@ ensure_guarded_commit_token() {
 
 start_installed_update_runtime() {
     if ! installed_release_has_guarded_bootstrap; then
-        "$ROOT_DIR/start.sh" --update-recovery-complete
+        "$ROOT_DIR/start.sh" --update-recovery-complete 198>&-
         return
     fi
     prepare_lifecycle_for_guarded_start || return 1
@@ -1489,7 +1747,7 @@ start_installed_update_runtime() {
         STREAMHOME_LIFECYCLE_OPERATION_ID="$LIFECYCLE_OPERATION_ID" \
         STREAMHOME_LIFECYCLE_GENERATION="$LIFECYCLE_GENERATION" \
         STREAMHOME_LIFECYCLE_FIRST_ADOPTION="$([[ "$LIFECYCLE_ENABLED" == true ]] && printf false || printf true)" \
-        "$ROOT_DIR/start.sh" --update-recovery-complete
+        "$ROOT_DIR/start.sh" --update-recovery-complete 198>&-
 }
 
 promote_recovered_guarded_runtime() {
@@ -1583,7 +1841,7 @@ PY
         STAGING_DIR=""
     fi
     case "$phase" in
-        preflight|waiting_for_idle|stopping|installing|starting|rolling_back|recovering)
+        preflight|waiting_for_idle|stopping|installing|starting|rolling_back|recovering|succeeded|rolled_back)
             ;;
         *)
             return 10
@@ -1662,6 +1920,38 @@ PY
         return 12
     fi
     if [[ "$current_head" == "$OLD_COMMIT" ]] && runtime_endpoints_ready "$OLD_COMMIT"; then
+        if [[ "$LIFECYCLE_ENABLED" == true && "$LIFECYCLE_PHASE" != "reserved" ]]; then
+            log "The previous runtime may retain a process-local cutover fence; replacing it before lifecycle completion."
+            RUNTIME_HEALTHY=false
+            CUTOVER_STARTED=true
+            if ! stop_installed_runtime_with_target_lifecycle; then
+                record_rollback_failure
+                return 1
+            fi
+            start_maintenance || true
+            prepare_lifecycle_for_guarded_start || {
+                record_rollback_failure
+                return 1
+            }
+            write_state "rolled_back" "The previous release remained installed and will be restarted without the abandoned cutover fence." "update_interrupted_rolled_back" "$TARGET_COMMIT" "$OLD_COMMIT"
+            stop_maintenance
+            if ! start_installed_update_runtime; then
+                record_rollback_failure
+                return 1
+            fi
+            RUNTIME_HEALTHY=true
+            CUTOVER_STARTED=false
+            if ! promote_recovered_guarded_runtime "$OLD_COMMIT"; then
+                if [[ "$NO_ROLLBACK_BOUNDARY" == false ]]; then
+                    record_rollback_failure
+                fi
+                return 1
+            fi
+            rm -f -- "$RUN_DIR/pre-update-database.db"
+            PRESERVE_RECOVERY_ARTIFACTS=false
+            RECOVERY_IN_PROGRESS=false
+            return 12
+        fi
         stop_maintenance
         rm -f -- "$RUN_DIR/pre-update-database.db"
         RUNTIME_HEALTHY=true
@@ -1821,7 +2111,7 @@ PY
 }
 
 execute_update() {
-    local commit_result
+    local commit_result cutover_result
     RUN_DIR="$ROOT_DIR/.run"
     STATUS_FILE="$RUN_DIR/update-state.json"
     UPDATE_LOG="$ROOT_DIR/update.log"
@@ -1880,7 +2170,7 @@ execute_update() {
         write_state "failed" "The checkout changed during preflight. The running installation was not modified." "dirty_worktree" "$TARGET_COMMIT"
         return 1
     fi
-    write_state "waiting_for_idle" "The official update.sh controller is beginning protected cutover."
+    write_state "waiting_for_idle" "The official update.sh controller is waiting for protected cutover admission."
     log "The official update.sh controller owns cutover; active sessions will be disconnected."
     if public_origin_matches "$OLD_COMMIT"; then
         PUBLIC_ORIGIN_WAS_READY=true
@@ -1889,9 +2179,20 @@ execute_update() {
         log "The configured public origin could not be verified from this host; local health gates remain authoritative."
     fi
 
+    request_process_local_cutover
+    cutover_result=$?
+    if [[ "$cutover_result" -ne 0 ]]; then
+        if [[ "$cutover_result" -eq 20 ]] || cancellation_requested; then
+            record_cancelled_update
+            return 0
+        fi
+        write_state "failed" "Protected cutover admission could not be established; the running installation was not changed." "cutover_admission_failed" "$TARGET_COMMIT"
+        return 1
+    fi
     write_state "stopping" "Prepared release is ready. Stopping StreamHome for a short protected activation."
     CUTOVER_STARTED=true
     RUNTIME_HEALTHY=false
+    validate_lifecycle_authority || return 1
     if git -C "$ROOT_DIR" status --porcelain --untracked-files=normal | grep -q .; then
         recover_unchanged_release \
             "The checkout changed before shutdown, so the update was not applied." \
@@ -1910,6 +2211,7 @@ execute_update() {
             "maintenance_start_failed" || true
         return 1
     fi
+    validate_lifecycle_authority || return 1
     if ! create_database_checkpoint; then
         recover_unchanged_release \
             "The database recovery checkpoint failed, so the update was not applied." \
@@ -1918,6 +2220,7 @@ execute_update() {
     fi
 
     write_state "installing" "Activating the exact preflighted commit and prepared runtime assets."
+    validate_lifecycle_authority || return 1
     if ! git -C "$ROOT_DIR" status --porcelain --untracked-files=normal | grep -q .; then
         :
     else
@@ -1956,6 +2259,10 @@ execute_update() {
         return 1
     fi
     write_state "starting" "Starting and health-checking the updated API and web client." "" "" "$TARGET_COMMIT"
+    prepare_lifecycle_for_guarded_start || {
+        rollback_release || record_rollback_failure
+        return 1
+    }
     stop_maintenance
     COMMIT_TOKEN="$(new_secret_token)"
     [[ -n "$COMMIT_TOKEN" ]] || {

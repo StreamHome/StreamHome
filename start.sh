@@ -244,6 +244,21 @@ restore_recovery_needed() {
         "$BACKEND_PYTHON" -m lifecycle.cli --root "$ROOT_DIR" restore-recovery-needed >/dev/null 2>&1
 }
 
+update_recovery_needed() {
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+        "$BACKEND_PYTHON" -m lifecycle.cli --root "$ROOT_DIR" update-recovery-needed >/dev/null 2>&1
+}
+
+update_recovery_required() {
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+        "$BACKEND_PYTHON" -m lifecycle.cli --root "$ROOT_DIR" update-recovery-required >/dev/null 2>&1
+}
+
+launch_update_recovery() {
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+        "$BACKEND_PYTHON" -m lifecycle.update_controller recover --root "$ROOT_DIR"
+}
+
 launch_restore_recovery() {
     PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
         "$BACKEND_PYTHON" -m lifecycle.restore_controller recover --root "$ROOT_DIR"
@@ -523,9 +538,21 @@ main() {
             printf '\nStreamHome was restored successfully by the update controller.\n'
             return 0
         fi
+        if update_recovery_required; then
+            UPDATE_RECOVERY_CHECKED=true
+            fail "Update recovery requires explicit operator action. Normal startup remains blocked."
+        fi
         set +e
-        "$ROOT_DIR/update.sh" --recover-interrupted "$ROOT_DIR"
-        recovery_result=$?
+        if update_recovery_needed; then
+            launch_update_recovery
+            recovery_result=$?
+        elif lifecycle_startup_allowed; then
+            # Legacy first-adoption recovery has no shared lifecycle operation.
+            "$ROOT_DIR/update.sh" --recover-interrupted "$ROOT_DIR"
+            recovery_result=$?
+        else
+            recovery_result=11
+        fi
         set -e
         case "$recovery_result" in
             0)

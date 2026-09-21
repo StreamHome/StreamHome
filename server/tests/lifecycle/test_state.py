@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import threading
 import unittest
 import uuid
 from unittest.mock import patch
@@ -116,6 +117,30 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertEqual(current, state.LifecycleState(1, 0, None))
         self.assertFalse((self.root / ".run").exists())
 
+    def test_update_restore_exclusion_persists_through_recovery_required(self) -> None:
+        claimed = self._claim()
+        operation = claimed.state.active_operation
+        with self.assertRaises(state.LifecycleConflictError):
+            state.claim_operation_with_credential(
+                self.root,
+                operation_type="restore",
+                owner_kind="restore_controller",
+            )
+        state.transition_operation(
+            self.root,
+            operation_id=operation.operation_id,
+            generation=claimed.state.generation,
+            expected_phase="reserved",
+            next_phase="recovery_required",
+            owner_capability=CAPABILITY_ONE,
+        )
+        with self.assertRaises(state.LifecycleConflictError):
+            state.claim_operation_with_credential(
+                self.root,
+                operation_type="restore",
+                owner_kind="restore_controller",
+            )
+
     def test_inspect_existing_state_does_not_create_a_lock_file(self) -> None:
         path = self._write_raw_state(
             {"schema_version": 1, "generation": 4, "active_operation": None}
@@ -157,6 +182,30 @@ class LifecycleStateTests(unittest.TestCase):
             self.assertEqual(process.exitcode, 0)
         self.assertEqual([result[0] for result in results].count("won"), 1)
         self.assertEqual([result[0] for result in results].count("conflict"), 1)
+
+    def test_idle_authority_guard_serializes_a_concurrent_claim(self) -> None:
+        started = threading.Event()
+        completed = threading.Event()
+
+        def claim() -> None:
+            started.set()
+            state.claim_operation_with_credential(
+                self.root,
+                operation_type=state.OperationType.UPDATE,
+                owner_kind=state.OwnerKind.UPDATER,
+            )
+            completed.set()
+
+        with state.hold_idle_authority(self.root):
+            worker = threading.Thread(target=claim)
+            worker.start()
+            self.assertTrue(started.wait(timeout=1))
+            self.assertFalse(completed.wait(timeout=0.05))
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(completed.is_set())
+        current = state.inspect_state(self.root)
+        self.assertEqual(current.active_operation.operation_type, state.OperationType.UPDATE)
 
     def test_wrong_identity_generation_owner_and_phase_fail_closed(self) -> None:
         claimed = self._claim()
@@ -359,6 +408,26 @@ class LifecycleStateTests(unittest.TestCase):
                 generation=2,
                 expected_phase="reserved",
             )
+
+    def test_typed_completion_cannot_release_a_foreign_operation(self) -> None:
+        claimed = state.claim_operation_with_credential(
+            self.root,
+            operation_type=state.OperationType.RESTORE,
+            owner_kind=state.OwnerKind.RESTORE_CONTROLLER,
+        )
+        operation = claimed.state.active_operation
+        assert operation is not None
+        credential = state.lifecycle_paths(self.root).credential_path(operation.operation_id)
+        with self.assertRaises(state.LifecycleConflictError):
+            state.complete_operation_with_credential(
+                self.root,
+                operation_id=operation.operation_id,
+                generation=claimed.state.generation,
+                expected_phase=state.LifecyclePhase.RESERVED,
+                expected_operation_type=state.OperationType.UPDATE,
+            )
+        current = state.inspect_state(self.root)
+        self.assertEqual(current.active_operation.operation_type, state.OperationType.RESTORE)
         self.assertTrue(credential.exists())
         state.complete_operation_with_credential(
             self.root,

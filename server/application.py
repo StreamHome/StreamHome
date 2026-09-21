@@ -488,6 +488,19 @@ async def _promote_committed_update(
     if not result.succeeded:
         logger.error(f"[Lifespan Startup] Post-update recovery failed: {result.error_code}")
         return
+    if STARTUP_CONTEXT.operation_id is None or STARTUP_CONTEXT.generation is None:
+        STARTUP_READINESS.mark_worker_start_failed("update_lifecycle_identity_missing")
+        return
+    try:
+        completion_fence = get_runtime_coordinator().close_admission(
+            list(EffectClass),
+            operation_id=STARTUP_CONTEXT.operation_id,
+            generation=STARTUP_CONTEXT.generation,
+        )
+    except Exception:
+        STARTUP_READINESS.mark_worker_start_failed("update_completion_fence_failed")
+        logger.error("[Lifespan Startup] Update completion fence could not be established.")
+        return
     try:
         await _start_runtime_workers(runtime)
     except Exception:
@@ -496,9 +509,32 @@ async def _promote_committed_update(
         return
     STARTUP_READINESS.mark_workers_started()
     STARTUP_READINESS.mark_general_ready()
-    if state.MAINTENANCE_REASON == "StreamHome is completing guarded startup verification.":
-        state.MAINTENANCE_MODE = False
-        state.MAINTENANCE_REASON = ""
+    while True:
+        try:
+            current = lifecycle_state.inspect_state(STARTUP_CONTEXT.installation_root)
+        except lifecycle_state.LifecycleError:
+            current = None
+        if (
+            current is not None
+            and current.active_operation is None
+            and current.generation == STARTUP_CONTEXT.generation
+        ):
+            get_runtime_coordinator().release_fence(completion_fence)
+            if state.MAINTENANCE_REASON == "StreamHome is completing guarded startup verification.":
+                state.MAINTENANCE_MODE = False
+                state.MAINTENANCE_REASON = ""
+            break
+        operation = current.active_operation if current is not None else None
+        if (
+            operation is None
+            or operation.operation_id != STARTUP_CONTEXT.operation_id
+            or current.generation != STARTUP_CONTEXT.generation
+            or operation.phase is lifecycle_state.LifecyclePhase.RECOVERY_REQUIRED
+        ):
+            STARTUP_READINESS.mark_worker_start_failed("update_lifecycle_unresolved")
+            await _stop_runtime_workers(runtime)
+            return
+        await asyncio.sleep(0.1)
     runtime.tasks.append(
         asyncio.create_task(_optional_playback_baselines(), name="playback-baselines")
     )
@@ -670,7 +706,10 @@ class StartupModeGateMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         readiness = STARTUP_READINESS.projection()
         public_ready = readiness["generalReady"]
-        if public_ready and STARTUP_CONTEXT.mode is StartupMode.RESTORE_VERIFY:
+        if public_ready and STARTUP_CONTEXT.mode in {
+            StartupMode.UPDATE_VERIFY,
+            StartupMode.RESTORE_VERIFY,
+        }:
             try:
                 current = lifecycle_state.inspect_state(STARTUP_CONTEXT.installation_root)
                 public_ready = (
@@ -783,6 +822,7 @@ class RuntimeWriteCoordinationMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         if path.startswith("/api/backup") or path in {
             "/api/update/commit",
+            "/api/update/cutover",
             "/api/update/install",
             "/api/update/pending",
             "/api/update/presence",

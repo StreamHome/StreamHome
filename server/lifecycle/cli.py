@@ -34,6 +34,8 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("startup-decision")
     commands.add_parser("startup-allowed")
     commands.add_parser("restore-recovery-needed")
+    commands.add_parser("update-recovery-needed")
+    commands.add_parser("update-recovery-required")
 
     claim = commands.add_parser("claim")
     claim.add_argument("--operation-type", required=True, choices=[item.value for item in state.OperationType])
@@ -45,6 +47,10 @@ def _parser() -> argparse.ArgumentParser:
 
     complete = commands.add_parser("complete")
     _add_expected_owner_arguments(complete)
+    complete.add_argument(
+        "--expected-operation-type",
+        choices=[item.value for item in state.OperationType],
+    )
 
     transition = commands.add_parser("transition")
     _add_expected_owner_arguments(transition)
@@ -106,6 +112,24 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
         if operation.phase is state.LifecyclePhase.RECOVERY_REQUIRED:
             raise state.LifecycleConflictError("restore recovery requires operator action")
         return _success("restore-recovery-needed", current)
+    if arguments.command == "update-recovery-needed":
+        current = state.inspect_state(root)
+        operation = current.active_operation
+        if operation is None or operation.operation_type is not state.OperationType.UPDATE:
+            raise state.LifecycleConflictError("update recovery is not active")
+        if operation.phase is state.LifecyclePhase.RECOVERY_REQUIRED:
+            raise state.LifecycleConflictError("update recovery requires operator action")
+        return _success("update-recovery-needed", current)
+    if arguments.command == "update-recovery-required":
+        current = state.inspect_state(root)
+        operation = current.active_operation
+        if (
+            operation is None
+            or operation.operation_type is not state.OperationType.UPDATE
+            or operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED
+        ):
+            raise state.LifecycleConflictError("update operator recovery is not required")
+        return _success("update-recovery-required", current)
     if arguments.command == "claim":
         result = state.claim_operation_with_credential(
             root,
@@ -137,6 +161,7 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
             operation_id=arguments.operation_id,
             generation=arguments.generation,
             expected_phase=arguments.expected_phase,
+            expected_operation_type=getattr(arguments, "expected_operation_type", None),
         )
         response = _success("complete", result.state)
         if result.credential_cleanup_error:
