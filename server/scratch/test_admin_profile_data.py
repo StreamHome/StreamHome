@@ -14,6 +14,7 @@ from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 import main as main_module
+import application as application_module
 from config import settings
 from models import (
     Movie,
@@ -42,9 +43,9 @@ async def main() -> None:
     os.close(handle)
     media_temp = tempfile.TemporaryDirectory()
     test_engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
-    original_main_engine = main_module.engine
+    original_application_engine = application_module.engine
     original_media_dir = settings.MEDIA_DIR
-    main_module.engine = test_engine
+    application_module.engine = test_engine
     settings.MEDIA_DIR = media_temp.name
     now = time.time()
     try:
@@ -124,7 +125,8 @@ async def main() -> None:
             assert cache["items"][0]["files"]["metadata"]["storedOnDisk"] is True
             assert cache["items"][0]["associationSources"] == ["activity", "love preference", "recommendation pool", "watchlist"]
 
-        await main_module.delete_profile("child", User(id=1, email="admin@example.com", password_hash="hash"))
+        assert application_module.delete_profile.__globals__["engine"] is test_engine
+        await application_module.delete_profile("child", User(id=1, email="admin@example.com", password_hash="hash"))
         async with AsyncSession(test_engine) as db:
             assert await db.get(Profile, "child") is None
             assert await db.get(Movie, "m_22") is not None, "shared TMDB catalog must survive profile deletion"
@@ -148,7 +150,7 @@ async def main() -> None:
             assert list((await db.exec(select(PlaybackMilestone))).all()) == []
         print("Admin profile data regression checks passed.")
     finally:
-        main_module.engine = original_main_engine
+        application_module.engine = original_application_engine
         settings.MEDIA_DIR = original_media_dir
         await test_engine.dispose()
         media_temp.cleanup()

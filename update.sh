@@ -49,6 +49,7 @@ if [[ -n "$LIFECYCLE_OPERATION_ID" || -n "$LIFECYCLE_GENERATION" ]]; then
 fi
 LIFECYCLE_PHASE="reserved"
 LIFECYCLE_PRESERVE=false
+NO_ROLLBACK_BOUNDARY=false
 UPDATE_COMMAND_TIMEOUT_SECONDS="${STREAMHOME_UPDATE_COMMAND_TIMEOUT_SECONDS:-1800}"
 
 usage() {
@@ -706,7 +707,8 @@ stop_maintenance() {
 cleanup() {
     local exit_code=$?
     trap - EXIT INT TERM HUP
-    if [[ "$CUTOVER_STARTED" == true && "$RUNTIME_HEALTHY" == false && "$RECOVERY_IN_PROGRESS" == false ]]; then
+    if [[ "$CUTOVER_STARTED" == true && "$RUNTIME_HEALTHY" == false \
+        && "$RECOVERY_IN_PROGRESS" == false && "$NO_ROLLBACK_BOUNDARY" == false ]]; then
         RECOVERY_IN_PROGRESS=true
         if [[ "$ACTIVATION_STARTED" == true ]]; then
             log "The update controller exited after activation began; starting emergency rollback."
@@ -1238,7 +1240,7 @@ rollback_release() {
         validate_current_python_environment || return 1
     fi
     stop_maintenance
-    if ! "$ROOT_DIR/start.sh" --update-recovery-complete; then
+    if ! start_installed_update_runtime; then
         start_maintenance || true
         return 1
     fi
@@ -1246,17 +1248,19 @@ rollback_release() {
     CUTOVER_STARTED=false
     ACTIVATION_STARTED=false
     write_state "rolled_back" "The update failed, and the previous healthy release was restored." "update_rolled_back" "$TARGET_COMMIT" "$OLD_COMMIT"
+    promote_recovered_guarded_runtime "$OLD_COMMIT" || return 1
     return 0
 }
 
 recover_unchanged_release() {
     local message="$1" error="$2"
     stop_maintenance
-    if "$ROOT_DIR/start.sh" --update-recovery-complete; then
+    if start_installed_update_runtime; then
         RUNTIME_HEALTHY=true
         CUTOVER_STARTED=false
         ACTIVATION_STARTED=false
         write_state "failed" "$message The existing release remains installed and healthy." "$error" "$TARGET_COMMIT" "$OLD_COMMIT"
+        promote_recovered_guarded_runtime "$OLD_COMMIT" || return 1
         rm -f -- "$RUN_DIR/pre-update-database.db"
         return 0
     fi
@@ -1311,8 +1315,34 @@ except Exception:
 PY
 }
 
+runtime_backend_live() {
+    local expected_commit="${1:-}"
+    [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+    python3 - "${expected_commit:0:12}" <<'PY'
+import json
+import sys
+import urllib.request
+
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open("http://127.0.0.1:8000/api/health/live", timeout=2) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    raise SystemExit(
+        0
+        if (
+            response.status < 400
+            and payload.get("status") == "live"
+            and str(payload.get("buildId") or "") == sys.argv[1]
+        )
+        else 1
+    )
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
 commit_updated_runtime() {
-    local code
+    local expected_commit="${1:-$TARGET_COMMIT}" code
     if [[ -z "$COMMIT_TOKEN" && -n "$COMMIT_FILE" ]]; then
         COMMIT_TOKEN="$(cat "$COMMIT_FILE" 2>/dev/null || true)"
     fi
@@ -1320,13 +1350,168 @@ commit_updated_runtime() {
     code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
         -H "Content-Type: application/json" \
         -H "X-StreamHome-Update-Commit: $COMMIT_TOKEN" \
-        --data "{\"transaction_id\":\"$TRANSACTION_ID\",\"target_commit\":\"$TARGET_COMMIT\"}" \
+        --data "{\"transaction_id\":\"$TRANSACTION_ID\",\"target_commit\":\"$expected_commit\"}" \
         -X POST "http://127.0.0.1:8000/api/update/commit" 2>/dev/null || true)"
     if [[ "$code" == "200" ]]; then
         rm -f -- "$COMMIT_FILE"
+        NO_ROLLBACK_BOUNDARY=true
+        CUTOVER_STARTED=false
+        ACTIVATION_STARTED=false
+        LIFECYCLE_PRESERVE=true
+        PRESERVE_RECOVERY_ARTIFACTS=true
         return 0
     fi
+    if [[ "$code" == "000" || "$code" =~ ^5 ]]; then
+        # Delivery or server failure can occur after the journal replacement.
+        # The controller must preserve the candidate rather than race a
+        # possibly accepted runtime with automatic rollback.
+        NO_ROLLBACK_BOUNDARY=true
+        CUTOVER_STARTED=false
+        ACTIVATION_STARTED=false
+        LIFECYCLE_PRESERVE=true
+        PRESERVE_RECOVERY_ARTIFACTS=true
+        return 2
+    fi
     return 1
+}
+
+wait_for_committed_runtime() {
+    local expected_commit="${1:-$TARGET_COMMIT}"
+    [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+    python3 - "${expected_commit:0:12}" <<'PY'
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+expected = sys.argv[1]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+unavailable = 0
+while True:
+    try:
+        with opener.open("http://127.0.0.1:8000/api/health/live", timeout=2) as response:
+            live = json.loads(response.read().decode("utf-8"))
+        if (
+            response.status >= 400
+            or live.get("status") != "live"
+            or str(live.get("buildId") or "") != expected
+        ):
+            raise OSError("unexpected guarded runtime identity")
+        unavailable = 0
+        if live.get("errorCode"):
+            raise SystemExit(2)
+    except Exception:
+        unavailable += 1
+        if unavailable >= 30:
+            raise SystemExit(2)
+        time.sleep(1)
+        continue
+
+    try:
+        with opener.open("http://127.0.0.1:8000/api/health", timeout=2) as response:
+            ready = json.loads(response.read().decode("utf-8"))
+        if (
+            response.status < 400
+            and ready.get("status") == "ready"
+            and ready.get("readyKind") == "general"
+            and str(ready.get("buildId") or "") == expected
+        ):
+            raise SystemExit(0)
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode("utf-8"))
+            code = str((body.get("detail") or {}).get("code") or "")
+        except Exception:
+            code = ""
+        if code and code not in {"startup_not_ready", "server_busy"}:
+            raise SystemExit(2)
+    except (OSError, ValueError, TypeError):
+        pass
+    time.sleep(1)
+PY
+}
+
+record_post_commit_recovery_failure() {
+    mark_lifecycle_recovery_required || true
+    write_state \
+        "recovering" \
+        "The accepted release failed mandatory recovery and remains fail-closed; automatic code/database rollback is disabled." \
+        "post_commit_recovery_failed" \
+        "$TARGET_COMMIT" \
+        "$TARGET_COMMIT"
+    RUNTIME_HEALTHY=false
+    CUTOVER_STARTED=false
+    ACTIVATION_STARTED=false
+    NO_ROLLBACK_BOUNDARY=true
+    LIFECYCLE_PRESERVE=true
+    PRESERVE_RECOVERY_ARTIFACTS=true
+}
+
+installed_release_has_guarded_bootstrap() {
+    [[ -f "$ROOT_DIR/server/lifecycle/bootstrap.py" ]]
+}
+
+prepare_lifecycle_for_guarded_start() {
+    [[ "$LIFECYCLE_ENABLED" == true ]] || return 0
+    if [[ "$LIFECYCLE_PHASE" != "recovery_required" ]]; then
+        return 0
+    fi
+    lifecycle_cli transition \
+        --operation-id "$LIFECYCLE_OPERATION_ID" \
+        --generation "$LIFECYCLE_GENERATION" \
+        --expected-phase recovery_required \
+        --next-phase exclusive >/dev/null || return 1
+    LIFECYCLE_PHASE="exclusive"
+    record_lifecycle_phase_in_update_journal "$LIFECYCLE_PHASE" || return 1
+}
+
+ensure_guarded_commit_token() {
+    if [[ -z "$COMMIT_TOKEN" ]]; then
+        COMMIT_TOKEN="$(new_secret_token)"
+    fi
+    [[ -n "$COMMIT_TOKEN" ]] || return 1
+    COMMIT_FILE="$RUN_DIR/update-commit.${TRANSACTION_ID}.token"
+    (umask 077; printf '%s' "$COMMIT_TOKEN" > "$COMMIT_FILE")
+}
+
+start_installed_update_runtime() {
+    if ! installed_release_has_guarded_bootstrap; then
+        "$ROOT_DIR/start.sh" --update-recovery-complete
+        return
+    fi
+    prepare_lifecycle_for_guarded_start || return 1
+    ensure_guarded_commit_token || return 1
+    env \
+        STREAMHOME_UPDATE_TRANSACTION="$TRANSACTION_ID" \
+        STREAMHOME_UPDATE_COMMIT_TOKEN="$COMMIT_TOKEN" \
+        STREAMHOME_LIFECYCLE_STARTUP_MODE="update_verify" \
+        STREAMHOME_LIFECYCLE_OPERATION_ID="$LIFECYCLE_OPERATION_ID" \
+        STREAMHOME_LIFECYCLE_GENERATION="$LIFECYCLE_GENERATION" \
+        STREAMHOME_LIFECYCLE_FIRST_ADOPTION="$([[ "$LIFECYCLE_ENABLED" == true ]] && printf false || printf true)" \
+        "$ROOT_DIR/start.sh" --update-recovery-complete
+}
+
+promote_recovered_guarded_runtime() {
+    local expected_commit="$1" commit_result
+    installed_release_has_guarded_bootstrap || return 0
+    commit_updated_runtime "$expected_commit"
+    commit_result=$?
+    if [[ "$commit_result" -eq 2 ]]; then
+        record_post_commit_recovery_failure
+        return 2
+    fi
+    [[ "$commit_result" -eq 0 ]] || return 1
+    write_state "recovering" "The accepted release is completing mandatory recovery without automatic rollback." "" "" "$expected_commit"
+    if ! wait_for_committed_runtime "$expected_commit"; then
+        record_post_commit_recovery_failure
+        return 1
+    fi
+    LIFECYCLE_PRESERVE=false
+    PRESERVE_RECOVERY_ARTIFACTS=false
+    if [[ "$LIFECYCLE_ENABLED" == true ]]; then
+        release_lifecycle_authority || return 1
+    fi
 }
 
 recovery_staging_is_safe() {
@@ -1340,7 +1525,7 @@ recovery_staging_is_safe() {
 }
 
 recover_interrupted_release() {
-    local phase current_head recovered_staging web_swapped runtime_committed
+    local phase current_head recovered_staging web_swapped runtime_committed commit_result
     RUN_DIR="$ROOT_DIR/.run"
     STATUS_FILE="$RUN_DIR/update-state.json"
     UPDATE_LOG="$ROOT_DIR/update.log"
@@ -1411,17 +1596,68 @@ PY
     initialize_lifecycle_authority || return 1
     trap cleanup EXIT
     current_head="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
+    if [[ "$runtime_committed" == true ]]; then
+        NO_ROLLBACK_BOUNDARY=true
+        CUTOVER_STARTED=false
+        ACTIVATION_STARTED=false
+        LIFECYCLE_PRESERVE=true
+        PRESERVE_RECOVERY_ARTIFACTS=true
+        if [[ "$current_head" != "$TARGET_COMMIT" ]]; then
+            record_post_commit_recovery_failure
+            return 1
+        fi
+        if ! runtime_backend_live "$TARGET_COMMIT"; then
+            stop_maintenance
+            if ! start_installed_update_runtime; then
+                record_post_commit_recovery_failure
+                return 1
+            fi
+            if ! runtime_endpoints_ready "$TARGET_COMMIT" "$TRANSACTION_ID"; then
+                record_post_commit_recovery_failure
+                return 1
+            fi
+            commit_updated_runtime
+            commit_result=$?
+            if [[ "$commit_result" -ne 0 ]]; then
+                record_post_commit_recovery_failure
+                return 1
+            fi
+        fi
+        write_state "recovering" "The accepted release is completing mandatory recovery without automatic rollback." "" "" "$TARGET_COMMIT"
+        if ! wait_for_committed_runtime "$TARGET_COMMIT"; then
+            record_post_commit_recovery_failure
+            return 1
+        fi
+        stop_maintenance
+        rm -f -- "$RUN_DIR/pre-update-database.db"
+        RUNTIME_HEALTHY=true
+        LIFECYCLE_PRESERVE=false
+        PRESERVE_RECOVERY_ARTIFACTS=false
+        write_state "succeeded" "The accepted release completed mandatory recovery; interrupted bookkeeping was reconciled." "" "" "$TARGET_COMMIT"
+        return 12
+    fi
     if [[ "$current_head" == "$TARGET_COMMIT" ]] \
-        && { { [[ "$runtime_committed" == true ]] && runtime_endpoints_ready "$TARGET_COMMIT"; } \
-            || { [[ "$runtime_committed" != true ]] && runtime_endpoints_ready "$TARGET_COMMIT" "$TRANSACTION_ID"; }; }; then
-        if [[ "$runtime_committed" != true ]]; then
-            COMMIT_TOKEN="$(cat "$COMMIT_FILE" 2>/dev/null || true)"
-            commit_updated_runtime || return 1
+        && runtime_endpoints_ready "$TARGET_COMMIT" "$TRANSACTION_ID"; then
+        COMMIT_TOKEN="$(cat "$COMMIT_FILE" 2>/dev/null || true)"
+        commit_updated_runtime
+        commit_result=$?
+        if [[ "$commit_result" -ne 0 ]]; then
+            if [[ "$commit_result" -eq 2 ]]; then
+                record_post_commit_recovery_failure
+            fi
+            return 1
+        fi
+        write_state "recovering" "The accepted release is completing mandatory recovery without automatic rollback." "" "" "$TARGET_COMMIT"
+        if ! wait_for_committed_runtime "$TARGET_COMMIT"; then
+            record_post_commit_recovery_failure
+            return 1
         fi
         stop_maintenance
         rm -f -- "$RUN_DIR/pre-update-database.db"
         RUNTIME_HEALTHY=true
         CUTOVER_STARTED=false
+        LIFECYCLE_PRESERVE=false
+        PRESERVE_RECOVERY_ARTIFACTS=false
         write_state "succeeded" "The updated release was already healthy; interrupted bookkeeping was reconciled." "" "" "$TARGET_COMMIT"
         return 12
     fi
@@ -1489,6 +1725,24 @@ PY
         }
     fi
     write_state "recovering" "The previous release is restored and will now pass normal startup health checks." "update_interrupted" "$TARGET_COMMIT" "$OLD_COMMIT"
+    if installed_release_has_guarded_bootstrap; then
+        stop_maintenance
+        if ! start_installed_update_runtime; then
+            record_rollback_failure
+            return 1
+        fi
+        RUNTIME_HEALTHY=true
+        CUTOVER_STARTED=false
+        write_state "rolled_back" "The interrupted update was rolled back and the previous release passed guarded startup verification." "update_interrupted_rolled_back" "$TARGET_COMMIT" "$OLD_COMMIT"
+        promote_recovered_guarded_runtime "$OLD_COMMIT" || {
+            record_rollback_failure
+            return 1
+        }
+        rm -f -- "$RUN_DIR/pre-update-database.db"
+        PRESERVE_RECOVERY_ARTIFACTS=false
+        RECOVERY_IN_PROGRESS=false
+        return 12
+    fi
     LIFECYCLE_PRESERVE=true
     return 0
 }
@@ -1567,6 +1821,7 @@ PY
 }
 
 execute_update() {
+    local commit_result
     RUN_DIR="$ROOT_DIR/.run"
     STATUS_FILE="$RUN_DIR/update-state.json"
     UPDATE_LOG="$ROOT_DIR/update.log"
@@ -1709,10 +1964,7 @@ execute_update() {
         return 1
     }
     (umask 077; printf '%s' "$COMMIT_TOKEN" > "$COMMIT_FILE")
-    if ! env \
-        STREAMHOME_UPDATE_TRANSACTION="$TRANSACTION_ID" \
-        STREAMHOME_UPDATE_COMMIT_TOKEN="$COMMIT_TOKEN" \
-        "$ROOT_DIR/start.sh" --update-recovery-complete; then
+    if ! start_installed_update_runtime; then
         start_maintenance || true
         rollback_release || record_rollback_failure
         return 1
@@ -1730,15 +1982,31 @@ execute_update() {
             return 1
         fi
     fi
-    if ! commit_updated_runtime; then
+    commit_updated_runtime
+    commit_result=$?
+    if [[ "$commit_result" -ne 0 ]]; then
+        if [[ "$commit_result" -eq 2 ]]; then
+            log "The guarded commit result is indeterminate; preserving the target without automatic rollback."
+            record_post_commit_recovery_failure
+            return 1
+        fi
         log "The exact target build could not commit its guarded update transaction; rolling back."
         rollback_release || record_rollback_failure
+        return 1
+    fi
+    write_state "recovering" "The accepted release is completing mandatory recovery without automatic rollback." "" "" "$TARGET_COMMIT"
+    if ! wait_for_committed_runtime "$TARGET_COMMIT"; then
+        log "The accepted target failed mandatory recovery; preserving it fail-closed without automatic rollback."
+        record_post_commit_recovery_failure
         return 1
     fi
     record_prepared_setup_state
     RUNTIME_HEALTHY=true
     CUTOVER_STARTED=false
     ACTIVATION_STARTED=false
+    NO_ROLLBACK_BOUNDARY=true
+    LIFECYCLE_PRESERVE=false
+    PRESERVE_RECOVERY_ARTIFACTS=false
     rm -f -- "$RUN_DIR/pre-update-database.db"
     write_state "succeeded" "Update installed successfully; both StreamHome services passed health checks." "" "" "$TARGET_COMMIT"
     log "Update completed successfully at ${TARGET_COMMIT:0:12}."

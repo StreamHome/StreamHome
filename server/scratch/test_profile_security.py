@@ -44,7 +44,7 @@ class ProfilePinSecurityTests(unittest.TestCase):
     def test_profile_api_never_serializes_pin_or_hash_fields(self):
         server_root = Path(__file__).resolve().parents[1]
         models_source = (server_root / "models.py").read_text(encoding="utf-8")
-        main_source = (server_root / "main.py").read_text(encoding="utf-8")
+        main_source = (server_root / "application.py").read_text(encoding="utf-8")
         response_source = models_source.split("class ProfileResponse", 1)[1].split("class EpisodeResponse", 1)[0]
 
         self.assertNotIn("pin:", response_source)

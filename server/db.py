@@ -26,7 +26,11 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor.execute("PRAGMA busy_timeout=5000")
     cursor.close()
 
-async def init_db():
+async def init_db(
+    *,
+    allow_migration_backups: bool = True,
+    allow_external_config_mutation: bool = True,
+):
     # Ensure models are imported before creating tables
     import models
     if os.path.exists(settings.db_path):
@@ -40,7 +44,7 @@ async def init_db():
                 or bool(playback_run_columns and "last_progress_at" not in playback_run_columns)
                 or bool(movie_columns and "source_fingerprint" not in movie_columns)
             )
-            if playback_upgrade_needed:
+            if playback_upgrade_needed and allow_migration_backups:
                 backup_dir = os.path.join(os.path.dirname(settings.db_path), "backup")
                 os.makedirs(backup_dir, exist_ok=True)
                 backup_path = os.path.join(backup_dir, f"pre-playback-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db")
@@ -50,7 +54,7 @@ async def init_db():
                     logger.info(f"[Database] Pre-playback migration backup created: {backup_path}")
                 finally:
                     target.close()
-            if movie_columns and "catalog_source" not in movie_columns:
+            if movie_columns and "catalog_source" not in movie_columns and allow_migration_backups:
                 backup_dir = os.path.join(os.path.dirname(settings.db_path), "backup")
                 os.makedirs(backup_dir, exist_ok=True)
                 backup_path = os.path.join(backup_dir, f"pre-recommendation-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db")
@@ -395,7 +399,8 @@ async def init_db():
                 credential.scopes = ["ingest"]
                 db.add(credential)
                 await db.commit()
-            remove_env_key(settings.SERVER_ENV_PATH, "API_BEARER_TOKEN")
+            if allow_external_config_mutation:
+                remove_env_key(settings.SERVER_ENV_PATH, "API_BEARER_TOKEN")
 
     from models import User
     from services.secret_crypto import is_protected_secret, protect_secret
@@ -409,6 +414,24 @@ async def init_db():
                 changed = True
         if changed:
             await db.commit()
+
+
+async def verify_database_integrity() -> None:
+    """Verify the initialized database without acquiring a write transaction."""
+
+    required_tables = {"user", "profile", "authsession", "movie", "downloadtask"}
+    async with engine.connect() as connection:
+        table_result = await connection.exec_driver_sql(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name IN ('user', 'profile', 'authsession', 'movie', 'downloadtask')"
+        )
+        available = {str(name) for name in table_result.scalars().all()}
+        if not required_tables.issubset(available):
+            raise RuntimeError("required_database_schema_missing")
+        integrity = await connection.exec_driver_sql("PRAGMA integrity_check")
+        row = integrity.first()
+        if row is None or str(row[0]).lower() != "ok":
+            raise RuntimeError("database_integrity_check_failed")
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     async_session = sessionmaker(

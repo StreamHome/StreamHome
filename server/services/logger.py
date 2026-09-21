@@ -7,8 +7,6 @@ from logging.handlers import RotatingFileHandler
 config_dir = os.path.dirname(os.path.abspath(__file__))
 server_root = os.path.abspath(os.path.join(config_dir, ".."))
 temp_dir = os.path.join(server_root, "temp")
-os.makedirs(temp_dir, exist_ok=True)
-
 log_file = os.path.join(temp_dir, "app.log")
 
 # Setup logger
@@ -31,16 +29,21 @@ console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-# Rotating file handler
-file_handler = RotatingFileHandler(
-    log_file,
-    maxBytes=5 * 1024 * 1024,  # 5 MB
-    backupCount=3,
-    encoding="utf-8"
-)
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+def initialize_file_logging() -> None:
+    """Enable canonical file logging after lifecycle startup authorizes writes."""
+
+    if any(isinstance(item, RotatingFileHandler) for item in logger.handlers):
+        return
+    os.makedirs(temp_dir, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
 
 _SENSITIVE_QUERY_VALUE = re.compile(

@@ -110,7 +110,7 @@ class WriterCoordinationContractTests(unittest.TestCase):
         )
         constants = {
             child.value
-            for child in ast.walk(parsed("main.py"))
+            for child in ast.walk(parsed("application.py"))
             if isinstance(child, ast.Constant) and isinstance(child.value, str)
         }
         self.assertIn("/api/setup/readiness", constants)

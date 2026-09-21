@@ -94,7 +94,6 @@ class PlaybackPreparationError(RuntimeError):
 class PlaybackPrepService:
     def __init__(self) -> None:
         self.cache_dir = Path(settings.TEMP_DIR) / "playback_cache"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.active_jobs: dict[str, asyncio.Task[None]] = {}
         self.running_jobs: set[str] = set()
         self.job_priorities: dict[str, int] = {}
@@ -108,6 +107,9 @@ class PlaybackPrepService:
         self._active_cache_leases: dict[str, float] = {}
         self._cloud_spool_locks: dict[str, asyncio.Lock] = {}
         self._update_quiesced = False
+
+    def initialize_storage(self) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     @property
     def update_quiesced(self) -> bool:

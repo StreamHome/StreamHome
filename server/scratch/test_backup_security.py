@@ -41,10 +41,10 @@ def run() -> None:
         else:
             raise AssertionError("An incompatible database schema was accepted")
 
-    main_source = Path(__file__).parents[1].joinpath("main.py").read_text(encoding="utf-8")
+    main_source = Path(__file__).parents[1].joinpath("application.py").read_text(encoding="utf-8")
     backup_worker = main_source[
-        main_source.index("    async def daily_backup_worker()"):
-        main_source.index("    background_tasks.append(asyncio.create_task(daily_backup_worker()")
+        main_source.index("async def _daily_backup_worker()"):
+        main_source.index("async def _optional_playback_baselines()")
     ]
     assert "is_database_idle" not in backup_worker
     assert "cloud_synced is False" in backup_worker

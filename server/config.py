@@ -3,6 +3,7 @@ import json
 import base64
 import secrets
 import stat
+from dataclasses import dataclass
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -26,35 +27,84 @@ load_dotenv(dotenv_path=root_env_path, override=False)
 load_dotenv(dotenv_path=server_env_path, override=False)
 
 
-def _append_private_env(path: str, key: str, value: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def _write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("private configuration write made no progress")
+        view = view[written:]
+
+
+def _private_atomic_replace(path: str, content: str) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    try:
+        target_mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        target_mode = None
+    if target_mode is not None and stat.S_ISLNK(target_mode):
+        raise OSError("refusing to replace a symlinked private configuration file")
+
+    temporary = f"{path}.{secrets.token_hex(8)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd: int | None = None
+    replaced = False
+    try:
+        fd = os.open(temporary, flags, stat.S_IRUSR | stat.S_IWUSR)
+        if os.name != "nt":
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        _write_all(fd, content.encode("utf-8"))
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.replace(temporary, path)
+        replaced = True
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(directory, directory_flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        if not replaced:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def _append_private_env_values(path: str, values: dict[str, str]) -> None:
     existing = ""
     if os.path.exists(path):
+        if os.path.islink(path):
+            raise OSError("refusing to read a symlinked private configuration file")
         with open(path, "r", encoding="utf-8") as handle:
             existing = handle.read()
-    temporary = f"{path}.{secrets.token_hex(8)}.tmp"
-    with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(existing.rstrip())
-        handle.write(f'\n{key}="{value}"\n')
-        handle.flush()
-        os.fsync(handle.fileno())
-    if os.name != "nt":
-        os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
-    os.replace(temporary, path)
+    content = existing.rstrip()
+    for key, value in values.items():
+        content += f'\n{key}="{value}"'
+    _private_atomic_replace(path, content + "\n")
+
+
+def _append_private_env(path: str, key: str, value: str) -> None:
+    _append_private_env_values(path, {key: value})
 
 
 def remove_env_key(path: str, key: str) -> None:
     if not os.path.exists(path):
         return
+    if os.path.islink(path):
+        raise OSError("refusing to read a symlinked private configuration file")
     prefix = f"{key}="
     with open(path, "r", encoding="utf-8") as handle:
         lines = [line for line in handle if not line.strip().startswith(prefix)]
-    temporary = f"{path}.tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        handle.writelines(lines)
-    if os.name != "nt":
-        os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
-    os.replace(temporary, path)
+    _private_atomic_replace(path, "".join(lines))
 
 class Settings:
     BASE_DIR: str = base_dir
@@ -92,17 +142,8 @@ class Settings:
     PLAYBACK_LOOPBACK_URL: str = os.getenv("PLAYBACK_LOOPBACK_URL", "http://127.0.0.1:8000").rstrip("/")
     
     # 2FA Authentication JWT settings
-    JWT_SECRET = os.getenv("JWT_SECRET")
-    if not JWT_SECRET:
-        generated_secret = secrets.token_hex(32)
-        env_file = os.path.join(config_dir, ".env")
-        _append_private_env(env_file, "JWT_SECRET", generated_secret)
-        os.environ["JWT_SECRET"] = generated_secret
-        JWT_SECRET = generated_secret
+    JWT_SECRET: str = os.getenv("JWT_SECRET", "")
     SECRET_ENCRYPTION_KEY: str = os.getenv("SECRET_ENCRYPTION_KEY", "")
-    if not SECRET_ENCRYPTION_KEY:
-        SECRET_ENCRYPTION_KEY = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
-        _append_private_env(server_env_path, "SECRET_ENCRYPTION_KEY", SECRET_ENCRYPTION_KEY)
     JWT_ALGORITHM: str = "HS256"
     SESSION_LIFETIME_DAYS: int = max(1, min(365, int(os.getenv("SESSION_LIFETIME_DAYS", "60"))))
     JWT_EXPIRATION_MINUTES: int = 60 * 24 * SESSION_LIFETIME_DAYS
@@ -119,10 +160,6 @@ class Settings:
     # Cloud storage configuration for rclone
     RCLONE_REMOTE_PATH: str = os.getenv("RCLONE_REMOTE_PATH", "gdrive:media")
     RCLONE_CONFIG_PASS: str = os.getenv("RCLONE_CONFIG_PASS", "")
-    if not RCLONE_CONFIG_PASS:
-        RCLONE_CONFIG_PASS = secrets.token_urlsafe(36)
-        os.environ["RCLONE_CONFIG_PASS"] = RCLONE_CONFIG_PASS
-        _append_private_env(server_env_path, "RCLONE_CONFIG_PASS", RCLONE_CONFIG_PASS)
     GOOGLE_DRIVE_AUDIENCE: str = os.getenv("GOOGLE_DRIVE_AUDIENCE", "external")
     GOOGLE_DRIVE_PUBLISHING_STATUS: str = os.getenv("GOOGLE_DRIVE_PUBLISHING_STATUS", "production")
 
@@ -205,3 +242,41 @@ class Settings:
 
 settings = Settings()
 settings.load_from_json()
+
+
+class ConfigurationInitializationError(RuntimeError):
+    code = "configuration_initialization_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigurationInitializationResult:
+    generated_keys: tuple[str, ...]
+
+
+def initialize_runtime_configuration(*, allow_mutation: bool) -> ConfigurationInitializationResult:
+    """Validate required secrets and generate them only for authorized normal startup."""
+
+    missing = [
+        key
+        for key in ("JWT_SECRET", "SECRET_ENCRYPTION_KEY", "RCLONE_CONFIG_PASS")
+        if not str(getattr(settings, key, "") or "")
+    ]
+    if not missing:
+        return ConfigurationInitializationResult(())
+    if not allow_mutation:
+        raise ConfigurationInitializationError("required startup configuration is missing")
+
+    generated = {
+        "JWT_SECRET": secrets.token_hex(32),
+        "SECRET_ENCRYPTION_KEY": base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii"),
+        "RCLONE_CONFIG_PASS": secrets.token_urlsafe(36),
+    }
+    selected = {key: generated[key] for key in missing}
+    try:
+        _append_private_env_values(settings.SERVER_ENV_PATH, selected)
+    except OSError as exc:
+        raise ConfigurationInitializationError("required startup configuration could not be persisted") from exc
+    for key, value in selected.items():
+        setattr(settings, key, value)
+        os.environ[key] = value
+    return ConfigurationInitializationResult(tuple(missing))

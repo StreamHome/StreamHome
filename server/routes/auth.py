@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, text, update
+from sqlalchemy import delete, func, update
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -42,6 +42,7 @@ from services.totp_enrollment import (
     verify_enrollment_code,
 )
 from lifecycle.coordination import AdmissionClosedError, EffectClass, runtime_work
+from lifecycle.bootstrap import current_readiness_projection, get_startup_readiness
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 health_router = APIRouter(tags=["System"])
@@ -333,55 +334,81 @@ async def require_recent_reauth(session: AuthSession = Depends(get_current_sessi
     return session
 
 
+@health_router.get("/api/health/live")
+async def health_live():
+    projection = get_startup_readiness().projection()
+    return {
+        "status": "live",
+        "version": settings.APP_VERSION,
+        "buildId": settings.BUILD_ID,
+        "serverTime": now(),
+        "mode": projection["mode"],
+        "generalReady": projection["generalReady"],
+        "recoveryCompleted": projection["recoveryCompleted"],
+        "recoverySucceeded": projection["recoverySucceeded"],
+        "errorCode": projection["errorCode"],
+    }
+
+
+async def _readiness_payload() -> dict:
+    projection = current_readiness_projection(get_startup_readiness())
+    ready = bool(projection["generalReady"] or projection["guardedReady"])
+    if not ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": projection["errorCode"] or "startup_not_ready",
+                "message": "StreamHome mandatory startup recovery is not ready.",
+            },
+        )
+    if "database" in projection["capabilities"]:
+        try:
+            async with engine.connect() as connection:
+                result = await connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name IN "
+                    "('user', 'profile', 'authsession', 'movie', 'downloadtask')"
+                )
+                available = {str(name) for name in result.scalars().all()}
+            if not {"user", "profile", "authsession", "movie", "downloadtask"}.issubset(available):
+                raise RuntimeError("required schema is incomplete")
+        except Exception as exc:
+            message = str(exc).lower()
+            code = (
+                "server_busy"
+                if "database is locked" in message or "database table is locked" in message
+                else "server_unavailable"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": code, "message": "The server database is not ready."},
+            ) from exc
+    return {
+        "status": "ready",
+        "version": settings.APP_VERSION,
+        "buildId": settings.BUILD_ID,
+        "serverTime": now(),
+        "updateTransaction": service_state.UPDATE_TRANSACTION_ID,
+        "storageEngine": settings.STORAGE_ENGINE,
+        "cloudStorage": (
+            rclone_service.cloud_health()
+            if projection["generalReady"] and settings.STORAGE_ENGINE == "CLOUD"
+            else None
+        ),
+        "readyKind": "general" if projection["generalReady"] else "guarded",
+        "mode": projection["mode"],
+        "capabilities": projection["capabilities"],
+    }
+
+
+@health_router.get("/api/health/ready")
+async def health_ready():
+    return await _readiness_payload()
+
+
 @health_router.get("/api/health")
 async def health():
-    connection = None
-    write_probe_started = False
-    try:
-        if service_state.MAINTENANCE_MODE and not (
-            service_state.UPDATE_TRANSACTION_ID and service_state.UPDATE_COMMIT_TOKEN
-        ):
-            raise RuntimeError("Server restart required after database restore")
-        connection = await engine.connect()
-        await connection.exec_driver_sql("PRAGMA busy_timeout=500")
-        await connection.exec_driver_sql("BEGIN IMMEDIATE")
-        write_probe_started = True
-        required_tables = {"user", "profile", "authsession", "movie", "downloadtask"}
-        table_result = await connection.execute(
-            text(
-                "SELECT name FROM sqlite_master "
-                "WHERE type = 'table' AND name IN ('user', 'profile', 'authsession', 'movie', 'downloadtask')"
-            )
-        )
-        available_tables = {str(name) for name in table_result.scalars().all()}
-        if not required_tables.issubset(available_tables):
-            raise RuntimeError("Required database schema is incomplete")
-        return {
-            "status": "ready",
-            "version": settings.APP_VERSION,
-            "buildId": settings.BUILD_ID,
-            "serverTime": now(),
-            "updateTransaction": service_state.UPDATE_TRANSACTION_ID,
-            "storageEngine": settings.STORAGE_ENGINE,
-            "cloudStorage": rclone_service.cloud_health() if settings.STORAGE_ENGINE == "CLOUD" else None,
-        }
-    except Exception as exc:
-        message = str(exc).lower()
-        code = "server_busy" if "database is locked" in message or "database table is locked" in message else "server_unavailable"
-        detail_message = "The server database is busy." if code == "server_busy" else "The server database is not ready."
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail={"code": code, "message": detail_message}) from exc
-    finally:
-        if connection is not None:
-            if write_probe_started:
-                try:
-                    await connection.rollback()
-                except Exception:
-                    pass
-            try:
-                await connection.exec_driver_sql("PRAGMA busy_timeout=5000")
-            except Exception:
-                pass
-            await connection.close()
+    return await _readiness_payload()
 
 
 @router.post("/login")

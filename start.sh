@@ -9,6 +9,7 @@ RUNTIME_CONTROL="$ROOT_DIR/server/scratch/runtime_control.py"
 LOCK_ACQUIRED=false
 STARTED_ANY=false
 START_SUCCEEDED=false
+STARTUP_RECOVERY_PENDING=false
 UPDATE_RECOVERY_CHECKED=false
 WAITED_FOR_UPDATE=false
 FINALIZE_UPDATE_RECOVERY="${STREAMHOME_FINALIZE_UPDATE_RECOVERY:-false}"
@@ -233,6 +234,33 @@ generate_runtime_token() {
     [[ -n "$RUNTIME_TOKEN" ]] || fail "A runtime ownership token could not be generated."
 }
 
+lifecycle_startup_decision() {
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT_DIR/server" \
+        "$BACKEND_PYTHON" -m lifecycle.cli --root "$ROOT_DIR" startup-decision
+}
+
+authorize_lifecycle_startup() {
+    local output decision
+    output="$(lifecycle_startup_decision)" \
+        || fail "Lifecycle authority could not be inspected safely. Startup remains blocked."
+    decision="$(printf '%s' "$output" | "$BACKEND_PYTHON" -c \
+        'import json,sys; print(str(json.load(sys.stdin).get("decision") or "fail_closed"))')" \
+        || fail "Lifecycle startup decision could not be decoded safely."
+    case "$decision" in
+        normal|update_verify)
+            ;;
+        restore_verify)
+            fail "Restore verification requires the Phase 4 offline controller and cannot be launched by normal startup."
+            ;;
+        recovery_only)
+            fail "Lifecycle recovery is required before normal startup can continue."
+            ;;
+        *)
+            fail "Lifecycle authority rejected startup (${decision})."
+            ;;
+    esac
+}
+
 start_backend() {
     local pid
     printf 'Starting StreamHome API on 127.0.0.1:8000...\n'
@@ -303,6 +331,32 @@ except Exception:
 PY
 }
 
+endpoint_live_without_error() {
+    "$BACKEND_PYTHON" - "$1" "$2" <<'PY'
+import json
+import sys
+import urllib.request
+
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open(sys.argv[1], timeout=1.5) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+        raise SystemExit(
+            0
+            if (
+                200 <= response.status < 400
+                and payload.get("status") == "live"
+                and payload.get("buildId") == sys.argv[2]
+                and payload.get("mode") == "normal"
+                and not payload.get("errorCode")
+            )
+            else 1
+        )
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
 wait_for_services() {
     local backend_pid web_pid checks attempt
     backend_pid="$(cat "$RUN_DIR/backend.pid")"
@@ -317,6 +371,11 @@ wait_for_services() {
         fi
         sleep 0.5
     done
+    if endpoint_live_without_error "http://127.0.0.1:8000/api/health/live" "$STREAMHOME_BUILD_ID" \
+        && endpoint_ready "http://127.0.0.1:${WEB_PORT}/" web "$STREAMHOME_BUILD_ID"; then
+        STARTUP_RECOVERY_PENDING=true
+        return 0
+    fi
     return 1
 }
 
@@ -480,6 +539,7 @@ main() {
         esac
     fi
 
+    authorize_lifecycle_startup
     validate_runtime_dependencies
 
     WEB_PORT="$(read_env WEB_PORT 3000)"
@@ -563,7 +623,12 @@ main() {
             printf '[StreamHome] Warning: services are healthy, but update recovery bookkeeping could not be finalized. Review update.log.\n' >&2
         fi
     fi
-    printf '\nStreamHome is running at %s\n' "$PUBLIC_URL"
+    if [[ "$STARTUP_RECOVERY_PENDING" == true ]]; then
+        printf '\nStreamHome processes are running at %s; mandatory recovery is still in progress.\n' "$PUBLIC_URL"
+        printf 'Normal traffic will remain unavailable until recovery succeeds.\n'
+    else
+        printf '\nStreamHome is running at %s\n' "$PUBLIC_URL"
+    fi
     if [[ "$SETUP_ACTIVE" == true ]]; then
         printf 'First-run setup is active.\n'
         printf 'Setup URL: %s/setup\n' "$PUBLIC_URL"

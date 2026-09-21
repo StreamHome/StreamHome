@@ -1,7 +1,9 @@
 import os
 import sys
 import tempfile
+import asyncio
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -21,6 +23,7 @@ from services.media_source import (
 )
 from services.audio_extractor import apply_primary_audio_language, audio_track_labels
 from config import settings
+from services import queue as queue_module
 
 
 def test_failure_classification() -> None:
@@ -187,7 +190,7 @@ def test_queue_contracts() -> None:
     route_source = Path(__file__).parents[1].joinpath("routes", "queue.py").read_text(encoding="utf-8")
     assert "if not last_failure.retryable" in queue_source
     assert "raise IngestionTaskError(probe_res[\"failure\"])" in queue_source
-    assert "await queue_manager.stop()" in Path(__file__).parents[1].joinpath("main.py").read_text(encoding="utf-8")
+    assert "await queue_manager.stop()" in Path(__file__).parents[1].joinpath("application.py").read_text(encoding="utf-8")
     assert "Running threaded exec command" not in ffmpeg_source
     assert "traceback.print_exc" not in ffmpeg_source
     assert ".part{output_ext" in ffmpeg_source
@@ -278,32 +281,50 @@ def test_catalog_recovery_releases_sqlite_writes_between_media_entries() -> None
 
 
 def test_database_writing_workers_wait_for_catalog_recovery() -> None:
-    main_source = Path(__file__).parents[1].joinpath("main.py").read_text(encoding="utf-8")
-    assert "catalog_recovery_complete = asyncio.Event()" in main_source
-    recovery_source = main_source[
-        main_source.index("    async def recover_catalog_and_playback()"):
-        main_source.index("    async def start_runtime_workers()")
+    main_source = Path(__file__).parents[1].joinpath("application.py").read_text(encoding="utf-8")
+    recovery_steps = main_source[
+        main_source.index("def _normal_recovery_steps()"):
+        main_source.index("def _guarded_recovery_steps()")
     ]
-    catalog_sync = recovery_source.index("await queue_manager.sync_media_from_disk()")
-    catalog_barrier = recovery_source.index("catalog_recovery_complete.set()")
-    vibe_start = recovery_source.index("await vibe_analysis_manager.start()")
-    playback_warming = recovery_source.index("await playback_prep_service.schedule_catalog_baselines()")
-    assert catalog_sync < catalog_barrier < vibe_start < playback_warming
-    assert "finally:\n                catalog_recovery_complete.set()" in recovery_source
+    assert '"catalog_and_languages"' in recovery_steps
+    assert "_recover_catalog_and_languages" in recovery_steps
+    assert "sync_media_from_disk(raise_on_critical_failure=True)" in main_source
+    assert "_start_runtime_workers" not in recovery_steps
 
-    worker_sections = {
-        "runtime workers": ("    async def start_runtime_workers()", "    async def daily_backup_worker()"),
-        "daily backup": ("    async def daily_backup_worker()", "    background_tasks.append(asyncio.create_task(daily_backup_worker()"),
-        "automatic updates": ("    async def guarded_automatic_update_worker()", "    background_tasks.append(asyncio.create_task(guarded_automatic_update_worker()"),
-        "recommendations": ("    async def guarded_recommendation_worker()", "    recommendation_task = asyncio.create_task"),
-        "playback reaper": ("    async def guarded_playback_reaper()", "    reaper_task = asyncio.create_task"),
-    }
-    for label, (start_marker, end_marker) in worker_sections.items():
-        section = main_source[
-            main_source.index(start_marker):
-            main_source.index(end_marker, main_source.index(start_marker))
-        ]
-        assert "await catalog_recovery_complete.wait()" in section, label
+    startup_source = main_source[
+        main_source.index("async def _complete_normal_startup"):
+        main_source.index("@asynccontextmanager")
+    ]
+    recovery_position = startup_source.index("result = await run_mandatory_recovery")
+    success_position = startup_source.index("if not result.succeeded", recovery_position)
+    worker_position = startup_source.index("await _start_runtime_workers(runtime)", success_position)
+    readiness_position = startup_source.index("STARTUP_READINESS.mark_general_ready()", worker_position)
+    assert recovery_position < success_position < worker_position < readiness_position
+    assert "catalog_recovery_complete" not in startup_source
+    assert "finally:" not in main_source[
+        main_source.index("async def _recover_catalog_and_languages"):
+        main_source.index("async def _daily_backup_worker")
+    ]
+
+
+def test_catalog_recovery_strict_mode_propagates_only_systemic_failure() -> None:
+    async def exercise() -> None:
+        with patch.object(
+            queue_module,
+            "AsyncSession",
+            side_effect=RuntimeError("systemic catalog failure"),
+        ):
+            await queue_module.queue_manager.sync_media_from_disk()
+            try:
+                await queue_module.queue_manager.sync_media_from_disk(
+                    raise_on_critical_failure=True
+                )
+            except RuntimeError as exc:
+                assert str(exc) == "systemic catalog failure"
+            else:
+                raise AssertionError("strict startup catalog recovery swallowed a systemic failure")
+
+    asyncio.run(exercise())
 
 
 if __name__ == "__main__":
@@ -317,4 +338,5 @@ if __name__ == "__main__":
     test_queue_contracts()
     test_catalog_recovery_releases_sqlite_writes_between_media_entries()
     test_database_writing_workers_wait_for_catalog_recovery()
+    test_catalog_recovery_strict_mode_propagates_only_systemic_failure()
     print("Queue failure handling regression checks passed.")

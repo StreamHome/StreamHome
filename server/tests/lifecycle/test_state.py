@@ -249,7 +249,7 @@ class LifecycleStateTests(unittest.TestCase):
                 "generation": 1,
                 "active_operation": {
                     "operation_id": str(uuid.uuid4()),
-                    "operation_type": "restore",
+                    "operation_type": "unsupported-operation",
                     "phase": "reserved",
                     "owner_kind": "updater",
                     "owner_nonce_hash": f"sha256:{'0' * 64}",

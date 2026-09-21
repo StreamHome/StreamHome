@@ -25,6 +25,7 @@ CAPABILITY_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 class OperationType(str, Enum):
     UPDATE = "update"
+    RESTORE = "restore"
 
 
 class LifecyclePhase(str, Enum):
@@ -36,6 +37,7 @@ class LifecyclePhase(str, Enum):
 
 class OwnerKind(str, Enum):
     UPDATER = "updater"
+    RESTORE_CONTROLLER = "restore_controller"
 
 
 ALLOWED_TRANSITIONS: Mapping[LifecyclePhase, frozenset[LifecyclePhase]] = {

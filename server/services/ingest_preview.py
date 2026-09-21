@@ -26,6 +26,8 @@ class IngestPreviewError(ValueError):
 class IngestPreviewService:
     def __init__(self) -> None:
         self.root = Path(settings.TEMP_DIR).resolve() / "ingest_preview"
+
+    def initialize_storage(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def task_path(self, task_id: str) -> Path:

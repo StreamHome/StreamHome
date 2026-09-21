@@ -204,6 +204,8 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
             patch.object(update_route, "read_update_state", return_value={"transaction_id": transaction, "target_commit": target}),
             patch.object(update_route, "write_update_state", side_effect=persist_commit) as persisted,
             patch.object(settings, "BUILD_ID", target[:12]),
+            patch.object(update_route, "require_current_guarded_authority"),
+            patch.object(update_route, "require_startup_context", return_value=object()),
         ):
             result = await update_route.commit_updated_runtime(
                 update_route.UpdateCommitRequest(transaction_id=transaction, target_commit=target),
@@ -212,10 +214,91 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(result["committed"])
+        self.assertTrue(result["recoveryPending"])
         persisted.assert_called_once()
-        self.assertFalse(state.MAINTENANCE_MODE)
+        self.assertTrue(state.MAINTENANCE_MODE)
         self.assertEqual(state.UPDATE_TRANSACTION_ID, "")
         self.assertEqual(state.UPDATE_COMMIT_TOKEN, "")
+
+    async def test_stale_guarded_authority_cannot_mutate_update_journal(self) -> None:
+        transaction = "failed-recovery-transaction"
+        target = "d" * 40
+        token = "failed-recovery-token"
+        state.MAINTENANCE_MODE = True
+        state.MAINTENANCE_REASON = "guarded"
+        state.UPDATE_COMMIT_TOKEN = token
+        state.UPDATE_TRANSACTION_ID = transaction
+
+        with (
+            patch.object(
+                update_route,
+                "read_update_state",
+                return_value={"transaction_id": transaction, "target_commit": target},
+            ),
+            patch.object(update_route, "write_update_state") as persisted,
+            patch.object(settings, "BUILD_ID", target[:12]),
+            patch.object(
+                update_route,
+                "require_current_guarded_authority",
+                side_effect=update_route.StartupAuthorityChangedError(
+                    "stale guarded authority"
+                ),
+            ),
+            patch.object(update_route, "require_startup_context", return_value=object()),
+        ):
+            with self.assertRaises(update_route.HTTPException) as raised:
+                await update_route.commit_updated_runtime(
+                    update_route.UpdateCommitRequest(
+                        transaction_id=transaction,
+                        target_commit=target,
+                    ),
+                    SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")),
+                    token,
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        persisted.assert_not_called()
+        self.assertEqual(state.UPDATE_TRANSACTION_ID, transaction)
+        self.assertEqual(state.UPDATE_COMMIT_TOKEN, token)
+
+    async def test_indeterminate_commit_persistence_keeps_guarded_runtime_closed(self) -> None:
+        transaction = "indeterminate-commit-transaction"
+        target = "e" * 40
+        token = "indeterminate-commit-token"
+        state.MAINTENANCE_MODE = True
+        state.MAINTENANCE_REASON = "guarded"
+        state.UPDATE_COMMIT_TOKEN = token
+        state.UPDATE_TRANSACTION_ID = transaction
+
+        with (
+            patch.object(
+                update_route,
+                "read_update_state",
+                return_value={"transaction_id": transaction, "target_commit": target},
+            ),
+            patch.object(
+                update_route,
+                "write_update_state",
+                side_effect=OSError("simulated directory fsync uncertainty"),
+            ),
+            patch.object(settings, "BUILD_ID", target[:12]),
+            patch.object(update_route, "require_current_guarded_authority"),
+            patch.object(update_route, "require_startup_context", return_value=object()),
+        ):
+            with self.assertRaises(update_route.HTTPException) as raised:
+                await update_route.commit_updated_runtime(
+                    update_route.UpdateCommitRequest(
+                        transaction_id=transaction,
+                        target_commit=target,
+                    ),
+                    SimpleNamespace(client=SimpleNamespace(host="127.0.0.1")),
+                    token,
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertTrue(state.MAINTENANCE_MODE)
+        self.assertEqual(state.UPDATE_TRANSACTION_ID, transaction)
+        self.assertEqual(state.UPDATE_COMMIT_TOKEN, token)
 
     def test_maintenance_window_supports_daytime_and_overnight_ranges(self) -> None:
         settings.UPDATE_MAINTENANCE_START = ""

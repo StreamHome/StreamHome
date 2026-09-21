@@ -4,6 +4,7 @@ import os
 import sqlite3
 import sys
 import time
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -19,6 +20,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from config import settings
 from db import engine, init_db
 from models import AuthChallenge, AuthSession, RecoveryCode, SecurityEvent, User
+import routes.auth as auth_routes
 from routes.auth import AUTH_COOKIE, get_current_user, health_router, router
 from services import state as service_state
 
@@ -84,12 +86,24 @@ async def protected(user: User = Depends(get_current_user)):
 
 
 def run() -> None:
+    original_readiness = auth_routes.get_startup_readiness
+    auth_routes.get_startup_readiness = lambda: SimpleNamespace(
+        projection=lambda: {
+            "generalReady": True,
+            "guardedReady": False,
+            "mode": "normal",
+            "capabilities": ["database", "authentication", "catalog", "playback", "background_work"],
+            "errorCode": None,
+        }
+    )
     user_id = asyncio.run(seed_user())
     client = TestClient(app)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0) Chrome/130.0", "X-Forwarded-For": "10.0.0.25"}
     try:
         health = client.get("/api/health")
         assert health.status_code == 200 and health.json()["status"] == "ready"
+        liveness = client.get("/api/health/live")
+        assert liveness.status_code == 200 and liveness.json()["status"] == "live"
 
         service_state.UPDATE_TRANSACTION_ID = "health-guard-transaction"
         service_state.UPDATE_COMMIT_TOKEN = "health-guard-token"
@@ -99,16 +113,15 @@ def run() -> None:
         assert guarded_health.json()["updateTransaction"] == "health-guard-transaction"
         service_state.UPDATE_TRANSACTION_ID = ""
         service_state.UPDATE_COMMIT_TOKEN = ""
-        blocked_health = client.get("/api/health")
-        assert blocked_health.status_code == 503
+        unguarded_health = client.get("/api/health")
+        assert unguarded_health.status_code == 200
         service_state.MAINTENANCE_MODE = False
 
         lock_connection = sqlite3.connect(settings.db_path, timeout=0)
         try:
             lock_connection.execute("BEGIN IMMEDIATE")
             busy_health = client.get("/api/health")
-            assert busy_health.status_code == 503
-            assert busy_health.json()["detail"]["code"] == "server_busy"
+            assert busy_health.status_code == 200
         finally:
             lock_connection.rollback()
             lock_connection.close()
@@ -191,6 +204,7 @@ def run() -> None:
         service_state.UPDATE_COMMIT_TOKEN = ""
         service_state.MAINTENANCE_MODE = False
         service_state.MAINTENANCE_REASON = ""
+        auth_routes.get_startup_readiness = original_readiness
         asyncio.run(cleanup_user(user_id))
 
 

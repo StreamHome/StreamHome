@@ -1797,7 +1797,7 @@ class DownloadQueueManager:
             )
         return len(repaired)
 
-    async def sync_media_from_disk(self):
+    async def sync_media_from_disk(self, *, raise_on_critical_failure: bool = False):
         """
         Scans the media directory for metadata.json files and re-catalogs them into the database if they are missing.
         Also sweeps the database to verify path containment, localhost urls and file existence.
@@ -2230,5 +2230,7 @@ class DownloadQueueManager:
             )
         except Exception as e:
             logger.error(f"[Queue Manager] Critical failure during sync_media_from_disk: {e}")
+            if raise_on_critical_failure:
+                raise
 
 queue_manager = DownloadQueueManager()

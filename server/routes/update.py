@@ -15,6 +15,11 @@ from db import get_session
 from models import APIModel, AuthSession, User
 from routes.auth import add_event, get_current_session, get_current_user, require_recent_reauth
 from lifecycle.coordination import EffectClass, runtime_work
+from lifecycle.bootstrap import (
+    StartupAuthorityChangedError,
+    require_current_guarded_authority,
+    require_startup_context,
+)
 from services import state
 from services.update import (
     ACTIVE_PHASES,
@@ -189,24 +194,55 @@ async def commit_updated_runtime(
         peer = ipaddress.ip_address(request.client.host if request.client else "")
     except ValueError as exc:
         raise HTTPException(status_code=403, detail={"code": "commit_forbidden", "message": "Update commit is local only."}) from exc
-    persisted = read_update_state()
     if (
         not peer.is_loopback
         or not state.UPDATE_COMMIT_TOKEN
         or not hmac.compare_digest(token, state.UPDATE_COMMIT_TOKEN)
         or not state.UPDATE_TRANSACTION_ID
         or not hmac.compare_digest(payload.transaction_id, state.UPDATE_TRANSACTION_ID)
-        or str(persisted.get("transaction_id") or "") != payload.transaction_id
-        or str(persisted.get("target_commit") or "") != payload.target_commit
+    ):
+        raise HTTPException(status_code=403, detail={"code": "commit_forbidden", "message": "Update commit authorization failed."})
+    try:
+        require_current_guarded_authority(require_startup_context())
+    except StartupAuthorityChangedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": StartupAuthorityChangedError.code,
+                "message": "The guarded lifecycle authority no longer matches this runtime.",
+            },
+        ) from exc
+    persisted = read_update_state()
+    persisted_phase = str(persisted.get("phase") or "")
+    expected_build = str(persisted.get("target_commit") or "")
+    if persisted_phase in {"failed", "rolled_back"}:
+        expected_build = str(persisted.get("current_commit") or "")
+    if (
+        str(persisted.get("transaction_id") or "") != payload.transaction_id
+        or expected_build != payload.target_commit
         or settings.BUILD_ID != payload.target_commit[:12]
     ):
         raise HTTPException(status_code=403, detail={"code": "commit_forbidden", "message": "Update commit authorization failed."})
-    write_update_state(runtime_committed=True, runtime_committed_at=time.time())
-    state.MAINTENANCE_MODE = False
-    state.MAINTENANCE_REASON = ""
+    try:
+        write_update_state(runtime_committed=True, runtime_committed_at=time.time())
+    except Exception as exc:
+        # Atomic replacement can become indeterminate after the rename.  Keep
+        # the guarded process closed and force the controller to preserve the
+        # candidate rather than racing it with rollback.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "update_commit_persistence_indeterminate",
+                "message": "The protected update commit could not be confirmed durably.",
+            },
+        ) from exc
     state.UPDATE_COMMIT_TOKEN = ""
     state.UPDATE_TRANSACTION_ID = ""
-    return {"committed": True, "buildId": settings.BUILD_ID}
+    return {
+        "committed": True,
+        "buildId": settings.BUILD_ID,
+        "recoveryPending": True,
+    }
 
 
 @router.get("/status", response_model=UpdateStatusResponse)

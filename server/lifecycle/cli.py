@@ -77,7 +77,17 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
     if arguments.command == "inspect":
         return _success("inspect", state.inspect_state(root))
     if arguments.command == "startup-decision":
-        return {"ok": True, "command": "startup-decision", **state.startup_decision(root)}
+        # Preserve strict authority error exits while delegating startup policy to
+        # the same bootstrap evaluator used by the ASGI entry point.
+        state.inspect_state(root)
+        from .bootstrap import evaluate_startup, public_startup_projection
+
+        context = evaluate_startup(root, install=False)
+        return {
+            "ok": True,
+            "command": "startup-decision",
+            **public_startup_projection(context),
+        }
     if arguments.command == "claim":
         result = state.claim_operation_with_credential(
             root,

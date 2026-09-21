@@ -153,7 +153,7 @@ class LifecycleCliTests(unittest.TestCase):
         conflict = self._run("claim", "--operation-type", "update", "--owner-kind", "updater")
         self.assertEqual(conflict.returncode, cli.EXIT_CONFLICT)
         self.assertEqual(json.loads(conflict.stderr)["error"], "conflict")
-        invalid = self._run("claim", "--operation-type", "restore", "--owner-kind", "updater")
+        invalid = self._run("claim", "--operation-type", "unsupported", "--owner-kind", "updater")
         self.assertEqual(invalid.returncode, cli.EXIT_INVALID_ARGUMENTS)
 
         paths = state.lifecycle_paths(self.root)
