@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
 from lifecycle.configuration_paths import resolve_temp_directory
+from services.hls_context import parse_hls_context_permissions
 from dotenv import load_dotenv
 
 # Load .env file relative to the config.py location
@@ -132,6 +133,9 @@ class Settings:
         for host in os.getenv("INGEST_TRUSTED_HOSTS", "").split(",")
         if host.strip()
     ]
+    HLS_CONTEXT_HEADER_PERMISSIONS = parse_hls_context_permissions(
+        os.getenv("INGEST_HLS_CONTEXT_ORIGINS", "{}")
+    )
     TMDB_API_KEY: str = os.getenv("TMDB_API_KEY", "")
     TMDB_READ_ACCESS_TOKEN: str = os.getenv("TMDB_READ_ACCESS_TOKEN", "")
     db_path = os.path.abspath(os.path.join(config_dir, "database.db")).replace("\\", "/")

@@ -838,6 +838,55 @@ The server remains responsible for:
 * path validation;
 * final cataloging.
 
+### HLS context across CDN origins
+
+The server strips `Authorization`, `Cookie`, `Origin` and `Referer` when a source
+crosses an origin boundary. Some authorized HLS sources require a non-secret
+`Origin` or root `Referer` on their CDN fragments. An operator can permit that
+context for exact source-to-CDN origin pairs in the server environment:
+
+```dotenv
+INGEST_HLS_CONTEXT_ORIGINS='{"https://media.example":["https://cdn-a.example","https://cdn-b.example:8443"]}'
+```
+
+The default is `{}`. Configure only destinations you trust with the submitted
+context and activate the configuration through the normal server restart process.
+Clients and playlists cannot add destinations. This does not change the API
+schema or the `source_headers: 1` capability.
+
+Origins contain only scheme, hostname and optional port, without a trailing slash,
+userinfo, path, query or fragment. Matching uses canonical scheme, IDNA hostname
+and effective port; there are no wildcards or inferred hostname families. Invalid
+or duplicate configuration fails startup with a safe error. Limits are 64 KiB of
+JSON, 64 source origins and 32 destinations per source.
+
+Only submitted `Origin` and `Referer` values that themselves contain a plain
+HTTP(S) origin, optionally followed by `/`, can cross an approved boundary. Values
+with private paths, queries, fragments or userinfo keep the strict default rules.
+`Cookie` and `Authorization` are never restored after crossing an origin boundary.
+Video and detached audio keep separate immutable context snapshots. The same
+policy applies to nested playlists, keys, initialization fragments, segments and
+each redirect; HTTPS downgrades remain blocked. Destination approval does not
+bypass private-network checks, pinned DNS or TLS certificate validation.
+
+Automatic playback repairs preserve the retained independent video, audio and
+subtitle sets, including explicit empty sets. Legacy shared headers still work.
+Unsafe retained sets cannot create a repair task.
+
+FFmpeg exiting successfully means native processing has finished. StreamHome then
+settles the source relays and checks their recorded failures before accepting the
+staging file. Task completion and 100% progress follow final publication acceptance.
+A failed segment remains fatal even if FFmpeg produced a partial playable file;
+an existing accepted title stays intact. Genuine HTTP 404 remains terminal, while
+temporary failures retain the bounded retry policy.
+
+Private task diagnostics in the configured temporary directory's `queue-errors`
+folder record bounded request counts, input role, attempt, playlist/segment
+sequence, interval or byte range, HTTP status and safe policy decisions. They do
+not contain source URLs or header values. At most eight detailed failures per
+relay are retained alongside aggregate counts; a task file is capped at 256 KiB.
+These files are not a browser playback contract and should not be shared publicly.
+
 ## Security Recommendations
 
 ### Use HTTPS

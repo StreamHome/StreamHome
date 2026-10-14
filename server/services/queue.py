@@ -749,6 +749,7 @@ class DownloadQueueManager:
                     audio_url,
                     headers,
                     audio_headers=audio_headers,
+                    attempt=probe_attempt,
                     task_id=task_id,
                     video_source_type=video_source_type,
                     audio_source_type=audio_source_type,
@@ -940,6 +941,7 @@ class DownloadQueueManager:
                 success, failure = await download_and_merge(
                     task_id=task_id, video_url=video_url, audio_url=audio_url,
                     headers=headers, audio_headers=audio_headers, output_path=output_abs_path, duration_secs=duration_secs,
+                    attempt=attempt,
                     video_source_type=video_source_type, audio_source_type=audio_source_type,
                     audio_timeline_offset=float(probe_res.get("audio_timeline_offset") or 0.0),
                     client_address=validation_client,
@@ -1073,6 +1075,8 @@ class DownloadQueueManager:
                     task_completed = mutation.accepted
                 created_artifacts.clear()
 
+            update_task_metrics(task_id, 100.0, speed="Finished", eta="00:00:00", force_write=True)
+            logger.info(f"[Queue Manager] Task completed successfully after publication acceptance: {task_id}")
             await self._schedule_playback_baseline(finalized_media_id, finalized_media_type)
             analysis_type = "movie" if media_type == "movie" else "episode"
             analysis_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"

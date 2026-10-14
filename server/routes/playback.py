@@ -36,6 +36,7 @@ from services.playback_prep import playback_prep_service
 from services.playback_source import LocalPlaybackSource, PlaybackSourceFailure, source_reader
 from services.ingest_preview import IngestPreviewError, ingest_preview_service
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
+from services.ingestion_headers import copy_source_headers, decode_source_headers
 from services.profile_security import require_profile_access
 from services.rclone import rclone_service
 from services.recommendation import record_playback_progress
@@ -451,10 +452,17 @@ async def _queue_media_repair_admitted(
         client_address = "127.0.0.1" if previous.private_source_allowed else ""
         await validate_url(previous.video_url, client_address=client_address)
         await validate_url(previous.audio_url, client_address=client_address)
-        normalized_headers = validate_headers(previous.headers)
+        retained_headers = copy_source_headers(previous.headers_str, validate_headers)
+        normalized_headers = decode_source_headers(retained_headers, "video")
+        retained_subtitles = []
         for subtitle in previous.subtitles:
             await validate_url(subtitle.get("url"), client_address=client_address)
-    except UnsafeIngestionSource as exc:
+            retained_subtitles.append({
+                **subtitle,
+                "headers": validate_headers(subtitle.get("headers"))
+                if subtitle.get("headers") is not None else dict(normalized_headers),
+            })
+    except (UnsafeIngestionSource, ValueError, TypeError, AttributeError) as exc:
         logger.warning(f"[Playback Repair] Retained source for {media_obj.id} is no longer safe: {type(exc).__name__}")
         return None
 
@@ -469,10 +477,10 @@ async def _queue_media_repair_admitted(
         audio_url=previous.audio_url,
         video_source_type=previous.video_source_type,
         audio_source_type=previous.audio_source_type,
-        headers_str=json.dumps(normalized_headers),
+        headers_str=retained_headers,
         private_source_allowed=previous.private_source_allowed,
         status="PENDING",
-        subtitles_str=previous.subtitles_str,
+        subtitles_str=json.dumps(retained_subtitles),
         quality=previous.quality,
         language=previous.language,
         skip_markers_str=previous.skip_markers_str,

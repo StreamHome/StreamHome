@@ -200,6 +200,7 @@ async def probe_media_stream(
     audio_source_type: str = "auto",
     client_address: str = "",
     audio_headers: Optional[Dict[str, str]] = None,
+    attempt: int = 1,
 ) -> Dict[str, Any]:
     """
     Probes remote or local video and audio streams using ffprobe to detect
@@ -207,7 +208,7 @@ async def probe_media_stream(
     """
     ffprobe_path = shutil.which("ffprobe") or r"C:\ffmpeg\bin\ffprobe.exe"
     
-    async def run_ffprobe(url: str, source_type: str, source_headers: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    async def run_ffprobe(url: str, source_type: str, source_headers: Optional[Dict[str, str]], input_role: str) -> Dict[str, Any]:
         headers_str = "".join(f"{k}: {v}\r\n" for k, v in (source_headers or {}).items())
         normalized_source_type = normalize_source_type(source_type)
         if not url:
@@ -222,8 +223,10 @@ async def probe_media_stream(
             
         if is_http_media_source(url) and not is_controlled_input(url):
             try:
-                async with controlled_media_input(url, headers=source_headers, client_address=client_address, source_type=normalized_source_type) as local_url:
-                    return await run_ffprobe(local_url, normalized_source_type, {})
+                async with controlled_media_input(url, headers=source_headers, client_address=client_address,
+                                                  source_type=normalized_source_type, task_id=task_id,
+                                                  input_role=input_role, attempt=attempt) as local_url:
+                    return await run_ffprobe(local_url, normalized_source_type, {}, input_role)
             except Exception as error:
                 return {"has_video": False, "has_audio": False, "height": 0,
                         "source_type": normalized_source_type, "diagnostics": type(error).__name__,
@@ -326,7 +329,7 @@ async def probe_media_stream(
 
     async def probe_source(url: str, source_type: str, expected_stream: str, source_headers: Optional[Dict[str, str]]) -> Dict[str, Any]:
         normalized_source_type = normalize_source_type(source_type)
-        result = await run_ffprobe(url, normalized_source_type, source_headers)
+        result = await run_ffprobe(url, normalized_source_type, source_headers, expected_stream)
         expected_found = bool(result.get(f"has_{expected_stream}"))
         failure = result.get("failure")
         should_force_hls = (
@@ -339,7 +342,7 @@ async def probe_media_stream(
             return result
 
         logger.info("[Media Probe] Retrying ambiguous HTTP source as an HLS manifest.")
-        forced_result = await run_ffprobe(url, "hls", source_headers)
+        forced_result = await run_ffprobe(url, "hls", source_headers, expected_stream)
         if forced_result.get(f"has_{expected_stream}") and not forced_result.get("failure"):
             return forced_result
         forced_failure = forced_result.get("failure")

@@ -101,10 +101,13 @@ def write_task_diagnostics(task_id: str, stage: str, diagnostics: str, temp_dir:
         diagnostics_dir.mkdir(parents=True, exist_ok=True)
         target = diagnostics_dir / f"{task_id}.log"
         safe_diagnostics = redact_diagnostics(diagnostics).strip()
-        with target.open("a", encoding="utf-8") as handle:
-            handle.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] {stage}\n")
-            handle.write(safe_diagnostics or "No diagnostics were emitted.")
-            handle.write("\n")
+        entry = f"\n[{datetime.now().isoformat(timespec='seconds')}] {stage}\n"
+        entry += (safe_diagnostics or "No diagnostics were emitted.") + "\n"
+        remaining = max(0, 256 * 1024 - (target.stat().st_size if target.exists() else 0))
+        payload = entry.encode("utf-8")[:min(remaining, 64 * 1024)].decode("utf-8", errors="ignore")
+        if payload:
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write(payload)
         return str(target)
     except OSError:
         return None

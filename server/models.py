@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field as PydanticField, model_valida
 from sqlmodel import SQLModel, Field, Relationship
 from sqlalchemy import UniqueConstraint
 from services.languages import normalize_language_tag
-from services.ingestion_headers import decode_source_headers
+from services.ingestion_headers import decode_source_headers, replace_video_source_headers
 
 def to_camel(s: str) -> str:
     parts = s.split("_")
@@ -599,7 +599,7 @@ class DownloadTask(SQLModel, table=True):
 
     @headers.setter
     def headers(self, val: Dict[str, str]):
-        self.headers_str = json.dumps(val or {})
+        self.headers_str = replace_video_source_headers(self.headers_str, val or {})
 
     @property
     def subtitles(self) -> List[Dict[str, Any]]:

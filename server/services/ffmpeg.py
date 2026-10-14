@@ -203,7 +203,7 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float, preview_enab
         process.wait()
         
         success = process.returncode == 0
-        error_msg = "" if success else "\n".join(stderr_lines)
+        error_msg = "\n".join(stderr_lines)
         return success, error_msg
         
     except Exception as e:
@@ -239,8 +239,12 @@ async def download_and_merge(
     audio_timeline_offset: float = 0.0,
     client_address: str = "",
     audio_headers: Optional[Dict[str, str]] = None,
+    attempt: int = 1,
 ) -> tuple[bool, Optional[IngestionFailure]]:
     """Give FFmpeg only scoped local inputs whose upstream fetches are pinned."""
+    candidate = _ingestion_candidate_path(output_path, task_id)
+    relays = []
+    native_results = []
     try:
         async with AsyncExitStack() as inputs:
             selected_video = video_url
@@ -248,18 +252,41 @@ async def download_and_merge(
             if is_http_media_source(video_url):
                 selected_video = await inputs.enter_async_context(controlled_media_input(
                     video_url, headers=headers, client_address=client_address, source_type=video_source_type,
+                    task_id=task_id, input_role="video", attempt=attempt, owner_callback=relays.append,
                 ))
             if audio_url and is_http_media_source(audio_url):
                 selected_audio = await inputs.enter_async_context(controlled_media_input(
                     audio_url, headers=audio_headers if audio_headers is not None else headers,
                     client_address=client_address, source_type=audio_source_type,
+                    task_id=task_id, input_role="audio", attempt=attempt, owner_callback=relays.append,
                 ))
-            return await _download_and_merge_controlled(
+            success, failure = await _download_and_merge_controlled(
                 task_id, selected_video, selected_audio, {}, output_path, duration_secs,
                 video_source_type, audio_source_type, preview_enabled, audio_timeline_offset,
+                source_failed=lambda: any(relay.failure is not None for relay in relays),
+                native_result_callback=lambda diagnostics, preview: native_results.append((diagnostics, preview)),
             )
+        # Every relay has settled and rejected any late source failure before the
+        # candidate becomes a complete staging input for final media verification.
+        if success:
+            os.replace(candidate, os.path.abspath(output_path))
+            if native_results and native_results[-1][1]:
+                ingest_preview_service.mark_complete(task_id)
+            logger.info(f"[FFmpeg Service] Transfer validated for task {task_id}; final publication is pending.")
+            update_task_metrics(task_id, 99.0, speed="Verifying media", eta="00:00:00")
+        return success, failure
     except (UnsafeIngestionSource, httpx.HTTPError, TimeoutError) as error:
+        if native_results and native_results[-1][0]:
+            write_task_diagnostics(task_id, "native result before source rejection", native_results[-1][0])
         return False, source_request_failure(error)
+    finally:
+        if os.path.exists(candidate):
+            os.remove(candidate)
+
+
+def _ingestion_candidate_path(output_path: str, task_id: str) -> str:
+    root, extension = os.path.splitext(os.path.abspath(output_path))
+    return f"{root}.{task_id}.part{extension or '.mp4'}"
 
 
 async def _download_and_merge_controlled(
@@ -273,6 +300,8 @@ async def _download_and_merge_controlled(
     audio_source_type: str = "auto",
     preview_enabled: bool = True,
     audio_timeline_offset: float = 0.0,
+    source_failed=None,
+    native_result_callback=None,
 ) -> tuple[bool, Optional[IngestionFailure]]:
     """Download video/audio streams, merge losslessly, inject headers, track progress."""
     
@@ -299,8 +328,8 @@ async def _download_and_merge_controlled(
         input_cmd.extend(ffmpeg_network_input_options(audio_url, audio_source_type) if is_audio_http else local_media_input_options())
         input_cmd.extend(["-i", audio_url])
         
-    output_root, output_ext = os.path.splitext(abs_output_path)
-    temp_output_path = f"{output_root}.{task_id}.part{output_ext or '.mp4'}"
+    temp_output_path = _ingestion_candidate_path(abs_output_path, task_id)
+    native_succeeded = False
     try:
         if os.path.exists(temp_output_path):
             os.remove(temp_output_path)
@@ -385,7 +414,7 @@ async def _download_and_merge_controlled(
         )
         preview_succeeded = bool(preview_enabled and success)
 
-        if not success and preview_enabled:
+        if not success and preview_enabled and not (source_failed and source_failed()):
             preview_failure = classify_failure(diagnostics, "PREVIEW_FAILED")
             ingest_preview_service.mark_error(task_id, preview_failure.code, preview_failure.message)
             if os.path.exists(temp_output_path):
@@ -401,11 +430,10 @@ async def _download_and_merge_controlled(
             )
         
         if success:
-            os.replace(temp_output_path, abs_output_path)
-            if preview_succeeded and ingest_preview_service.playlist_path(task_id).is_file():
-                ingest_preview_service.mark_complete(task_id)
-            logger.info(f"[FFmpeg Service] Task completed successfully: {task_id}")
-            update_task_metrics(task_id, 100.0, speed="Finished", eta="00:00:00")
+            native_succeeded = True
+            if native_result_callback is not None:
+                native_result_callback(diagnostics, preview_succeeded)
+            logger.info(f"[FFmpeg Service] Native process exited successfully for task {task_id}; checking sources.")
             return True, None
 
         diagnostics_path = write_task_diagnostics(task_id, "ffmpeg", diagnostics)
@@ -435,7 +463,7 @@ async def _download_and_merge_controlled(
         update_task_metrics(task_id, 0.0, speed="Failed", eta="00:00:00")
         return False, failure
     finally:
-        if os.path.exists(temp_output_path):
+        if os.path.exists(temp_output_path) and not native_succeeded:
             try:
                 os.remove(temp_output_path)
             except OSError:
