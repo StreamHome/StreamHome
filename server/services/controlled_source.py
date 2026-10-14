@@ -19,7 +19,6 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-from config import settings
 from lifecycle.coordination import EffectClass, runtime_work
 from lifecycle.media_work import settle
 from services.hls_context import SourceContextPolicy
@@ -92,7 +91,6 @@ class SourceRelay:
         self.client: httpx.AsyncClient | None = None
         self.closed = False
         self.failure: Exception | None = None
-        self.permissions = settings.HLS_CONTEXT_HEADER_PERMISSIONS
         self.context_policy: SourceContextPolicy | None = None
         self.task_id = task_id
         self.input_role = input_role if input_role in {"video", "audio", "source"} else "source"
@@ -157,7 +155,7 @@ class SourceRelay:
     async def prepare_input(self, url: str, headers: dict[str, str], *, manifest: bool = False) -> str:
         if self.context_policy is None:
             try:
-                self.context_policy = SourceContextPolicy.capture(self.permissions, url, headers)
+                self.context_policy = SourceContextPolicy.capture(url, headers)
             except (ValueError, UnicodeError):
                 error = UnsafeIngestionSource("Source origin is unavailable.")
                 error.streamhome_policy_hops = [{"hop": 0, "decision": "source-origin-rejected", "context_headers": []}]

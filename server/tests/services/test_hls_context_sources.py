@@ -26,13 +26,13 @@ from services import controlled_source, ffmpeg
 from services import queue as worker, state
 from services.ingestion_headers import encode_source_headers
 from services.controlled_source import SourceRelay, controlled_media_input, is_controlled_input
-from services.hls_context import SourceContextPolicy, parse_hls_context_permissions
+from services.hls_context import SourceContextPolicy
 from services.ingestion_errors import write_task_diagnostics
 from services.ingestion_security import UnsafeIngestionSource
 
 
 CONTEXT = {"Origin": "https://player.example", "Referer": "https://player.example/"}
-ROOT_HEADERS = {**CONTEXT, "Cookie": "synthetic=root-only", "Authorization": "Bearer synthetic-root"}
+ROOT_HEADERS = {**CONTEXT, "Referer": "https://player.example/watch/private?token=synthetic-referer-secret#fragment", "Cookie": "synthetic=root-only", "Authorization": "Bearer synthetic-root"}
 
 
 class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
@@ -48,7 +48,6 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
         self.peers = [await self.origin() for _ in range(4)]
         self.patches = ExitStack()
         self.patches.enter_context(patch.object(settings, "TEMP_DIR", str(self.root / "temp")))
-        self.patches.enter_context(patch.object(settings, "HLS_CONTEXT_HEADER_PERMISSIONS", parse_hls_context_permissions("{}")))
 
     async def asyncTearDown(self):
         for server in self.servers:
@@ -95,11 +94,6 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
     def route(self, peer, path, body=b"", status=200, headers=None):
         self.routes[(int(peer.rsplit(":", 1)[1]), path)] = (status, headers or {}, body)
 
-    def approve(self, targets=None):
-        settings.HLS_CONTEXT_HEADER_PERMISSIONS = parse_hls_context_permissions(json.dumps({
-            self.peers[0]: targets or self.peers[1:]
-        }))
-
     async def native_fixture(self):
         command = [shutil.which("ffmpeg"), "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=25",
                    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "16", "-c:v", "libx264",
@@ -127,6 +121,9 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_native_eight_late_segments_reject_partial_output_then_preserve_all_frames(self):
         source = await self.native_fixture()
+        original_routes = {key: self.routes[key] for key in self.gated}
+        for key in self.gated:
+            self.routes[key] = (404, {}, b"")
         output = self.root / "healthy.mp4"
         shutil.copyfile(self.root / "accepted-source.mp4", output)
         original_hash = hashlib.sha256(output.read_bytes()).hexdigest()
@@ -155,12 +152,12 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(snapshot["status_counts"]["404"], 8)
         self.assertEqual(snapshot["failures"][0]["start_seconds"], 6)
         self.assertIn("native result before source rejection", diagnostic)
-        for sensitive in (source, "synthetic-query-secret", "synthetic-root", "https://player.example"):
+        for sensitive in (source, "synthetic-query-secret", "synthetic-root", "synthetic-referer-secret", "https://player.example"):
             self.assertNotIn(sensitive, diagnostic)
-        self.approve()
+        self.routes.update(original_routes)
         self.requests.clear()
         with patch.object(ffmpeg, "update_task_metrics") as metrics_mock:
-            success, failure = await ffmpeg.download_and_merge("native-approved", source, None, ROOT_HEADERS,
+            success, failure = await ffmpeg.download_and_merge("native-automatic", source, None, ROOT_HEADERS,
                 str(output), 16, preview_enabled=False, client_address="127.0.0.1", attempt=2)
         self.assertTrue(success, failure)
         self.assertTrue(all(call.args[1] < 100 for call in metrics_mock.call_args_list))
@@ -179,33 +176,33 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("authorization", headers)
             self.assertNotIn("cookie", headers)
 
-    async def test_real_redirect_chain_restores_only_approved_context_and_snapshots_settings(self):
-        root, foreign, approved, _ = self.peers
+    async def test_real_redirect_chain_automatically_preserves_context_and_input_snapshot(self):
+        root, foreign, second, _ = self.peers
         self.route(root, "/root", status=302, headers={"Location": foreign + "/foreign"})
-        self.route(foreign, "/foreign", status=302, headers={"Location": approved + "/approved"})
-        self.route(approved, "/approved", b"synthetic payload")
-        self.approve([approved])
+        self.route(foreign, "/foreign", status=302, headers={"Location": second + "/second"})
+        self.route(second, "/second", status=302, headers={"Location": root + "/final"})
+        self.route(root, "/final", b"synthetic payload")
         relay = SourceRelay(client_address="127.0.0.1")
-        settings.HLS_CONTEXT_HEADER_PERMISSIONS = parse_hls_context_permissions("{}")
+        submitted = dict(ROOT_HEADERS)
         await relay.start()
         try:
-            local = await relay.prepare_input(root + "/root", ROOT_HEADERS)
+            local = await relay.prepare_input(root + "/root", submitted)
+            submitted["Origin"] = "https://changed.example"
+            submitted["Referer"] = "https://changed.example/private"
             async with httpx.AsyncClient(trust_env=False) as consumer:
                 self.assertEqual((await consumer.get(local)).content, b"synthetic payload")
         finally:
             await relay.close()
         self.assertFalse(is_controlled_input(local))
         for _, path, headers, _ in self.requests:
-            if path == "/foreign":
-                self.assertTrue(all(name not in headers for name in ("origin", "referer", "cookie", "authorization")))
-            elif path == "/approved":
+            if path in ("/foreign", "/second", "/final"):
                 self.assertEqual(headers["origin"], CONTEXT["Origin"])
                 self.assertNotIn("cookie", headers)
                 self.assertNotIn("authorization", headers)
+                self.assertEqual(headers["referer"], ROOT_HEADERS["Referer"] if path == "/final" else CONTEXT["Referer"])
 
     async def test_native_source_processing_error_cannot_accept_partial_frames(self):
         source = await self.native_fixture()
-        self.approve()
         for key in self.gated:
             status, headers, body = self.routes[key]
             # Actual upstream wire bytes: HTTPX decodes valid UTF-8 obs-text,
@@ -231,12 +228,15 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(list(self.root.glob("*.part.mp4")))
         diagnostic = Path(failure.diagnostics_path).read_text()
         self.assertIn('"error_kind": "UnicodeEncodeError"', diagnostic)
-        self.assertIn('"decision": "approved-context"', diagnostic)
+        self.assertIn('"decision": "automatic-context"', diagnostic)
         self.assertNotIn("日本語", diagnostic)
         self.assertNotIn("synthetic-query-secret", diagnostic)
 
     async def test_actual_queue_preserves_accepted_catalog_then_retries_transient_source_with_fresh_relays(self):
         source = await self.native_fixture()
+        original_routes = {key: self.routes[key] for key in self.gated}
+        for key in self.gated:
+            self.routes[key] = (404, {}, b"")
         database = self.root / "queue.db"
         engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
         media_dir = self.root / "media"
@@ -309,7 +309,7 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), old_hash)
                 self.assertEqual(attempts, [], "Terminal probe failure must stop before native download")
                 self.assertNotIn(("queue-denied", 100), metrics)
-                self.approve()
+                self.routes.update(original_routes)
                 await seed("queue-transient")
                 await worker.DownloadQueueManager()._process_task("queue-transient")
                 async with AsyncSession(engine) as session:
@@ -481,7 +481,6 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_video_and_audio_relays_keep_independent_context_on_the_same_cdn(self):
         video, audio, cdn, _ = self.peers
-        settings.HLS_CONTEXT_HEADER_PERMISSIONS = parse_hls_context_permissions(json.dumps({video: [cdn], audio: [cdn]}))
         for root, role in ((video, "video"), (audio, "audio")):
             self.route(root, "/master", f"#EXTM3U\n#EXTINF:1,\n{cdn}/{role}.ts\n#EXT-X-ENDLIST\n".encode())
             self.route(cdn, f"/{role}.ts", role.encode())
@@ -505,7 +504,7 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
     async def test_repeated_uri_occurrences_and_diagnostic_bounds(self):
         relay = SourceRelay(task_id="occurrences")
         relay.base_url = "http://127.0.0.1:1/synthetic-capability"
-        relay.context_policy = SourceContextPolicy.capture(parse_hls_context_permissions("{}"), "https://source.example/playlist", {})
+        relay.context_policy = SourceContextPolicy.capture("https://source.example/playlist", {})
         rewritten = relay.rewrite_manifest(b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:20\n#EXT-X-BYTERANGE:10@0\n#EXTINF:2,\nshared.ts\n#EXT-X-BYTERANGE:10@10\n#EXTINF:3,\nshared.ts\n", "https://source.example/playlist", {})
         paths = [line for line in rewritten.decode().splitlines() if line.startswith("http")]
         self.assertEqual(len(set(paths)), 2)

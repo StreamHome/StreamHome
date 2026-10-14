@@ -840,34 +840,27 @@ The server remains responsible for:
 
 ### HLS context across CDN origins
 
-The server strips `Authorization`, `Cookie`, `Origin` and `Referer` when a source
-crosses an origin boundary. Some authorized HLS sources require a non-secret
-`Origin` or root `Referer` on their CDN fragments. An operator can permit that
-context for exact source-to-CDN origin pairs in the server environment:
+StreamHome automatically follows submitted media sources and their HLS resources
+using each input's own context. **No CDN list or per-source server setting is
+required.** The former `INGEST_HLS_CONTEXT_ORIGINS` setting is retired and ignored;
+there is no replacement setting. The API schema and `source_headers: 1` capability
+are unchanged.
 
-```dotenv
-INGEST_HLS_CONTEXT_ORIGINS='{"https://media.example":["https://cdn-a.example","https://cdn-b.example:8443"]}'
-```
+On cross-origin requests, a valid submitted `Origin` is retained. It must be a plain
+HTTP(S) origin without userinfo, path, query or fragment. A valid absolute HTTP(S)
+`Referer` is reduced to its canonical site origin followed by `/`; private page
+paths, queries and fragments are never forwarded to another origin. Same-origin
+requests preserve their original submitted context. After returning to the
+original source, only captured eligible context can be restored.
 
-The default is `{}`. Configure only destinations you trust with the submitted
-context and activate the configuration through the normal server restart process.
-Clients and playlists cannot add destinations. This does not change the API
-schema or the `source_headers: 1` capability.
-
-Origins contain only scheme, hostname and optional port, without a trailing slash,
-userinfo, path, query or fragment. Matching uses canonical scheme, IDNA hostname
-and effective port; there are no wildcards or inferred hostname families. Invalid
-or duplicate configuration fails startup with a safe error. Limits are 64 KiB of
-JSON, 64 source origins and 32 destinations per source.
-
-Only submitted `Origin` and `Referer` values that themselves contain a plain
-HTTP(S) origin, optionally followed by `/`, can cross an approved boundary. Values
-with private paths, queries, fragments or userinfo keep the strict default rules.
-`Cookie` and `Authorization` are never restored after crossing an origin boundary.
-Video and detached audio keep separate immutable context snapshots. The same
-policy applies to nested playlists, keys, initialization fragments, segments and
-each redirect; HTTPS downgrades remain blocked. Destination approval does not
-bypass private-network checks, pinned DNS or TLS certificate validation.
+`Cookie` and `Authorization` are stripped at an origin boundary and never restored.
+Video and detached audio use separate immutable snapshots; absent or invalid
+context is not invented. The policy applies to nested playlists, keys,
+initialization fragments, segments and every redirect in the controlled ingestion
+input. Other HTTP consumers retain their strict defaults. Automatic context does
+not bypass private-network restrictions, pinned DNS or TLS certificate validation;
+every HTTPS-to-HTTP transition remains blocked. No hostname-family inference or
+persistent learned trust is introduced.
 
 Automatic playback repairs preserve the retained independent video, audio and
 subtitle sets, including explicit empty sets. Legacy shared headers still work.
