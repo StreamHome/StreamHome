@@ -1,7 +1,7 @@
 import { useLayoutEffect } from "react";
-import type { AppView } from "./queryState";
+import type { AdminSection, AppView } from "./queryState";
 
-export function useViewScrollToTop(view: AppView): void {
+export function useViewScrollToTop(view: AppView | AdminSection): void {
   useLayoutEffect(() => {
     const root = document.getElementById("root");
     if (root) {

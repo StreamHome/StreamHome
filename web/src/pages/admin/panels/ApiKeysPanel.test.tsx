@@ -21,7 +21,7 @@ vi.mock("../SudoModal", () => ({
 }));
 
 const scopes = [
-  { id: "ingest" as const, label: "Add media", description: "Submit movies and episodes to the ingestion queue." },
+  { id: "ingest" as const, label: "Manage media", description: "Submit movies and episodes and manage supported media sidecars." },
   { id: "downloads:read" as const, label: "View download queue", description: "Read current and recent ingestion task status." },
   { id: "downloads:cancel" as const, label: "Cancel downloads", description: "Cancel ingestion workers and remove download tasks." },
 ];
@@ -55,26 +55,36 @@ describe("ApiKeysPanel", () => {
     vi.mocked(auth.getIntegrationScopes).mockResolvedValue(scopes);
   });
 
-  it("lists server-wide keys and makes Add media readiness explicit", async () => {
+  it("lists server-wide keys and makes Manage media readiness explicit", async () => {
     render(<ApiKeysPanel />);
     expect(await screen.findByRole("heading", { name: "Existing API keys" })).toBeTruthy();
     expect(screen.getByText("Bedroom sender")).toBeTruthy();
     expect(screen.getByText("Queue monitor")).toBeTruthy();
-    expect(screen.getByText("Media add enabled")).toBeTruthy();
-    expect(screen.getByText("Media add disabled")).toBeTruthy();
+    expect(screen.getByText("Manage media enabled")).toBeTruthy();
+    expect(screen.getByText("Manage media disabled")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Edit permissions" })).toBeTruthy();
   });
 
-  it("creates a named API key with Add media selected by default and shows its secret once", async () => {
+  it("keeps the selected permission badge in sync without changing the server scope id", async () => {
+    render(<ApiKeysPanel />);
+    fireEvent.click(await screen.findByLabelText("Manage media"));
+    expect(screen.getByText("Manage media not selected")).toBeTruthy();
+    expect(auth.createIntegrationCredential).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByLabelText("Manage media"));
+    expect(screen.getByText("Manage media selected")).toBeTruthy();
+  });
+
+  it("creates a named API key with Manage media selected by default and shows its secret once", async () => {
     vi.mocked(auth.createIntegrationCredential).mockResolvedValue({
       credential: { ...sender, id: "credential-3", name: "Living room sender" },
       token: "shk_complete_show_once_secret",
     });
     render(<ApiKeysPanel />);
     fireEvent.change(await screen.findByLabelText("API key name"), { target: { value: "Living room sender" } });
-    expect((screen.getByLabelText("Add media") as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText("Manage media") as HTMLInputElement).checked).toBe(true);
     fireEvent.click(screen.getByLabelText("View download queue"));
-    fireEvent.change(screen.getByLabelText("API key expiration"), { target: { value: "90" } });
+    fireEvent.click(screen.getByRole("combobox", { name: "API key expiration" }));
+    fireEvent.click(screen.getByRole("option", { name: "90 days" }));
     fireEvent.click(screen.getByRole("button", { name: "Create API key" }));
     await waitFor(() => expect(auth.createIntegrationCredential).toHaveBeenCalledWith(
       "Living room sender",
@@ -113,5 +123,18 @@ describe("ApiKeysPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Complete reauthorization" }));
     await waitFor(() => expect(auth.getIntegrationCredentials).toHaveBeenCalledTimes(2));
     expect(await screen.findByText("Bedroom sender")).toBeTruthy();
+  });
+
+  it("opens permission guidance without changing a key or the selected create permissions", async () => {
+    render(<ApiKeysPanel />);
+    await screen.findByText("Bedroom sender");
+    expect(screen.queryByText(/inspect its error code/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "MediaSender permissions and troubleshooting" }));
+    expect(screen.getByRole("dialog", { name: "MediaSender permissions and troubleshooting" })).toBeTruthy();
+    expect(screen.getByText(/inspect its error code/)).toBeTruthy();
+    expect((screen.getByLabelText("Manage media") as HTMLInputElement).checked).toBe(true);
+    expect(auth.createIntegrationCredential).not.toHaveBeenCalled();
+    expect(auth.updateIntegrationCredential).not.toHaveBeenCalled();
+    expect(auth.revokeIntegrationCredential).not.toHaveBeenCalled();
   });
 });

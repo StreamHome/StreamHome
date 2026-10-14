@@ -1,7 +1,6 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useId, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  beginReauthentication,
   cancelSetup2FA,
   disable2FA,
   getAuthSessions,
@@ -15,9 +14,12 @@ import {
   updateAccountEmail,
   updateAccountPassword,
   updateSessionPolicy,
-  verifyReauthentication,
   verifySetup2FA,
 } from "../api/auth";
+import { ApiError } from "../api/client";
+import { ReauthenticationForm } from "./admin/ReauthenticationForm";
+import { AccountSectionNavigation } from "./admin/AccountSectionNavigation";
+import { AuthenticatorCodeInput } from "../components/ui/AuthenticatorCodeInput";
 import { MOTION_EASE, MOTION_TIMINGS, useAppMotion } from "../motion/motionSystem";
 import { useAuthStore } from "../stores/authStore";
 import type {
@@ -98,14 +100,19 @@ function SecurityEventDialog({ event, onClose }: { event: SecurityEventInfo | nu
   </motion.div>}</AnimatePresence>;
 }
 
+function CredentialPassword({ label, purpose, ...props }: React.InputHTMLAttributes<HTMLInputElement> & { label: string; purpose: string }) {
+  const id = useId();
+  const [visible, setVisible] = useState(false);
+  return <div className="security-password-field"><label htmlFor={id}>{label}</label><div>
+    <input {...props} id={id} type={visible ? "text" : "password"} />
+    <button type="button" disabled={props.disabled} aria-controls={id} aria-pressed={visible} aria-label={`${visible ? "Hide" : "Show"} ${label.toLowerCase()} ${purpose}`} onClick={() => setVisible((value) => !value)}>{visible ? "Hide" : "Show"}</button>
+  </div></div>;
+}
+
 export function AccountSecurityPage() {
   const logout = useAuthStore((state) => state.logout);
   const setToken = useAuthStore((state) => state.setToken);
   const [gate, setGate] = useState<GateState>("checking");
-  const [password, setPassword] = useState("");
-  const [challengeToken, setChallengeToken] = useState("");
-  const [factorCode, setFactorCode] = useState("");
-  const [factorMethod, setFactorMethod] = useState<"totp" | "recovery">("totp");
   const [summary, setSummary] = useState<SecuritySummary | null>(null);
   const [sessions, setSessions] = useState<AuthSessionInfo[]>([]);
   const [events, setEvents] = useState<SecurityEventInfo[]>([]);
@@ -128,6 +135,14 @@ export function AccountSecurityPage() {
   const [sessionLifetimeDays, setSessionLifetimeDays] = useState(60);
   const closeEventDialog = useCallback(() => setSelectedEvent(null), []);
 
+  const handleError = useCallback((requestError: unknown, fallback: string) => {
+    if (requestError instanceof ApiError && requestError.code === "reauthentication_required") {
+      setGate("locked");
+      setEmailPassword(""); setCurrentPassword(""); setNewPassword(""); setConfirmPassword("");
+      setError("Your identity confirmation expired. Confirm your password, then retry your change.");
+    } else setError(requestError instanceof Error ? requestError.message : fallback);
+  }, []);
+
   const load = useCallback(async () => {
     setBusy(true); setError("");
     try {
@@ -138,35 +153,20 @@ export function AccountSecurityPage() {
       ]);
       setSummary(nextSummary); setSessions(nextSessions); setEvents(nextEvents.events); setNextCursor(nextEvents.nextCursor);
       setEmail(nextSummary.email); setSessionLifetimeDays(nextSummary.sessionLifetimeDays);
-    } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Security information could not be loaded."); }
+    } catch (requestError) { handleError(requestError, "Security information could not be loaded."); }
     finally { setBusy(false); }
-  }, []);
+  }, [handleError]);
 
   useEffect(() => {
     getReauthenticationStatus().then((status) => { if (status.reauthenticated) { setGate("ready"); void load(); } else setGate("locked"); }).catch(() => setGate("locked"));
   }, [load]);
-
-  const authenticate = async (event: React.FormEvent) => {
-    event.preventDefault(); setBusy(true); setError("");
-    try {
-      if (challengeToken) {
-        await verifyReauthentication({ challengeToken, method: factorMethod, code: factorCode });
-        setGate("ready"); setChallengeToken(""); setFactorCode(""); await load();
-      } else {
-        const response = await beginReauthentication(password);
-        if ("requires2fa" in response) setChallengeToken(response.challengeToken);
-        else { setGate("ready"); await load(); }
-      }
-    } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Reauthentication failed."); }
-    finally { setBusy(false); }
-  };
 
   const saveEmail = async (event: React.FormEvent) => {
     event.preventDefault(); setBusy(true); setError(""); setMessage("");
     try {
       const result = await updateAccountEmail(email, emailPassword);
       setToken("", result.email); setEmailPassword(""); setMessage(`${result.message} Other signed-in devices were revoked.`); await load();
-    } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "The account email could not be updated."); }
+    } catch (requestError) { handleError(requestError, "The account email could not be updated."); }
     finally { setBusy(false); }
   };
 
@@ -177,53 +177,50 @@ export function AccountSecurityPage() {
     try {
       const result = await updateAccountPassword(currentPassword, newPassword);
       setCurrentPassword(""); setNewPassword(""); setConfirmPassword(""); setMessage(`${result.message} Other signed-in devices were revoked.`); await load();
-    } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "The password could not be updated."); }
+    } catch (requestError) { handleError(requestError, "The password could not be updated."); }
     finally { setBusy(false); }
   };
 
   const saveSessionPolicy = async (event: React.FormEvent) => {
     event.preventDefault(); setBusy(true); setError(""); setMessage("");
     try { const result = await updateSessionPolicy(sessionLifetimeDays); setSessionLifetimeDays(result.sessionLifetimeDays); setMessage(result.message); await load(); }
-    catch (requestError) { setError(requestError instanceof Error ? requestError.message : "The session lifetime could not be updated."); }
+    catch (requestError) { handleError(requestError, "The session lifetime could not be updated."); }
     finally { setBusy(false); }
   };
 
-  const beginSetup = async () => { setBusy(true); setError(""); setSetupCopyStatus(""); try { setSetup(await setup2FA()); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "TOTP setup failed."); } finally { setBusy(false); } };
-  const confirmSetup = async () => { if (!setup) return; setBusy(true); setError(""); try { const result = await verifySetup2FA(setup.enrollmentId, setupCode); setRecoveryCodes(result.recoveryCodes); setCodesSaved(false); setSetup(null); setSetupCode(""); setSetupCopyStatus(""); setMessage(result.message); await load(); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "The code was not accepted."); } finally { setBusy(false); } };
-  const cancelSetup = async () => { if (!setup) return; setBusy(true); setError(""); try { await cancelSetup2FA(setup.enrollmentId); setSetup(null); setSetupCode(""); setSetupCopyStatus(""); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "TOTP enrollment could not be cancelled."); } finally { setBusy(false); } };
+  const beginSetup = async () => { setBusy(true); setError(""); setSetupCopyStatus(""); try { setSetup(await setup2FA()); } catch (requestError) { handleError(requestError, "TOTP setup failed."); } finally { setBusy(false); } };
+  const confirmSetup = async () => { if (!setup) return; setBusy(true); setError(""); try { const result = await verifySetup2FA(setup.enrollmentId, setupCode); setRecoveryCodes(result.recoveryCodes); setCodesSaved(false); setSetup(null); setSetupCode(""); setSetupCopyStatus(""); setMessage(result.message); await load(); } catch (requestError) { handleError(requestError, "The code was not accepted."); } finally { setBusy(false); } };
+  const cancelSetup = async () => { if (!setup) return; setBusy(true); setError(""); try { await cancelSetup2FA(setup.enrollmentId); setSetup(null); setSetupCode(""); setSetupCopyStatus(""); } catch (requestError) { handleError(requestError, "TOTP enrollment could not be cancelled."); } finally { setBusy(false); } };
   const copySetupKey = async () => { if (!setup) return; try { await navigator.clipboard.writeText(setup.manualKey); setSetupCopyStatus("copied"); } catch { setSetupCopyStatus("failed"); } };
-  const disable = async () => { setBusy(true); setError(""); try { const result = await disable2FA(disableCode); setDisableCode(""); setMessage(result.message); await load(); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "TOTP could not be disabled."); } finally { setBusy(false); } };
-  const regenerate = async () => { setBusy(true); setError(""); try { const result = await regenerateRecoveryCodes(); setRecoveryCodes(result.recoveryCodes); setCodesSaved(false); setMessage("New recovery codes generated. Previous codes no longer work."); await load(); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Recovery codes could not be generated."); } finally { setBusy(false); } };
+  const disable = async () => { setBusy(true); setError(""); try { const result = await disable2FA(disableCode); setDisableCode(""); setMessage(result.message); await load(); } catch (requestError) { handleError(requestError, "TOTP could not be disabled."); } finally { setBusy(false); } };
+  const regenerate = async () => { setBusy(true); setError(""); try { const result = await regenerateRecoveryCodes(); setRecoveryCodes(result.recoveryCodes); setCodesSaved(false); setMessage("New recovery codes generated. Previous codes no longer work."); await load(); } catch (requestError) { handleError(requestError, "Recovery codes could not be generated."); } finally { setBusy(false); } };
   const copyCodes = async () => { await navigator.clipboard.writeText(recoveryCodes.join("\n")); setMessage("Recovery codes copied."); };
   const downloadCodes = () => { const blob = new Blob([`StreamHome recovery codes\nGenerated ${new Date().toISOString()}\n\n${recoveryCodes.join("\n")}\n`], { type: "text/plain" }); const href = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = href; anchor.download = "streamhome-recovery-codes.txt"; anchor.click(); URL.revokeObjectURL(href); };
-  const revoke = async (session: AuthSessionInfo) => { setBusy(true); setError(""); try { const result = await revokeAuthSession(session.id); if (result.currentSession) { logout(); return; } await load(); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Session could not be revoked."); } finally { setBusy(false); } };
-  const revokeOthers = async () => { setBusy(true); setError(""); try { const result = await revokeOtherSessions(); setMessage(`${result.revokedCount} other session${result.revokedCount === 1 ? "" : "s"} signed out.`); await load(); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "Other sessions could not be revoked."); } finally { setBusy(false); } };
+  const revoke = async (session: AuthSessionInfo) => { setBusy(true); setError(""); try { const result = await revokeAuthSession(session.id); if (result.currentSession) { logout(); return; } await load(); } catch (requestError) { handleError(requestError, "Session could not be revoked."); } finally { setBusy(false); } };
+  const revokeOthers = async () => { setBusy(true); setError(""); try { const result = await revokeOtherSessions(); setMessage(`${result.revokedCount} other session${result.revokedCount === 1 ? "" : "s"} signed out.`); await load(); } catch (requestError) { handleError(requestError, "Other sessions could not be revoked."); } finally { setBusy(false); } };
   const loadMore = async () => { if (!nextCursor) return; setBusy(true); try { const result = await getSecurityEvents(nextCursor); setEvents((current) => [...current, ...result.events]); setNextCursor(result.nextCursor); } finally { setBusy(false); } };
 
+  const pageHeading = <header className="admin-panel__header"><p>IDENTITY / ACCESS</p><h1>Account and Security</h1><span>Manage sign-in, recovery and devices for your server account.</span></header>;
   return <section className="admin-panel admin-panel--account admin-security">
-    <header className="admin-panel__header"><p>IDENTITY / ACCESS</p><h1>Account and Security</h1><span>Manage credentials, authentication, recovery access, signed-in devices, and security history without leaving the control plane.</span></header>
-    {gate !== "ready" ? <section className="security-gate">
-      <p className="security-eyebrow">Sensitive controls</p><h2>{gate === "checking" ? "Checking authorization" : "Confirm your identity"}</h2><p>Security controls require a recent password and local second factor.</p>
-      {gate === "locked" && <form onSubmit={authenticate}>
-        {!challengeToken ? <label>Password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required autoFocus /></label> : <><label>{factorMethod === "totp" ? "Authenticator code" : "Recovery code"}<input inputMode={factorMethod === "totp" ? "numeric" : "text"} autoComplete="one-time-code" value={factorCode} onChange={(event) => setFactorCode(factorMethod === "totp" ? event.target.value.replace(/\D/g, "").slice(0, 6) : event.target.value.toUpperCase())} required autoFocus /></label><button type="button" className="security-text-action" onClick={() => { setFactorMethod((value) => value === "totp" ? "recovery" : "totp"); setFactorCode(""); }}>{factorMethod === "totp" ? "Use recovery code" : "Use authenticator"}</button></>}
-        {error && <p className="security-error" role="alert">{error}</p>}<button className="security-primary" disabled={busy}>{busy ? "Verifying…" : challengeToken ? "Verify factor" : "Continue"}</button>
-      </form>}
-    </section> : <div className="security-content">
-      <div className="security-heading"><div><p className="security-eyebrow">Server account controls</p><h2>Protect every StreamHome session</h2><span>Changes made here are enforced by the server and recorded in security activity.</span></div><button onClick={() => void load()} disabled={busy}>Refresh</button></div>
+    {gate !== "ready" ? <>{pageHeading}<section className="security-gate">
+      <p className="security-eyebrow">Sensitive controls</p><h2>{gate === "checking" ? "Checking access" : "Confirm your identity"}</h2><p>Verify access to your account’s sensitive controls.</p>
+      {gate === "locked" && <>{error && <p className="security-error" role="alert">{error}</p>}<ReauthenticationForm onSuccess={async () => { setGate("ready"); await load(); }} /></>}
+    </section></> : <div className="account-workspace"><AccountSectionNavigation /><div className="account-main">{pageHeading}<div className="security-content">
+      <div className="security-heading"><div><p className="security-eyebrow">Server account controls</p><h2>Account overview</h2><span>Account changes apply across StreamHome and appear in security activity.</span></div><button onClick={() => void load()} disabled={busy}>Refresh</button></div>
       <AnimatePresence>{(error || message) && <motion.div className={error ? "security-notice security-notice--error" : "security-notice"} initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} role={error ? "alert" : "status"}>{error || message}</motion.div>}</AnimatePresence>
-      <section className="security-overview"><article><span>Account</span><strong>{summary?.email ?? "Loading…"}</strong><small>TOTP {summary?.twoFactorEnabled ? "enabled" : "not enabled"}</small></article><article><span>Previous successful login</span><strong>{formatTime(summary?.previousLogin?.at)}</strong><small>{summary?.previousLogin ? `${summary.previousLogin.deviceLabel} · ${summary.previousLogin.ipAddress}` : "No earlier login recorded"}</small></article><article><span>Session policy</span><strong>{summary?.sessionLifetimeDays ?? 60} days</strong><small>Absolute lifetime for new sign-ins</small></article><article><span>Recovery access</span><strong>{summary?.recoveryCodesRemaining ?? 0} codes remaining</strong><small>Every code works once</small></article></section>
-      <section className="security-card security-credentials"><header><div><p className="security-eyebrow">Administrator identity</p><h3>Email and password</h3></div></header><div className="security-credential-grid">
-        <form onSubmit={saveEmail}><div><h4>Account email</h4><p>This address is used to sign in. Updating it signs out every other device.</p></div><label>Email address<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label><label>Current password<input type="password" autoComplete="current-password" value={emailPassword} onChange={(event) => setEmailPassword(event.target.value)} required /></label><button className="security-primary" disabled={busy || !summary || email.trim().toLowerCase() === summary.email.toLowerCase()}>Update email</button></form>
-        <form onSubmit={savePassword}><div><h4>Change password</h4><p>Use at least six characters. Updating it invalidates pending challenges and signs out other devices.</p></div><label>Current password<input type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></label><label>New password<input type="password" autoComplete="new-password" minLength={6} maxLength={72} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /></label><label>Confirm new password<input type="password" autoComplete="new-password" minLength={6} maxLength={72} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} required /></label><button className="security-primary" disabled={busy || newPassword.length < 6 || confirmPassword.length < 6}>Update password</button></form>
-      </div></section>
-      <section className="security-card"><header><div><p className="security-eyebrow">Local second factor</p><h3>Authenticator and recovery</h3></div>{!summary?.twoFactorEnabled && !setup && <button className="security-primary" onClick={() => void beginSetup()}>Set up TOTP</button>}</header>
-        {setup && <div className="security-setup security-totp-enrollment"><div className="security-totp-qr"><img src={setup.qrImageUrl} alt={`Scan this QR code to add StreamHome for ${summary?.email ?? "this account"} to an authenticator app`} /><div><h4>Scan with your authenticator</h4><p>This QR code is generated by your StreamHome server and expires at {new Date(setup.expiresAt * 1000).toLocaleTimeString()}.</p></div></div><div className="security-totp-manual"><span>Can&apos;t scan? Enter this setup key manually.</span><code>{setup.manualKey}</code><button type="button" onClick={() => void copySetupKey()}>{setupCopyStatus === "copied" ? "Copied" : "Copy setup key"}</button>{setupCopyStatus === "failed" && <small role="status">Copy was blocked. Select the key and copy it manually.</small>}</div><label>Six-digit authenticator code<input aria-label="TOTP setup code" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={setupCode} onChange={(event) => setSetupCode(event.target.value.replace(/\D/g, ""))} /></label><div className="security-inline-actions"><button type="button" onClick={() => void cancelSetup()} disabled={busy}>Cancel</button><button className="security-primary" disabled={setupCode.length !== 6 || busy} onClick={() => void confirmSetup()}>Enable TOTP</button></div></div>}
-        {summary?.twoFactorEnabled && <div className="security-actions"><div><h4>Recovery codes</h4><p>Generate a fresh set if the previous copy is unavailable.</p><button onClick={() => void regenerate()} disabled={busy}>Regenerate codes</button></div><div><h4>Disable TOTP</h4><p>This also invalidates recovery codes and signs out other devices.</p><input aria-label="TOTP code to disable" inputMode="numeric" maxLength={6} value={disableCode} onChange={(event) => setDisableCode(event.target.value.replace(/\D/g, ""))} placeholder="Six-digit code" /><button className="security-danger" disabled={disableCode.length !== 6 || busy} onClick={() => void disable()}>Disable TOTP</button></div></div>}
+      <section className="security-overview"><article><a href="#account-credentials">Account</a><strong>{summary?.email ?? "Loading…"}</strong><small>TOTP {summary?.twoFactorEnabled ? "enabled" : "not enabled"}</small></article><article><span>Previous successful login</span><strong>{formatTime(summary?.previousLogin?.at)}</strong><small>{summary?.previousLogin ? `${summary.previousLogin.deviceLabel} · ${summary.previousLogin.ipAddress}` : "No earlier login recorded"}</small></article><article><a href="#account-sessions">Session policy</a><strong>{summary?.sessionLifetimeDays ?? 60} days</strong><small>Absolute lifetime for new sign-ins</small></article><article><a href="#account-authenticator">Recovery access</a><strong>{summary?.recoveryCodesRemaining ?? 0} codes remaining</strong><small>Every code works once</small></article></section>
+      <section id="account-authenticator" tabIndex={-1} className="security-card"><header><div><p className="security-eyebrow">Local second factor</p><h2>Authenticator and recovery</h2></div>{!summary?.twoFactorEnabled && !setup && <button className="security-primary" onClick={() => void beginSetup()}>Set up TOTP</button>}</header>
+        {setup && <div className="security-setup security-totp-enrollment"><div className="security-totp-qr"><img src={setup.qrImageUrl} alt={`Scan this QR code to add StreamHome for ${summary?.email ?? "this account"} to an authenticator app`} /><div><h3>Scan with your authenticator</h3><p>This QR code is generated by your StreamHome server and expires at {new Date(setup.expiresAt * 1000).toLocaleTimeString()}.</p></div></div><div className="security-totp-manual"><span>Can&apos;t scan? Enter this setup key manually.</span><code>{setup.manualKey}</code><button type="button" onClick={() => void copySetupKey()}>{setupCopyStatus === "copied" ? "Copied" : "Copy setup key"}</button>{setupCopyStatus === "failed" && <small role="status">Copy was blocked. Select the key and copy it manually.</small>}</div><AuthenticatorCodeInput label="TOTP setup code" value={setupCode} onChange={setSetupCode} disabled={busy} /><div className="security-inline-actions"><button type="button" onClick={() => void cancelSetup()} disabled={busy}>Cancel</button><button className="security-primary" disabled={setupCode.length !== 6 || busy} onClick={() => void confirmSetup()}>Enable TOTP</button></div></div>}
+        {summary?.twoFactorEnabled && <div className="security-actions"><div><h3>Recovery codes</h3><p>Generating a new set immediately invalidates all previous codes. Save the new codes before leaving this page; they are shown only once.</p><button onClick={() => void regenerate()} disabled={busy}>Regenerate codes</button></div><div><h3>Disable TOTP</h3><p>This also invalidates recovery codes and signs out other devices.</p><AuthenticatorCodeInput label="TOTP code to disable" value={disableCode} onChange={setDisableCode} disabled={busy} /><button className="security-danger" disabled={disableCode.length !== 6 || busy} onClick={() => void disable()}>Disable TOTP</button></div></div>}
       </section>
-      {recoveryCodes.length > 0 && <section className="security-card security-recovery"><header><div><p className="security-eyebrow">Show once</p><h3>Save your recovery codes now</h3></div></header><p>Each code can replace your authenticator once. They cannot be displayed again.</p><div className="security-code-grid">{recoveryCodes.map((item) => <code key={item}>{item}</code>)}</div><div className="security-inline-actions"><button onClick={() => void copyCodes()}>Copy all</button><button onClick={downloadCodes}>Download .txt</button></div><label><input type="checkbox" checked={codesSaved} onChange={(event) => setCodesSaved(event.target.checked)} /> I saved these codes somewhere secure</label><button className="security-primary" disabled={!codesSaved} onClick={() => setRecoveryCodes([])}>Finish</button></section>}
-      <section className="security-card"><header><div><p className="security-eyebrow">Session access policy</p><h3>Active sessions</h3></div><button onClick={() => void revokeOthers()} disabled={busy || sessions.length < 2}>Sign out all other devices</button></header><form className="security-session-policy" onSubmit={saveSessionPolicy}><label>New-session lifetime<div><input aria-label="Session lifetime in days" type="number" min={1} max={365} value={sessionLifetimeDays} onChange={(event) => setSessionLifetimeDays(Number(event.target.value))} /><span>days</span></div></label><p>Applies to future sign-ins. Existing sessions retain the expiration shown below.</p><button className="security-primary" disabled={busy || !summary || sessionLifetimeDays === summary.sessionLifetimeDays || sessionLifetimeDays < 1 || sessionLifetimeDays > 365}>Save lifetime</button></form><div className="security-session-list">{sessions.map((item) => <article key={item.id}><div><strong>{item.deviceLabel}{item.current && <b>Current</b>}</strong><span>{item.ipAddress} · Last active {formatTime(item.lastSeenAt)}</span><small>Expires {formatTime(item.expiresAt)}</small></div><button className={item.current ? "security-danger" : ""} onClick={() => void revoke(item)}>{item.current ? "Sign out" : "Revoke"}</button></article>)}</div></section>
-      <section className="security-card"><header><div><p className="security-eyebrow">180-day history</p><h3>Security activity</h3></div></header><div className="security-event-list">{events.map((item) => <button type="button" className="security-event-entry" key={item.id} aria-haspopup="dialog" onClick={() => setSelectedEvent(item)}><i data-outcome={item.outcome} aria-hidden="true" /><span className="security-event-entry__copy"><strong>{eventLabel(item.type)}</strong><small>{item.deviceLabel} · {item.ipAddress}</small></span><time dateTime={new Date(item.createdAt * 1000).toISOString()}>{formatTime(item.createdAt)}</time></button>)}{events.length === 0 && <p>No security activity has been recorded yet.</p>}</div>{nextCursor && <button className="security-load-more" disabled={busy} onClick={() => void loadMore()}>Load earlier activity</button>}</section>
-    </div>}
+      {recoveryCodes.length > 0 && <section className="security-card security-recovery"><header><div><p className="security-eyebrow">Show once</p><h2>Save your recovery codes now</h2></div></header><p>Each code can replace your authenticator once. They cannot be displayed again.</p><div className="security-code-grid">{recoveryCodes.map((item) => <code key={item}>{item}</code>)}</div><div className="security-inline-actions"><button onClick={() => void copyCodes()}>Copy all</button><button onClick={downloadCodes}>Download .txt</button></div><label><input type="checkbox" checked={codesSaved} onChange={(event) => setCodesSaved(event.target.checked)} /> I saved these codes somewhere secure</label><button className="security-primary" disabled={!codesSaved} onClick={() => setRecoveryCodes([])}>Finish</button></section>}
+      <section id="account-credentials" tabIndex={-1} className="security-card security-credentials"><header><div><p className="security-eyebrow">Administrator identity</p><h2>Email and password</h2></div></header><div className="security-credential-grid">
+        <form onSubmit={saveEmail}><div><h3>Account email</h3><p>This address is used to sign in. Updating it signs out every other device.</p></div><label>Email address<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label><CredentialPassword label="Current password" purpose="for email change" autoComplete="current-password" value={emailPassword} onChange={(event) => setEmailPassword(event.target.value)} required disabled={busy} /><button className="security-primary" disabled={busy || !summary || email.trim().toLowerCase() === summary.email.toLowerCase()}>Update email</button></form>
+        <form onSubmit={savePassword}><div><h3>Change password</h3><p>Use at least six characters. Updating it invalidates pending challenges and signs out other devices.</p></div><CredentialPassword label="Current password" purpose="for password change" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required disabled={busy} /><CredentialPassword label="New password" purpose="for password change" autoComplete="new-password" minLength={6} maxLength={72} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required disabled={busy} /><CredentialPassword label="Confirm new password" purpose="for password change" autoComplete="new-password" minLength={6} maxLength={72} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} required disabled={busy} /><button className="security-primary" disabled={busy || newPassword.length < 6 || confirmPassword.length < 6}>Update password</button></form>
+      </div></section>
+      <section id="account-sessions" tabIndex={-1} className="security-card"><header><div><p className="security-eyebrow">Session access policy</p><h2>Active sessions</h2></div><button onClick={() => void revokeOthers()} disabled={busy || sessions.length < 2}>Sign out all other devices</button></header><form className="security-session-policy" onSubmit={saveSessionPolicy}><label>New-session lifetime<div><input aria-label="Session lifetime in days" type="number" min={1} max={365} value={sessionLifetimeDays} onChange={(event) => setSessionLifetimeDays(Number(event.target.value))} /><span>days</span></div></label><p>Applies to future sign-ins. Existing sessions retain the expiration shown below.</p><button className="security-primary" disabled={busy || !summary || sessionLifetimeDays === summary.sessionLifetimeDays || sessionLifetimeDays < 1 || sessionLifetimeDays > 365}>Save lifetime</button></form><div className="security-session-list">{sessions.map((item) => <article key={item.id}><div><strong>{item.deviceLabel}{item.current && <b>Current</b>}</strong><span>{item.ipAddress} · Last active {formatTime(item.lastSeenAt)}</span><small>Expires {formatTime(item.expiresAt)}</small></div><button className={item.current ? "security-danger" : ""} onClick={() => void revoke(item)}>{item.current ? "Sign out" : "Revoke"}</button></article>)}</div></section>
+      <section id="account-activity" tabIndex={-1} className="security-card"><header><div><p className="security-eyebrow">180-day history</p><h2>Security activity</h2></div></header><div className="security-event-list">{events.map((item) => <button type="button" className="security-event-entry" key={item.id} aria-haspopup="dialog" onClick={() => setSelectedEvent(item)}><i data-outcome={item.outcome} aria-hidden="true" /><span className="security-event-entry__copy"><strong>{eventLabel(item.type)}</strong><small>{item.deviceLabel} · {item.ipAddress}</small></span><span className="security-event-entry__details" aria-hidden="true">View details →</span><time dateTime={new Date(item.createdAt * 1000).toISOString()}>{formatTime(item.createdAt)}</time></button>)}{events.length === 0 && <p>No security activity has been recorded yet.</p>}</div>{nextCursor && <button className="security-load-more" disabled={busy} onClick={() => void loadMore()}>Load earlier activity</button>}</section>
+    </div></div></div>}
     <SecurityEventDialog event={selectedEvent} onClose={closeEventDialog} />
   </section>;
 }

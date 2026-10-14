@@ -49,7 +49,8 @@ export function ServerDownloads() {
                 <div><small>{download.status}</small><h2>{download.title}</h2></div>
                 <strong>{Math.round(download.progress)}%</strong>
               </header>
-              <p>{download.speed} · ETA {download.eta}</p>
+              {statusKind(download.status) === "active" && <p>{download.speed} · ETA {download.eta}</p>}
+              {statusKind(download.status) === "failed" && <p className="server-downloads__failure-help">Check that the source is available in the app that submitted this job. If the problem continues, ask the server operator to inspect it.</p>}
               <ProgressBar className="server-downloads__progress" progress={downloadFraction(download.progress)} />
             </article>
           ))}

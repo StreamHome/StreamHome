@@ -1,6 +1,7 @@
 export function ScanLines() {
   return (
     <div
+      className="ember-scanlines"
       style={{
         position: 'fixed',
         inset: 0,

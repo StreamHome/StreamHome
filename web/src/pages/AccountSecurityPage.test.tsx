@@ -28,18 +28,38 @@ describe("AccountSecurityPage", () => {
     vi.mocked(auth.getSecurityEvents).mockResolvedValue({ events: [securityEvent], nextCursor: null });
   });
 
+  it("reveals each credential independently without submitting or changing its value", async () => {
+    vi.mocked(auth.getReauthenticationStatus).mockResolvedValue({ reauthenticated: true, remainingSeconds: 600 });
+    renderPage();
+    const newPassword = await screen.findByLabelText("New password") as HTMLInputElement;
+    const confirmation = screen.getByLabelText("Confirm new password") as HTMLInputElement;
+    fireEvent.change(newPassword, { target: { value: "fixture-only-value" } });
+    fireEvent.click(screen.getByRole("button", { name: "Show new password for password change" }));
+    expect(newPassword.type).toBe("text");
+    expect(newPassword.value).toBe("fixture-only-value");
+    expect(confirmation.type).toBe("password");
+    fireEvent.click(screen.getByRole("button", { name: "Hide new password for password change" }));
+    expect(newPassword.type).toBe("password");
+    expect(newPassword.value).toBe("fixture-only-value");
+    expect(auth.updateAccountPassword).not.toHaveBeenCalled();
+    expect(auth.updateAccountEmail).not.toHaveBeenCalled();
+  });
+
   it("requires server-side reauthentication before loading sensitive details", async () => {
     vi.mocked(auth.getReauthenticationStatus).mockResolvedValue({ reauthenticated: false, remainingSeconds: 0 });
     vi.mocked(auth.beginReauthentication).mockResolvedValue({ requires2fa: true, challengeToken: "challenge", expiresInSeconds: 300, email: "admin@example.test", message: "TOTP required" });
     vi.mocked(auth.verifyReauthentication).mockResolvedValue({ reauthenticated: true, validForSeconds: 600 });
     renderPage();
     expect(await screen.findByRole("heading", { name: "Confirm your identity" })).toBeTruthy();
+    expect(screen.queryByRole("navigation", { name: "Account tasks" })).toBeNull();
+    expect(auth.getSecuritySummary).not.toHaveBeenCalled();
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "secret" } });
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     expect(await screen.findByLabelText("Authenticator code")).toBeTruthy();
     fireEvent.change(screen.getByLabelText("Authenticator code"), { target: { value: "123456" } });
-    fireEvent.click(screen.getByRole("button", { name: "Verify factor" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify authenticator" }));
     expect(await screen.findByText("Active sessions")).toBeTruthy();
+    expect(screen.getByRole("navigation", { name: "Account tasks" })).toBeTruthy();
     expect(auth.verifyReauthentication).toHaveBeenCalledWith({ challengeToken: "challenge", method: "totp", code: "123456" });
   });
 

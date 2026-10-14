@@ -1,6 +1,6 @@
 import { renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AppView } from "./queryState";
+import type { AdminSection, AppView } from "./queryState";
 import { useViewScrollToTop } from "./useViewScrollToTop";
 
 describe("view scroll restoration", () => {
@@ -26,5 +26,23 @@ describe("view scroll restoration", () => {
     rerender({ view: "movies" });
     expect(scrollTo).toHaveBeenLastCalledWith({ top: 0, left: 0, behavior: "auto" });
     expect(scrollTo).toHaveBeenCalledTimes(2);
+  });
+
+  it("resets both scroll containers for admin section changes, while retaining same-section scroll", () => {
+    const { rerender } = renderHook(({ section }: { section: AdminSection }) => useViewScrollToTop(section), { initialProps: { section: "updates" as AdminSection } });
+    const root = document.getElementById("root")!;
+    root.scrollTop = 670;
+    root.scrollLeft = 40;
+    rerender({ section: "updates" });
+    expect(root.scrollTop).toBe(670);
+    expect(root.scrollLeft).toBe(40);
+    expect(scrollTo).toHaveBeenCalledTimes(1);
+    rerender({ section: "recommendations" });
+    expect(root.scrollTop).toBe(0);
+    expect(root.scrollLeft).toBe(0);
+    expect(scrollTo).toHaveBeenLastCalledWith({ top: 0, left: 0, behavior: "auto" });
+    expect(scrollTo).toHaveBeenCalledTimes(2);
+    rerender({ section: "updates" });
+    expect(scrollTo).toHaveBeenCalledTimes(3);
   });
 });

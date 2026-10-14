@@ -429,6 +429,8 @@ export type UpdatePhase =
   | "starting"
   | "rolling_back"
   | "recovering"
+  | "recovery_required"
+  | "lifecycle_blocked"
   | "succeeded"
   | "failed"
   | "rolled_back"
@@ -455,6 +457,7 @@ export interface UpdateStatus {
   error: string;
   blockers: string[];
   maintenanceWindowOpen: boolean;
+  serverClock?: { timeZone: string; utcOffset: string; localTime: string } | null;
   updateInProgress: boolean;
   logTail: string[];
   policy: UpdatePolicy;

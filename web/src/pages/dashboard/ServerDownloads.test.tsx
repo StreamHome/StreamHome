@@ -36,6 +36,12 @@ describe("themed server downloads", () => {
     expect(screen.getByText("Restoring the live queue")).toBeTruthy();
     expect(screen.getByText("Reconnecting")).toBeTruthy();
   });
+  it("shows speed and remaining time only for an active transfer", () => {
+    vi.mocked(useDownloadStream).mockReturnValue({ downloads: [download, { ...download, id: "done", status: "Completed", speed: "—", eta: "—" }, { ...download, id: "failed", status: "Failed", speed: "—", eta: "—" }], connectionState: "connected" });
+    render(<ServerDownloads />);
+    expect(screen.getByText("8 MB/s · ETA 00:01:20")).toBeTruthy();
+    expect(screen.queryByText("— · ETA —")).toBeNull();
+  });
 
   it("defines dedicated layout contracts for Aurora, Cinema, and Gemini", () => {
     const css = readFileSync(resolve("src/themes/application/application.css"), "utf8");

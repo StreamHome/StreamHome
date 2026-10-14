@@ -1,0 +1,34 @@
+.admin-context-help { margin-top:16px; }
+.admin-help-trigger { display:inline-flex; align-items:center; gap:10px; min-height:44px; max-width:100%; padding:8px 12px; border:1px solid var(--glass-border); border-radius:var(--radius,8px); background:transparent; color:var(--text-secondary); text-align:left; font:500 14px/1.45 var(--font-body); cursor:pointer; transition:color .14s ease,border-color .14s ease,background-color .14s ease; }
+.admin-help-trigger:hover { color:var(--text-primary); background:color-mix(in srgb,var(--text-primary) 5%,transparent); border-color:var(--glass-border-hover); }
+.admin-help-trigger__icon { display:grid; place-items:center; flex:0 0 22px; width:22px; height:22px; border:1px solid currentColor; border-radius:50%; color:var(--text-accent); font:600 13px/1 var(--font-body); }
+.admin-shell .admin-help-trigger:focus-visible,.admin-shell .admin-help-dialog__close:focus-visible { outline:2px solid var(--accent-primary); outline-offset:3px; }
+.admin-shell [role="dialog"]:has(> .admin-help-dialog) { max-height:90dvh; overflow-y:auto; overscroll-behavior:contain; }
+.admin-shell [role="dialog"]:has(> .admin-help-dialog--details) { max-width:min(800px,calc(100vw - 32px)); }
+.admin-shell .admin-help-dialog { display:flex; flex-direction:column; max-height:90dvh; padding:0; background:var(--admin-surface,var(--bg-surface-container)); color:var(--text-primary); border:1px solid var(--glass-border-hover); }
+.admin-help-dialog__header { display:flex; flex:0 0 auto; align-items:start; gap:16px; padding:24px 24px 20px; border-bottom:1px solid var(--glass-border); }
+.admin-help-dialog__header > div { flex:1; min-width:0; }
+.admin-help-dialog__header p { margin:0 0 8px; color:var(--text-accent); font:600 11px/1.4 var(--font-mono); letter-spacing:.12em; }
+.admin-help-dialog__header h2 { margin:0; font:600 clamp(22px,3vw,28px)/1.25 var(--font-headline); overflow-wrap:anywhere; }
+.admin-help-dialog__header > div > span { display:block; margin-top:10px; color:var(--text-secondary); font-size:14px; line-height:1.55; }
+.admin-help-dialog__close { display:grid; place-items:center; flex:0 0 44px; width:44px; min-height:44px; border:1px solid var(--glass-border); border-radius:var(--radius,8px); background:transparent; color:var(--text-primary); font-size:24px; cursor:pointer; }
+.admin-help-dialog__content { display:grid; grid-auto-rows:max-content; align-content:start; gap:20px; min-height:0; overflow-y:auto; overscroll-behavior:contain; padding:24px; color:var(--text-secondary); font-size:14px; line-height:1.6; overflow-wrap:anywhere; }
+.admin-help-dialog__content:focus-visible { outline:2px solid var(--accent-primary); outline-offset:-3px; }
+.admin-help-dialog__content p { margin:0; }
+.admin-help-dialog__content :is(h3,h4) { color:var(--text-primary); font:600 18px/1.4 var(--font-body); }
+.admin-help-dialog__content :is(ul,ol) { padding-left:20px; }
+.admin-help-dialog__content code { font-size:13px; overflow-wrap:anywhere; }
+.admin-help-dialog .profile-data-card { padding:0; margin:0; border:0; border-radius:0; background:transparent; }
+.admin-help-dialog .profile-data-card + .profile-data-card { padding-top:20px; border-top:1px solid var(--glass-border); }
+.admin-help-dialog .profile-data-card header h2 { font-size:22px; }
+.admin-help-dialog .recommendation-admin-columns { margin:0; grid-template-columns:1fr; gap:24px; }
+.admin-help-dialog .recommendation-admin-columns section { padding:0; border:0; background:transparent; }
+.admin-storage-help { display:flex; flex-wrap:wrap; gap:8px 12px; margin-top:20px; padding-top:16px; border-top:1px solid var(--glass-border); }
+.admin-storage-help .admin-context-help { margin:0; }
+.admin-panel--storage .admin-drive-status { margin-top:24px; padding:20px; gap:8px; }
+.admin-shell.theme-app--ember :is(.admin-help-trigger,.admin-help-dialog,.admin-help-dialog__close) { border-radius:0; }
+@media (max-width:480px) {
+  .admin-help-dialog__header { padding:18px; gap:12px; }
+  .admin-help-dialog__content { padding:18px; }
+  .admin-help-dialog__header h2 { font-size:22px; }
+}

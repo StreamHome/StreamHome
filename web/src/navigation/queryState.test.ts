@@ -33,6 +33,16 @@ describe("query-state navigation", () => {
     expect(canonicalAppUrl("?junk=1&view=admin&profile=1&section=invalid")).toBe("/?profile=1&view=admin&section=account");
   });
 
+  it("restores valid profile-data categories while retaining the active and inspected profiles", () => {
+    const url = "/?profile=owner&view=admin&section=profiles&subject=child&category=activity";
+    expect(canonicalAppUrl(url.slice(1))).toBe(url);
+    expect(parseAppQuery(url.slice(1))).toMatchObject({ profile: "owner", adminProfile: "child", adminCategory: "activity" });
+    expect(appUrl("owner", "admin", { section: "profiles", adminProfile: "child", adminCategory: "history" })).toContain("subject=child&category=history");
+    expect(canonicalAppUrl("?view=admin&section=profiles&category=unknown")).toBe("/?view=admin&section=profiles");
+    expect(canonicalAppUrl("?view=admin&section=profiles&category=overview")).toBe("/?view=admin&section=profiles");
+    expect(canonicalAppUrl("?view=admin&section=storage&category=activity")).toBe("/?view=admin&section=storage");
+  });
+
   it("preserves categories only while moving among catalog views", () => {
     const current = parseAppQuery("?profile=1&view=home&genre=Action");
     expect(preservedCatalogCategory(current, "movies")).toEqual({ genre: "Action" });

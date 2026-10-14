@@ -65,6 +65,31 @@ describe("LoginPage", () => {
     await waitFor(() => expect(verify2FA).toHaveBeenCalledWith({ challengeToken: "challenge", method: "totp", code: "123456" }, expect.any(AbortSignal)));
   });
 
+  it.each(["totp", "recovery"])("returns retry focus after a rejected %s code has been re-enabled", async (method) => {
+    vi.mocked(login).mockResolvedValue({ requires2fa: true, email: "admin@example.test", challengeToken: "challenge", expiresInSeconds: 300 });
+    let rejectAttempt!: (error: Error) => void;
+    vi.mocked(verify2FA).mockReturnValue(new Promise((_, reject) => { rejectAttempt = reject; }));
+    renderLogin();
+    fireEvent.change(screen.getByLabelText("Email address"), { target: { value: "admin@example.test" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await screen.findByLabelText("Six-digit authenticator code");
+    if (method === "recovery") fireEvent.click(screen.getByRole("button", { name: "Use a recovery code" }));
+    const field = screen.getByLabelText(method === "totp" ? "Six-digit authenticator code" : "Recovery code") as HTMLInputElement;
+    fireEvent.change(field, { target: { value: method === "totp" ? "000000" : "ABCD-EFGH-IJKL-MNOP" } });
+    const submit = screen.getByRole("button", { name: method === "totp" ? "Verify authenticator" : "Verify recovery code" });
+    submit.focus();
+    fireEvent.click(submit);
+    expect(field.disabled).toBe(true);
+    rejectAttempt(new ApiError("That code is not valid. Try the latest code.", 401, "invalid_code"));
+    await screen.findByRole("alert");
+    await waitFor(() => expect(document.activeElement).toBe(field));
+    expect(field.disabled).toBe(false);
+    expect(field.value).toBe("");
+    fireEvent.change(field, { target: { value: "123456" } });
+    expect(field.value).toBe("123456");
+  });
+
   it("announces authentication failures and allows returning from TOTP", async () => {
     vi.mocked(login).mockRejectedValueOnce(new Error("Invalid credentials"));
     renderLogin();
@@ -104,7 +129,24 @@ describe("LoginPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     fireEvent.click(await screen.findByRole("button", { name: "Use a recovery code" }));
     fireEvent.change(screen.getByLabelText("Recovery code"), { target: { value: "ABCD-EFGH-IJKL-MNOP" } });
-    fireEvent.click(screen.getByRole("button", { name: "Use recovery code" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify recovery code" }));
     expect((await screen.findByRole("alert")).textContent).toContain("1:30");
   });
+  it("requires a fresh password after a factor challenge expires", async () => {
+    vi.mocked(login).mockResolvedValueOnce({ requires2fa: true, email: "admin@example.test", challengeToken: "expired-challenge", expiresInSeconds: 300 });
+    vi.mocked(verify2FA).mockRejectedValueOnce(new ApiError("Verification expired. Enter your password again.", 401, "challenge_expired"));
+    renderLogin();
+    fireEvent.change(screen.getByLabelText("Email address"), { target: { value: "admin@example.test" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    fireEvent.change(await screen.findByLabelText("Six-digit authenticator code"), { target: { value: "123456" } });
+    fireEvent.click(screen.getByRole("button", { name: "Verify authenticator" }));
+    const password = await screen.findByLabelText("Password");
+    expect((password as HTMLInputElement).value).toBe("");
+    expect(password.getAttribute("type")).toBe("password");
+    await waitFor(() => expect(screen.queryByLabelText("Six-digit authenticator code")).toBeNull());
+    expect((await screen.findByRole("alert")).textContent).toContain("expired");
+    expect(screen.getByRole("button", { name: "Continue" }).hasAttribute("disabled")).toBe(true);
+  });
+
 });

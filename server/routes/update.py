@@ -15,6 +15,7 @@ from db import get_session
 from models import APIModel, AuthSession, User
 from routes.auth import add_event, get_current_session, get_current_user, require_recent_reauth
 from lifecycle.coordination import EffectClass, runtime_work
+from lifecycle.clock import server_clock_snapshot
 from lifecycle.bootstrap import (
     StartupAuthorityChangedError,
     current_readiness_projection,
@@ -87,6 +88,12 @@ class UpdatePolicyResponse(APIModel):
     require_signed_commits: bool
 
 
+class ServerClockResponse(APIModel):
+    time_zone: str
+    utc_offset: str
+    local_time: str
+
+
 class UpdateStatusResponse(APIModel):
     phase: str
     message: str
@@ -108,6 +115,7 @@ class UpdateStatusResponse(APIModel):
     error: str
     blockers: list[str]
     maintenance_window_open: bool
+    server_clock: Optional[ServerClockResponse] = None
     update_in_progress: bool
     log_tail: list[str]
     policy: UpdatePolicyResponse
@@ -155,6 +163,7 @@ async def _status_response() -> UpdateStatusResponse:
         error=str(persisted.get("error") or ""),
         blockers=await protected_cutover_blockers() if active_immediate else await idle_blockers(),
         maintenance_window_open=maintenance_window_open(),
+        server_clock=ServerClockResponse(**server_clock_snapshot()),
         update_in_progress=bool(
             persisted.get("phase") in ACTIVE_PHASES
             or update_lock_active()

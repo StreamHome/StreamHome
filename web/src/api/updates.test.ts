@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  getUpdateStatus,
+  normalizeUpdateStatus,
   cancelPendingUpdate,
   checkForUpdates,
   installUpdate,
@@ -51,5 +53,26 @@ describe("update API contracts", () => {
       credentials: "same-origin",
       keepalive: true,
     }));
+  });
+});
+
+
+describe("update server clock normalization", () => {
+  const clock = { timeZone: "EEST", utcOffset: "UTC+03:00", localTime: "2026-10-13 15:30:00" };
+
+  it("preserves the server wall time without converting it into browser time", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ phase: "idle", serverClock: clock }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const status = await getUpdateStatus();
+    expect(status.serverClock).toEqual(clock);
+    expect(fetchMock).toHaveBeenCalledWith("/api/update/status", expect.objectContaining({ credentials: "same-origin" }));
+  });
+
+  it("keeps older servers compatible and treats incomplete clock data as unavailable", () => {
+    for (const serverClock of [undefined, null, { ...clock, utcOffset: "" }, { ...clock, localTime: 42 }]) {
+      expect(normalizeUpdateStatus({ phase: "idle", serverClock } as import("../types/api").UpdateStatus).serverClock).toBeNull();
+    }
   });
 });
