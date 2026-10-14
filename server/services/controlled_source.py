@@ -52,6 +52,13 @@ async def _send(writer: asyncio.StreamWriter, payload: bytes) -> None:
         await writer.drain()
     except ConnectionError as error:
         raise _ConsumerDisconnected from error
+    except RuntimeError as error:
+        # uvloop reports writes to a closed downstream transport as RuntimeError.
+        # Only a confirmed consumer closure is harmless; live writer defects must
+        # still reject the source instead of being mistaken for a prefix read.
+        if writer.is_closing():
+            raise _ConsumerDisconnected from error
+        raise
 
 
 def is_controlled_input(url: str) -> bool:
