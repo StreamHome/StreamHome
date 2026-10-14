@@ -23,6 +23,7 @@ from services.logger import logger
 from routes.auth import resolve_auth
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
 from services.ingest_preview import ingest_preview_service
+from services.ingestion_headers import encode_source_headers, SOURCE_HEADERS_VERSION
 from services.integration_auth import (
     authenticate_integration_token,
     integration_token_hash,
@@ -78,6 +79,15 @@ def require_browser_or_integration_scope(scope: str, *, recent_reauthentication:
 
 # ----------------- Ingestion Endpoint -----------------
 
+@router.get("/api/mediasender/capabilities")
+async def mediasender_capabilities(
+    credential: IntegrationCredential = Depends(require_integration_scope("ingest")),
+):
+    """Advertise only implemented ingestion capabilities to authenticated senders."""
+    del credential
+    return {"ingestion": {"source_headers": SOURCE_HEADERS_VERSION}}
+
+
 @router.post("/api/add-movie", status_code=status.HTTP_201_CREATED)
 async def add_movie(
     payload: DownloadAddRequest,
@@ -93,6 +103,11 @@ async def add_movie(
         for subtitle in payload.subtitles or []:
             await validate_url(subtitle.url, client_address=source_client)
         headers_dict = validate_headers(payload.headers)
+        video_headers = validate_headers(payload.video_headers) if payload.video_headers is not None else headers_dict
+        audio_headers = validate_headers(payload.audio_headers) if payload.audio_headers is not None else headers_dict
+        subtitles_list = [{"language": s.language, "url": s.url,
+                           "headers": validate_headers(s.headers) if s.headers is not None else headers_dict}
+                          for s in payload.subtitles or []]
     except UnsafeIngestionSource as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -122,7 +137,6 @@ async def add_movie(
     
     # Save the task to SQLite database using AsyncSession
     async with AsyncSession(engine) as db:
-        subtitles_list = [{"language": s.language, "url": s.url} for s in payload.subtitles] if payload.subtitles else []
         new_task = DownloadTask(
             id=task_id,
             tmdb_id=payload.tmdb_id,
@@ -134,7 +148,7 @@ async def add_movie(
             audio_url=payload.audio_url,
             video_source_type=payload.video_source_type,
             audio_source_type=payload.audio_source_type,
-            headers_str=json.dumps(headers_dict),
+            headers_str=encode_source_headers(video_headers, audio_headers),
             private_source_allowed=address_is_loopback(source_client),
             status="PENDING",
             subtitles_str=json.dumps(subtitles_list),

@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field as PydanticField, model_valida
 from sqlmodel import SQLModel, Field, Relationship
 from sqlalchemy import UniqueConstraint
 from services.languages import normalize_language_tag
+from services.ingestion_headers import decode_source_headers
 
 def to_camel(s: str) -> str:
     parts = s.split("_")
@@ -575,10 +576,10 @@ class DownloadTask(SQLModel, table=True):
     audio_url: Optional[str] = None
     video_source_type: str = Field(default="auto")
     audio_source_type: str = Field(default="auto")
-    headers_str: Optional[str] = Field(default="{}")  # Serialized JSON headers
+    headers_str: Optional[str] = Field(default="{}")  # Legacy headers or versioned video/audio sets
     private_source_allowed: bool = Field(default=False)
     status: str = "PENDING"  # PENDING, DOWNLOADING, MERGING, COMPLETED, FAILED
-    subtitles_str: Optional[str] = Field(default="[]")  # Serialized JSON List[Dict[str, str]]
+    subtitles_str: Optional[str] = Field(default="[]")  # Private source tracks, including resolved header sets
     quality: Optional[str] = Field(default=None)
     language: Optional[str] = Field(default=None)
     error_message: Optional[str] = Field(default=None)
@@ -590,24 +591,25 @@ class DownloadTask(SQLModel, table=True):
 
     @property
     def headers(self) -> Dict[str, str]:
-        try:
-            return json.loads(self.headers_str or "{}")
-        except Exception:
-            return {}
+        return decode_source_headers(self.headers_str, "video")
+
+    @property
+    def audio_headers(self) -> Dict[str, str]:
+        return decode_source_headers(self.headers_str, "audio")
 
     @headers.setter
     def headers(self, val: Dict[str, str]):
         self.headers_str = json.dumps(val or {})
 
     @property
-    def subtitles(self) -> List[Dict[str, str]]:
+    def subtitles(self) -> List[Dict[str, Any]]:
         try:
             return json.loads(self.subtitles_str or "[]")
         except Exception:
             return []
 
     @subtitles.setter
-    def subtitles(self, val: List[Dict[str, str]]):
+    def subtitles(self, val: List[Dict[str, Any]]):
         self.subtitles_str = json.dumps(val or [])
 
     @property
@@ -823,6 +825,7 @@ class PlaybackSessionResponse(APIModel):
     is_finished: Optional[bool]
 
 class SubtitleInput(BaseModel):
+    headers: Optional[Dict[str, str]] = None
     language: str = PydanticField(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     url: str = PydanticField(min_length=1, max_length=4096)
 
@@ -922,6 +925,8 @@ class DownloadAddRequest(BaseModel):
     video_source_type: Literal["auto", "hls"] = "auto"
     audio_source_type: Literal["auto", "hls"] = "auto"
     headers: Optional[Dict[str, str]] = None
+    video_headers: Optional[Dict[str, str]] = None
+    audio_headers: Optional[Dict[str, str]] = None
     subtitles: Optional[List[SubtitleInput]] = PydanticField(default=None, max_length=32)
     quality: Optional[str] = PydanticField(default=None, max_length=32)
     language: Optional[str] = PydanticField(default=None, min_length=1, max_length=64)

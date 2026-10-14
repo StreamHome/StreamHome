@@ -238,6 +238,7 @@ async def download_and_merge(
     preview_enabled: bool = True,
     audio_timeline_offset: float = 0.0,
     client_address: str = "",
+    audio_headers: Optional[Dict[str, str]] = None,
 ) -> tuple[bool, Optional[IngestionFailure]]:
     """Give FFmpeg only scoped local inputs whose upstream fetches are pinned."""
     try:
@@ -250,7 +251,8 @@ async def download_and_merge(
                 ))
             if audio_url and is_http_media_source(audio_url):
                 selected_audio = await inputs.enter_async_context(controlled_media_input(
-                    audio_url, headers=headers, client_address=client_address, source_type=audio_source_type,
+                    audio_url, headers=audio_headers if audio_headers is not None else headers,
+                    client_address=client_address, source_type=audio_source_type,
                 ))
             return await _download_and_merge_controlled(
                 task_id, selected_video, selected_audio, {}, output_path, duration_secs,

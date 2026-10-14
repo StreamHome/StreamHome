@@ -129,7 +129,9 @@ http://localhost:8000/api/add-movie
 | `audio_source_type`  | String           |    No    | `"auto"` (default) or `"hls"` for a separately supplied audio manifest.            |
 | `season`             | Integer          |  TV only | Season number for a television episode.                                            |
 | `episode`            | Integer          |  TV only | Episode number for a television episode.                                           |
-| `headers`            | Object           |    No    | Request headers required to access the submitted source.                           |
+| `headers`            | Object           |    No    | Legacy shared fallback for video, audio and subtitles. |
+| `video_headers`      | Object           |    No    | Headers for the video source only; overrides the shared fallback. |
+| `audio_headers`      | Object           |    No    | Headers for the detached audio source only; overrides the shared fallback. |
 | `subtitles`          | Array            |    No    | External subtitle sources with language and URL information.                       |
 | `quality`            | String           |    No    | Source-quality label such as `"1080p"` or `"720p"`.                                |
 | `language`           | String           |    No    | Primary audio-language code such as `"en"` or `"tr"`.                              |
@@ -270,37 +272,70 @@ Do not submit them as:
 
 Recommended movie payloads contain neither field.
 
-### `headers`
+### Source request headers
 
-Some authorized sources require request headers.
+`headers` is the legacy shared fallback. `video_headers`, `audio_headers` and
+each `subtitles[].headers` are independent overrides. For each source, an omitted
+or `null` override uses `headers` (or an empty set when it is omitted). An explicit
+`{}` override sends no source headers. Video overrides never become audio or
+subtitle defaults. Existing clients that send only `headers` retain their behavior.
 
-Example:
+Before submitting independent sets, authenticate with an integration credential
+that has the `ingest` scope and request:
+
+```http
+GET /api/mediasender/capabilities
+Authorization: Bearer EXAMPLE_INTEGRATION_KEY
+```
+
+The implemented response is:
+
+```json
+{"ingestion": {"source_headers": 1}}
+```
+
+Only integer version `1` establishes this capability. Missing/unsupported/failed
+discovery is not permission to send fields to an older server that may ignore
+them. The discovery endpoint is read-only and creates no download task.
+
+Example independent-source request (all addresses/credentials are synthetic):
 
 ```json
 {
-  "headers": {
-    "User-Agent": "MediaSender/1.0",
-    "Referer": "https://media.example.com/"
-  }
+  "tmdb_id": 123,
+  "media_type": "movie",
+  "video_url": "https://video.example/movie.m3u8",
+  "headers": {},
+  "video_headers": {"Referer": "https://player.example/", "Cookie": "session=EXAMPLE_VIDEO"},
+  "audio_url": "https://audio.example/track.m4a",
+  "audio_headers": {"Authorization": "Bearer EXAMPLE_AUDIO"},
+  "subtitles": [{
+    "language": "tr",
+    "url": "https://subtitles.example/tr.vtt",
+    "headers": {"Referer": "https://subtitles.example/"}
+  }]
 }
 ```
 
-Possible headers include:
+Each resolved set is validated separately: at most 16 headers, names limited to
+Accept, Accept-Language, Authorization, Cookie, Origin, Referer, Range and
+User-Agent; no CR/LF/NUL values; at most 4096 characters per value and 8192 total
+name/value characters per set. URLs retain the existing HTTP(S), DNS, private
+address and redirect checks. Subtitle download removes Range/Content-Length
+before reading the whole track, as before.
 
-* `User-Agent`;
-* `Referer`;
-* `Origin`;
-* `Cookie`;
-* other source-specific HTTP headers.
-
-> [!CAUTION]
-> Headers may contain authentication cookies or other private information.
->
-> A MediaSender client must not log, publish, synchronize, or expose sensitive header values unnecessarily.
-
-Only include headers required by the submitted source.
+Source Cookie/Authorization belong only to their source, not to the API's Bearer
+integration credential. Do not copy one source's credentials to another URL or
+include them in logs, browser/catalog responses or portable media metadata.
+Independent sets survive queue persistence/recovery, media probing and controlled
+FFmpeg inputs. Legacy flat stored task headers remain readable; no database-schema
+migration or existing-task rewrite is required.
 
 ### `subtitles`
+
+Each subtitle may additionally contain an optional `headers` object with the
+source-only override semantics described above. Its language and URL fields are
+unchanged.
 
 Subtitles are submitted as an array.
 
@@ -310,6 +345,7 @@ Each subtitle object contains:
 | ---------- | ------ | :------: | --------------------------- |
 | `language` | String |    Yes   | Subtitle-language code.     |
 | `url`      | String |    Yes   | HTTP or HTTPS subtitle URL. |
+| `headers` | Object | No | Independent source headers; `{}` disables the shared fallback. |
 
 Example:
 

@@ -703,6 +703,7 @@ class DownloadQueueManager:
                 tmdb_id = task.tmdb_id
                 media_type = task.media_type
                 headers = task.headers
+                audio_headers = task.audio_headers
                 video_url = task.video_url
                 submitted_video_url = video_url
                 audio_url = task.audio_url
@@ -717,11 +718,13 @@ class DownloadQueueManager:
 
             try:
                 headers = validate_headers(headers)
+                audio_headers = validate_headers(audio_headers)
                 validation_client = "127.0.0.1" if private_source_allowed else ""
                 await validate_url(video_url, client_address=validation_client)
                 await validate_url(audio_url, client_address=validation_client)
                 for subtitle in subtitles_list:
                     await validate_url(subtitle.get("url"), client_address=validation_client)
+                    subtitle["headers"] = validate_headers(subtitle.get("headers")) if subtitle.get("headers") is not None else headers
             except UnsafeIngestionSource as exc:
                 raise IngestionTaskError(IngestionFailure("UNSAFE_SOURCE", str(exc), False)) from exc
 
@@ -745,6 +748,7 @@ class DownloadQueueManager:
                     video_url,
                     audio_url,
                     headers,
+                    audio_headers=audio_headers,
                     task_id=task_id,
                     video_source_type=video_source_type,
                     audio_source_type=audio_source_type,
@@ -864,7 +868,7 @@ class DownloadQueueManager:
                     try:
                         subtitle_headers = {
                             key: value
-                            for key, value in headers.items()
+                            for key, value in sub["headers"].items()
                             if key.lower() not in {"range", "content-length"}
                         }
                         ext = ".srt" if ".srt" in sub_url.lower() else ".vtt"
@@ -935,7 +939,7 @@ class DownloadQueueManager:
                 await validate_url(audio_url, client_address=validation_client)
                 success, failure = await download_and_merge(
                     task_id=task_id, video_url=video_url, audio_url=audio_url,
-                    headers=headers, output_path=output_abs_path, duration_secs=duration_secs,
+                    headers=headers, audio_headers=audio_headers, output_path=output_abs_path, duration_secs=duration_secs,
                     video_source_type=video_source_type, audio_source_type=audio_source_type,
                     audio_timeline_offset=float(probe_res.get("audio_timeline_offset") or 0.0),
                     client_address=validation_client,
@@ -1205,7 +1209,7 @@ class DownloadQueueManager:
         self, db: AsyncSession, tmdb_id: int, media_type: str, season: Optional[int], 
         episode: Optional[int], meta: Dict[str, Any], file_path: str, 
         extracted_languages: Optional[List[str]] = None, language: Optional[str] = None, 
-        subtitles_list: Optional[List[Dict[str, str]]] = None, quality: Optional[str] = None,
+        subtitles_list: Optional[List[Dict[str, Any]]] = None, quality: Optional[str] = None,
         skip_markers: Optional[Dict[str, Any]] = None,
         *,
         finalize: bool = True,
