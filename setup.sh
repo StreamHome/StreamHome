@@ -258,19 +258,20 @@ validate_versions() {
     node_major="$(node -p 'Number(process.versions.node.split(".")[0])')"
     [[ "$node_major" =~ ^[0-9]+$ && "$node_major" -ge 18 ]] \
         || fail "Node.js 18 or newer is required."
-    ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '(^|[[:space:]])libx264([[:space:]]|$)' \
+    # Drain capability output: grep -q can SIGPIPE the producer under pipefail.
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -E '(^|[[:space:]])libx264([[:space:]]|$)' >/dev/null \
         || fail "The installed FFmpeg does not provide the required libx264 encoder."
-    ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '(^|[[:space:]])aac([[:space:]]|$)' \
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -E '(^|[[:space:]])aac([[:space:]]|$)' >/dev/null \
         || fail "The installed FFmpeg does not provide the required AAC encoder."
-    ffmpeg -hide_banner -muxers 2>/dev/null | grep -Eq '(^|[[:space:]])hls([[:space:]]|$)' \
+    ffmpeg -hide_banner -muxers 2>/dev/null | grep -E '(^|[[:space:]])hls([[:space:]]|$)' >/dev/null \
         || fail "The installed FFmpeg does not provide the required HLS muxer."
-    ffmpeg -hide_banner -filters 2>/dev/null | grep -Eq '(^|[[:space:]])scale([[:space:]]|$)' \
+    ffmpeg -hide_banner -filters 2>/dev/null | grep -E '(^|[[:space:]])scale([[:space:]]|$)' >/dev/null \
         || fail "The installed FFmpeg does not provide the required scale filter."
-    ffmpeg -hide_banner -filters 2>/dev/null | grep -Eq '(^|[[:space:]])pad([[:space:]]|$)' \
+    ffmpeg -hide_banner -filters 2>/dev/null | grep -E '(^|[[:space:]])pad([[:space:]]|$)' >/dev/null \
         || fail "The installed FFmpeg does not provide the required pad filter."
-    ffprobe -v error -show_program_version -of json 2>/dev/null | grep -q '"program_version"' \
+    ffprobe -v error -show_program_version -of json 2>/dev/null | grep '"program_version"' >/dev/null \
         || fail "The installed FFprobe does not provide the required JSON output support."
-    if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '(^|[[:space:]])libx265([[:space:]]|$)'; then
+    if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -E '(^|[[:space:]])libx265([[:space:]]|$)' >/dev/null; then
         log "FFmpeg has no libx265 encoder; optional background HEVC optimization will remain unavailable"
     fi
     if ! rclone_version_supported; then

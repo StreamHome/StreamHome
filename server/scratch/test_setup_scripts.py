@@ -113,6 +113,45 @@ def unused_port() -> int:
 
 
 class SetupScriptContracts(unittest.TestCase):
+    def test_setup_capability_checks_drain_large_output_under_pipefail(self) -> None:
+        bash = bash_command()
+        if not bash:
+            self.skipTest("Bash is unavailable")
+        source = (ROOT / "setup.sh").read_text(encoding="utf-8")
+        validation = source.split("validate_versions() {", 1)[1].split(
+            "\nstop_existing_runtime() {", 1
+        )[0]
+        script = "set -Eeuo pipefail\nvalidate_versions() {" + validation + r'''
+log() { printf '%s\n' "$1"; }
+fail() { printf '%s\n' "$1" >&2; exit 1; }
+command() { if [[ "$1" == -v ]]; then return 0; fi; builtin command "$@"; }
+node() { printf '22\n'; }
+rclone_version_supported() { return 0; }
+emit_capabilities() {
+    local capability line
+    for capability in libx264 aac hls scale pad libx265 '"program_version"'; do
+        [[ "$capability" == "${MISSING_CAPABILITY:-}" ]] && continue
+        printf ' capability %s supported\n' "$capability"
+    done
+    for ((line = 0; line < 10000; line++)); do
+        printf ' unrelated capability padding padding padding padding padding\n'
+    done
+}
+ffmpeg() { emit_capabilities; }
+ffprobe() { emit_capabilities; }
+validate_versions
+'''
+        for missing in ("", "libx264", "aac", "hls", "scale", "pad", '"program_version"'):
+            with self.subTest(missing=missing):
+                env = {**os.environ, "MISSING_CAPABILITY": missing}
+                result = run([bash, "-c", script], cwd=ROOT, env=env)
+                if missing:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("required", result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotIn("unavailable", result.stdout)
+
     def test_linux_bootstrap_setup_and_lifecycle_contracts(self) -> None:
         install_sh = (ROOT / "install.sh").read_text(encoding="utf-8")
         setup_sh = (ROOT / "setup.sh").read_text(encoding="utf-8")
