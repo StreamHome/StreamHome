@@ -151,10 +151,11 @@ async def extract_audio_and_strip_video(
         return []
 
     ffprobe = get_ffprobe_path()
-    # 1. Probe for audio streams
+    # Use the unique stream tag section. Generic "tags" also enables packet/frame
+    # output, making a metadata-only probe scan and decode the entire input.
     cmd_probe = [
         ffprobe, "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=index:tags=language:stream_disposition=default",
+        "-show_entries", "stream=index:stream_tags=language:stream_disposition=default",
         "-of", "json", *local_media_input_options(), video_path
     ]
     
