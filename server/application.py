@@ -16,7 +16,7 @@ import warnings
 import asyncio
 import json
 import mimetypes
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import List, Optional
 from datetime import datetime
 
@@ -78,6 +78,7 @@ from lifecycle.coordination import (
     get_runtime_coordinator,
     runtime_work,
 )
+from lifecycle.media_work import accepted_commit, settle
 from lifecycle import state as lifecycle_state
 import services.state as state
 from routes.queue import router as queue_router
@@ -283,6 +284,9 @@ async def _recover_catalog_and_languages() -> None:
             EffectClass.DISPOSABLE_CACHE_WRITE,
         ],
     ):
+        from lifecycle.media_publication import recover_media_operations
+
+        await recover_media_operations()
         await queue_manager.sync_media_from_disk(raise_on_critical_failure=True)
         from services.audio_extractor import repair_completed_ingestion_languages
 
@@ -299,13 +303,11 @@ async def _daily_backup_worker() -> None:
                     get_local_backups_async,
                     prune_old_backups,
                     sync_backups_to_cloud,
+                    backup_due,
                 )
 
                 backups = await get_local_backups_async()
-                should_backup = not backups
-                if backups:
-                    newest_time = datetime.fromisoformat(backups[0]["timestamp"])
-                    should_backup = (datetime.now() - newest_time).total_seconds() >= 24 * 60 * 60
+                should_backup = backup_due(backups)
                 if should_backup:
                     logger.info("[Backup Worker] Initiating online daily database backup...")
                     async with runtime_work("backup.daily", [EffectClass.DATABASE_SNAPSHOT]):
@@ -501,6 +503,10 @@ async def _promote_committed_update(
         STARTUP_READINESS.mark_worker_start_failed("update_completion_fence_failed")
         logger.error("[Lifespan Startup] Update completion fence could not be established.")
         return
+    drained = await get_runtime_coordinator().drain(completion_fence, timeout=30.0)
+    if not drained.complete:
+        STARTUP_READINESS.mark_worker_start_failed("update_completion_drain_timeout")
+        return
     try:
         await _start_runtime_workers(runtime)
     except Exception:
@@ -579,6 +585,10 @@ async def _promote_committed_restore(
     except Exception:
         STARTUP_READINESS.mark_worker_start_failed("restore_completion_fence_failed")
         logger.error("[Lifespan Startup] Restore completion fence could not be established.")
+        return
+    drained = await get_runtime_coordinator().drain(completion_fence, timeout=30.0)
+    if not drained.complete:
+        STARTUP_READINESS.mark_worker_start_failed("restore_completion_drain_timeout")
         return
     try:
         await _start_runtime_workers(runtime)
@@ -821,13 +831,15 @@ class RuntimeWriteCoordinationMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         path = request.url.path
         if path.startswith("/api/backup") or path in {
+            "/api/lifecycle/restore/commit",
             "/api/update/commit",
             "/api/update/cutover",
             "/api/update/install",
             "/api/update/pending",
             "/api/update/presence",
         }:
-            # Exact update ownership/release remains the Phase 1 bridge; backup
+            # Protected controller requests validate their exact operation and
+            # capability instead of entering normal mutation admission. Backup
             # operations declare their narrower effects in the backup service.
             return await call_next(request)
         effects = {EffectClass.DB_WRITE}
@@ -954,6 +966,27 @@ async def serve_media_file(file_path: str, request: Request):
 
 # ----------------- Movies Catalog API -----------------
 
+@asynccontextmanager
+async def _catalog_session(profile_id: Optional[str], auth_session: AuthSession):
+    """Keep personalized ranking ownership until its transaction is settled."""
+    async with AsyncExitStack() as work:
+        db = AsyncSession(engine)
+        try:
+            if profile_id:
+                await require_profile_access(db, auth_session, profile_id)
+                await work.enter_async_context(
+                    runtime_work("catalog.personalized", [EffectClass.DB_WRITE])
+                )
+            yield db
+        finally:
+            # Session close rolls back unfinished ranking writes and returns its
+            # connection. A shield alone can leave that cleanup running after
+            # repeated cancellation has already released the work lease.
+            _, cancelled = await settle(db.close())
+            if cancelled:
+                raise asyncio.CancelledError
+
+
 @app.get("/api/movies", response_model=List[MovieResponse])
 async def get_movies(
     profile_id: Optional[str] = Query(None),
@@ -961,9 +994,7 @@ async def get_movies(
     auth_session: AuthSession = Depends(get_current_session),
 ):
     """Fetches all cataloged media assets with linked episode detail mappings, optionally personalized."""
-    async with AsyncSession(engine) as db:
-        if profile_id:
-            await require_profile_access(db, auth_session, profile_id)
+    async with _catalog_session(profile_id, auth_session) as db:
         stmt = select(Movie)
         result = await db.exec(stmt)
         movies = result.all()
@@ -977,7 +1008,9 @@ async def get_movies(
         if profile_id:
             ranked = await rank_movies_for_profile(db, profile_id, movies, episodes_by_movie)
             responses = {movie.id: response for movie, response in results}
-            return [responses[movie.id] for _, movie, _, _, _ in ranked]
+            ordered_responses = [responses[movie.id] for _, movie, _, _, _ in ranked]
+            await accepted_commit(db)
+            return ordered_responses
 
         return [res for m, res in results]
 
@@ -1081,8 +1114,7 @@ async def get_recommendations(
     """Return a personalized mixed cached/server catalog for the future web client."""
     if scope not in {"home", "movies", "series"}:
         raise HTTPException(status_code=400, detail="Invalid recommendation scope")
-    async with AsyncSession(engine) as db:
-        await require_profile_access(db, auth_session, profile_id)
+    async with _catalog_session(profile_id, auth_session) as db:
         payload = await build_recommendation_payload(db, profile_id, scope, category, limit, offset)
         return RecommendationFeedResponse(**payload)
 
@@ -1420,50 +1452,61 @@ async def get_profiles(user = Depends(get_current_user)):
 @app.post("/api/profiles", response_model=ProfileResponse)
 async def save_profile(req: ProfileSaveRequest, user = Depends(get_current_user)):
     """Creates a new profile or updates an existing profile configuration in the database."""
+    from sqlalchemy import case, func, update
+
+    clean_name = req.name.strip()
+    if not clean_name or len(clean_name) > 40:
+        raise HTTPException(status_code=422, detail={"code": "invalid_profile_name", "message": "Profile names must contain between 1 and 40 characters."})
+    protection_requested = "pin_enabled" in req.model_fields_set
+    pin_hash: Optional[str] = None
+    if protection_requested and req.pin_enabled and req.pin:
+        try:
+            # Do not hold the SQLite writer while computing the password hash.
+            pin_hash = hash_profile_pin(req.pin)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_profile_pin", "message": str(exc)}) from exc
+
     async with AsyncSession(engine) as db:
-        stmt = select(Profile).where(Profile.id == req.id)
-        result = await db.exec(stmt)
-        profile = result.first()
+        values = {"name": clean_name, "avatar_color": req.avatar_color, "theme": req.theme}
+        stmt = update(Profile).where(Profile.id == req.id)
+        current_version = func.coalesce(Profile.pin_version, 0)
+        has_hash = Profile.pin_hash.is_not(None) & (Profile.pin_hash != "")
+        protected = Profile.pin_enabled.is_(True) & has_hash
+        if protection_requested:
+            if req.pin_enabled:
+                values["pin_enabled"] = True
+                if pin_hash:
+                    values["pin_hash"] = pin_hash
+                    values["pin_version"] = current_version + 1
+                else:
+                    # A form that retains its PIN must retain the current stored
+                    # hash, including a concurrent save's newer PIN.
+                    stmt = stmt.where(has_hash)
+                    values["pin_version"] = case((protected, current_version), else_=current_version + 1)
+            else:
+                values["pin_enabled"] = False
+                values["pin_hash"] = None
+                values["pin_version"] = case((protected, current_version + 1), else_=current_version)
 
-        clean_name = req.name.strip()
-        if not clean_name or len(clean_name) > 40:
-            raise HTTPException(status_code=422, detail={"code": "invalid_profile_name", "message": "Profile names must contain between 1 and 40 characters."})
-        previous_pin_enabled = bool(profile and profile.pin_enabled and profile.pin_hash)
-        pin_hash: Optional[str] = profile.pin_hash if profile else None
-        pin_changed = False
-        if req.pin_enabled:
-            if req.pin:
-                try:
-                    pin_hash = hash_profile_pin(req.pin)
-                    pin_changed = True
-                except ValueError as exc:
-                    raise HTTPException(status_code=422, detail={"code": "invalid_profile_pin", "message": str(exc)}) from exc
-            elif not pin_hash:
+        # The first database operation acquires the writer. Compute every PIN
+        # generation from the stored row in this same transaction, never from an
+        # ORM snapshot read before another profile save committed.
+        result = await db.execute(stmt.values(**values).execution_options(synchronize_session=False))
+        profile = await db.get(Profile, req.id)
+        if result.rowcount == 0 and profile:
+            raise HTTPException(status_code=422, detail={"code": "profile_pin_required", "message": "Enter a 4 to 8 digit PIN before enabling profile protection."})
+        if profile is None:
+            if req.pin_enabled and not pin_hash:
                 raise HTTPException(status_code=422, detail={"code": "profile_pin_required", "message": "Enter a 4 to 8 digit PIN before enabling profile protection."})
-        else:
-            pin_changed = previous_pin_enabled
-            pin_hash = None
-
-        if not profile:
             profile = Profile(
                 id=req.id,
                 name=clean_name,
                 avatar_color=req.avatar_color,
                 theme=req.theme,
-                pin_enabled=req.pin_enabled,
+                pin_enabled=bool(req.pin_enabled),
                 pin_hash=pin_hash,
                 pin_version=1 if req.pin_enabled and pin_hash else 0,
             )
-            db.add(profile)
-        else:
-            profile.name = clean_name
-            profile.avatar_color = req.avatar_color
-            profile.theme = req.theme
-            profile.pin_enabled = req.pin_enabled
-            profile.pin_hash = pin_hash
-            next_pin_enabled = bool(req.pin_enabled and pin_hash)
-            if pin_changed or next_pin_enabled != previous_pin_enabled:
-                profile.pin_version = int(profile.pin_version or 0) + 1
             db.add(profile)
 
         await db.commit()
@@ -1505,33 +1548,46 @@ async def unlock_profile(
         profile = await db.get(Profile, profile_id)
         if not profile:
             raise HTTPException(status_code=404, detail={"code": "profile_not_found", "message": "That profile does not exist."})
-        if not profile.pin_enabled or not profile.pin_hash:
+        # Clearing a previous failure can commit and expire the ORM profile.
+        # Preserve exactly the protection generation whose PIN we verified; a
+        # concurrent PIN change must never upgrade this grant to its new version.
+        verified_profile = Profile(
+            id=profile.id, name=profile.name, pin_enabled=profile.pin_enabled,
+            pin_hash=profile.pin_hash, pin_version=profile.pin_version,
+        )
+        if not verified_profile.pin_enabled or not verified_profile.pin_hash:
             await clear_rate_limit(db, "profile_pin", identity)
-            await grant_profile_access(db, auth_session, profile)
+            await grant_profile_access(db, auth_session, verified_profile)
             return {"verified": True}
         if not verify_profile_pin(req.pin, profile.pin_hash):
             await fail_rate_limit(db, "profile_pin", identity, limit=5, window_seconds=300)
             raise HTTPException(status_code=401, detail={"code": "invalid_profile_pin", "message": "The profile PIN was not accepted."})
         await clear_rate_limit(db, "profile_pin", identity)
-        await grant_profile_access(db, auth_session, profile)
+        await grant_profile_access(db, auth_session, verified_profile)
         return {"verified": True}
 
 @app.delete("/api/profiles/{profile_id}")
 async def delete_profile(profile_id: str, user = Depends(get_current_user)):
     """Deletes a profile from the database."""
+    from sqlalchemy import update
+
+    if profile_id == "1":
+        raise HTTPException(status_code=403, detail={"code": "permanent_profile", "message": "The administrator profile cannot be deleted."})
     async with AsyncSession(engine) as db:
+        # Acquire the writer before any profile/grant lookup. A grant that
+        # committed first is cleared by this UPDATE; a later grant cannot pass
+        # its exact protection predicate after this transaction deletes the row.
+        await db.execute(
+            update(AuthSession)
+            .where(AuthSession.selected_profile_id == profile_id)
+            .values(selected_profile_id=None, selected_profile_pin_version=None)
+            .execution_options(synchronize_session=False)
+        )
         stmt = select(Profile).where(Profile.id == profile_id)
         result = await db.exec(stmt)
         profile = result.first()
         if not profile:
             raise HTTPException(status_code=404, detail="Profile not found")
-        sessions = (
-            await db.exec(select(AuthSession).where(AuthSession.selected_profile_id == profile_id))
-        ).all()
-        for auth_session in sessions:
-            auth_session.selected_profile_id = None
-            auth_session.selected_profile_pin_version = None
-            db.add(auth_session)
         attempts = (
             await db.exec(select(ViewingAttempt).where(ViewingAttempt.profile_id == profile_id))
         ).all()

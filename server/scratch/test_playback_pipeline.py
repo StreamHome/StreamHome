@@ -9,11 +9,17 @@ import tempfile
 import threading
 import unittest
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlmodel import SQLModel
+from sqlmodel.ext.asyncio.session import AsyncSession
+
 from config import settings
+from models import Movie
 from routes.playback import (
     catalog_duration_seconds,
     media_duration_seconds,
@@ -43,6 +49,31 @@ class PlaybackPipelineRegression(unittest.TestCase):
     media_directory: Path
     media_file: Path
     catalog_path: str
+
+    @asynccontextmanager
+    async def catalog_fixture(self, media: SimpleNamespace):
+        """Give real preparation jobs disposable server-owned catalog authority."""
+        with tempfile.TemporaryDirectory(prefix="streamhome-playback-catalog-") as directory:
+            fixture_engine = create_async_engine(f"sqlite+aiosqlite:///{Path(directory) / 'catalog.db'}")
+            try:
+                async with fixture_engine.begin() as connection:
+                    await connection.run_sync(SQLModel.metadata.create_all)
+                movie = Movie(
+                    id=media.id, title="Playback fixture", description="", thumbnail_url="",
+                    banner_url="", video_url=media.video_url, duration="5s", release_year=2026,
+                    source_fingerprint=media.source_fingerprint, probed_duration=media.probed_duration,
+                    container=media.container, codec=media.codec, width=media.width, height=media.height,
+                    frame_rate=media.frame_rate, quality="Source", catalog_source="server", availability="available",
+                )
+                movie.audio_metadata = media.audio_metadata
+                movie.languages = media.languages
+                async with AsyncSession(fixture_engine) as db:
+                    db.add(movie)
+                    await db.commit()
+                with patch("db.engine", fixture_engine):
+                    yield
+            finally:
+                await fixture_engine.dispose()
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -836,8 +867,9 @@ class PlaybackPipelineRegression(unittest.TestCase):
         embedded = [{"index": 0, "language": "en", "label": "English", "channels": 2, "default": True}]
         with patch.object(rclone_service, "run", new=AsyncMock(return_value=response)) as run:
             tracks = asyncio.run(probe_cloud_external_audio("streamhome:/Movies/Title/movie.mp4", embedded))
-        self.assertEqual([item["language"] for item in tracks], ["en", "tr"])
-        self.assertTrue(all(item["source"] == "external" for item in tracks))
+        self.assertEqual([item["language"] for item in tracks], ["en", "en", "tr"])
+        self.assertEqual(tracks[0], embedded[0])
+        self.assertTrue(all(item["source"] == "external" for item in tracks[1:]))
         run.assert_awaited_once_with("lsjson", "streamhome:/Movies/Title/audio", "--files-only", timeout=30)
 
     def test_audio_and_subtitle_contracts_accept_standard_language_tags(self) -> None:
@@ -1171,9 +1203,10 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 audio_metadata=probe["audio_metadata"],
                 languages=["eng", "tur"],
             )
-            await playback_prep_service.prepare(media.id, media, source, include_remaining=False)
-            relevant = [task for key, task in playback_prep_service.active_jobs.items() if key.startswith(f"{media.id}:{source.fingerprint}:")]
-            await asyncio.gather(*relevant)
+            async with self.catalog_fixture(media):
+                await playback_prep_service.prepare(media.id, media, source, include_remaining=False)
+                relevant = [task for key, task in playback_prep_service.active_jobs.items() if key.startswith(f"{media.id}:{source.fingerprint}:")]
+                await asyncio.gather(*relevant)
             await playback_prep_service.rebuild_master(media.id, source.fingerprint, media)
             return playback_prep_service.cache_path(media.id, source.fingerprint), media
 
@@ -1270,6 +1303,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             source = await resolve_media_source(catalog_path, check_cloud=False)
             media = SimpleNamespace(
                 id="m_hevc_playback_fixture",
+                video_url=catalog_path,
                 source_fingerprint=source.fingerprint,
                 probed_duration=probe["probed_duration"],
                 container=probe["container"],
@@ -1280,9 +1314,10 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 audio_metadata=probe["audio_metadata"],
                 languages=["und"],
             )
-            await playback_prep_service.prepare(media.id, media, source, include_remaining=False)
-            tasks = [task for key, task in playback_prep_service.active_jobs.items() if key.startswith(f"{media.id}:{source.fingerprint}:")]
-            await asyncio.gather(*tasks)
+            async with self.catalog_fixture(media):
+                await playback_prep_service.prepare(media.id, media, source, include_remaining=False)
+                tasks = [task for key, task in playback_prep_service.active_jobs.items() if key.startswith(f"{media.id}:{source.fingerprint}:")]
+                await asyncio.gather(*tasks)
             return playback_prep_service.cache_path(media.id, source.fingerprint)
 
         cache_path = asyncio.run(prepare())

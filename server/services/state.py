@@ -117,47 +117,31 @@ def unregister_process(task_id: str) -> bool:
     return True
 
 async def cancel_and_kill_process(task_id: str) -> bool:
-    """Explicitly terminates or kills a running OS process registered to a task."""
-    process = ACTIVE_PROCESSES.pop(task_id, None)
-    association = ACTIVE_PROCESS_LEASES.pop(task_id, None)
-    if not process:
-        if association is not None:
-            lease, identity = association
-            try:
-                lease.detach_child(identity)
-            except LeaseStateError:
-                pass
+    """Keep ownership visible until the child is terminated and reaped."""
+    from lifecycle.media_work import settle, stop_process
+
+    process = ACTIVE_PROCESSES.get(task_id)
+    if process is None:
+        unregister_process(task_id)
         return False
-        
     try:
-        logger.info(f"[Process Registry] Terminating active media process for task: {task_id}")
-        process.terminate()
-        try:
-            if isinstance(process, subprocess.Popen):
-                await run_cancellation_safe_thread(process.wait, 2.0)
-            else:
-                await asyncio.wait_for(process.wait(), timeout=2.0)
-            logger.info(f"[Process Registry] Process for task {task_id} exited gracefully.")
-        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
-            logger.warning(f"[Process Registry] Process did not respond to SIGTERM. Killing task {task_id}...")
-            process.kill()
-            if isinstance(process, subprocess.Popen):
-                await run_cancellation_safe_thread(process.wait)
-            else:
-                await process.wait()
-            logger.info(f"[Process Registry] Process for task {task_id} killed successfully.")
+        if isinstance(process, subprocess.Popen):
+            def stop_sync():
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            _, cancelled = await settle(asyncio.to_thread(stop_sync))
+        else:
+            _, cancelled = await settle(stop_process(process))
+        if cancelled:
+            raise asyncio.CancelledError
         return True
-    except Exception as e:
-        logger.error(f"[Process Registry] Error trying to kill process for task {task_id}: {type(e).__name__}")
-        if getattr(process, "returncode", None) is None:
-            ACTIVE_PROCESSES[task_id] = process
-            if association is not None:
-                ACTIVE_PROCESS_LEASES[task_id] = association
+    except Exception as error:
+        logger.error("[Process Registry] Child termination remains unresolved: %s", type(error).__name__)
         return False
     finally:
-        if association is not None and getattr(process, "returncode", None) is not None:
-            lease, identity = association
-            try:
-                lease.detach_child(identity)
-            except LeaseStateError:
-                pass
+        unregister_process(task_id)

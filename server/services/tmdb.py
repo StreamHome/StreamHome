@@ -20,6 +20,29 @@ GENRES_MAP = {
     10765: "Sci-Fi & Fantasy", 10766: "Soap", 10767: "Talk", 10768: "War & Politics"
 }
 
+class TMDBDiscoveryError(RuntimeError):
+    """A required discovery response was unavailable or incomplete."""
+
+
+def _discovery_results(payload: Any, *, require_complete: bool) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        if require_complete:
+            raise TMDBDiscoveryError("TMDB discovery response unavailable or malformed")
+        return []
+    results = payload["results"]
+    if not all(isinstance(item, dict) for item in results):
+        if require_complete:
+            raise TMDBDiscoveryError("TMDB discovery results malformed")
+        return []
+    # An identity is required to distinguish a catalog result from an empty
+    # response. Reject malformed sets before filtering or caching partial data.
+    if not all(type(item.get("id")) is int and item["id"] > 0 for item in results):
+        if require_complete:
+            raise TMDBDiscoveryError("TMDB discovery result identity missing or invalid")
+        return []
+    return results
+
+
 class TMDBClient:
     def __init__(self):
         self.api_key = settings.TMDB_API_KEY
@@ -549,12 +572,18 @@ class TMDBClient:
 
     async def _cache_media_locally_admitted(self, item_dict: Dict[str, Any], raw_poster_url: str, raw_backdrop_url: str):
         async with self._cache_semaphore:
+            staging = None
             try:
                 import time
                 from sqlmodel.ext.asyncio.session import AsyncSession
                 from db import engine
                 from models import Movie
                 from services.ffmpeg import download_and_cache_metadata_image
+                from lifecycle.media_work import media_ownership
+                from lifecycle.media_publication import MediaMutation
+                from pathlib import Path
+                import tempfile
+                import shutil
 
                 tmdb_id = int(item_dict.get("tmdb_id"))
                 media_type = "series" if item_dict.get("type") in ("series", "tv") else "movie"
@@ -578,10 +607,11 @@ class TMDBClient:
                 folder_rel = os.path.join(settings.MEDIA_DIR, library_name, folder_name)
                 folder_abs = os.path.abspath(os.path.join(server_root, folder_rel))
                 metadata_dir = os.path.join(folder_abs, ".metadata")
-                os.makedirs(metadata_dir, exist_ok=True)
 
-                poster_abs = os.path.join(folder_abs, "poster.jpg")
-                backdrop_abs = os.path.join(folder_abs, "backdrop.jpg")
+                os.makedirs(settings.TEMP_DIR, exist_ok=True)
+                staging = tempfile.TemporaryDirectory(prefix="tmdb-artwork-", dir=settings.TEMP_DIR)
+                poster_abs = os.path.join(staging.name, "poster.jpg")
+                backdrop_abs = os.path.join(staging.name, "backdrop.jpg")
 
                 async def safe_download(url: str, destination: str):
                     if not url or not url.startswith("http") or os.path.exists(destination):
@@ -602,108 +632,133 @@ class TMDBClient:
                 if missing_assets:
                     raise RuntimeError(f"TMDB artwork download failed: {', '.join(missing_assets)}")
 
-                metadata_content = {
-                    "tmdb_id": tmdb_id,
-                    "media_type": media_type,
-                    "title": title,
-                    "description": item_dict.get("description", ""),
-                    "release_year": release_year,
-                    "genres": item_dict.get("genres", []),
-                    "cast": item_dict.get("cast", []),
-                    "director": item_dict.get("director"),
-                    "crew": item_dict.get("crew", []),
-                    "original_language": item_dict.get("original_language", "en"),
-                    "catalog_source": "tmdb_cache",
-                    "availability": "cached",
-                    "video_url": "",
-                    "quality": item_dict.get("quality", "Source"),
-                    "languages": item_dict.get("languages", []),
-                    "subtitles": item_dict.get("subtitles", []),
-                    "keywords": item_dict.get("keywords", []),
-                    "collection_name": item_dict.get("collection_name") or item_dict.get("collectionName"),
-                    "trope_vectors": item_dict.get("trope_vectors") or item_dict.get("tropeVectors", []),
-                    "vibe_analysis_version": 1,
-                }
-                metadata_file = os.path.join(metadata_dir, "metadata.json")
-                with open(metadata_file, "w", encoding="utf-8") as file:
-                    json.dump(metadata_content, file, indent=2, ensure_ascii=False)
+                async with media_ownership(movie_id):
+                    async with AsyncSession(engine) as owner_db:
+                        owner = await owner_db.get(Movie, movie_id)
+                        if owner and (owner.catalog_source == "server" or owner.video_url):
+                            return movie_id
+                    existing_metadata = Path(metadata_dir) / "metadata.json"
+                    if existing_metadata.exists():
+                        existing_payload = json.loads(existing_metadata.read_text(encoding="utf-8"))
+                        if existing_payload.get("catalog_source") == "server" or existing_payload.get("video_url"):
+                            return movie_id
+                    async with MediaMutation(movie_id) as mutation:
+                        from services.media_updates import synchronize_local_asset
+                        for source, name in ((poster_abs, "poster.jpg"), (backdrop_abs, "backdrop.jpg")):
+                            if os.path.isfile(source):
+                                destination = Path(folder_abs) / name
+                                mutation.capture_local(str(destination))
+                                destination.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(source, destination)
+                                synchronize_local_asset(destination)
+                        poster_abs = os.path.join(folder_abs, "poster.jpg")
+                        backdrop_abs = os.path.join(folder_abs, "backdrop.jpg")
+                        metadata_content = {
+                            "tmdb_id": tmdb_id,
+                            "media_type": media_type,
+                            "title": title,
+                            "description": item_dict.get("description", ""),
+                            "release_year": release_year,
+                            "genres": item_dict.get("genres", []),
+                            "cast": item_dict.get("cast", []),
+                            "director": item_dict.get("director"),
+                            "crew": item_dict.get("crew", []),
+                            "original_language": item_dict.get("original_language", "en"),
+                            "catalog_source": "tmdb_cache",
+                            "availability": "cached",
+                            "video_url": "",
+                            "quality": item_dict.get("quality", "Source"),
+                            "languages": item_dict.get("languages", []),
+                            "subtitles": item_dict.get("subtitles", []),
+                            "keywords": item_dict.get("keywords", []),
+                            "collection_name": item_dict.get("collection_name") or item_dict.get("collectionName"),
+                            "trope_vectors": item_dict.get("trope_vectors") or item_dict.get("tropeVectors", []),
+                            "vibe_analysis_version": 1,
+                        }
+                        metadata_file = os.path.join(metadata_dir, "metadata.json")
+                        from services.media_updates import atomic_json_write
+                        mutation.capture_local(metadata_file)
+                        atomic_json_write(Path(metadata_file), metadata_content)
 
-                local_poster = f"/media/{library_name}/{folder_name}/poster.jpg" if os.path.exists(poster_abs) else (raw_poster_url or "")
-                local_backdrop = f"/media/{library_name}/{folder_name}/backdrop.jpg" if os.path.exists(backdrop_abs) else (raw_backdrop_url or "")
-                now = time.time()
-                async with AsyncSession(engine) as db:
-                    movie = await db.get(Movie, movie_id)
-                    if not movie:
-                        movie = Movie(
-                            id=movie_id,
-                            tmdb_id=tmdb_id,
-                            title=title,
-                            description=item_dict.get("description", ""),
-                            thumbnail_url=local_poster,
-                            banner_url=local_backdrop,
-                            video_url="",
-                            duration=item_dict.get("duration", "45m" if media_type == "series" else "2h"),
-                            release_year=release_year,
-                            rating=item_dict.get("rating"),
-                            director=item_dict.get("director"),
-                            type=media_type,
-                            vote_average=float(item_dict.get("vote_average") or 0.0),
-                            vote_count=int(item_dict.get("vote_count") or 0),
-                            popularity=float(item_dict.get("popularity") or 0.0),
-                            catalog_source="tmdb_cache",
-                            availability="cached",
-                            cached_at=now,
-                            metadata_refreshed_at=now,
-                            remote_thumbnail_url=raw_poster_url or None,
-                            remote_banner_url=raw_backdrop_url or None,
-                            local_thumbnail_url=f"/media/{library_name}/{folder_name}/poster.jpg" if raw_poster_url else None,
-                            local_banner_url=f"/media/{library_name}/{folder_name}/backdrop.jpg" if raw_backdrop_url else None,
-                            cache_state="ready",
-                            catalog_enrichment_version=1,
-                        )
-                        movie.genres = item_dict.get("genres", [])
-                        movie.cast = item_dict.get("cast", [])
-                        movie.keywords = item_dict.get("keywords", [])
-                        movie.crew = item_dict.get("crew", [])
-                        movie.trope_vectors = item_dict.get("trope_vectors") or item_dict.get("tropeVectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
-                        movie.collection_name = item_dict.get("collection_name") or item_dict.get("collectionName")
-                    elif movie.availability != "available":
-                        movie.title = title
-                        movie.description = item_dict.get("description", movie.description)
-                        movie.thumbnail_url = local_poster or movie.thumbnail_url
-                        movie.banner_url = local_backdrop or movie.banner_url
-                        movie.genres = item_dict.get("genres", movie.genres)
-                        movie.cast = item_dict.get("cast", movie.cast)
-                        movie.director = item_dict.get("director", movie.director)
-                        movie.vote_average = float(item_dict.get("vote_average") or movie.vote_average or 0.0)
-                        movie.vote_count = int(item_dict.get("vote_count") or movie.vote_count or 0)
-                        movie.popularity = float(item_dict.get("popularity") or movie.popularity or 0.0)
-                        movie.catalog_source = "tmdb_cache"
-                        movie.availability = "cached"
-                        movie.cached_at = movie.cached_at or now
-                        movie.metadata_refreshed_at = now
-                        movie.remote_thumbnail_url = raw_poster_url or movie.remote_thumbnail_url
-                        movie.remote_banner_url = raw_backdrop_url or movie.remote_banner_url
-                        movie.local_thumbnail_url = f"/media/{library_name}/{folder_name}/poster.jpg" if raw_poster_url else movie.local_thumbnail_url
-                        movie.local_banner_url = f"/media/{library_name}/{folder_name}/backdrop.jpg" if raw_backdrop_url else movie.local_banner_url
-                        movie.cache_state = "ready"
-                        movie.cache_retry_count = 0
-                        movie.cache_next_retry_at = None
-                        movie.cache_last_error = None
-                        movie.catalog_enrichment_version = 1
-                        movie.keywords = item_dict.get("keywords", movie.keywords)
-                        movie.crew = item_dict.get("crew", movie.crew)
-                        movie.trope_vectors = item_dict.get("trope_vectors") or item_dict.get("tropeVectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
-                        movie.collection_name = item_dict.get("collection_name") or item_dict.get("collectionName") or movie.collection_name
-                    db.add(movie)
-                    await db.commit()
+                        local_poster = f"/media/{library_name}/{folder_name}/poster.jpg" if os.path.exists(poster_abs) else (raw_poster_url or "")
+                        local_backdrop = f"/media/{library_name}/{folder_name}/backdrop.jpg" if os.path.exists(backdrop_abs) else (raw_backdrop_url or "")
+                        now = time.time()
+                        async with AsyncSession(engine) as db:
+                            movie = await db.get(Movie, movie_id)
+                            if not movie:
+                                movie = Movie(
+                                    id=movie_id,
+                                    tmdb_id=tmdb_id,
+                                    title=title,
+                                    description=item_dict.get("description", ""),
+                                    thumbnail_url=local_poster,
+                                    banner_url=local_backdrop,
+                                    video_url="",
+                                    duration=item_dict.get("duration", "45m" if media_type == "series" else "2h"),
+                                    release_year=release_year,
+                                    rating=item_dict.get("rating"),
+                                    director=item_dict.get("director"),
+                                    type=media_type,
+                                    vote_average=float(item_dict.get("vote_average") or 0.0),
+                                    vote_count=int(item_dict.get("vote_count") or 0),
+                                    popularity=float(item_dict.get("popularity") or 0.0),
+                                    catalog_source="tmdb_cache",
+                                    availability="cached",
+                                    cached_at=now,
+                                    metadata_refreshed_at=now,
+                                    remote_thumbnail_url=raw_poster_url or None,
+                                    remote_banner_url=raw_backdrop_url or None,
+                                    local_thumbnail_url=f"/media/{library_name}/{folder_name}/poster.jpg" if raw_poster_url else None,
+                                    local_banner_url=f"/media/{library_name}/{folder_name}/backdrop.jpg" if raw_backdrop_url else None,
+                                    cache_state="ready",
+                                    catalog_enrichment_version=1,
+                                )
+                                movie.genres = item_dict.get("genres", [])
+                                movie.cast = item_dict.get("cast", [])
+                                movie.keywords = item_dict.get("keywords", [])
+                                movie.crew = item_dict.get("crew", [])
+                                movie.trope_vectors = item_dict.get("trope_vectors") or item_dict.get("tropeVectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
+                                movie.collection_name = item_dict.get("collection_name") or item_dict.get("collectionName")
+                            elif movie.availability != "available":
+                                movie.title = title
+                                movie.description = item_dict.get("description", movie.description)
+                                movie.thumbnail_url = local_poster or movie.thumbnail_url
+                                movie.banner_url = local_backdrop or movie.banner_url
+                                movie.genres = item_dict.get("genres", movie.genres)
+                                movie.cast = item_dict.get("cast", movie.cast)
+                                movie.director = item_dict.get("director", movie.director)
+                                movie.vote_average = float(item_dict.get("vote_average") or movie.vote_average or 0.0)
+                                movie.vote_count = int(item_dict.get("vote_count") or movie.vote_count or 0)
+                                movie.popularity = float(item_dict.get("popularity") or movie.popularity or 0.0)
+                                movie.catalog_source = "tmdb_cache"
+                                movie.availability = "cached"
+                                movie.cached_at = movie.cached_at or now
+                                movie.metadata_refreshed_at = now
+                                movie.remote_thumbnail_url = raw_poster_url or movie.remote_thumbnail_url
+                                movie.remote_banner_url = raw_backdrop_url or movie.remote_banner_url
+                                movie.local_thumbnail_url = f"/media/{library_name}/{folder_name}/poster.jpg" if raw_poster_url else movie.local_thumbnail_url
+                                movie.local_banner_url = f"/media/{library_name}/{folder_name}/backdrop.jpg" if raw_backdrop_url else movie.local_banner_url
+                                movie.cache_state = "ready"
+                                movie.cache_retry_count = 0
+                                movie.cache_next_retry_at = None
+                                movie.cache_last_error = None
+                                movie.catalog_enrichment_version = 1
+                                movie.keywords = item_dict.get("keywords", movie.keywords)
+                                movie.crew = item_dict.get("crew", movie.crew)
+                                movie.trope_vectors = item_dict.get("trope_vectors") or item_dict.get("tropeVectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
+                                movie.collection_name = item_dict.get("collection_name") or item_dict.get("collectionName") or movie.collection_name
+                            db.add(movie)
+                            await mutation.commit(db)
                 logger.info(f"[TMDB Client] In-place recommendation cache complete for: {title}")
                 return movie_id
             except Exception as e:
                 logger.error(f"[TMDB Client] Error caching {item_dict.get('title')}: {e}")
                 raise
+            finally:
+                if staging is not None:
+                    staging.cleanup()
 
-    async def discover_media(self, category: str, media_type: str = "movie", profile_id: Optional[str] = None, cache_limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    async def discover_media(self, category: str, media_type: str = "movie", profile_id: Optional[str] = None, cache_limit: Optional[int] = None, *, require_complete: bool = False) -> List[Dict[str, Any]]:
         import asyncio
         from services.recommendation import get_profile_preferences
         
@@ -748,8 +803,7 @@ class TMDBClient:
         for page in range(1, pages_to_fetch + 1):
             page_params = {**params, "page": page}
             data = await self._get(path, params=page_params)
-            if data and data.get("results"):
-                all_results.extend(data.get("results", []))
+            all_results.extend(_discovery_results(data, require_complete=require_complete))
 
         
         raw_results = []
@@ -896,7 +950,7 @@ class TMDBClient:
 
         return await self._upsert_search_results(raw_results)
 
-    async def discover_related_media(self, tmdb_id: int, media_type: str, limit: int = 12) -> List[Dict[str, Any]]:
+    async def discover_related_media(self, tmdb_id: int, media_type: str, limit: int = 12, *, require_complete: bool = False) -> List[Dict[str, Any]]:
         """Cache a bounded mix of TMDB recommendations and similar titles for one seed."""
         is_tv = media_type in {"series", "tv"}
         api_type = "tv" if is_tv else "movie"
@@ -904,10 +958,12 @@ class TMDBClient:
             self._get(f"/{api_type}/{tmdb_id}/recommendations", params={"page": 1}),
             self._get(f"/{api_type}/{tmdb_id}/similar", params={"page": 1}),
         )
+        # Validate every required endpoint before accepting a partial result set.
+        result_sets = [_discovery_results(payload, require_complete=require_complete) for payload in payloads]
         seen: set[int] = set()
         items: List[Dict[str, Any]] = []
-        for payload in payloads:
-            for item in (payload or {}).get("results", []):
+        for results in result_sets:
+            for item in results:
                 related_id = item.get("id")
                 if not related_id or related_id == tmdb_id or related_id in seen or item.get("adult") is True:
                     continue

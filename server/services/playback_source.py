@@ -1,23 +1,23 @@
 from __future__ import annotations
 
 import mimetypes
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Mapping, Optional
-from urllib.parse import urljoin
 
 import aiofiles
 import aiofiles.os
 import httpx
 
-from services.ingestion_security import validate_headers, validate_url
+from services.ingestion_security import validate_headers, validated_stream_request
 from services.media_source import ResolvedMediaSource
 from services.rclone import rclone_service
+from lifecycle.media_work import settle
 
 
 READ_CHUNK_BYTES = 256 * 1024
-MAX_HTTP_REDIRECTS = 5
 
 
 class PlaybackSourceFailure(RuntimeError):
@@ -53,9 +53,25 @@ class LocalPlaybackSource(SeekablePlaybackSource):
     def __init__(self, path: Path, catalog_path: str):
         self.path = path.resolve()
         self.catalog_path = catalog_path
+        self._pinned_handle = None
+
+    async def pin(self) -> None:
+        """Open the selected inode while its media publication lock is held."""
+        if self._pinned_handle is None:
+            handle, cancelled = await settle(aiofiles.open(self.path, "rb"))
+            self._pinned_handle = handle
+            if cancelled:
+                await self.close()
+                import asyncio
+                raise asyncio.CancelledError
+
+    async def close(self) -> None:
+        handle, self._pinned_handle = self._pinned_handle, None
+        if handle is not None:
+            await settle(handle.close())
 
     async def stat(self) -> PlaybackSourceStat:
-        size = (await aiofiles.os.stat(self.path)).st_size
+        size = os.fstat(self._pinned_handle.fileno()).st_size if self._pinned_handle is not None else (await aiofiles.os.stat(self.path)).st_size
         return PlaybackSourceStat(
             size=size,
             content_type=mimetypes.guess_type(self.catalog_path)[0] or "application/octet-stream",
@@ -63,7 +79,7 @@ class LocalPlaybackSource(SeekablePlaybackSource):
         )
 
     async def open_range(self, start: int, length: int) -> AsyncIterator[bytes]:
-        async with aiofiles.open(self.path, "rb") as handle:
+        async def chunks(handle):
             await handle.seek(start)
             remaining = length
             while remaining > 0:
@@ -75,6 +91,13 @@ class LocalPlaybackSource(SeekablePlaybackSource):
                     )
                 remaining -= len(chunk)
                 yield chunk
+        if self._pinned_handle is not None:
+            async for chunk in chunks(self._pinned_handle):
+                yield chunk
+        else:
+            async with aiofiles.open(self.path, "rb") as handle:
+                async for chunk in chunks(handle):
+                    yield chunk
 
     def ffmpeg_input(self, media_id: str, ticket: str, source_id: str = "main") -> str:
         del media_id, ticket, source_id
@@ -181,23 +204,18 @@ class HttpPlaybackSource(SeekablePlaybackSource):
         selected_url = self._resolved_url
         headers = dict(self.headers)
         if range_header:
+            headers = {key: value for key, value in headers.items() if key.lower() != "range"}
             headers["Range"] = range_header
-        for _ in range(MAX_HTTP_REDIRECTS + 1):
-            await validate_url(selected_url, client_address=self.client_address)
-            client = httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(20, read=60))
-            source_request = client.build_request(method, selected_url, headers=headers)
-            response = await client.send(source_request, stream=True)
-            response.extensions["streamhome_client"] = client
-            if response.status_code not in {301, 302, 303, 307, 308}:
-                self._resolved_url = selected_url
-                return response
-            location = response.headers.get("location")
-            await response.aclose()
-            await client.aclose()
-            if not location:
-                raise PlaybackSourceFailure("HTTP_REDIRECT_INVALID", "The media source returned an invalid redirect.")
-            selected_url = urljoin(selected_url, location)
-        raise PlaybackSourceFailure("HTTP_REDIRECT_LIMIT", "The media source redirected too many times.")
+        async with httpx.AsyncClient(trust_env=False, timeout=httpx.Timeout(20, read=60)) as client:
+            response = await validated_stream_request(client, selected_url, headers=headers,
+                                                      client_address=self.client_address, method=method)
+        self._resolved_url = response.extensions["streamhome_final_url"]
+        # The owned response stream closes its actual pinned client. Keeping this
+        # source's headers after a cross-origin redirect would reintroduce them on
+        # the next range request, so persist only the final approved header set.
+        self.headers = {key: value for key, value in response.extensions["streamhome_final_headers"].items()
+                        if key.lower() != "range"}
+        return response
 
     @staticmethod
     async def _close_response(response: httpx.Response) -> None:
@@ -266,7 +284,10 @@ class HttpPlaybackSource(SeekablePlaybackSource):
 
     def ffmpeg_input(self, media_id: str, ticket: str, source_id: str = "main") -> str:
         del media_id, ticket, source_id
-        return self._resolved_url
+        raise PlaybackSourceFailure(
+            "HTTP_INPUT_REQUIRES_RELAY",
+            "Remote FFmpeg input requires a controlled media input scope.",
+        )
 
 
 def source_reader(source: ResolvedMediaSource, *, loopback_url: str) -> SeekablePlaybackSource:

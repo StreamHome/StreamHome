@@ -103,12 +103,12 @@ class LifecycleStateTests(unittest.TestCase):
         )
 
     def test_import_does_not_load_application_modules(self) -> None:
-        import sys
-
-        self.assertNotIn("config", sys.modules)
-        self.assertNotIn("db", sys.modules)
-        self.assertNotIn("main", sys.modules)
-        self.assertFalse(any(name.startswith("services.") for name in sys.modules))
+        result = subprocess.run([sys.executable, "-c",
+            "import sys; from lifecycle import state; "
+            "assert {'config','db','main','application','models','services','routes'}.isdisjoint(sys.modules); "
+            "assert not any(name.startswith(('services.','routes.')) for name in sys.modules)"],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_explicit_root_rejects_missing_markers_symlinks_and_traversal(self) -> None:
         unrelated = Path(self.temporary.name) / "unrelated"

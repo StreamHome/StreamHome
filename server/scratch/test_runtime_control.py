@@ -3,6 +3,8 @@ from __future__ import annotations
 import tempfile
 import os
 import socket
+import subprocess
+import sys
 import time
 import unittest
 from pathlib import Path
@@ -75,6 +77,33 @@ class RuntimeControlTests(unittest.TestCase):
             environment=self.marked_environment("updater"),
         )
         self.assertEqual(runtime_control.owned_service(unknown_service, self.root), "")
+
+    @unittest.skipUnless(os.name == "posix" and Path("/proc").is_dir(), "Linux /proc required")
+    def test_start_registration_preserves_leading_dash_token_exactly(self) -> None:
+        start_source = (Path(__file__).resolve().parents[2] / "start.sh").read_text(encoding="utf-8")
+        begin = start_source.index("record_service() {")
+        end = start_source.index("\n}", begin) + 2
+        function = start_source[begin:end]
+        token = "-isolated-leading-dash-runtime-token"
+        environment = {**os.environ, **self.marked_environment("backend", token)}
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=self.root, env=environment, start_new_session=True)
+        try:
+            shell_environment = {**environment, "BACKEND_PYTHON": sys.executable,
+                "RUNTIME_CONTROL": str(Path(runtime_control.__file__)), "ROOT_DIR": str(self.root),
+                "RUNTIME_TOKEN": token, "TEST_PID": str(process.pid)}
+            result = subprocess.run(["bash", "-c", function + '\nrecord_service backend "$TEST_PID"\n'],
+                cwd=self.root, env=shell_environment, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = runtime_control.read_runtime_record(self.root, "backend")
+            self.assertEqual(record["token"], token)
+            self.assertEqual(record["pid"], process.pid)
+            self.assertTrue(runtime_control.service_matches(self.root, "backend", process.pid))
+            wrong = dict(record, token="different-token")
+            self.assertFalse(runtime_control.record_matches(runtime_control.inspect_process(process.pid), self.root, "backend", wrong))
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
 
     def test_runtime_record_rejects_pid_reuse_start_or_token_mismatch(self) -> None:
         info = self.process(

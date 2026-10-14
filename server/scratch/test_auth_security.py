@@ -88,12 +88,16 @@ async def protected(user: User = Depends(get_current_user)):
 def run() -> None:
     original_readiness = auth_routes.get_startup_readiness
     auth_routes.get_startup_readiness = lambda: SimpleNamespace(
+        context=SimpleNamespace(mode="normal"),
         projection=lambda: {
             "generalReady": True,
             "guardedReady": False,
             "mode": "normal",
             "capabilities": ["database", "authentication", "catalog", "playback", "background_work"],
             "errorCode": None,
+            "workersStarted": False,
+            "recoveryCompleted": True,
+            "recoverySucceeded": True,
         }
     )
     user_id = asyncio.run(seed_user())

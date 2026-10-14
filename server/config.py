@@ -5,6 +5,8 @@ import secrets
 import stat
 from dataclasses import dataclass
 from typing import Optional
+from pathlib import Path
+from lifecycle.configuration_paths import resolve_temp_directory
 from dotenv import load_dotenv
 
 # Load .env file relative to the config.py location
@@ -135,7 +137,7 @@ class Settings:
     db_path = os.path.abspath(os.path.join(config_dir, "database.db")).replace("\\", "/")
     DATABASE_URL: str = f"sqlite+aiosqlite:///{db_path}"
     MEDIA_DIR: str = os.path.abspath(os.path.join(config_dir, "media"))
-    TEMP_DIR: str = os.path.abspath(os.getenv("TEMP_DIR", os.path.join(config_dir, "temp")))
+    TEMP_DIR: str = str(resolve_temp_directory(Path(base_dir), environment=os.environ))
     PLAYBACK_CACHE_GB: float = max(0.25, min(500.0, float(os.getenv("PLAYBACK_CACHE_GB", "20"))))
     PLAYBACK_TRANSCODE_CONCURRENCY: int = env_int("PLAYBACK_TRANSCODE_CONCURRENCY", 2, 1, 8)
     PLAYBACK_JOB_STALL_SECONDS: int = env_int("PLAYBACK_JOB_STALL_SECONDS", 120, 30, 900)

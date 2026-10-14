@@ -6,19 +6,22 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import sys
 import time
 import weakref
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from config import settings
 from services.logger import logger
 from services.languages import language_label, normalize_language_tag
 from services.media_timing import canonical_audio_filter_chain
-from services.media_source import ResolvedMediaSource, playback_source_fingerprint, resolve_media_source
+from services.ffmpeg_input import generated_hls_input_options, local_media_input_options, native_media_environment
+from services.media_source import ResolvedMediaSource, clear_cloud_object_cache, playback_source_fingerprint, resolve_media_source
 from services.rclone import rclone_service
 from services.state import register_process, unregister_process
 from lifecycle.coordination import (
@@ -27,6 +30,7 @@ from lifecycle.coordination import (
     run_cancellation_safe_thread,
     runtime_work,
 )
+from lifecycle.media_work import MediaRecoveryRequired, media_ownership, require_resolved_media
 
 
 STANDARD_HEIGHTS = (1080, 720, 480, 360, 240, 144)
@@ -434,11 +438,13 @@ class PlaybackPrepService:
             [
                 ffprobe,
                 "-v", "error",
+                *generated_hls_input_options(),
                 "-show_entries", "stream=codec_type,codec_name,profile,sample_rate,channels,start_time",
                 "-of", "json",
                 str(playlist),
             ],
             check=False,
+            env=native_media_environment(),
             capture_output=True,
             text=True,
             timeout=15,
@@ -488,12 +494,14 @@ class PlaybackPrepService:
                     "-nostdin",
                     "-v", "error",
                     "-xerror",
+                    *generated_hls_input_options(),
                     "-i", str(playlist),
                     "-map", "0:a:0",
                     "-f", "null",
                     "-",
                 ],
                 check=False,
+                env=native_media_environment(),
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -1037,6 +1045,79 @@ class PlaybackPrepService:
                 )
         return str(spool_path), None
 
+    @asynccontextmanager
+    async def _owned_job_input(
+        self,
+        media_id: str,
+        fingerprint: str,
+        rendition_name: str,
+        requested_source: ResolvedMediaSource,
+    ) -> AsyncIterator[tuple[str, Optional[asyncio.subprocess.Process], tuple[int, ...]]]:
+        """Bind queued work to current catalog authority and immutable input bytes."""
+        from db import engine
+        from models import Episode, Movie
+        from sqlmodel.ext.asyncio.session import AsyncSession
+
+        descriptor: Optional[int] = None
+        ownership = media_ownership(media_id)
+        held = False
+        try:
+            await ownership.__aenter__()
+            held = True
+            try:
+                require_resolved_media(media_id)
+            except MediaRecoveryRequired as exc:
+                raise PlaybackPreparationError("MEDIA_RECOVERY_REQUIRED", "Media publication must finish before preparing playback.") from exc
+            # A capacity wait may span an entire replacement. Do not keep a DB
+            # snapshot while waiting for ownership or staging a cloud source.
+            async with AsyncSession(engine) as db:
+                item = await db.get(Movie, media_id)
+                if item is None:
+                    item = await db.get(Episode, media_id)
+                if item is None or str(item.source_fingerprint or "") != fingerprint:
+                    raise PlaybackPreparationError("PLAYBACK_SOURCE_CHANGED", "The queued playback source changed.")
+                catalog_path = item.video_url
+                current_media = self.snapshot_media(item)
+            # Cloud identity caches cannot establish which bytes a queued job
+            # will download after an earlier publication has completed.
+            if settings.STORAGE_ENGINE == "CLOUD":
+                clear_cloud_object_cache()
+            source = await resolve_media_source(catalog_path)
+            if (not source.available or source.catalog_path != requested_source.catalog_path
+                    or playback_source_fingerprint(source, current_media.audio_metadata) != fingerprint):
+                raise PlaybackPreparationError("PLAYBACK_SOURCE_CHANGED", "The queued playback source changed.")
+            audio = next((track for track in self.audio_renditions(current_media)
+                          if track.name == rendition_name), None)
+            if audio and audio.source == "external":
+                source = self._external_audio_source(source, audio, self._external_audio_path(source, audio))
+                if source is None:
+                    raise PlaybackPreparationError("MEDIA_SOURCE_MISSING", "The selected audio source is no longer available.")
+            if source.local_exists and sys.platform.startswith("linux"):
+                path = source.local_path
+                if path.is_symlink() or not path.resolve().is_relative_to(Path(settings.MEDIA_DIR).resolve()):
+                    raise PlaybackPreparationError("MEDIA_SOURCE_INVALID", "The playback source is outside the media root.")
+                descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise PlaybackPreparationError("MEDIA_SOURCE_INVALID", "The playback source is not a regular file.")
+                # The child inherits this exact inode even if publication later
+                # renames its old directory or replaces a dubbing sidecar.
+                actual_input, process = f"/proc/self/fd/{descriptor}", None
+                pass_fds = (descriptor,)
+            else:
+                actual_input, process = await self._input_process(source, media_id, fingerprint)
+                pass_fds = ()
+            if not source.local_exists or descriptor is not None:
+                await ownership.__aexit__(None, None, None)
+                held = False
+            # Platforms without inherited Linux descriptors retain ownership
+            # until FFmpeg exits; cloud jobs now read their private spool file.
+            yield actual_input, process, pass_fds
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if held:
+                await ownership.__aexit__(None, None, None)
+
     async def _pump_cloud_input(
         self,
         cloud_process: asyncio.subprocess.Process,
@@ -1184,16 +1265,20 @@ class PlaybackPrepService:
             cloud_stderr_task: Optional[asyncio.Task[bytes]] = None
             ffmpeg_stderr_task: Optional[asyncio.Task[bytes]] = None
             try:
-                actual_input, cloud_process = await self._input_process(source, media_id, fingerprint)
-                command = [self._ffmpeg_executable(), "-hide_banner", "-nostdin", "-y", "-i", actual_input, *arguments, *self._hls_output_args(target_dir)]
+                actual_input, cloud_process, input_descriptors = await capacity.enter_async_context(
+                    self._owned_job_input(media_id, fingerprint, rendition_name, source)
+                )
+                command = [self._ffmpeg_executable(), "-hide_banner", "-nostdin", "-y", *local_media_input_options(), "-i", actual_input, *arguments, *self._hls_output_args(target_dir)]
                 logger.info(f"[Playback Prep] Preparing {media_id} rendition {rendition_name}.")
                 ffmpeg_process = await asyncio.create_subprocess_exec(
                     *command,
+                    env=native_media_environment(),
                     cwd=str(target_dir),
                     stdin=asyncio.subprocess.PIPE if cloud_process else asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                    **({"pass_fds": input_descriptors} if input_descriptors else {}),
                 )
                 register_process(f"playback:{job_key}", ffmpeg_process)
                 publish_task = asyncio.create_task(
@@ -1463,6 +1548,7 @@ class PlaybackPrepService:
         result = subprocess.run(
             [
                 ffprobe, "-v", "error",
+                *generated_hls_input_options(),
                 "-show_entries", "stream=codec_type,start_time,duration:format=duration",
                 "-of", "json", str(playlist),
             ],
@@ -1470,6 +1556,7 @@ class PlaybackPrepService:
             capture_output=True,
             text=True,
             timeout=15,
+            env=native_media_environment(),
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         if result.returncode != 0:
@@ -1662,23 +1749,39 @@ class PlaybackPrepService:
         from sqlmodel.ext.asyncio.session import AsyncSession
 
         self.recover_interrupted_outputs()
-        async with AsyncSession(engine, expire_on_commit=False) as db:
-            movies = (await db.exec(select(Movie).where(Movie.video_url != ""))).all()
-            episodes = (await db.exec(select(Episode).where(Episode.video_url != ""))).all()
-            for media_obj in [*movies, *episodes]:
-                try:
-                    source = await resolve_media_source(media_obj.video_url)
+        async with AsyncSession(engine) as db:
+            movies = (await db.exec(select(Movie.id).where(Movie.video_url != ""))).all()
+            episodes = (await db.exec(select(Episode.id).where(Episode.video_url != ""))).all()
+        targets = [(Movie, media_id) for media_id in movies] + [(Episode, media_id) for media_id in episodes]
+        for model, media_id in targets:
+            try:
+                async with media_ownership(media_id):
+                    require_resolved_media(media_id)
+                    async with AsyncSession(engine) as db:
+                        media_obj = await db.get(model, media_id)
+                        if media_obj is None or not media_obj.video_url:
+                            continue
+                        catalog_path = media_obj.video_url
+                        previous_fingerprint = str(media_obj.source_fingerprint or "")
+                        audio_metadata = list(media_obj.audio_metadata or [])
+                    source = await resolve_media_source(catalog_path)
                     if not source.available:
                         continue
-                    fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
-                    if media_obj.source_fingerprint != fingerprint:
-                        if media_obj.source_fingerprint:
-                            self.cancel_media(media_obj.id, media_obj.source_fingerprint)
+                    fingerprint = playback_source_fingerprint(source, audio_metadata)
+                    if previous_fingerprint == fingerprint:
+                        continue
+                    async with AsyncSession(engine) as db:
+                        media_obj = await db.get(model, media_id)
+                        if (media_obj is None or media_obj.video_url != catalog_path
+                                or str(media_obj.source_fingerprint or "") != previous_fingerprint):
+                            continue
+                        if previous_fingerprint:
+                            self.cancel_media(media_id, previous_fingerprint)
                         media_obj.source_fingerprint = fingerprint
                         db.add(media_obj)
-                except Exception as exc:
-                    logger.warning(f"[Playback Prep] Cache identity reconciliation skipped for {media_obj.id}: {self.sanitize_diagnostics(str(exc), 400)}")
-            await db.commit()
+                        await db.commit()
+            except Exception as exc:
+                logger.warning(f"[Playback Prep] Cache identity reconciliation skipped for {media_id}: {self.sanitize_diagnostics(str(exc), 400)}")
 
     async def schedule_catalog_baselines(self) -> None:
         """Prepare the complete rendition set for existing catalog media in bounded order."""

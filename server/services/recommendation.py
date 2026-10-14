@@ -39,12 +39,14 @@ from models import (
 from services.logger import logger
 from services.vibe_analysis import VIBE_ANALYSIS_VERSION, crew_names
 from lifecycle.coordination import AdmissionClosedError, EffectClass, runtime_work
+from lifecycle.media_work import accepted_commit
 
 TASTE_HALF_LIFE_DAYS = 90.0
 DECAY_RATE = math.log(2.0) / TASTE_HALF_LIFE_DAYS
 TMDB_POOL_LIMIT = 80
 TMDB_REFRESH_SECONDS = 6 * 60 * 60
 TMDB_STALE_SECONDS = 24 * 60 * 60
+TMDB_RETRY_SECONDS = 15 * 60
 ATTEMPT_GAP_SECONDS = 30 * 60
 REWATCH_COOLDOWN_SECONDS = 24 * 60 * 60
 ALGORITHM_VERSION = "v2.1"
@@ -842,8 +844,9 @@ async def rank_movies_for_profile(
                 "generated_at": now,
             },
         )
-        async with engine.begin() as connection:
-            await connection.execute(statement)
+        # Ranking may already have flushed a pacing vector. Use its transaction
+        # rather than waiting on a second SQLite writer owned by this same call.
+        await db.exec(statement)
     return ranked
 
 
@@ -1102,7 +1105,7 @@ async def _build_recommendation_payload_admitted(
         "vibe_rails": vibe_rails,
         "algorithm_version": ALGORITHM_VERSION if settings.RECOMMENDATION_V2_ENABLED else "v1",
     }
-    await db.commit()
+    await accepted_commit(db)
     return payload
 
 
@@ -1111,12 +1114,9 @@ async def refresh_profile_cache(profile_id: str, force: bool = False) -> bool:
     now = time.time()
     async with AsyncSession(engine) as db:
         state = await db.get(RecommendationRefreshState, profile_id) or RecommendationRefreshState(profile_id=profile_id)
-        pool_result = await db.exec(select(ProfileRecommendation).where(ProfileRecommendation.profile_id == profile_id))
-        pool = list(pool_result.all())
-        movie_count = sum(1 for item in pool if item.media_type == "movie")
-        series_count = sum(1 for item in pool if item.media_type == "series")
-        shortage = movie_count < TMDB_POOL_LIMIT or series_count < TMDB_POOL_LIMIT
-        if not force and not shortage and state.next_tmdb_refresh_at and now < state.next_tmdb_refresh_at:
+        # An incomplete/empty pool cannot bypass the provider retry deadline.
+        # A successful empty discovery is also eligible for the regular interval.
+        if not force and now < _tmdb_refresh_deadline(state):
             if state.refresh_requested:
                 await persist_profile_pool(db, profile_id)
                 await db.commit()
@@ -1124,11 +1124,11 @@ async def refresh_profile_cache(profile_id: str, force: bool = False) -> bool:
 
     try:
         from services.tmdb import tmdb_client
-        await tmdb_client.discover_media("trending", "movie", profile_id, cache_limit=TMDB_POOL_LIMIT)
-        await tmdb_client.discover_media("trending", "tv", profile_id, cache_limit=TMDB_POOL_LIMIT)
+        await tmdb_client.discover_media("trending", "movie", profile_id, cache_limit=TMDB_POOL_LIMIT, require_complete=True)
+        await tmdb_client.discover_media("trending", "tv", profile_id, cache_limit=TMDB_POOL_LIMIT, require_complete=True)
         # A small unfiltered pool provides exploration and cold-start diversity.
-        await tmdb_client.discover_media("trending", "movie", None, cache_limit=10)
-        await tmdb_client.discover_media("trending", "tv", None, cache_limit=10)
+        await tmdb_client.discover_media("trending", "movie", None, cache_limit=10, require_complete=True)
+        await tmdb_client.discover_media("trending", "tv", None, cache_limit=10, require_complete=True)
         async with AsyncSession(engine) as seed_db:
             explicit_result = await seed_db.exec(select(ProfileMediaPreference).where(ProfileMediaPreference.profile_id == profile_id, ProfileMediaPreference.preference.in_(["like", "love"])).order_by(ProfileMediaPreference.updated_at.desc()))
             attempt_result = await seed_db.exec(select(ViewingAttempt).where(ViewingAttempt.profile_id == profile_id, ViewingAttempt.max_completion >= 0.50).order_by(ViewingAttempt.last_seen_at.desc()))
@@ -1136,7 +1136,7 @@ async def refresh_profile_cache(profile_id: str, force: bool = False) -> bool:
             seeds = [movie for movie in [await seed_db.get(Movie, movie_id) for movie_id in seed_ids] if movie and infer_tmdb_id(movie)]
         related_ids: List[str] = []
         for seed in seeds:
-            related = await tmdb_client.discover_related_media(infer_tmdb_id(seed), seed.type or "movie", limit=12)
+            related = await tmdb_client.discover_related_media(infer_tmdb_id(seed), seed.type or "movie", limit=12, require_complete=True)
             related_ids.extend(item["id"] for item in related)
         async with AsyncSession(engine) as db:
             await persist_profile_pool(db, profile_id)
@@ -1160,14 +1160,28 @@ async def refresh_profile_cache(profile_id: str, force: bool = False) -> bool:
             await db.commit()
         return True
     except Exception as exc:
-        logger.error(f"[Recommendation] TMDB refresh failed for profile {profile_id}: {exc}")
+        # Provider exceptions can contain credentials or request URLs. Store only
+        # a safe failure category; full request diagnostics do not belong here.
+        failure = f"TMDB refresh failed ({type(exc).__name__})"
+        logger.error(f"[Recommendation] {failure} for profile {profile_id}")
         async with AsyncSession(engine) as db:
             state = await db.get(RecommendationRefreshState, profile_id) or RecommendationRefreshState(profile_id=profile_id)
-            state.last_error = str(exc)[:500]
-            state.next_tmdb_refresh_at = now + 15 * 60
+            state.last_error = failure
+            state.next_tmdb_refresh_at = now + TMDB_RETRY_SECONDS
             db.add(state)
             await db.commit()
         return False
+
+
+def _tmdb_refresh_deadline(state: Optional[RecommendationRefreshState]) -> float:
+    """Use the durable retry/success deadline, including legacy refresh rows."""
+    if state is None:
+        return 0.0
+    if state.next_tmdb_refresh_at is not None:
+        return state.next_tmdb_refresh_at
+    if state.last_tmdb_refresh_at is not None:
+        return state.last_tmdb_refresh_at + TMDB_REFRESH_SECONDS
+    return 0.0
 
 
 async def recommendation_worker(stop_event) -> None:
@@ -1183,6 +1197,7 @@ async def recommendation_worker(stop_event) -> None:
             continue
         backfilled = 0
         admission_deferred = False
+        refresh_delay = 3600.0
         try:
             async with runtime_work(
                 "recommendation.worker",
@@ -1198,15 +1213,22 @@ async def recommendation_worker(stop_event) -> None:
                 now = time.time()
                 for profile_id in profile_ids:
                     state = states.get(profile_id)
-                    stale = not state or not state.last_tmdb_refresh_at or now - state.last_tmdb_refresh_at >= TMDB_STALE_SECONDS
-                    if stale or (state and state.refresh_requested):
+                    if now >= _tmdb_refresh_deadline(state) or (state and state.refresh_requested):
                         await refresh_profile_cache(profile_id)
+                # A failed provider refresh retries in fifteen minutes, rather
+                # than waiting for the hourly loop or the 24-hour UI stale flag.
+                async with AsyncSession(engine) as db:
+                    result = await db.exec(select(RecommendationRefreshState))
+                    deadlines = [_tmdb_refresh_deadline(state) for state in result.all() if state.profile_id in profile_ids]
+                now = time.time()
+                if deadlines:
+                    refresh_delay = min(3600.0, max(1.0, min(deadlines) - now))
         except AdmissionClosedError:
             admission_deferred = True
         except Exception as exc:
             logger.error(f"[Recommendation] Background worker error: {exc}")
         try:
-            delay = 5 if admission_deferred else 15 if backfilled >= 24 else 3600
+            delay = 5 if admission_deferred else 15 if backfilled >= 24 else refresh_delay
             await __import__("asyncio").wait_for(stop_event.wait(), timeout=delay)
         except __import__("asyncio").TimeoutError:
             pass

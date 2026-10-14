@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import asyncio
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from services.ingestion_errors import (
     write_task_diagnostics,
 )
 from services.ffmpeg_input import ffmpeg_network_input_options, is_hls_media_source
+from services.controlled_source import SourceRelay
 from services.media_source import (
     MediaSourceError,
     catalog_path_from_storage,
@@ -53,21 +55,32 @@ def test_failure_classification() -> None:
 
 
 def test_ffmpeg_input_options_are_source_specific() -> None:
-    direct_options = ffmpeg_network_input_options("http://127.0.0.1:9000/video.mp4")
+    async def exercise() -> None:
+        relay = SourceRelay(client_address="127.0.0.1")
+        await relay.start()
+        try:
+            _assert_source_specific_options(relay)
+        finally:
+            await relay.close()
+    asyncio.run(exercise())
+
+
+def _assert_source_specific_options(relay: SourceRelay) -> None:
+    direct_options = ffmpeg_network_input_options(relay.add("http://127.0.0.1:9000/video.mp4", {}))
     assert "-protocol_whitelist" in direct_options
     assert "-allowed_extensions" not in direct_options
     assert "-extension_picky" not in direct_options
 
-    manifest_options = ffmpeg_network_input_options("https://sender.example/master.m3u8?token=secret")
+    manifest_options = ffmpeg_network_input_options(relay.add("https://sender.example/master.m3u8?token=secret", {}, manifest=True))
     assert is_hls_media_source("https://sender.example/master.m3u8?token=secret")
     assert "-allowed_extensions" in manifest_options
     assert "-extension_picky" in manifest_options
 
-    query_manifest_options = ffmpeg_network_input_options("https://sender.example/play?format=m3u8")
+    query_manifest_options = ffmpeg_network_input_options(relay.add("https://sender.example/play?format=m3u8", {}, manifest=True))
     assert "-allowed_extensions" in query_manifest_options
 
     disguised_manifest_options = ffmpeg_network_input_options(
-        "https://sender.example/hls/movie.mp4/txt/master.txt",
+        relay.add("https://sender.example/hls/movie.mp4/txt/master.txt", {}, manifest=True),
         "hls",
     )
     assert is_hls_media_source("https://sender.example/hls/movie.mp4/txt/master.txt", "hls")
@@ -174,46 +187,28 @@ def test_diagnostics_file_redacts_secrets() -> None:
         path = write_task_diagnostics(
             "queue-test",
             "ffmpeg",
-            "Failed https://sender.example/video.m3u8?token=secret-value and returned 404",
+            "Failed https://sender.example/private-path-secret/video.m3u8?token=secret-value and returned 404",
             temp_dir=temp_dir,
         )
         assert path is not None
         content = Path(path).read_text(encoding="utf-8")
         assert "secret-value" not in content
-        assert "https://sender.example/video.m3u8" in content
+        assert "private-path-secret" not in content
+        assert "sender.example" not in content
+        assert "[REDACTED_URL]" in content
         assert "returned 404" in content
 
 
 def test_queue_contracts() -> None:
-    queue_source = Path(__file__).parents[1].joinpath("services", "queue.py").read_text(encoding="utf-8")
-    ffmpeg_source = Path(__file__).parents[1].joinpath("services", "ffmpeg.py").read_text(encoding="utf-8")
-    route_source = Path(__file__).parents[1].joinpath("routes", "queue.py").read_text(encoding="utf-8")
-    assert "if not last_failure.retryable" in queue_source
-    assert "raise IngestionTaskError(probe_res[\"failure\"])" in queue_source
-    assert "await queue_manager.stop()" in Path(__file__).parents[1].joinpath("application.py").read_text(encoding="utf-8")
-    assert "Running threaded exec command" not in ffmpeg_source
-    assert "traceback.print_exc" not in ffmpeg_source
-    assert ".part{output_ext" in ffmpeg_source
-    assert "preserve_local_media" in route_source
-    assert "preserve_local_episode" in route_source
-    process_source = queue_source[queue_source.index("    async def _process_task"):queue_source.index("    async def _record_task_failure")]
-    catalog_position = process_source.index("await self._catalog_media")
-    preparation_commit_position = process_source.index("await db.commit()", catalog_position)
-    playback_index_position = process_source.index("await self._prepare_ingested_media", preparation_commit_position)
-    cloud_upload_position = process_source.index("await self.run_rclone_move_dir", playback_index_position)
-    publication_position = process_source.index("await self._finalize_catalog_media", cloud_upload_position)
-    completion_position = process_source.index('task.status = "COMPLETED"', cloud_upload_position)
-    assert catalog_position < preparation_commit_position < playback_index_position < cloud_upload_position
-    assert cloud_upload_position < publication_position < completion_position
-    assert "finalize=False" in process_source
-    assert "adaptive segments will be generated at the requested timestamp" in queue_source
-    assert "wait_until_fully_prepared" not in queue_source
-    assert "PLAYBACK_CACHE_MIGRATION_FAILED" not in queue_source
-    assert "Rclone can take minutes or hours" in process_source
-    assert "CATALOG_UPDATE_FAILED" in queue_source
-    vibe_source = Path(__file__).parents[1].joinpath("services", "vibe_analysis.py").read_text(encoding="utf-8")
-    analyze_source = vibe_source[vibe_source.index("    async def analyze_entity"):]
-    assert "AsyncSession(engine, expire_on_commit=False)" in analyze_source
+    # Exercise the real producer instead of requiring the old provisional commit
+    # that overwrote a healthy catalog before candidate publication was accepted.
+    from tests.media.test_remediation import MediaRemediation
+    suite = unittest.TestSuite(MediaRemediation(name) for name in (
+        "test_real_queue_rejects_sender_label_and_publishes_measured_analysis",
+        "test_real_queue_final_probe_failure_preserves_prior_catalog",
+        "test_real_queue_cancel_before_acceptance_restores_catalog_and_directory",
+    ))
+    assert unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful()
 
 
 def test_catalog_recovery_releases_sqlite_writes_between_media_entries() -> None:

@@ -1,30 +1,15 @@
 import unittest
+import tempfile
+import time
 from pathlib import Path
 
 from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlmodel import SQLModel
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 from models import AuthSession, Profile
 from services.profile_security import grant_profile_access, hash_profile_pin, require_profile_access, validate_profile_pin, verify_profile_pin
-
-
-class FakeSession:
-    def __init__(self, profile: Profile, auth_session: AuthSession):
-        self.profile = profile
-        self.auth_session = auth_session
-        self.commits = 0
-
-    async def get(self, model, item_id):
-        if model is Profile and item_id == self.profile.id:
-            return self.profile
-        if model is AuthSession and item_id == self.auth_session.id:
-            return self.auth_session
-        return None
-
-    def add(self, item):
-        del item
-
-    async def commit(self):
-        self.commits += 1
 
 
 class ProfilePinSecurityTests(unittest.TestCase):
@@ -55,22 +40,31 @@ class ProfilePinSecurityTests(unittest.TestCase):
 
 class ProfileAccessGrantTests(unittest.IsolatedAsyncioTestCase):
     async def test_protected_profile_requires_matching_session_grant_and_pin_version(self):
-        profile = Profile(id="protected", name="Protected", pin_enabled=True, pin_hash="hash", pin_version=3)
-        auth_session = AuthSession(id="session", user_id=1, created_at=1, last_seen_at=1, expires_at=999)
-        db = FakeSession(profile, auth_session)
-
-        with self.assertRaises(HTTPException) as denied:
-            await require_profile_access(db, auth_session, profile.id)
-        self.assertEqual(denied.exception.status_code, 403)
-
-        await grant_profile_access(db, auth_session, profile)
-        self.assertEqual(auth_session.selected_profile_id, profile.id)
-        self.assertEqual(auth_session.selected_profile_pin_version, 3)
-        self.assertIs(await require_profile_access(db, auth_session, profile.id), profile)
-
-        profile.pin_version = 4
-        with self.assertRaises(HTTPException):
-            await require_profile_access(db, auth_session, profile.id)
+        with tempfile.TemporaryDirectory(prefix="streamhome-profile-access-") as directory:
+            engine = create_async_engine(f"sqlite+aiosqlite:///{Path(directory) / 'profiles.db'}")
+            try:
+                async with engine.begin() as connection:
+                    await connection.run_sync(SQLModel.metadata.create_all)
+                async with AsyncSession(engine, expire_on_commit=False) as db:
+                    profile = Profile(id="protected", name="Protected", pin_enabled=True, pin_hash="hash", pin_version=3)
+                    auth_session = AuthSession(id="session", user_id=1, created_at=time.time(), last_seen_at=time.time(), expires_at=time.time() + 3600)
+                    db.add(profile)
+                    db.add(auth_session)
+                    await db.commit()
+                    with self.assertRaises(HTTPException) as denied:
+                        await require_profile_access(db, auth_session, profile.id)
+                    self.assertEqual(denied.exception.status_code, 403)
+                    await grant_profile_access(db, auth_session, profile)
+                    self.assertEqual(auth_session.selected_profile_id, profile.id)
+                    self.assertEqual(auth_session.selected_profile_pin_version, 3)
+                    self.assertIs(await require_profile_access(db, auth_session, profile.id), profile)
+                    profile.pin_version = 4
+                    db.add(profile)
+                    await db.commit()
+                    with self.assertRaises(HTTPException):
+                        await require_profile_access(db, auth_session, profile.id)
+            finally:
+                await engine.dispose()
 
 
 if __name__ == "__main__":

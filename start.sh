@@ -211,7 +211,7 @@ record_service() {
             --root "$ROOT_DIR" \
             --service "$service" \
             --pid "$pid" \
-            --token "$RUNTIME_TOKEN" 2>&1)"; then
+            --token="$RUNTIME_TOKEN" 2>&1)"; then
             return 0
         fi
         kill -0 "$pid" 2>/dev/null || break
@@ -295,7 +295,7 @@ start_backend() {
             STREAMHOME_INSTANCE_ROOT="$ROOT_DIR" \
             STREAMHOME_INSTANCE_TOKEN="$RUNTIME_TOKEN" \
             STREAMHOME_SERVICE=backend \
-            "$BACKEND_PYTHON" -m uvicorn main:app --host 127.0.0.1 --port 8000 \
+            "$BACKEND_PYTHON" -m uvicorn main:app --host 127.0.0.1 --port 8000 --no-proxy-headers \
             > "$ROOT_DIR/backend.log" 2>&1 < /dev/null &
         pid=$!
         if ! record_service backend "$pid"; then
@@ -316,6 +316,7 @@ start_web() {
             WEB_PORT="$WEB_PORT" \
             SETUP="$SETUP" \
             PUBLIC_URL="$PUBLIC_URL" \
+            TRUSTED_PROXY_CIDRS="$TRUSTED_PROXY_CIDRS" \
             STREAMHOME_INSTANCE_ROOT="$ROOT_DIR" \
             STREAMHOME_INSTANCE_TOKEN="$RUNTIME_TOKEN" \
             STREAMHOME_SERVICE=web \
@@ -580,6 +581,7 @@ main() {
     WEB_PORT="$(read_env WEB_PORT 3000)"
     SETUP="$(read_env SETUP false)"
     CONFIGURED_PUBLIC_URL="$(read_env PUBLIC_URL "")"
+    TRUSTED_PROXY_CIDRS="$(read_env TRUSTED_PROXY_CIDRS '127.0.0.1/32,::1/128')"
     if ! [[ "$WEB_PORT" =~ ^[0-9]+$ ]] || (( 10#$WEB_PORT < 1 || 10#$WEB_PORT > 65535 )); then
         fail "Invalid WEB_PORT in .env: $WEB_PORT"
     fi
@@ -619,7 +621,7 @@ main() {
     PUBLIC_URL="${PUBLIC_URL%/}"
     validate_public_url "$PUBLIC_URL" || fail "The resolved PUBLIC_URL is invalid: $PUBLIC_URL"
     STREAMHOME_BUILD_ID="$(git -C "$ROOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || printf 'dev')"
-    export WEB_PORT SETUP PUBLIC_URL STREAMHOME_PUBLIC_URL_EXPLICIT STREAMHOME_BUILD_ID
+    export WEB_PORT SETUP PUBLIC_URL STREAMHOME_PUBLIC_URL_EXPLICIT STREAMHOME_BUILD_ID TRUSTED_PROXY_CIDRS
 
     acquire_lifecycle_lock
     "$ROOT_DIR/stop.sh" --startup --lock-held

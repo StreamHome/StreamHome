@@ -17,7 +17,9 @@ from services.media_updates import (
 )
 from services.request_security import client_ip
 from config import settings
+from lifecycle.media_work import MediaRecoveryRequired
 from lifecycle.coordination import EffectClass, runtime_work
+from services.logger import logger
 
 
 router = APIRouter(prefix="/api/media", tags=["media-sender"])
@@ -37,6 +39,16 @@ def update_error(exc: MediaUpdateFailure) -> HTTPException:
     )
 
 
+async def rollback_failed_update(db: AsyncSession) -> None:
+    """Preserve the operation's API error when its failed session cannot roll back."""
+    try:
+        await db.rollback()
+    except Exception as exc:
+        # Cancellation remains authoritative. A committed/failed-close session
+        # cannot make an unresolved media operation safe by raising another error.
+        logger.warning("[Media Updates] Session rollback failed: %s", type(exc).__name__)
+
+
 @router.patch("/{media_id}/metadata")
 async def patch_media_metadata(
     media_id: str,
@@ -53,8 +65,11 @@ async def patch_media_metadata(
     try:
         async with runtime_work("media-sender.sidecar", media_mutation_effects()):
             return await update_skip_markers(media_id, markers, db)
+    except MediaRecoveryRequired as exc:
+        await rollback_failed_update(db)
+        raise HTTPException(status_code=503, detail={"code": "media_recovery_required", "message": "This media operation needs recovery before further changes."}) from exc
     except MediaUpdateFailure as exc:
-        await db.rollback()
+        await rollback_failed_update(db)
         raise update_error(exc) from exc
 
 
@@ -82,8 +97,11 @@ async def put_media_subtitle(
                 client_address=client_ip(request),
                 db=db,
             )
+    except MediaRecoveryRequired as exc:
+        await rollback_failed_update(db)
+        raise HTTPException(status_code=503, detail={"code": "media_recovery_required", "message": "This media operation needs recovery before further changes."}) from exc
     except MediaUpdateFailure as exc:
-        await db.rollback()
+        await rollback_failed_update(db)
         raise update_error(exc) from exc
 
 
@@ -99,8 +117,11 @@ async def delete_media_subtitle(
     try:
         async with runtime_work("media-sender.sidecar", media_mutation_effects()):
             return await remove_subtitle(media_id, track_id, db)
+    except MediaRecoveryRequired as exc:
+        await rollback_failed_update(db)
+        raise HTTPException(status_code=503, detail={"code": "media_recovery_required", "message": "This media operation needs recovery before further changes."}) from exc
     except MediaUpdateFailure as exc:
-        await db.rollback()
+        await rollback_failed_update(db)
         raise update_error(exc) from exc
 
 
@@ -127,8 +148,11 @@ async def put_media_audio(
                 source_type=payload.source_type,
                 db=db,
             )
+    except MediaRecoveryRequired as exc:
+        await rollback_failed_update(db)
+        raise HTTPException(status_code=503, detail={"code": "media_recovery_required", "message": "This media operation needs recovery before further changes."}) from exc
     except MediaUpdateFailure as exc:
-        await db.rollback()
+        await rollback_failed_update(db)
         raise update_error(exc) from exc
 
 
@@ -144,6 +168,9 @@ async def delete_media_audio(
     try:
         async with runtime_work("media-sender.sidecar", media_mutation_effects()):
             return await remove_audio(media_id, language, db)
+    except MediaRecoveryRequired as exc:
+        await rollback_failed_update(db)
+        raise HTTPException(status_code=503, detail={"code": "media_recovery_required", "message": "This media operation needs recovery before further changes."}) from exc
     except MediaUpdateFailure as exc:
-        await db.rollback()
+        await rollback_failed_update(db)
         raise update_error(exc) from exc

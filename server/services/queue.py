@@ -18,6 +18,7 @@ from services.ffmpeg import download_and_merge, download_and_cache_metadata_imag
 from services.tmdb import tmdb_client
 from config import settings
 from services.logger import logger
+from services.media_analysis import duration_label, refreshed_analysis, current_duration_analysis, stored_analysis, positive_number
 from services.media_probe import probe_media_stream, notify_video_sender, probe_completed_media
 from services.ingestion_errors import IngestionFailure, IngestionTaskError, prune_task_diagnostics, write_task_diagnostics
 from services.ingest_preview import ingest_preview_service
@@ -28,13 +29,17 @@ from services.media_source import (
     ResolvedMediaSource,
     catalog_path_from_storage,
     local_catalog_source_exists,
+    local_path_for,
     local_playback_fingerprint,
     local_video_fingerprint,
     playback_source_fingerprint,
     resolve_media_source,
 )
 from services.vibe_analysis import VIBE_ANALYSIS_VERSION, compute_trope_vectors, vibe_analysis_manager
-from services.audio_extractor import apply_primary_audio_language, extract_audio_and_strip_video, normalize_language_code
+from services.audio_extractor import (apply_primary_audio_language, extract_audio_and_strip_video, normalize_language_code,
+    audio_languages, primary_embedded_audio_index, retained_primary_audio_language)
+from lifecycle.media_work import MediaRecoveryRequired, media_ownership, settle
+from lifecycle.media_publication import MediaMutation
 from lifecycle.coordination import (
     AdmissionClosedError,
     EffectClass,
@@ -60,6 +65,376 @@ def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _portable_owner(data: Any, path: Path) -> Optional[tuple]:
+    """Identify a recovery owner using the same legacy episode fallbacks as sync."""
+    if not isinstance(data, dict) or data.get("media_type") not in {"movie", "series", "tv"}:
+        return None
+    try:
+        tmdb_id = int(data.get("tmdb_id"))
+        if tmdb_id <= 0 or isinstance(data.get("tmdb_id"), bool):
+            return None
+        if data["media_type"] == "movie":
+            return ("movie", tmdb_id)
+        season, episode = data.get("season"), data.get("episode")
+        if season is None or episode is None:
+            match = re.fullmatch(r"metadata_s([1-9][0-9]*)_e([1-9][0-9]*)\.json", path.name)
+            if match:
+                season, episode = map(int, match.groups())
+            elif path.parent.parent.name.startswith("Episode_") and path.parent.parent.parent.name.startswith("Season_"):
+                season = int(path.parent.parent.parent.name.removeprefix("Season_"))
+                episode = int(path.parent.parent.name.removeprefix("Episode_"))
+        if season is None and episode is None:
+            return ("show", tmdb_id)
+        if isinstance(season, bool) or isinstance(episode, bool) or int(season) <= 0 or int(episode) <= 0:
+            return None
+        return ("episode", tmdb_id, int(season), int(episode))
+    except (TypeError, ValueError):
+        return None
+
+
+def _portable_episode_directory(owner: tuple, path: Path) -> Optional[Path]:
+    _, _, season, episode = owner
+    directory = path.parent.parent
+    if directory.name == f"Episode_{episode}" and directory.parent.name == f"Season_{season}":
+        return directory
+    if re.fullmatch(rf"metadata_s{season}_e{episode}\.json", path.name):
+        return directory / f"Season_{season}" / f"Episode_{episode}"
+    return None
+
+
+def _portable_episode_source(data: Any, path: Path) -> Optional[tuple]:
+    """Bind compatible episode locations to one owner and one physical source."""
+    owner = _portable_owner(data, path)
+    if owner is None or owner[0] != "episode":
+        return None
+    _, _, season, episode = owner
+    for field, expected in (("tmdb_id", owner[1]), ("season", season), ("episode", episode)):
+        value = data.get(field)
+        if value is None and field != "tmdb_id":
+            continue
+        if type(value) is not int and (not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value)):
+            return None
+        if int(value) != expected:
+            return None
+    episode_directory = _portable_episode_directory(owner, path)
+    if episode_directory is None:
+        return None
+    try:
+        video_url = data.get("video_url")
+        if video_url:
+            source = local_path_for(video_url)
+            if source.parent != episode_directory.resolve():
+                return None
+        else:
+            videos = [item for item in episode_directory.iterdir() if item.is_file()
+                and item.suffix.lower() in {".mp4", ".mkv", ".avi", ".mov"}]
+            if len(videos) != 1:
+                return None
+            source = videos[0].resolve()
+        return owner, str(source)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _portable_media_source(data: Any, path: Path, accepted_sources: Optional[Dict[tuple, str]] = None) -> Optional[tuple]:
+    owner = _portable_owner(data, path)
+    if owner is None:
+        return None
+    if owner[0] != "movie":
+        key = _portable_episode_source(data, path)
+        directory = _portable_episode_directory(owner, path) if owner[0] == "episode" else None
+    else:
+        value = data.get("tmdb_id")
+        if type(value) is not int and (not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value)):
+            return None
+        directory = path.parent.parent
+        try:
+            if data.get("video_url"):
+                source = local_path_for(data["video_url"])
+                if source.parent != directory.resolve():
+                    return None
+                key = owner, str(source)
+            else:
+                videos = [item for item in directory.iterdir() if item.is_file()
+                    and item.suffix.lower() in {".mp4", ".mkv", ".avi", ".mov"}]
+                key = (owner, str(videos[0].resolve())) if len(videos) == 1 else None
+        except (OSError, ValueError, TypeError):
+            return None
+    # A declaration outside the supported location is never reinterpreted.
+    # Only an absent or physically missing contained declaration may fall back
+    # to the DB's independently proved current source in this same location.
+    if data.get("video_url") and key is None:
+        return None
+    if directory is not None and (key is None or not Path(key[1]).is_file()):
+        fallback = (accepted_sources or {}).get(owner)
+        if fallback:
+            source = Path(fallback)
+            if source.is_file() and source.parent == directory.resolve():
+                return owner, str(source)
+    return key
+
+
+def _recovery_metadata_files(root: str, files: List[str]) -> List[str]:
+    """Canonical same-owner metadata wins regardless of filesystem entry order."""
+    canonical_owner = None
+    canonical_source = None
+    canonical = Path(root) / "metadata.json"
+    if "metadata.json" in files:
+        try:
+            canonical_data = json.loads(canonical.read_text(encoding="utf-8"))
+            canonical_owner = _portable_owner(canonical_data, canonical)
+            canonical_source = _portable_media_source(canonical_data, canonical)
+        except (OSError, ValueError):
+            pass
+    selected = []
+    for name in sorted(files, key=lambda name: (name != "metadata.json", name)):
+        if not name.endswith(".json"):
+            continue
+        if name != "metadata.json" and canonical_owner is not None:
+            try:
+                path = Path(root) / name
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if _portable_owner(data, path) == canonical_owner and (canonical_owner[0] == "show"
+                    or canonical_source is not None and _portable_media_source(data, path) == canonical_source):
+                    continue
+            except (OSError, ValueError):
+                pass
+        selected.append(name)
+    return selected
+
+
+def _recovery_metadata_inventory(media_dir: str, accepted_sources: Optional[Dict[tuple, str]] = None,
+    *, ambiguous_sources: Optional[Dict[tuple, set[str]]] = None) -> List[tuple[str, List[str]]]:
+    """Select canonicals before any alias can author reconstructed DB state."""
+    inventory = [(root, files) for root, _, files in os.walk(media_dir) if os.path.basename(root) == ".metadata"]
+    accepted_sources = accepted_sources or {}
+    canonicals = {}
+    source_owners = {}
+    for owner, source in accepted_sources.items():
+        if source in source_owners and source_owners[source] != owner:
+            raise MediaRecoveryRequired("Conflicting accepted recovery owners")
+        source_owners[source] = owner
+    for root, files in inventory:
+        if "metadata.json" not in files:
+            continue
+        path = Path(root) / "metadata.json"
+        try:
+            key = _portable_media_source(json.loads(path.read_text(encoding="utf-8")), path, accepted_sources)
+            if key is not None and (key[1] not in source_owners or source_owners[key[1]] == key[0]):
+                canonicals[key] = str(path)
+                source_owners[key[1]] = key[0]
+        except (OSError, ValueError):
+            pass
+    selected = []
+    owner_sources = {}
+    for root, files in sorted(inventory):
+        names = []
+        for name in _recovery_metadata_files(root, files):
+            path = Path(root) / name
+            data = None
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                owner = _portable_owner(data, path)
+                key = _portable_media_source(data, path, accepted_sources)
+            except (OSError, ValueError):
+                key, owner = None, None
+            if isinstance(data, dict) and data.get("media_type") in {"series", "tv"} and owner is None:
+                continue
+            if owner in accepted_sources and key is None:
+                continue
+            if owner is not None and owner[0] == "episode" and key is None:
+                if data.get("video_url"):
+                    # Contradictory explicit identity cannot be reinterpreted
+                    # by the older directory-based video discovery below.
+                    continue
+                directory = _portable_episode_directory(owner, path)
+                if directory and directory.is_dir() and sum(item.is_file() and item.suffix.lower()
+                    in {".mp4", ".mkv", ".avi", ".mov"} for item in directory.iterdir()) > 1:
+                    raise MediaRecoveryRequired("Ambiguous episode recovery sources")
+            if owner is not None and owner[0] == "movie":
+                if key is None and data.get("video_url"):
+                    continue
+                directory = path.parent.parent
+                videos = [item for item in directory.iterdir() if item.is_file()
+                    and item.suffix.lower() in {".mp4", ".mkv", ".avi", ".mov"}]
+                if key is None and len(videos) > 1:
+                    raise MediaRecoveryRequired("Ambiguous movie recovery sources")
+                if key is not None and data.get("video_url") and not Path(key[1]).is_file() and videos:
+                    raise MediaRecoveryRequired("Declared movie recovery source is missing")
+            if key is not None and key[1] in source_owners and source_owners[key[1]] != key[0]:
+                continue
+            if key is not None and key[0] in accepted_sources and accepted_sources[key[0]] != key[1]:
+                continue
+            if key is not None and key in canonicals and canonicals[key] != str(path):
+                continue
+            if key is not None:
+                owner_sources.setdefault(key[0], set()).add(key[1])
+            names.append(name)
+        selected.append((root, names))
+    ambiguous = {owner: sources for owner, sources in owner_sources.items() if len(sources) > 1}
+    if ambiguous_sources is not None:
+        ambiguous_sources.update(ambiguous)
+    elif ambiguous:
+        raise MediaRecoveryRequired("Ambiguous episode recovery sources")
+    return selected
+
+
+_CLOUD_BUNDLE_FIELDS = ("skip_markers", "subtitles", "audio_metadata", "languages", "quality", "duration",
+    "probed_duration", "container", "codec", "width", "height", "frame_rate", "source_fingerprint", "analysis")
+_MEASURED_BUNDLE_FIELDS = ("quality", "duration", "probed_duration", "container", "codec", "width", "height", "frame_rate")
+
+
+def _catalog_bundle(item: Movie | Episode) -> Dict[str, Any]:
+    bundle = {field: getattr(item, field) for field in _CLOUD_BUNDLE_FIELDS if field != "analysis"}
+    bundle.update(video_url=item.video_url, analysis=stored_analysis(item.analysis_metadata_str))
+    if not isinstance(bundle["audio_metadata"], list) or not all(isinstance(track, dict) for track in bundle["audio_metadata"]):
+        bundle["audio_metadata"] = []
+    return bundle
+
+
+def _cloud_bundle_differs(bundle: Dict[str, Any], portable: Dict[str, Any]) -> bool:
+    return bundle["video_url"] != portable.get("video_url") or any(
+        bundle[field] != (stored_analysis(portable.get(field)) if field == "analysis"
+            else portable.get(field) or duration_label(portable.get("probed_duration")) if field == "duration"
+            else portable.get(field))
+        for field in _CLOUD_BUNDLE_FIELDS)
+
+
+def _current_cloud_bundle(bundle: Dict[str, Any], observed: ResolvedMediaSource, *, portable: bool = False) -> bool:
+    if not observed.video_fingerprint:
+        return False
+    try:
+        if local_path_for(bundle.get("video_url")) != observed.local_path:
+            return False
+    except (TypeError, ValueError):
+        return False
+    audio = bundle.get("audio_metadata")
+    if not isinstance(audio, list) or not all(isinstance(track, dict) for track in audio):
+        audio = []
+    analysis = stored_analysis(bundle.get("analysis"))
+    return (analysis.get("video_fingerprint") == observed.video_fingerprint
+        or portable and bundle.get("video_fingerprint") == observed.video_fingerprint
+        or bool(bundle.get("source_fingerprint")) and bundle["source_fingerprint"] == playback_source_fingerprint(observed, audio))
+
+
+def _select_cloud_bundle(db_bundle: Optional[Dict[str, Any]], portable: Dict[str, Any], observed: ResolvedMediaSource) -> Dict[str, Any]:
+    db_current = bool(db_bundle and _current_cloud_bundle(db_bundle, observed))
+    portable_current = _current_cloud_bundle(portable, observed, portable=True)
+    selected = dict(db_bundle if db_current else portable if portable_current else {})
+    audio = selected.get("audio_metadata")
+    if not isinstance(audio, list) or not all(isinstance(track, dict) for track in audio):
+        audio = []
+    selected["audio_metadata"] = audio
+    analysis = stored_analysis(selected.get("analysis"))
+    if db_current and "sender_quality" not in refreshed_analysis(None, analysis) and portable_current:
+        analysis = refreshed_analysis(analysis, portable.get("analysis"))
+    else:
+        analysis = refreshed_analysis(analysis, analysis)
+    analysis["video_fingerprint"] = observed.video_fingerprint
+    fingerprint = playback_source_fingerprint(observed, audio)
+    analysis["source_fingerprint"] = fingerprint
+    measurements = dict(selected)
+    measured_analysis = analysis
+    if not current_duration_analysis(measured_analysis) and db_current and portable_current:
+        fallback = stored_analysis(portable.get("analysis"))
+        fallback["video_fingerprint"] = observed.video_fingerprint
+        if current_duration_analysis(fallback):
+            measurements, measured_analysis = portable, refreshed_analysis(fallback, analysis)
+    valid_measurement = (current_duration_analysis(measured_analysis)
+        and positive_number(measured_analysis.get("probed_duration")) is not None
+        and type(measured_analysis.get("width")) is int and measured_analysis["width"] > 0
+        and type(measured_analysis.get("height")) is int and measured_analysis["height"] > 0)
+    if valid_measurement:
+        for field in _MEASURED_BUNDLE_FIELDS:
+            selected[field] = measurements.get(field)
+        selected.update(width=measured_analysis["width"], height=measured_analysis["height"],
+            quality=measured_analysis.get("quality") or "Source", probed_duration=measured_analysis["probed_duration"],
+            duration=duration_label(measured_analysis["probed_duration"]))
+        analysis = refreshed_analysis(measured_analysis, analysis)
+        analysis.update(video_fingerprint=observed.video_fingerprint, source_fingerprint=fingerprint)
+    else:
+        analysis = refreshed_analysis(None, analysis)
+        analysis.update(video_fingerprint=observed.video_fingerprint, source_fingerprint=fingerprint)
+        selected.update({field: None for field in _MEASURED_BUNDLE_FIELDS})
+        selected.update(quality="Source", duration="Unknown")
+    selected.update(video_url=observed.catalog_path, analysis=analysis, source_fingerprint=fingerprint)
+    for field, default in (("skip_markers", {}), ("subtitles", []), ("languages", [])):
+        selected[field] = selected.get(field) or default
+    return {field: selected[field] for field in (*_CLOUD_BUNDLE_FIELDS, "video_url")}
+
+
+def _apply_catalog_bundle(item: Movie | Episode, bundle: Dict[str, Any]) -> None:
+    for field in _CLOUD_BUNDLE_FIELDS:
+        if field == "analysis":
+            item.analysis_metadata_str = json.dumps(bundle[field])
+        elif field == "languages":
+            # An explicitly selected unknown bundle stays unknown; the legacy
+            # property setter otherwise changes [] into an English assertion.
+            item.languages_str = json.dumps(bundle[field])
+        else:
+            setattr(item, field, bundle[field])
+    item.video_url = bundle["video_url"]
+
+
+def _retained_subtitles(directory: str, tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Retain accepted track identity only for present, contained subtitle assets."""
+    retained = []
+    root = Path(directory).resolve()
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        name = track.get("fileName")
+        if not isinstance(name, str) or not re.fullmatch(r"subtitle_[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.vtt", name):
+            continue
+        path = root / name
+        if path.is_symlink() or not path.is_file() or path.resolve().parent != root:
+            continue
+        retained.append({key: value for key, value in track.items()
+            if key in {"trackId", "language", "ext", "fileName", "label"}})
+    return retained
+
+
+def _retained_external_audio(measured: List[Dict[str, Any]], *bundles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep accepted sidecar details only when its physical identity is unchanged."""
+    def identity(track):
+        return (track.get("fileName"), track.get("fileSize"), track.get("modifiedAt"))
+    result = []
+    for track in measured:
+        retained = track
+        if track.get("source") == "external" and all(identity(track)):
+            for bundle in bundles:
+                match = next((previous for previous in bundle if previous.get("source") == "external"
+                    and identity(previous) == identity(track)), None)
+                if match is not None:
+                    retained = dict(match)
+                    break
+        result.append(retained)
+    return result
+
+
+def _write_recovery_metadata(path: str, data: Dict[str, Any]) -> None:
+    """Refresh canonical recovery aliases without touching another catalog owner."""
+    from services.media_updates import portable_metadata_names
+    primary = Path(path)
+    owner = _portable_owner(data, primary)
+    destinations = [primary]
+    if primary.name == "metadata.json":
+        for name in portable_metadata_names(data):
+            candidate = primary.with_name(name)
+            if candidate == primary:
+                continue
+            if candidate.exists():
+                try:
+                    if _portable_owner(json.loads(candidate.read_text(encoding="utf-8")), candidate) != owner:
+                        continue
+                except (OSError, ValueError):
+                    continue
+            destinations.append(candidate)
+    for destination in destinations:
+        _atomic_write_json(str(destination), data)
+
 
 def srt_to_vtt(srt_path: str, vtt_path: str) -> bool:
     """
@@ -230,109 +605,6 @@ class DownloadQueueManager:
             except Exception as e:
                 logger.error(f"[Queue Manager] Error in worker loop: {e}")
 
-    async def run_rclone_move_dir(
-        self,
-        local_dir: str,
-        remote_subpath: str,
-        task_id: str,
-    ) -> tuple[bool, Optional[str]]:
-        if not rclone_service.cloud_write_available():
-            health = rclone_service.cloud_health()
-            logger.warning(
-                f"[Queue Manager] Cloud upload circuit is open: "
-                f"{health.get('errorCode') or health.get('state')}."
-            )
-            return False, None
-        if not rclone_service.executable():
-            logger.error("[Queue Manager] Rclone binary not found. Cannot perform cloud upload.")
-            return False, None
-        target_remote = f"{settings.RCLONE_REMOTE_PATH}/{remote_subpath.replace('\\', '/')}"
-        safe_task_id = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)
-        staging_remote = f"{settings.RCLONE_REMOTE_PATH}/.streamhome-ingestion/{safe_task_id}"
-        backup_remote = f"{settings.RCLONE_REMOTE_PATH}/.streamhome-replacement-backups/{safe_task_id}"
-        previous_remote: Optional[str] = None
-        try:
-            await rclone_service.run("purge", staging_remote, timeout=30 * 60)
-            await rclone_service.run("purge", backup_remote, timeout=30 * 60)
-            upload = await rclone_service.run(
-                "sync",
-                local_dir,
-                staging_remote,
-                "--retries",
-                "3",
-                timeout=6 * 60 * 60,
-            )
-            if not upload.ok:
-                logger.error(f"[Queue Manager] Drive upload failed: {upload.error_code or 'rclone_failed'}")
-                return False, None
-            verification = await rclone_service.run("check", local_dir, staging_remote, "--one-way", timeout=60 * 60)
-            if not verification.ok:
-                logger.error(f"[Queue Manager] Drive upload verification failed: {verification.error_code or 'rclone_failed'}")
-                await rclone_service.run("purge", staging_remote, timeout=30 * 60)
-                return False, None
-
-            target_state = await rclone_service.run("lsjson", target_remote, "--stat", timeout=5 * 60)
-            if target_state.ok:
-                moved_previous = await rclone_service.run("moveto", target_remote, backup_remote, timeout=60 * 60)
-                if not moved_previous.ok:
-                    logger.error(
-                        f"[Queue Manager] Could not preserve the previous Drive tree: "
-                        f"{moved_previous.error_code or 'rclone_failed'}"
-                    )
-                    await rclone_service.run("purge", staging_remote, timeout=30 * 60)
-                    return False, None
-                previous_remote = backup_remote
-            elif target_state.error_code != "drive_not_found":
-                logger.error(
-                    f"[Queue Manager] Could not inspect the Drive publication target: "
-                    f"{target_state.error_code or 'rclone_failed'}"
-                )
-                await rclone_service.run("purge", staging_remote, timeout=30 * 60)
-                return False, None
-
-            published = await rclone_service.run("moveto", staging_remote, target_remote, timeout=60 * 60)
-            if not published.ok:
-                logger.error(
-                    f"[Queue Manager] Could not publish the verified Drive staging tree: "
-                    f"{published.error_code or 'rclone_failed'}"
-                )
-                if previous_remote:
-                    await rclone_service.run("moveto", previous_remote, target_remote, timeout=60 * 60)
-                await rclone_service.run("purge", staging_remote, timeout=30 * 60)
-                return False, None
-            logger.info(f"[Queue Manager] Rclone publication verified: {local_dir} -> {target_remote}")
-            return True, previous_remote
-        except Exception as error:
-            logger.error(f"[Queue Manager] Rclone publication exception: {type(error).__name__}")
-            if previous_remote:
-                await rclone_service.run("purge", target_remote, timeout=30 * 60)
-                await rclone_service.run("moveto", previous_remote, target_remote, timeout=60 * 60)
-            await rclone_service.run("purge", staging_remote, timeout=30 * 60)
-            return False, None
-
-    async def _rollback_cloud_publication(
-        self,
-        remote_subpath: str,
-        previous_remote: Optional[str],
-    ) -> None:
-        target_remote = f"{settings.RCLONE_REMOTE_PATH}/{remote_subpath.replace('\\', '/')}"
-        await rclone_service.run("purge", target_remote, timeout=30 * 60)
-        if previous_remote:
-            restored = await rclone_service.run("moveto", previous_remote, target_remote, timeout=60 * 60)
-            if not restored.ok:
-                raise RuntimeError(restored.error_code or "cloud_rollback_failed")
-
-    @staticmethod
-    async def _finalize_cloud_publication(previous_remote: Optional[str]) -> None:
-        if not previous_remote:
-            return
-        result = await rclone_service.run("purge", previous_remote, timeout=30 * 60)
-        if not result.ok and result.error_code != "drive_not_found":
-            logger.warning(
-                f"[Queue Manager] Could not remove committed Drive rollback data: "
-                f"{result.error_code or 'rclone_failed'}"
-            )
-
     @staticmethod
     def _media_identity_key(
         tmdb_id: int,
@@ -386,58 +658,6 @@ class DownloadQueueManager:
             raise ValueError(f"{label} is outside its configured storage root") from exc
         return candidate
 
-    def _publish_local_directory(
-        self,
-        staging_dir: str,
-        destination_dir: str,
-        task_id: str,
-    ) -> Optional[str]:
-        """Publish one task-owned directory while retaining a recoverable replacement."""
-
-        staging = self._assert_directory_within(staging_dir, settings.TEMP_DIR, "Staging directory")
-        destination = self._assert_directory_within(destination_dir, settings.MEDIA_DIR, "Media destination")
-        backup_root = Path(settings.TEMP_DIR).resolve() / "replacement-backups" / task_id
-        backup = backup_root / "previous"
-        if backup_root.exists():
-            shutil.rmtree(backup_root)
-        backup_root.mkdir(parents=True, exist_ok=True)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-
-        had_previous = destination.exists()
-        if had_previous:
-            shutil.move(str(destination), str(backup))
-        try:
-            shutil.move(str(staging), str(destination))
-        except Exception:
-            if destination.exists():
-                shutil.rmtree(destination)
-            if had_previous and backup.exists():
-                shutil.move(str(backup), str(destination))
-            shutil.rmtree(backup_root, ignore_errors=True)
-            raise
-        return str(backup) if had_previous else None
-
-    def _rollback_local_publication(
-        self,
-        destination_dir: Optional[str],
-        replacement_backup: Optional[str],
-        task_id: str,
-    ) -> None:
-        if not destination_dir:
-            return
-        destination = self._assert_directory_within(destination_dir, settings.MEDIA_DIR, "Media destination")
-        backup = Path(replacement_backup).resolve() if replacement_backup else None
-        if destination.exists():
-            shutil.rmtree(destination)
-        if backup and backup.exists():
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(backup), str(destination))
-        shutil.rmtree(Path(settings.TEMP_DIR).resolve() / "replacement-backups" / task_id, ignore_errors=True)
-
-    @staticmethod
-    def _finalize_local_publication(task_id: str) -> None:
-        shutil.rmtree(Path(settings.TEMP_DIR).resolve() / "replacement-backups" / task_id, ignore_errors=True)
-
     async def _process_task(self, task_id: str):
         effects = {
             EffectClass.DB_WRITE,
@@ -467,12 +687,10 @@ class DownloadQueueManager:
         staging_task_root = Path(settings.TEMP_DIR).resolve() / "ingestion" / task_id
         created_artifacts: List[str] = []
         submitted_video_url = ""
-        published_local_dir: Optional[str] = None
-        replacement_backup: Optional[str] = None
-        cloud_remote_subpath: Optional[str] = None
-        cloud_replacement_backup: Optional[str] = None
         uploaded_to_cloud = False
         task_completed = False
+        mutation = None
+        ownership = None
         try:
             async with AsyncSession(engine) as db:
                 task = await db.get(DownloadTask, task_id)
@@ -530,6 +748,7 @@ class DownloadQueueManager:
                     task_id=task_id,
                     video_source_type=video_source_type,
                     audio_source_type=audio_source_type,
+                    client_address=validation_client,
                 )
                 probe_failure = probe_res.get("failure")
                 if not probe_failure or not probe_failure.retryable or probe_attempt == 3:
@@ -591,7 +810,7 @@ class DownloadQueueManager:
                 logger.error(f"[Queue Manager] Error fetching TMDB metadata: {e}")
                 meta = {}
 
-            probed_duration = float(probe_res.get("probed_duration") or 0)
+            probed_duration = float(probe_res.get("video_duration") or 0)
             if probed_duration > 0:
                 duration_secs = probed_duration
             estimated_bytes = (
@@ -719,6 +938,7 @@ class DownloadQueueManager:
                     headers=headers, output_path=output_abs_path, duration_secs=duration_secs,
                     video_source_type=video_source_type, audio_source_type=audio_source_type,
                     audio_timeline_offset=float(probe_res.get("audio_timeline_offset") or 0.0),
+                    client_address=validation_client,
                 )
                 
                 if success:
@@ -758,151 +978,96 @@ class DownloadQueueManager:
             cloud_ingestion = settings.STORAGE_ENGINE == "CLOUD"
             finalized_media_id = ""
             finalized_media_type = "movie" if media_type == "movie" else "episode"
+            media_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"
+            ownership = media_ownership(media_id, *([f"tv_{tmdb_id}"] if media_type != "movie" else []))
+            await ownership.__aenter__()
             async with AsyncSession(engine, expire_on_commit=False) as db:
                 task = await db.get(DownloadTask, task_id)
                 if not task:
-                    self.active_tasks.discard(task_id)
-                    from services.state import remove_task_metrics
-                    remove_task_metrics(task_id)
                     return
-                    
-                try:
-                    await self._catalog_media(
-                        db,
-                        tmdb_id,
-                        media_type,
-                        season,
-                        episode,
-                        meta,
-                        output_rel_path,
-                        extracted_languages,
-                        language,
-                        subtitles_list,
-                        quality,
-                        task.skip_markers,
-                        finalize=False,
-                        preview_task_id=task_id,
-                        catalog_file_path=catalog_abs_path,
-                    )
-                    await db.commit()
-                except Exception as cat_err:
-                    await db.rollback()
-                    diagnostics_path = write_task_diagnostics(task_id, "catalog", traceback.format_exc())
-                    raise IngestionTaskError(
-                        IngestionFailure(
-                            "CATALOG_UPDATE_FAILED",
-                            f"The downloaded media could not be committed to the catalog ({type(cat_err).__name__}).",
-                            False,
-                            diagnostics_path,
-                        )
-                    ) from cat_err
-
+                await self._catalog_media(
+                    db, tmdb_id, media_type, season, episode, meta, output_rel_path,
+                    extracted_languages, language, subtitles_list, quality, task.skip_markers,
+                    finalize=True, catalog_file_path=catalog_abs_path,
+                )
+                model = Movie if media_type == "movie" else Episode
+                candidate = await db.get(model, media_id)
+                candidate_data = candidate.model_dump()
+                show_data = None
+                if media_type != "movie":
+                    show_data = (await db.get(Movie, f"tv_{tmdb_id}")).model_dump()
+                await db.rollback()
+            candidate = model.model_validate(candidate_data)
+            mutation = MediaMutation(media_id)
+            await mutation.__aenter__()
             from services.state import update_task_metrics
-            update_task_metrics(task_id, 99.0, speed="Indexing playback", eta="00:00:00", force_write=True)
-            prepared_fingerprint = await self._prepare_ingested_media(
-                tmdb_id,
-                media_type,
-                season,
-                episode,
-                output_abs_path,
-            )
-
+            update_task_metrics(task_id, 99.0, speed="Publishing verified media", eta="00:00:00", force_write=True)
             if cloud_ingestion:
-                # Rclone can take minutes or hours. It must never run while an SQLite
-                # write transaction is open, otherwise login and telemetry writes are
-                # blocked for the entire upload.
-                update_task_metrics(task_id, 99.9, speed="Uploading", eta="00:00:00", force_write=True)
-                if media_type == "movie":
-                    remote_subpath = os.path.join("Movies", folder_name)
-                else:
-                    remote_subpath = os.path.join("Series", folder_name, f"Season_{season}", f"Episode_{episode}")
-                cloud_remote_subpath = remote_subpath
-                uploaded_to_cloud, cloud_replacement_backup = await self.run_rclone_move_dir(
-                    local_dir,
-                    remote_subpath,
-                    task_id,
-                )
-                if not uploaded_to_cloud:
-                    logger.warning(f"[Queue Manager] Cloud upload failed for task {task_id}; falling back to local storage.")
-                    try:
-                        dest_dir = os.path.dirname(str(catalog_abs_path))
-                        replacement_backup = await run_cancellation_safe_thread(
-                            self._publish_local_directory,
-                            local_dir,
-                            dest_dir,
-                            task_id,
-                        )
-                        published_local_dir = dest_dir
-                        logger.info(f"[Queue Manager] Local fallback completed for task {task_id}: {dest_dir}")
-                    except Exception as fallback_err:
-                        diagnostics_path = write_task_diagnostics(task_id, "cloud fallback", traceback.format_exc())
-                        raise IngestionTaskError(
-                            IngestionFailure(
-                                "CLOUD_MOVE_FAILED",
-                                f"Cloud upload and local fallback failed ({type(fallback_err).__name__}).",
-                                False,
-                                diagnostics_path,
-                            )
-                        ) from fallback_err
+                remote_subpath = (os.path.join("Movies", folder_name) if media_type == "movie" else
+                                  os.path.join("Series", folder_name, f"Season_{season or 1}", f"Episode_{episode or 1}"))
+                # Complete each bounded remote operation before observing cancellation.
+                await mutation.publish_cloud_directory(local_dir, remote_subpath)
+                uploaded_to_cloud = True
+                from services.media_source import clear_cloud_object_cache
+                clear_cloud_object_cache()
+                source = await resolve_media_source(candidate.video_url, require_cloud=True)
+                if not source.cloud_exists:
+                    raise IngestionTaskError(IngestionFailure("CLOUD_MOVE_FAILED", "The verified uploaded media is unavailable."))
+                if source.local_exists:
+                    # A retained local fallback must receive the same accepted bytes.
+                    _, cancelled = await settle(asyncio.to_thread(mutation.publish_directory, local_dir, os.path.dirname(catalog_abs_path)))
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    source = await resolve_media_source(candidate.video_url, require_cloud=True)
+                candidate_data["source_fingerprint"] = playback_source_fingerprint(source, candidate.audio_metadata)
             else:
-                dest_dir = os.path.dirname(str(catalog_abs_path))
-                try:
-                    replacement_backup = await run_cancellation_safe_thread(
-                        self._publish_local_directory,
-                        local_dir,
-                        dest_dir,
-                        task_id,
-                    )
-                    published_local_dir = dest_dir
-                    logger.info(f"[Queue Manager] Local publication completed for task {task_id}: {dest_dir}")
-                except Exception as publish_err:
-                    diagnostics_path = write_task_diagnostics(task_id, "local publication", traceback.format_exc())
-                    raise IngestionTaskError(
-                        IngestionFailure(
-                            "LOCAL_PUBLISH_FAILED",
-                            f"The prepared media could not be published ({type(publish_err).__name__}).",
-                            False,
-                            diagnostics_path,
-                        )
-                    ) from publish_err
-
-            final_fingerprint = prepared_fingerprint
-            if cloud_ingestion and uploaded_to_cloud:
-                final_fingerprint = await self._migrate_ingested_cache_to_cloud(
-                    tmdb_id,
-                    media_type,
-                    season,
-                    episode,
-                    prepared_fingerprint,
-                )
-
+                _, cancelled = await settle(asyncio.to_thread(mutation.publish_directory, local_dir, os.path.dirname(catalog_abs_path)))
+                # Fingerprints include mtime/inode where appropriate; use the published bytes.
+                candidate_data["source_fingerprint"] = local_playback_fingerprint(Path(catalog_abs_path), candidate.audio_metadata)
+                if cancelled:
+                    raise asyncio.CancelledError
+            from services.media_updates import atomic_json_write, upload_cloud_file
+            portable = Path(local_dir) / ".metadata" / "metadata.json" if cloud_ingestion else Path(catalog_abs_path).parent / ".metadata" / "metadata.json"
+            payload = json.loads(portable.read_text(encoding="utf-8"))
+            payload["source_fingerprint"] = candidate_data["source_fingerprint"]
+            accepted_video_fingerprint = source.video_fingerprint if cloud_ingestion else local_video_fingerprint(Path(catalog_abs_path))
+            payload["video_fingerprint"] = accepted_video_fingerprint
+            accepted_analysis = json.loads(candidate_data["analysis_metadata_str"])
+            accepted_analysis.update(video_fingerprint=accepted_video_fingerprint, source_fingerprint=candidate_data["source_fingerprint"])
+            candidate_data["analysis_metadata_str"] = json.dumps(accepted_analysis)
+            payload["analysis"] = accepted_analysis
+            if cloud_ingestion and source.local_exists:
+                local_portable = Path(catalog_abs_path).parent / ".metadata" / "metadata.json"
+                mutation.capture_local(str(local_portable))
+                atomic_json_write(local_portable, payload)
+            if not cloud_ingestion:
+                mutation.capture_local(str(portable))
+            atomic_json_write(portable, payload)
+            if cloud_ingestion:
+                await upload_cloud_file(portable, f"{source.cloud_path.rsplit('/', 1)[0]}/.metadata/metadata.json")
+            if media_type != "movie":
+                compatible = portable.with_name(f"metadata_s{season or 1}_e{episode or 1}.json")
+                if not cloud_ingestion:
+                    mutation.capture_local(str(compatible))
+                atomic_json_write(compatible, payload)
+                if cloud_ingestion:
+                    await upload_cloud_file(compatible, f"{source.cloud_path.rsplit('/', 1)[0]}/.metadata/{compatible.name}")
             async with AsyncSession(engine, expire_on_commit=False) as db:
                 task = await db.get(DownloadTask, task_id)
                 if not task:
-                    self.active_tasks.discard(task_id)
-                    from services.state import remove_task_metrics
-                    remove_task_metrics(task_id)
-                    return
-                finalized_media = await self._finalize_catalog_media(
-                    db,
-                    tmdb_id,
-                    media_type,
-                    season,
-                    episode,
-                    task_id,
-                    uploaded_to_cloud=uploaded_to_cloud,
-                    source_fingerprint=final_fingerprint,
-                )
+                    raise RuntimeError("Publication task disappeared before acceptance")
+                if show_data is not None:
+                    await db.merge(Movie.model_validate(show_data))
+                finalized_media = await db.merge(model.model_validate(candidate_data))
                 task.status = "COMPLETED"
                 task.error_message = None
                 db.add(task)
-                finalized_media_id = str(finalized_media.id)
-                await db.commit()
+                finalized_media_id = media_id
+                try:
+                    await mutation.commit(db)
+                finally:
+                    task_completed = mutation.accepted
                 created_artifacts.clear()
-                task_completed = True
-
-            await run_cancellation_safe_thread(self._finalize_local_publication, task_id)
-            await self._finalize_cloud_publication(cloud_replacement_backup)
 
             await self._schedule_playback_baseline(finalized_media_id, finalized_media_type)
             analysis_type = "movie" if media_type == "movie" else "episode"
@@ -931,30 +1096,17 @@ class DownloadQueueManager:
             await self._record_task_failure(task_id, failure, submitted_video_url)
                 
         finally:
-            if published_local_dir and not task_completed:
+            recovery_pending = False
+            if mutation is not None:
                 try:
-                    await run_cancellation_safe_thread(
-                        self._rollback_local_publication,
-                        published_local_dir,
-                        replacement_backup,
-                        task_id,
-                    )
-                except Exception as rollback_error:
-                    logger.error(
-                        f"[Queue Manager] Failed to roll back local publication for task {task_id}: "
-                        f"{type(rollback_error).__name__}"
-                    )
-            if uploaded_to_cloud and cloud_remote_subpath and not task_completed:
-                try:
-                    await self._rollback_cloud_publication(
-                        cloud_remote_subpath,
-                        cloud_replacement_backup,
-                    )
-                except Exception as rollback_error:
-                    logger.error(
-                        f"[Queue Manager] Failed to roll back cloud publication for task {task_id}: "
-                        f"{type(rollback_error).__name__}"
-                    )
+                    await mutation.__aexit__(None, None, None)
+                except BaseException as rollback_error:
+                    recovery_pending = True
+                    logger.error("[Queue Manager] Media publication evidence retained for recovery: %s", type(rollback_error).__name__)
+            if ownership is not None:
+                await ownership.__aexit__(None, None, None)
+            if recovery_pending:
+                created_artifacts.clear()
             for artifact in created_artifacts:
                 if os.path.exists(artifact):
                     try:
@@ -963,7 +1115,7 @@ class DownloadQueueManager:
                         pass
             if output_abs_path:
                 self._remove_empty_parents(os.path.dirname(output_abs_path))
-            if staging_task_root.exists():
+            if staging_task_root.exists() and not recovery_pending:
                 try:
                     await run_cancellation_safe_thread(shutil.rmtree, staging_task_root)
                 except OSError as staging_cleanup_error:
@@ -978,7 +1130,6 @@ class DownloadQueueManager:
             remove_task_metrics(task_id)
 
     async def _record_task_failure(self, task_id: str, failure: IngestionFailure, submitted_video_url: str) -> None:
-        ingest_preview_service.mark_error(task_id, failure.code, failure.message)
         try:
             async with AsyncSession(engine) as db:
                 task = await db.get(DownloadTask, task_id)
@@ -990,45 +1141,11 @@ class DownloadQueueManager:
                         f"{failure.code}"
                     )
                     return
+                ingest_preview_service.mark_error(task_id, failure.code, failure.message)
                 task.status = "FAILED"
                 task.error_message = failure.display
                 db.add(task)
 
-                if task.media_type == "movie":
-                    movie = await db.get(Movie, f"m_{task.tmdb_id}")
-                    if movie and movie.preview_task_id == task_id:
-                        if local_catalog_source_exists(movie.video_url):
-                            movie.availability = "available"
-                            movie.catalog_source = "server"
-                            movie.source_fingerprint = None
-                            logger.info(
-                                f"[Queue Manager] Preserved existing local movie after failed "
-                                f"replacement task {task_id}."
-                            )
-                        else:
-                            movie.video_url = ""
-                            movie.availability = "cached"
-                        movie.preview_task_id = None
-                        db.add(movie)
-                elif task.season is not None and task.episode is not None:
-                    episode = await db.get(Episode, f"ep_{task.tmdb_id}_s{task.season}_e{task.episode}")
-                    if episode and episode.preview_task_id == task_id:
-                        if local_catalog_source_exists(episode.video_url):
-                            episode.source_fingerprint = None
-                            logger.info(
-                                f"[Queue Manager] Preserved existing local episode after failed "
-                                f"replacement task {task_id}."
-                            )
-                        else:
-                            episode.video_url = ""
-                        episode.preview_task_id = None
-                        db.add(episode)
-                    show = await db.get(Movie, f"tv_{task.tmdb_id}")
-                    if show:
-                        episode_result = await db.exec(select(Episode).where(Episode.movie_id == show.id))
-                        has_local_episode = any(item.video_url.startswith("/media/") for item in episode_result.all() if item.video_url)
-                        show.availability = "available" if has_local_episode else "cached"
-                        db.add(show)
                 await db.commit()
         except Exception as db_err:
             logger.error(f"[Queue Manager] Failed to persist task {task_id} failure: {type(db_err).__name__}")
@@ -1084,74 +1201,6 @@ class DownloadQueueManager:
                 f"{media_id or 'unknown'}: {type(exc).__name__}"
             )
 
-    async def _prepare_ingested_media(
-        self,
-        tmdb_id: int,
-        media_type: str,
-        season: Optional[int],
-        episode: Optional[int],
-        output_abs_path: str,
-    ) -> str:
-        """Bind the verified source identity without blocking publication on transcoding."""
-
-        media_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"
-        async with AsyncSession(engine, expire_on_commit=False) as db:
-            model = Movie if media_type == "movie" else Episode
-            media_obj = await db.get(model, media_id)
-            if not media_obj:
-                raise IngestionTaskError(
-                    IngestionFailure("PLAYBACK_PREPARATION_FAILED", "The prepared catalog entry is missing.")
-                )
-            catalog_path = str(media_obj.video_url)
-            source = ResolvedMediaSource(
-                catalog_path=catalog_path,
-                relative_path=catalog_path.removeprefix("/media/"),
-                local_path=Path(output_abs_path).resolve(),
-                cloud_path=None,
-                local_exists=True,
-                cloud_exists=False,
-            )
-            fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
-            media_obj.source_fingerprint = fingerprint
-            db.add(media_obj)
-            await db.commit()
-        logger.info(
-            f"[Queue Manager] Seekable playback source indexed for {media_id}; "
-            "adaptive segments will be generated at the requested timestamp."
-        )
-        return fingerprint
-
-    async def _migrate_ingested_cache_to_cloud(
-        self,
-        tmdb_id: int,
-        media_type: str,
-        season: Optional[int],
-        episode: Optional[int],
-        local_fingerprint: str,
-    ) -> str:
-        """Replace the staging identity with the verified uploaded object identity."""
-
-        del local_fingerprint
-
-        media_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"
-        async with AsyncSession(engine, expire_on_commit=False) as db:
-            model = Movie if media_type == "movie" else Episode
-            media_obj = await db.get(model, media_id)
-            if not media_obj:
-                raise IngestionTaskError(
-                    IngestionFailure("PLAYBACK_PREPARATION_FAILED", "The uploaded catalog entry is missing.")
-                )
-            source = await resolve_media_source(media_obj.video_url)
-            if not source.cloud_exists:
-                raise IngestionTaskError(
-                    IngestionFailure("CLOUD_MOVE_FAILED", "The uploaded media could not be resolved from cloud storage.")
-                )
-            cloud_fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
-            media_obj.source_fingerprint = cloud_fingerprint
-            db.add(media_obj)
-            await db.commit()
-        return cloud_fingerprint
-
     async def _catalog_media(
         self, db: AsyncSession, tmdb_id: int, media_type: str, season: Optional[int], 
         episode: Optional[int], meta: Dict[str, Any], file_path: str, 
@@ -1162,6 +1211,9 @@ class DownloadQueueManager:
         finalize: bool = True,
         preview_task_id: Optional[str] = None,
         catalog_file_path: Optional[str] = None,
+        retained_audio_metadata: Optional[List[Dict[str, Any]]] = None,
+        retained_video_fingerprint: Optional[str] = None,
+        retained_subtitle_metadata: Optional[List[Dict[str, Any]]] = None,
     ):
         server_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         
@@ -1186,26 +1238,6 @@ class DownloadQueueManager:
             elif (media_type == "series" or media_type == "tv") and len(parts) >= 4:
                 current_folder_name = parts[-4]
                 
-            if current_folder_name and current_folder_name != correct_folder_name:
-                old_folder_abs = os.path.abspath(os.path.join(server_root, parent_dir_rel, current_folder_name))
-                new_folder_abs = os.path.abspath(os.path.join(server_root, parent_dir_rel, correct_folder_name))
-                
-                if os.path.exists(old_folder_abs) and not os.path.exists(new_folder_abs):
-                    logger.info(f"[Queue Manager] Renaming placeholder folder on disk: {current_folder_name} -> {correct_folder_name}")
-                    try:
-                        os.rename(old_folder_abs, new_folder_abs)
-                        file_path = file_path.replace(current_folder_name, correct_folder_name)
-                        if media_type == "movie":
-                            old_file_name = parts[-1]
-                            new_file_name = f"{clean_title}_{release_year}.mp4"
-                            old_file_abs = os.path.abspath(os.path.join(new_folder_abs, old_file_name))
-                            new_file_abs = os.path.abspath(os.path.join(new_folder_abs, new_file_name))
-                            if os.path.exists(old_file_abs):
-                                os.rename(old_file_abs, new_file_abs)
-                                file_path = os.path.join(parent_dir_rel, correct_folder_name, new_file_name).replace("\\", "/")
-                    except Exception as e:
-                        logger.error(f"[Queue Manager] Failed to rename folder/file {current_folder_name}: {e}")
-
             file_candidate = os.path.abspath(file_path) if os.path.isabs(file_path) else os.path.abspath(os.path.join(server_root, file_path))
             catalog_candidate = catalog_file_path or file_candidate
             served_url = catalog_path_from_storage(catalog_candidate)
@@ -1216,12 +1248,12 @@ class DownloadQueueManager:
         if media_type == "movie":
             main_folder_rel = os.path.dirname(virtual_path)
         else:
-            main_folder_rel = os.path.dirname(os.path.dirname(os.path.dirname(virtual_path)))
+            main_folder_rel = os.path.dirname(virtual_path)
             
         if media_type == "movie":
             main_folder_abs = os.path.dirname(abs_file_path)
         else:
-            main_folder_abs = os.path.dirname(os.path.dirname(os.path.dirname(abs_file_path)))
+            main_folder_abs = os.path.dirname(abs_file_path)
         os.makedirs(main_folder_abs, exist_ok=True)
         
         poster_abs = os.path.join(main_folder_abs, "poster.jpg")
@@ -1234,11 +1266,23 @@ class DownloadQueueManager:
         if os.path.exists(backdrop_abs):
             local_banner = f"/{os.path.join(main_folder_rel, 'backdrop.jpg').replace(os.sep, '/')}"
 
+        ep_thumb_rel = ""
+        if media_type != "movie":
+            ep_thumb_abs = os.path.join(os.path.dirname(abs_file_path), "thumbnail.jpg")
+            ep_still_url = (meta.get("episode_detail") or {}).get("thumbnailUrl")
+            if ep_still_url:
+                await download_and_cache_metadata_image(ep_still_url, ep_thumb_abs)
+            if os.path.exists(ep_thumb_abs):
+                ep_thumb_rel = f"/{os.path.join(os.path.dirname(virtual_path), 'thumbnail.jpg').replace(os.sep, '/')}"
+
         # Probe completed media file
         probe_meta = {}
         if file_path:
             probe_meta = await probe_completed_media(abs_file_path)
 
+        if file_path and not probe_meta.get("valid_video"):
+            raise IngestionTaskError(IngestionFailure("MEDIA_PROBE_FAILED", "The completed media has no valid measurable video stream."))
+        analysis = refreshed_analysis(probe_meta.get("analysis"), {"sender_quality": quality})
         probed_duration = probe_meta.get("probed_duration")
         container = probe_meta.get("container")
         codec = probe_meta.get("codec")
@@ -1249,12 +1293,20 @@ class DownloadQueueManager:
         video_fingerprint = probe_meta.get("video_fingerprint")
         selected_language = normalize_language_code(language, "en") if language else None
         audio_meta_list = apply_primary_audio_language(probe_meta.get("audio_metadata", []), selected_language)
+        if retained_audio_metadata:
+            audio_meta_list = retained_primary_audio_language(audio_meta_list, retained_audio_metadata,
+                same_video=bool(video_fingerprint) and retained_video_fingerprint == video_fingerprint)
+            if video_fingerprint and retained_video_fingerprint == video_fingerprint:
+                audio_meta_list = _retained_external_audio(audio_meta_list, retained_audio_metadata)
+        primary = primary_embedded_audio_index(audio_meta_list)
+        if primary is not None and audio_meta_list[primary].get("languageOverride", {}).get("source") == "sender":
+            selected_language = audio_meta_list[primary]["language"]
         
         if media_type == "movie":
             movie_id = f"m_{tmdb_id}"
             movie_folder_abs = os.path.dirname(abs_file_path)
-            movie_quality = quality or "Source"
-            movie_languages = extracted_languages if extracted_languages else ([selected_language] if selected_language else ["en"])
+            movie_quality = probe_meta.get("quality") or "Source"
+            movie_languages = audio_languages(audio_meta_list) or extracted_languages or ([selected_language] if selected_language else ["en"])
             
             subs_on_disk = []
             if subtitles_list:
@@ -1271,7 +1323,9 @@ class DownloadQueueManager:
                             "fileName": f"subtitle_{sub_lang}.vtt",
                         })
 
-            duration_str = meta.get("duration", "1h 30m")
+            if retained_subtitle_metadata is not None and video_fingerprint and retained_video_fingerprint == video_fingerprint:
+                subs_on_disk = _retained_subtitles(movie_folder_abs, retained_subtitle_metadata)
+            duration_str = duration_label(probed_duration)
             skip_data = skip_markers or {}
             
             movie = await db.get(Movie, movie_id)
@@ -1296,6 +1350,7 @@ class DownloadQueueManager:
                 movie.collection_name = meta.get("collectionName") or meta.get("collection_name")
                 movie.trope_vectors = meta.get("tropeVectors") or meta.get("trope_vectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
                 movie.quality = movie_quality
+                movie.analysis_metadata_str = json.dumps(analysis)
                 movie.languages = movie_languages
                 movie.subtitles = subs_on_disk
                 movie.skip_markers = skip_data
@@ -1325,6 +1380,7 @@ class DownloadQueueManager:
                 movie.trope_vectors = meta.get("tropeVectors") or meta.get("trope_vectors") or compute_trope_vectors(movie.genres, movie.keywords, movie.description)
                 movie.original_language = selected_language or meta.get("originalLanguage", movie.original_language)
                 movie.quality = movie_quality
+                movie.analysis_metadata_str = json.dumps(analysis)
                 movie.languages = movie_languages
                 movie.subtitles = subs_on_disk
                 movie.skip_markers = skip_data
@@ -1365,12 +1421,13 @@ class DownloadQueueManager:
                 "video_url": served_url,
                 "catalog_source": "server",
                 "availability": "available",
-                "language": selected_language or "en",
+                "language": audio_meta_list[primary]["language"] if primary is not None else selected_language or "en",
                 "languages": movie_languages,
                 "quality": movie_quality,
                 "subtitles": subs_on_disk,
-                "original_language": selected_language or "en",
+                "original_language": movie.original_language,
                 "skip_markers": skip_data,
+                "analysis": analysis,
                 "probed_duration": probed_duration,
                 "container": container,
                 "codec": codec,
@@ -1437,8 +1494,8 @@ class DownloadQueueManager:
             season_num = season or 1
             episode_num = episode or 1
 
-            ep_quality = quality or "Source"
-            ep_languages = extracted_languages if extracted_languages else ([selected_language] if selected_language else ["en"])
+            ep_quality = probe_meta.get("quality") or "Source"
+            ep_languages = audio_languages(audio_meta_list) or extracted_languages or ([selected_language] if selected_language else ["en"])
 
             ep_folder_abs = os.path.dirname(abs_file_path)
             subs_on_disk = []
@@ -1456,6 +1513,8 @@ class DownloadQueueManager:
                             "fileName": f"subtitle_{sub_lang}.vtt",
                         })
             
+            if retained_subtitle_metadata is not None and video_fingerprint and retained_video_fingerprint == video_fingerprint:
+                subs_on_disk = _retained_subtitles(ep_folder_abs, retained_subtitle_metadata)
             ep_id = f"ep_{tmdb_id}_s{season_num}_e{episode_num}"
             ep_entry = await db.get(Episode, ep_id)
             
@@ -1464,25 +1523,7 @@ class DownloadQueueManager:
             ep_desc = ep_meta.get("description", f"Season {season_num}, Episode {episode_num}")
             ep_still_url = ep_meta.get("thumbnailUrl")
             
-            ep_thumb_rel = ""
-            if ep_still_url:
-                ep_thumb_abs = os.path.join(ep_folder_abs, "thumbnail.jpg")
-                ep_thumb_rel = await download_and_cache_metadata_image(ep_still_url, ep_thumb_abs)
-
-            ep_poster_abs = os.path.join(ep_folder_abs, "poster.jpg")
-            ep_backdrop_abs = os.path.join(ep_folder_abs, "backdrop.jpg")
-            
-            if poster_abs and os.path.exists(poster_abs) and not os.path.exists(ep_poster_abs):
-                shutil.copy(poster_abs, ep_poster_abs)
-            elif not os.path.exists(ep_poster_abs) and meta.get("thumbnailUrl"):
-                await download_and_cache_metadata_image(meta.get("thumbnailUrl"), ep_poster_abs)
-                
-            if backdrop_abs and os.path.exists(backdrop_abs) and not os.path.exists(ep_backdrop_abs):
-                shutil.copy(backdrop_abs, ep_backdrop_abs)
-            elif not os.path.exists(ep_backdrop_abs) and meta.get("bannerUrl"):
-                await download_and_cache_metadata_image(meta.get("bannerUrl"), ep_backdrop_abs)
-                
-            ep_dur_str = ep_meta.get("duration", "45m")
+            ep_dur_str = duration_label(probed_duration)
             ep_skip_data = skip_markers or {}
             
             if not ep_entry:
@@ -1496,6 +1537,7 @@ class DownloadQueueManager:
                     hevc_compressed=str(codec or "").lower() in {"hevc", "h265"},
                 )
                 ep_entry.quality = ep_quality
+                ep_entry.analysis_metadata_str = json.dumps(analysis)
                 ep_entry.languages = ep_languages
                 ep_entry.subtitles = subs_on_disk
                 ep_entry.skip_markers = ep_skip_data
@@ -1512,6 +1554,7 @@ class DownloadQueueManager:
                 ep_entry.video_url = served_url
                 ep_entry.duration = ep_dur_str
                 ep_entry.quality = ep_quality
+                ep_entry.analysis_metadata_str = json.dumps(analysis)
                 ep_entry.languages = ep_languages
                 ep_entry.subtitles = subs_on_disk
                 ep_entry.skip_markers = ep_skip_data
@@ -1552,12 +1595,13 @@ class DownloadQueueManager:
                 "video_url": served_url,
                 "catalog_source": "server",
                 "availability": "available",
-                "language": selected_language or "en",
+                "language": audio_meta_list[primary]["language"] if primary is not None else selected_language or "en",
                 "languages": ep_languages,
                 "quality": ep_quality,
                 "subtitles": subs_on_disk,
-                "original_language": selected_language or "en",
+                "original_language": show.original_language,
                 "skip_markers": ep_skip_data,
+                "analysis": analysis,
                 "probed_duration": probed_duration,
                 "container": container,
                 "codec": codec,
@@ -1583,39 +1627,6 @@ class DownloadQueueManager:
             sync_compatible_metadata_file = os.path.join(ep_metadata_dir, f"metadata_s{season_num}_e{episode_num}.json")
             _atomic_write_json(sync_compatible_metadata_file, ep_metadata_content)
 
-    async def _finalize_catalog_media(
-        self,
-        db: AsyncSession,
-        tmdb_id: int,
-        media_type: str,
-        season: Optional[int],
-        episode: Optional[int],
-        preview_task_id: str,
-        *,
-        uploaded_to_cloud: bool,
-        source_fingerprint: str,
-    ) -> Any:
-        """Publish a verified seekable local or cloud catalog row in one short transaction."""
-
-        if media_type == "movie":
-            media_obj = await db.get(Movie, f"m_{tmdb_id}")
-            if not media_obj:
-                raise RuntimeError("Prepared movie catalog row disappeared before finalization")
-            media_obj.availability = "available"
-        else:
-            media_obj = await db.get(Episode, f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}")
-            if not media_obj:
-                raise RuntimeError("Prepared episode catalog row disappeared before finalization")
-            show = await db.get(Movie, f"tv_{tmdb_id}")
-            if show:
-                show.availability = "available"
-                db.add(show)
-        if media_obj.preview_task_id == preview_task_id:
-            media_obj.preview_task_id = None
-        media_obj.source_fingerprint = source_fingerprint
-        db.add(media_obj)
-        return media_obj
-
     def _parse_duration_to_seconds(self, duration_str: str) -> float:
         total_seconds = 0.0
         try:
@@ -1639,11 +1650,14 @@ class DownloadQueueManager:
         meta: Dict[str, Any],
         season: Optional[int],
         episode: Optional[int],
+        *, verified_source_fingerprint: Optional[str] = None,
+        selected_bundle: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Rebuild a playable catalog row from verified cloud-side portable metadata."""
         tmdb_id = int(data["tmdb_id"])
         video_url = str(data["video_url"])
         codec = data.get("codec")
+        measured_duration = duration_label(data.get("probed_duration"))
         common_probe = {
             "probed_duration": data.get("probed_duration"),
             "container": data.get("container"),
@@ -1651,7 +1665,8 @@ class DownloadQueueManager:
             "width": data.get("width"),
             "height": data.get("height"),
             "frame_rate": data.get("frame_rate"),
-            "source_fingerprint": None,
+            "analysis_metadata_str": json.dumps(refreshed_analysis(data.get("analysis"), data.get("analysis"))),
+            "source_fingerprint": verified_source_fingerprint,
         }
         if data.get("media_type") == "movie":
             folder_url = video_url.rsplit("/", 1)[0]
@@ -1677,6 +1692,7 @@ class DownloadQueueManager:
             movie.catalog_source = "server"
             movie.availability = "available"
             movie.quality = data.get("quality") or "Source"
+            movie.duration = measured_duration if measured_duration != "Unknown" else (data.get("duration") or movie.duration)
             movie.languages = data.get("languages") or [data.get("language") or "en"]
             movie.subtitles = data.get("subtitles") or []
             movie.skip_markers = data.get("skip_markers") or {}
@@ -1690,13 +1706,15 @@ class DownloadQueueManager:
             movie.hevc_compressed = str(codec or "").lower() in {"hevc", "h265"}
             for key, value in common_probe.items():
                 setattr(movie, key, value)
+            if selected_bundle is not None:
+                _apply_catalog_bundle(movie, selected_bundle)
             db.add(movie)
             await db.flush()
             return
 
         if season is None or episode is None:
             raise ValueError("Cloud episode metadata is missing season or episode")
-        show_folder_url = "/".join(video_url.split("/")[:4])
+        show_folder_url = video_url.rsplit("/", 1)[0]
         show_id = f"tv_{tmdb_id}"
         show = await db.get(Movie, show_id) or Movie(
             id=show_id,
@@ -1738,11 +1756,14 @@ class DownloadQueueManager:
         )
         ep_entry.video_url = video_url
         ep_entry.quality = data.get("quality") or "Source"
+        ep_entry.duration = measured_duration if measured_duration != "Unknown" else (data.get("duration") or ep_entry.duration)
         ep_entry.languages = data.get("languages") or [data.get("language") or "en"]
         ep_entry.subtitles = data.get("subtitles") or []
         ep_entry.skip_markers = data.get("skip_markers") or {}
         ep_entry.audio_metadata = data.get("audio_metadata") or []
         ep_entry.hevc_compressed = str(codec or "").lower() in {"hevc", "h265"}
+        if selected_bundle is not None:
+            _apply_catalog_bundle(ep_entry, selected_bundle)
         for key, value in common_probe.items():
             setattr(ep_entry, key, value)
             db.add(ep_entry)
@@ -1804,7 +1825,7 @@ class DownloadQueueManager:
         """
         try:
             server_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            media_dir = os.path.join(server_root, "media")
+            media_dir = os.path.abspath(settings.MEDIA_DIR)
 
             cloud_inventory: Optional[set[str]] = None
             if settings.STORAGE_ENGINE == "CLOUD" and rclone_service.executable():
@@ -1878,7 +1899,7 @@ class DownloadQueueManager:
                                 m.video_url = f"/media/{match.group(1)}"
                         
                         rel_path = m.video_url.lstrip("/")
-                        exists = recovery_source_exists(rel_path)
+                        exists = recovery_source_exists(m.video_url)
                         if exists is False:
                             logger.warning(f"[Sync Recovery] Movie {m.title} file missing at {rel_path}. Demoting to cached.")
                             m.video_url = ""
@@ -1906,7 +1927,7 @@ class DownloadQueueManager:
                                 ep.video_url = f"/media/{match.group(1)}"
                         
                         rel_path = ep.video_url.lstrip("/")
-                        exists = recovery_source_exists(rel_path)
+                        exists = recovery_source_exists(ep.video_url)
                         if exists is False:
                             logger.warning(f"[Sync Recovery] Episode {ep.title} file missing at {rel_path}. Clearing video URL.")
                             ep.video_url = ""
@@ -1934,12 +1955,110 @@ class DownloadQueueManager:
 
             logger.info("[Queue Manager] Starting disk-to-database recovery sync...")
             count = 0
+            accepted_sources = {}
+            accepted_cloud_fingerprints = {}
+            snapshots = []
+            async with AsyncSession(engine) as authority_db:
+                rows = [*(await authority_db.exec(select(Episode))).all(), *(await authority_db.exec(select(Movie))).all()]
+                for existing in rows:
+                    try:
+                        episode_row = isinstance(existing, Episode)
+                        match = re.fullmatch(r"tv_([1-9][0-9]*)" if episode_row else r"m_([1-9][0-9]*)",
+                            existing.movie_id if episode_row else existing.id)
+                        source = local_path_for(existing.video_url)
+                        if not match:
+                            continue
+                        owner = (("episode", int(match.group(1)), existing.season_number, existing.episode_number)
+                            if episode_row else ("movie", int(match.group(1))))
+                        snapshots.append((owner, source, _catalog_bundle(existing)))
+                    except (OSError, ValueError, TypeError):
+                        continue
+            # Detached primitive snapshots keep provider observations outside
+            # even the DB read session, before any catalog reconstruction writes.
+            cloud_candidates = {}
+            for owner, source, bundle in snapshots:
+                try:
+                    if source.is_file():
+                        if (bundle["analysis"].get("video_fingerprint") == local_video_fingerprint(source)
+                            or bundle["source_fingerprint"] == local_playback_fingerprint(source, bundle["audio_metadata"])):
+                            accepted_sources[owner] = str(source)
+                    elif settings.STORAGE_ENGINE == "CLOUD":
+                        cloud_candidates[owner] = bundle
+                except (OSError, ValueError, TypeError):
+                    continue
+            ambiguous_sources = {}
+            preliminary_inventory = _recovery_metadata_inventory(media_dir, accepted_sources, ambiguous_sources=ambiguous_sources)
+            cloud_records = {}
+            observation_owners = set(ambiguous_sources)
+            for root, names in preliminary_inventory:
+                for name in names:
+                    path = Path(root) / name
+                    try:
+                        portable = json.loads(path.read_text(encoding="utf-8"))
+                        key = _portable_media_source(portable, path)
+                    except (OSError, ValueError):
+                        continue
+                    if key is None or Path(key[1]).is_file() or settings.STORAGE_ENGINE != "CLOUD":
+                        continue
+                    cloud_records.setdefault(key[0], []).append((str(path), portable))
+                    candidate = cloud_candidates.get(key[0])
+                    if candidate is None or _cloud_bundle_differs(candidate, portable):
+                        observation_owners.add(key[0])
+            cloud_bundles = {}
+            for owner in sorted(observation_owners):
+                candidate = cloud_candidates.get(owner)
+                records = cloud_records.get(owner, [])
+                if candidate is None and owner in ambiguous_sources:
+                    raise MediaRecoveryRequired("Ambiguous media recovery sources")
+                if candidate is None and not records:
+                    continue
+                catalog_path = candidate["video_url"] if candidate else records[0][1]["video_url"]
+                try:
+                    observed = await asyncio.wait_for(resolve_media_source(catalog_path,
+                        require_cloud=True, refresh_cloud=True), timeout=35)
+                    available = not observed.local_exists and observed.cloud_exists and bool(observed.video_fingerprint)
+                    current = bool(available and candidate and _current_cloud_bundle(candidate, observed))
+                except (OSError, ValueError, TypeError, asyncio.TimeoutError):
+                    available, current = False, False
+                if not available or owner in ambiguous_sources and not current:
+                    raise MediaRecoveryRequired("Ambiguous media recovery sources")
+                if current:
+                    accepted_sources[owner] = str(observed.local_path)
+                for path, portable in records:
+                    if local_path_for(portable["video_url"]) != observed.local_path:
+                        if current:
+                            continue
+                        observed = await asyncio.wait_for(resolve_media_source(portable["video_url"],
+                            require_cloud=True, refresh_cloud=True), timeout=35)
+                        if observed.local_exists or not observed.cloud_exists or not observed.video_fingerprint:
+                            raise MediaRecoveryRequired("Cloud recovery source could not be verified")
+                    selected = _select_cloud_bundle(candidate, portable, observed)
+                    cloud_bundles[(owner, str(observed.local_path))] = selected
+                    if current:
+                        accepted_cloud_fingerprints[owner] = selected["source_fingerprint"]
+                    if any(portable.get(field) != selected[field] for field in _CLOUD_BUNDLE_FIELDS):
+                        portable_current = _current_cloud_bundle(portable, observed, portable=True)
+                        portable.update(selected)
+                        portable["video_fingerprint"] = observed.video_fingerprint
+                        primary = primary_embedded_audio_index(selected["audio_metadata"])
+                        portable["language"] = selected["audio_metadata"][primary].get("language") if primary is not None else None
+                        if not portable_current:
+                            portable.pop("stream_manifest", None)
+                        _write_recovery_metadata(path, portable)
+            # Identical, nonambiguous existing bundles are left intact; this is
+            # not a new source proof and does not require per-library cloud I/O.
+            for owner, records in cloud_records.items():
+                candidate = cloud_candidates.get(owner)
+                if candidate is None:
+                    continue
+                for _, portable in records:
+                    key = (owner, str(local_path_for(portable["video_url"])))
+                    if key not in cloud_bundles and not _cloud_bundle_differs(candidate, portable):
+                        cloud_bundles[key] = candidate
+            metadata_inventory = _recovery_metadata_inventory(media_dir, accepted_sources)
             
             async with AsyncSession(engine) as db:
-                for root, dirs, files in os.walk(media_dir):
-                    if os.path.basename(root) != ".metadata":
-                        continue
-                        
+                for root, files in metadata_inventory:
                     for file in files:
                         if file.endswith(".json"):
                             meta_path = os.path.join(root, file)
@@ -1952,6 +2071,12 @@ class DownloadQueueManager:
                                 
                                 if not tmdb_id or not media_type:
                                     continue
+                                cloud_bundle = None
+                                if data.get("video_url"):
+                                    owner = _portable_owner(data, Path(meta_path))
+                                    cloud_bundle = cloud_bundles.get((owner, str(local_path_for(data["video_url"]))))
+                                    if cloud_bundle is not None:
+                                        data.update(cloud_bundle)
                                     
                                 parent_dir = os.path.dirname(root)
                                 video_file_rel = None
@@ -1978,45 +2103,97 @@ class DownloadQueueManager:
                                         except Exception:
                                             pass
                                             
-                                    if season is not None and episode is not None:
-                                        if os.path.basename(parent_dir).startswith("Episode_"):
-                                            ep_dir = parent_dir
-                                        else:
-                                            ep_dir = os.path.join(parent_dir, f"Season_{season}", f"Episode_{episode}")
-                                            
-                                        if os.path.exists(ep_dir):
-                                            for item in os.listdir(ep_dir):
-                                                if item.endswith((".mp4", ".mkv", ".avi", ".mov")):
-                                                    video_file_rel = os.path.relpath(os.path.join(ep_dir, item), server_root)
-                                                    break
-                                else: # movie
-                                    try:
-                                        for item in os.listdir(parent_dir):
-                                            if item.endswith((".mp4", ".mkv", ".avi", ".mov")) and not os.path.isdir(os.path.join(parent_dir, item)):
-                                                video_file_rel = os.path.relpath(os.path.join(parent_dir, item), server_root)
-                                                break
-                                    except Exception:
-                                        pass
-                                        
+                                selected_source_changed = False
+                                selection = _portable_media_source(data, Path(meta_path), accepted_sources)
+                                if selection is not None:
+                                    selected_path = Path(selection[1])
+                                    if selected_path.is_file():
+                                        video_file_rel = os.path.relpath(selected_path, server_root)
+                                        selected_url = catalog_path_from_storage(str(selected_path))
+                                        selected_source_changed = data.get("video_url") != selected_url
+                                        data["video_url"] = selected_url
+
                                 probe_info: Dict[str, Any] = {}
+                                retained_subtitles = None
                                 if video_file_rel:
                                     file_path = video_file_rel.replace("\\", "/")
                                     abs_video_path = os.path.abspath(os.path.join(server_root, file_path))
                                     portable_audio = data.get("audio_metadata")
-                                    if not isinstance(portable_audio, list):
+                                    if not isinstance(portable_audio, list) or not all(isinstance(track, dict) for track in portable_audio):
                                         portable_audio = []
+                                    existing_media = None
+                                    if media_type == "movie":
+                                        existing_media = await db.get(Movie, f"m_{tmdb_id}")
+                                    elif season is not None and episode is not None:
+                                        existing_media = await db.get(Episode, f"ep_{tmdb_id}_s{season}_e{episode}")
+                                    db_audio = existing_media.audio_metadata if existing_media else []
+                                    if not isinstance(db_audio, list) or not all(isinstance(track, dict) for track in db_audio):
+                                        db_audio = []
                                     try:
                                         current_video_fingerprint = local_video_fingerprint(Path(abs_video_path))
                                         current_recovery_fingerprint = local_playback_fingerprint(
                                             Path(abs_video_path),
                                             portable_audio,
                                         )
+                                        current_db_fingerprint = local_playback_fingerprint(Path(abs_video_path), db_audio)
                                     except OSError:
                                         current_video_fingerprint = ""
                                         current_recovery_fingerprint = ""
-                                    metadata_changed = False
-                                    if current_recovery_fingerprint == str(data.get("source_fingerprint") or ""):
+                                        current_db_fingerprint = ""
+                                    # Each accepted bundle owns its own source proof. Portable
+                                    # metadata cannot authorize stale or unbound catalog audio.
+                                    retained_audio = []
+                                    current_db_bundle = bool(existing_media and current_video_fingerprint and (
+                                        stored_analysis(existing_media.analysis_metadata_str).get("video_fingerprint") == current_video_fingerprint
+                                        or (current_db_fingerprint and existing_media.source_fingerprint == current_db_fingerprint)
+                                    ))
+                                    current_portable_bundle = bool(current_video_fingerprint and (
+                                        data.get("video_fingerprint") == current_video_fingerprint
+                                        or stored_analysis(data.get("analysis")).get("video_fingerprint") == current_video_fingerprint
+                                        or (current_recovery_fingerprint and data.get("source_fingerprint") == current_recovery_fingerprint)
+                                    ))
+                                    retained_analysis = {}
+                                    retained_mutables_changed = False
+                                    if current_db_bundle:
+                                        retained_audio.append(db_audio)
+                                        retained_analysis = refreshed_analysis(None, existing_media.analysis_metadata_str)
+                                        # Accepted server mutables on this unchanged video must
+                                        # not regress when a legacy portable copy is stale.
+                                        for field in ("skip_markers", "subtitles"):
+                                            value = getattr(existing_media, field)
+                                            retained_mutables_changed |= data.get(field) != value
+                                            data[field] = value
+                                    if current_portable_bundle:
+                                        retained_audio.append(portable_audio)
+                                        if "sender_quality" not in retained_analysis:
+                                            retained_analysis = refreshed_analysis(None, data.get("analysis"))
+                                    if current_db_bundle or current_portable_bundle:
+                                        retained_subtitles = data.get("subtitles")
+                                        if not isinstance(retained_subtitles, list):
+                                            retained_subtitles = None
+                                    manifest = data.get("stream_manifest")
+                                    complete_portable_audio = isinstance(manifest, list) and bool(manifest) and all(isinstance(track, dict) for track in manifest)
+                                    if complete_portable_audio:
+                                        measured_indexes = {track.get("index") for track in manifest if track.get("type") == "audio"}
+                                        portable_indexes = {track.get("streamIndex", track.get("stream_index")) for track in portable_audio
+                                            if str(track.get("source") or "embedded").lower() == "embedded"}
+                                        complete_portable_audio = measured_indexes == portable_indexes
+                                    retained_portable_audio = retained_primary_audio_language(
+                                        portable_audio, *retained_audio, same_video=bool(retained_audio))
+                                    metadata_changed = retained_mutables_changed or selected_source_changed
+                                    if (
+                                        current_video_fingerprint
+                                        and current_recovery_fingerprint
+                                        and current_recovery_fingerprint == str(data.get("source_fingerprint") or "")
+                                        and current_duration_analysis(data.get("analysis"))
+                                        and complete_portable_audio
+                                        and retained_portable_audio == portable_audio
+                                    ):
                                         probe_info = data
+                                        analysis = refreshed_analysis(data.get("analysis"), retained_analysis)
+                                        if analysis != data.get("analysis"):
+                                            data["analysis"] = analysis
+                                            metadata_changed = True
                                         if current_video_fingerprint and data.get("video_fingerprint") != current_video_fingerprint:
                                             data["video_fingerprint"] = current_video_fingerprint
                                             metadata_changed = True
@@ -2050,11 +2227,21 @@ class DownloadQueueManager:
 
                                         probe_info = await probe_completed_media(abs_video_path)
                                         if probe_info:
+                                            probe_info["audio_metadata"] = retained_primary_audio_language(
+                                                probe_info.get("audio_metadata") or [], *retained_audio,
+                                                same_video=bool(retained_audio) and probe_info.get("video_fingerprint") == current_video_fingerprint)
+                                            if probe_info.get("video_fingerprint") == current_video_fingerprint:
+                                                probe_info["audio_metadata"] = _retained_external_audio(probe_info["audio_metadata"], *retained_audio)
+                                            data["languages"] = audio_languages(probe_info["audio_metadata"]) or data.get("languages") or []
+                                            primary = primary_embedded_audio_index(probe_info["audio_metadata"])
+                                            if primary is not None:
+                                                data["language"] = probe_info["audio_metadata"][primary]["language"]
+                                            probe_info["analysis"] = refreshed_analysis(probe_info.get("analysis"), retained_analysis)
                                             data.update(probe_info)
                                             metadata_changed = True
                                     if metadata_changed:
                                         try:
-                                            _atomic_write_json(meta_path, data)
+                                            _write_recovery_metadata(meta_path, data)
                                         except Exception:
                                             pass
                                 else:
@@ -2066,6 +2253,8 @@ class DownloadQueueManager:
                                     movie_id = f"m_{tmdb_id}"
                                     existing = await db.get(Movie, movie_id)
                                     if existing and not (existing.title.startswith("Captured ") or "credentials are not set" in (existing.description or "")):
+                                        if cloud_bundle is not None:
+                                            _apply_catalog_bundle(existing, cloud_bundle)
                                         existing.crew = data.get("crew", existing.crew)
                                         existing.keywords = data.get("keywords", existing.keywords)
                                         existing.collection_name = data.get("collection_name", existing.collection_name)
@@ -2085,13 +2274,17 @@ class DownloadQueueManager:
                                             db.add(existing)
                                         if file_path and probe_info:
                                             existing.probed_duration = probe_info.get("probed_duration")
+                                            existing.duration = duration_label(existing.probed_duration)
                                             existing.container = probe_info.get("container")
                                             existing.codec = probe_info.get("codec")
                                             existing.width = probe_info.get("width")
                                             existing.height = probe_info.get("height")
                                             existing.frame_rate = probe_info.get("frame_rate")
+                                            existing.quality = probe_info.get("quality") or existing.quality
+                                            existing.analysis_metadata_str = json.dumps(refreshed_analysis(probe_info.get("analysis"), probe_info.get("analysis")))
                                             existing.source_fingerprint = probe_info.get("source_fingerprint")
                                             existing.audio_metadata = probe_info.get("audio_metadata", [])
+                                            existing.languages = audio_languages(existing.audio_metadata) or existing.languages
                                             db.add(existing)
                                         await db.commit()
                                         continue
@@ -2103,6 +2296,8 @@ class DownloadQueueManager:
                                         ep_id = f"ep_{tmdb_id}_s{season}_e{episode}"
                                         existing = await db.get(Episode, ep_id)
                                         if existing and not (existing.title.startswith("Episode ") or "stream." in (existing.description or "")):
+                                            if cloud_bundle is not None:
+                                                _apply_catalog_bundle(existing, cloud_bundle)
                                             existing.dialogue_wpm = data.get("dialogue_wpm", existing.dialogue_wpm)
                                             existing.dialogue_word_count = int(data.get("dialogue_word_count", existing.dialogue_word_count) or 0)
                                             existing.dialogue_language = data.get("dialogue_language", existing.dialogue_language)
@@ -2121,13 +2316,17 @@ class DownloadQueueManager:
                                                 db.add(existing)
                                             if file_path and probe_info:
                                                 existing.probed_duration = probe_info.get("probed_duration")
+                                                existing.duration = duration_label(existing.probed_duration)
                                                 existing.container = probe_info.get("container")
                                                 existing.codec = probe_info.get("codec")
                                                 existing.width = probe_info.get("width")
                                                 existing.height = probe_info.get("height")
                                                 existing.frame_rate = probe_info.get("frame_rate")
+                                                existing.quality = probe_info.get("quality") or existing.quality
+                                                existing.analysis_metadata_str = json.dumps(refreshed_analysis(probe_info.get("analysis"), probe_info.get("analysis")))
                                                 existing.source_fingerprint = probe_info.get("source_fingerprint")
                                                 existing.audio_metadata = probe_info.get("audio_metadata", [])
+                                                existing.languages = audio_languages(existing.audio_metadata) or existing.languages
                                                 db.add(existing)
                                             await db.commit()
                                             continue
@@ -2151,7 +2350,10 @@ class DownloadQueueManager:
                                     and cloud_video_url.startswith("/media/")
                                     and recovery_source_exists(cloud_video_url) is True
                                 ):
-                                    await self._restore_cloud_catalog_entry(db, data, meta, season, episode)
+                                    owner = _portable_owner(data, Path(meta_path))
+                                    await self._restore_cloud_catalog_entry(db, data, meta, season, episode,
+                                        verified_source_fingerprint=(cloud_bundle["source_fingerprint"] if cloud_bundle
+                                            else accepted_cloud_fingerprints.get(owner)), selected_bundle=cloud_bundle)
                                     await db.commit()
                                     count += 1
                                     continue
@@ -2208,8 +2410,11 @@ class DownloadQueueManager:
                                 # Re-run cataloging with physical video.
                                 await self._catalog_media(
                                     db, tmdb_id, media_type, season, episode, meta, file_path,
-                                    language=language, subtitles_list=data.get("subtitles"),
-                                    quality=data.get("quality"), skip_markers=data.get("skip_markers")
+                                    subtitles_list=data.get("subtitles"),
+                                    retained_audio_metadata=data.get("audio_metadata"),
+                                    retained_video_fingerprint=data.get("video_fingerprint"),
+                                    retained_subtitle_metadata=retained_subtitles,
+                                    quality=refreshed_analysis(None, data.get("analysis")).get("sender_quality"), skip_markers=data.get("skip_markers")
                                 )
                                 # _catalog_media intentionally flushes without
                                 # committing so ingestion can publish atomically.

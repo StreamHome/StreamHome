@@ -21,6 +21,7 @@ from config import settings
 from db import engine
 from models import Episode, Movie
 from services.logger import logger
+from lifecycle.media_work import media_ownership, require_resolved_media
 from lifecycle.coordination import (
     AdmissionClosedError,
     EffectClass,
@@ -230,9 +231,8 @@ def _update_metadata_file(folder: Path, entity: Movie | Episode) -> None:
             "vibe_analysis_version": entity.vibe_analysis_version,
             "vibe_analyzed_at": entity.vibe_analyzed_at,
         })
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(temporary, path)
+        from services.media_updates import atomic_json_write
+        atomic_json_write(path, payload)
     except Exception as exc:
         logger.warning(f"[Vibe Analysis] Could not update {path}: {exc}")
 
@@ -300,6 +300,17 @@ class VibeAnalysisManager:
 
     async def _analyze_entity_admitted(self, entity_type: str, entity_id: str) -> Optional[DialogueMetrics]:
         model = Movie if entity_type == "movie" else Episode
+        async with AsyncSession(engine) as db:
+            current = await db.get(model, entity_id)
+            if current is None:
+                return None
+            identities = [entity_id] + ([current.movie_id] if isinstance(current, Episode) else [])
+        async with media_ownership(*identities):
+            require_resolved_media(entity_id)
+            return await self._analyze_owned_entity(entity_type, entity_id)
+
+    async def _analyze_owned_entity(self, entity_type: str, entity_id: str) -> Optional[DialogueMetrics]:
+        model = Movie if entity_type == "movie" else Episode
         async with AsyncSession(engine, expire_on_commit=False) as db:
             entity = await db.get(model, entity_id)
             if not entity:
@@ -360,45 +371,44 @@ async def backfill_catalog_vibes(limit: int = 24) -> int:
 
 async def _backfill_catalog_vibes_admitted(limit: int = 24) -> int:
     from services.tmdb import tmdb_client
+    from services.media_updates import atomic_json_write
 
     if not tmdb_client.api_key and not tmdb_client.read_access_token:
         return 0
     async with AsyncSession(engine) as db:
         movies = list((await db.exec(select(Movie))).all())
-        targets = [
-            movie for movie in movies
-            if movie.tmdb_id and int(movie.catalog_enrichment_version or 0) < VIBE_ANALYSIS_VERSION
-        ][:max(1, limit)]
-        changed = 0
-        for movie in targets:
-            try:
-                details = await (tmdb_client.fetch_show_metadata(movie.tmdb_id) if movie.type == "series" else tmdb_client.fetch_movie_metadata(movie.tmdb_id))
-            except Exception as exc:
-                logger.warning(f"[Vibe Backfill] TMDB enrichment failed for {movie.id}: {exc}")
-                continue
-            crew = details.get("crew") or []
-            keywords = details.get("keywords") or movie.keywords
-            tropes = details.get("tropeVectors") or compute_trope_vectors(details.get("genres") or movie.genres, keywords, details.get("description") or movie.description)
-            movie.crew = crew or movie.crew
-            movie.keywords = keywords
-            movie.trope_vectors = tropes
-            movie.director = details.get("director") or movie.director
-            movie.metadata_refreshed_at = time.time()
-            movie.catalog_enrichment_version = VIBE_ANALYSIS_VERSION
-            db.add(movie)
-            folder = _media_folder(movie.video_url or movie.local_thumbnail_url or movie.thumbnail_url)
-            if folder:
-                path = folder / ".metadata" / "metadata.json"
-                if path.is_file():
+        targets = [(movie.id, movie.tmdb_id, movie.type) for movie in movies
+                   if movie.tmdb_id and int(movie.catalog_enrichment_version or 0) < VIBE_ANALYSIS_VERSION][:max(1, limit)]
+    changed = 0
+    for media_id, tmdb_id, media_type in targets:
+        try:
+            details = await (tmdb_client.fetch_show_metadata(tmdb_id) if media_type == "series" else tmdb_client.fetch_movie_metadata(tmdb_id))
+        except Exception as error:
+            logger.warning("[Vibe Backfill] TMDB enrichment failed for %s: %s", media_id, type(error).__name__)
+            continue
+        async with media_ownership(media_id):
+            require_resolved_media(media_id)
+            async with AsyncSession(engine, expire_on_commit=False) as db:
+                movie = await db.get(Movie, media_id)
+                if movie is None:
+                    continue
+                movie.crew = details.get("crew") or movie.crew
+                movie.keywords = details.get("keywords") or movie.keywords
+                movie.trope_vectors = details.get("tropeVectors") or compute_trope_vectors(details.get("genres") or movie.genres, movie.keywords, details.get("description") or movie.description)
+                movie.director = details.get("director") or movie.director
+                movie.metadata_refreshed_at = time.time()
+                movie.catalog_enrichment_version = VIBE_ANALYSIS_VERSION
+                db.add(movie)
+                await db.commit()
+                folder = _media_folder(movie.video_url or movie.local_thumbnail_url or movie.thumbnail_url)
+                path = folder / ".metadata" / "metadata.json" if folder else None
+                owns_portable = not (movie.type == "series" and folder and any(part.startswith("Episode_") for part in folder.parts))
+                if owns_portable and path is not None and path.is_file():
                     try:
                         payload = json.loads(path.read_text(encoding="utf-8"))
                         payload.update({"crew": movie.crew, "keywords": movie.keywords, "trope_vectors": movie.trope_vectors, "director": movie.director})
-                        temporary = path.with_suffix(".json.tmp")
-                        temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-                        os.replace(temporary, path)
-                    except Exception as exc:
-                        logger.warning(f"[Vibe Backfill] Metadata update failed for {movie.id}: {exc}")
-            changed += 1
-        if changed:
-            await db.commit()
-        return changed
+                        atomic_json_write(path, payload)
+                    except Exception as error:
+                        logger.warning("[Vibe Backfill] Metadata update deferred for %s: %s", media_id, type(error).__name__)
+                changed += 1
+    return changed

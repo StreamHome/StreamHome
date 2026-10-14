@@ -84,6 +84,7 @@ class Movie(SQLModel, table=True):
     width: Optional[int] = Field(default=None)
     height: Optional[int] = Field(default=None)
     frame_rate: Optional[float] = Field(default=None)
+    analysis_metadata_str: str = Field(default="{}")
     source_fingerprint: Optional[str] = Field(default=None, index=True)
     audio_metadata_str: Optional[str] = Field(default="[]")
     preview_task_id: Optional[str] = Field(default=None, index=True)
@@ -215,6 +216,7 @@ class Episode(SQLModel, table=True):
     width: Optional[int] = Field(default=None)
     height: Optional[int] = Field(default=None)
     frame_rate: Optional[float] = Field(default=None)
+    analysis_metadata_str: str = Field(default="{}")
     source_fingerprint: Optional[str] = Field(default=None, index=True)
     audio_metadata_str: Optional[str] = Field(default="[]")
     preview_task_id: Optional[str] = Field(default=None, index=True)
@@ -441,10 +443,18 @@ class AuthChallenge(SQLModel, table=True):
     token_hash: str = Field(unique=True, index=True)
     user_id: int = Field(foreign_key="user.id", index=True)
     purpose: str
+    auth_session_id: Optional[str] = Field(default=None, index=True)
     created_at: float
     expires_at: float = Field(index=True)
     attempts: int = Field(default=0)
     used_at: Optional[float] = Field(default=None)
+
+
+class MediaOperationReceipt(SQLModel, table=True):
+    """Acceptance committed in the same transaction as media catalog changes."""
+    operation_id: str = Field(primary_key=True)
+    media_id: str = Field(index=True)
+    accepted_at: float = Field(default_factory=time.time)
 
 class RecoveryCode(SQLModel, table=True):
     id: str = Field(primary_key=True)
@@ -637,6 +647,7 @@ class EpisodeResponse(APIModel):
     video_url: str
     duration: str
     quality: Optional[str] = "Source"
+    analysis: Dict[str, Any] = {}
     languages: List[str] = ["en"]
     subtitles: List[Dict[str, str]] = []
     skip_markers: Dict[str, Any] = {}
@@ -659,6 +670,7 @@ class MovieResponse(APIModel):
     director: Optional[str]
     type: Optional[str]
     quality: Optional[str] = "Source"
+    analysis: Dict[str, Any] = {}
     languages: List[str] = ["en"]
     subtitles: List[Dict[str, str]] = []
     vote_average: Optional[float] = 7.5
@@ -695,6 +707,7 @@ class MovieResponse(APIModel):
             director=movie.director,
             type=movie.type,
             quality=movie.quality or "Source",
+            analysis=json.loads(movie.analysis_metadata_str or "{}"),
             languages=movie.languages,
             subtitles=movie.subtitles,
             vote_average=movie.vote_average,
@@ -711,6 +724,7 @@ class MovieResponse(APIModel):
                     video_url="" if e.preview_task_id else e.video_url,
                     duration=e.duration,
                     quality=e.quality or "Source",
+                    analysis=json.loads(e.analysis_metadata_str or "{}"),
                     languages=e.languages,
                     subtitles=e.subtitles,
                     skip_markers=e.skip_markers,

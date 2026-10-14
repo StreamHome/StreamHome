@@ -940,9 +940,12 @@ def _restore_plan(
     recognized_canonical = canonical is not None and canonical in {
         item for item in (staged_identity, previous_identity, rollback_identity) if item is not None
     }
+    installed_lineage = restore_controller.installed_database_is_recognized(paths, journal)
+    if installed_lineage:
+        artifacts["canonicalDatabase"] = "valid"
+    recognized_canonical = recognized_canonical or installed_lineage
     if accepted:
-        expected = rollback_identity if journal.get("outcome") == "rolled_back" else staged_identity
-        if canonical is not None and expected is not None and canonical == expected:
+        if installed_lineage:
             actions.append("continue_recovery")
     else:
         if source_status == "valid" and (
@@ -1033,6 +1036,12 @@ def _durable_recovery_evidence(
                     paths.operation_dir / "rollback-activation.db"
                 ),
                 "canonical": _evidence_file_identity(paths.database_path),
+                "canonicalSidecars": {
+                    suffix: _evidence_file_identity(Path(f"{paths.database_path}{suffix}"))
+                    for suffix in ("-wal", "-shm", "-journal")
+                },
+                "candidateLineage": _evidence_file_identity(paths.operation_dir / "candidate-lineage.json"),
+                "rollbackLineage": _evidence_file_identity(paths.operation_dir / "rollback-lineage.json"),
             }
         else:
             journal_path = root / ".run" / "update-state.json"
@@ -1114,6 +1123,35 @@ def _safe_staging_status(root: Path, value: Any) -> str:
     )
 
 
+def _queued_update_was_not_launched(root: Path, journal: Mapping[str, Any]) -> bool:
+    """Recognize exact producer evidence for abandoning a queued claim only."""
+    operation_id = journal.get("transaction_id")
+    previous = journal.get("previous_commit")
+    if (
+        not isinstance(operation_id, str)
+        or journal.get("phase") != "queued"
+        or journal.get("runtime_committed") is not False
+        or not isinstance(previous, str)
+        or not update_controller.COMMIT_RE.fullmatch(previous)
+        or journal.get("current_commit") != previous
+        or journal.get("started_at") is not None
+        or journal.get("controller_pid") is not None
+        or journal.get("controller_start_ticks") not in (None, "")
+        or journal.get("staging_dir") not in (None, "")
+        or journal.get("web_artifacts_swapped") is not False
+        or journal.get("web_dependencies_swapped") is not False
+    ):
+        return False
+    return all(
+        _path_is_absent(root / ".run" / name)
+        for name in (
+            f"update-controller.{operation_id}.sh",
+            "pre-update-database.db",
+            "update-transaction.json",
+        )
+    )
+
+
 def _update_plan(
     root: Path,
     operation_id: str,
@@ -1134,6 +1172,9 @@ def _update_plan(
                 journal_authority_generation,
                 authority.active_operation,
             )
+        previous = update_controller.pre_cutover_previous_commit(root, journal, journal_authority)
+        if previous is not None:
+            journal["previous_commit"] = previous
         update_controller._validate_update_journal_semantics(
             journal, authority=journal_authority
         )
@@ -1167,6 +1208,18 @@ def _update_plan(
             and artifacts["databaseCheckpoint"] == "absent"
             and runtime_status == "offline"
         ):
+            actions.append("safe_abort")
+        elif (
+            installed is not None
+            and _git_commit_exists(root, installed)
+            and artifacts["targetCommit"] == "valid"
+            and artifacts["previousCommit"] == "valid"
+            and runtime_status == "offline"
+            and _queued_update_was_not_launched(root, journal)
+        ):
+            # The owner may have installed a different release after queueing.
+            # An explicit abort releases only this unlaunched claim; it neither
+            # restores the old Git HEAD nor starts the selected target.
             actions.append("safe_abort")
         if (
             detail in {"starting", "recovering"}
@@ -1611,6 +1664,7 @@ def _cleanup_restore_resolution(
         paths.candidate_path,
         paths.rollback_path,
         paths.operation_dir / "rollback-activation.db",
+        paths.operation_dir / "completion.db",
     )
     if not all(_unlink_exact_regular(path) for path in transient):
         return False

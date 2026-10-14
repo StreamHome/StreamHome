@@ -29,6 +29,7 @@ from models import AuthSession, DownloadTask, Movie, PlaybackRun, PlaybackSessio
 from routes.auth import get_current_user
 from routes.playback import ensure_source_metadata, router
 from services.media_source import resolve_media_source
+from services.media_probe import probe_completed_media
 from services.ingest_preview import ingest_preview_service
 from services.playback_prep import AUDIO_VERIFIED_MARKER, VIDEO_VERIFIED_MARKER, playback_prep_service
 
@@ -48,9 +49,9 @@ class PlaybackContractRegression(unittest.TestCase):
         subprocess.run(
             [
                 ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-f", "lavfi", "-i", "testsrc=size=640x360:rate=24",
+                "-f", "lavfi", "-i", "color=size=640x360:rate=24",
                 "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
-                "-t", "2", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+                "-t", "120", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-metadata:s:a:0", "language=eng", "-shortest",
                 str(cls.media_file),
             ],
             check=True,
@@ -72,6 +73,7 @@ class PlaybackContractRegression(unittest.TestCase):
             async with cls.engine.begin() as connection:
                 await connection.run_sync(SQLModel.metadata.create_all)
             source = await resolve_media_source(cls.catalog_path, check_cloud=False)
+            measured = await probe_completed_media(str(cls.media_file))
             cls.fingerprint = source.fingerprint
             async with AsyncSession(cls.engine, expire_on_commit=False) as db:
                 db.add(cls.user)
@@ -96,10 +98,11 @@ class PlaybackContractRegression(unittest.TestCase):
                     height=360,
                     frame_rate=24,
                     source_fingerprint=cls.fingerprint,
-                    quality="1080p",
+                    quality="360p",
+                    analysis_metadata_str=json.dumps(measured["analysis"]),
                 )
                 movie.languages = ["eng"]
-                movie.audio_metadata = [{"index": 0, "streamIndex": 1, "language": "eng", "label": "English", "channels": 2, "default": True}]
+                movie.audio_metadata = measured["audio_metadata"]
                 db.add(movie)
                 await db.commit()
 
@@ -193,7 +196,7 @@ class PlaybackContractRegression(unittest.TestCase):
             self.assertGreaterEqual(payload["preparationProgress"]["readySegments"], 0)
             self.assertGreater(payload["sourceMetadata"]["duration"], 0)
             if payload["manifestUrl"]:
-                self.assertEqual(payload["renditions"][0]["label"], "1080p")
+                self.assertEqual(payload["renditions"][0]["label"], "360p")
                 self.assertTrue(any(item["ready"] for item in payload["renditions"]))
             else:
                 self.assertEqual(payload["renditions"], [])
@@ -358,60 +361,44 @@ class PlaybackContractRegression(unittest.TestCase):
         prepare.assert_not_awaited()
 
     def test_stale_portable_video_identity_forces_stream_metadata_reprobe(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=self.media_directory) as directory:
             media_path = Path(directory) / "fixture.mp4"
-            media_path.write_bytes(b"current-video")
+            shutil.copy2(self.media_file, media_path)
+            measured = asyncio.run(probe_completed_media(str(media_path)))
+            self.assertTrue(measured["valid_video"])
+            catalog_path = "/media/" + media_path.relative_to(Path(settings.MEDIA_DIR)).as_posix()
+            source = asyncio.run(resolve_media_source(catalog_path, check_cloud=False))
             metadata_path = media_path.parent / ".metadata" / "metadata.json"
             metadata_path.parent.mkdir()
             metadata_path.write_text(json.dumps({
-                "title": "Fixture",
-                "codec": "h264",
+                "title": "Fixture", "codec": "hevc",
                 "video_fingerprint": "stale-video-fingerprint",
             }), encoding="utf-8")
-            source = SimpleNamespace(
-                local_exists=True,
-                local_path=media_path,
-                video_fingerprint="current-video-fingerprint",
-                fingerprint="current-playback-fingerprint",
+            media = Movie(
+                id="m_stale_probe", title="Fixture", description="", thumbnail_url="",
+                video_url=catalog_path, duration="2m", release_year=2026,
+                probed_duration=120.0, container="mov,mp4", codec="hevc",
+                width=1920, height=1080, frame_rate=59.94,
+                source_fingerprint=measured["source_fingerprint"],
+                analysis_metadata_str=json.dumps(measured["analysis"]),
             )
-            media = SimpleNamespace(
-                id="m_stale_probe",
-                probed_duration=120.0,
-                container="mov,mp4",
-                codec="h264",
-                width=1920,
-                height=1080,
-                frame_rate=24.0,
-                source_fingerprint="current-playback-fingerprint",
-                audio_metadata=[],
-            )
-            db = SimpleNamespace(add=lambda _value: None, commit=AsyncMock())
-            refreshed_probe = {
-                "probed_duration": 120.0,
-                "container": "mov,mp4",
-                "codec": "hevc",
-                "width": 1920,
-                "height": 1080,
-                "frame_rate": 59.94,
-                "source_fingerprint": "current-playback-fingerprint",
-                "video_fingerprint": "current-video-fingerprint",
-                "audio_metadata": [],
-                "stream_manifest": [],
-            }
-
-            with (
-                patch("routes.playback.merge_local_external_audio", return_value=[]),
-                patch("routes.playback.playback_source_fingerprint", return_value="current-playback-fingerprint"),
-                patch("routes.playback.probe_completed_media", new=AsyncMock(return_value=refreshed_probe)) as probe,
-            ):
-                asyncio.run(ensure_source_metadata(db, media, source))
-
+            media.audio_metadata = measured["audio_metadata"]
+            with patch("routes.playback.probe_completed_media", new=AsyncMock(wraps=probe_completed_media)) as probe:
+                async def refresh_metadata():
+                    async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                        db.add(media)
+                        await db.commit()
+                        await ensure_source_metadata(db, media, source)
+                asyncio.run(refresh_metadata())
             probe.assert_awaited_once_with(str(media_path))
-            self.assertEqual(media.codec, "hevc")
-            self.assertEqual(media.frame_rate, 59.94)
+            self.assertEqual(media.codec, "h264")
+            self.assertEqual(media.frame_rate, 24)
+            self.assertEqual((media.width, media.height), (640, 360))
+            self.assertAlmostEqual(media.probed_duration, 120, places=5)
             portable = json.loads(metadata_path.read_text(encoding="utf-8"))
-            self.assertEqual(portable["codec"], "hevc")
-            self.assertEqual(portable["video_fingerprint"], "current-video-fingerprint")
+            self.assertEqual(portable["codec"], "h264")
+            self.assertEqual(portable["video_fingerprint"], source.video_fingerprint)
+            self.assertEqual(portable["analysis"], json.loads(media.analysis_metadata_str))
 
     def test_ingest_preview_is_protected_and_survives_local_catalog_handoff(self) -> None:
         task_id = f"preview-{uuid.uuid4().hex}"

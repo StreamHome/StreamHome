@@ -43,11 +43,15 @@ class _HeaderProtectedMediaHandler(BaseHTTPRequestHandler):
         self._serve(send_body=False)
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
-        self._serve(send_body=True)
+        try:
+            self._serve(send_body=True)
+        except (BrokenPipeError, ConnectionResetError):
+            # Controlled input inspection closes its bounded preflight read.
+            pass
 
     def _serve(self, *, send_body: bool) -> None:
         headers_match = (
-            self.headers.get("X-StreamHome-Test") == EXPECTED_HEADER
+            self.headers.get("User-Agent") == EXPECTED_HEADER
             and self.headers.get("Referer") == EXPECTED_REFERER
         )
         if not headers_match:
@@ -396,11 +400,12 @@ class FFmpegHeaderRegression(unittest.TestCase):
                         video_url=f"http://127.0.0.1:{port}/long-source.mp4",
                         audio_url=None,
                         headers={
-                            "X-StreamHome-Test": EXPECTED_HEADER,
+                            "User-Agent": EXPECTED_HEADER,
                             "Referer": EXPECTED_REFERER,
                         },
                         output_path=str(output_path),
                         duration_secs=16.0,
+                        client_address="127.0.0.1",
                     )
                 )
                 ready_before_completion = False
@@ -443,6 +448,7 @@ class FFmpegHeaderRegression(unittest.TestCase):
                     probe_media_stream(
                         f"http://127.0.0.1:{port}/missing-master.txt",
                         headers={"Referer": EXPECTED_REFERER},
+                        client_address="127.0.0.1",
                     )
                 )
             finally:
@@ -476,11 +482,12 @@ class FFmpegHeaderRegression(unittest.TestCase):
                         video_url=f"http://127.0.0.1:{port}/source.mp4",
                         audio_url=None,
                         headers={
-                            "X-StreamHome-Test": EXPECTED_HEADER,
+                            "User-Agent": EXPECTED_HEADER,
                             "Referer": EXPECTED_REFERER,
                         },
                         output_path=str(output_path),
                         duration_secs=1.0,
+                        client_address="127.0.0.1",
                     )
                 )
             finally:
@@ -515,6 +522,7 @@ class FFmpegHeaderRegression(unittest.TestCase):
                     probe_media_stream(
                         source_url,
                         headers={"Referer": EXPECTED_REFERER},
+                        client_address="127.0.0.1",
                     )
                 )
                 failure = probe.get("failure")
@@ -532,6 +540,7 @@ class FFmpegHeaderRegression(unittest.TestCase):
                         output_path=str(output_path),
                         duration_secs=2.0,
                         video_source_type=probe["video_source_type"],
+                        client_address="127.0.0.1",
                     )
                 )
             finally:
@@ -570,6 +579,7 @@ class FFmpegHeaderRegression(unittest.TestCase):
                         headers={"Referer": EXPECTED_REFERER},
                         video_source_type="hls",
                         audio_source_type="hls",
+                        client_address="127.0.0.1",
                     )
                 )
                 failure = probe.get("failure")
@@ -589,6 +599,7 @@ class FFmpegHeaderRegression(unittest.TestCase):
                         duration_secs=2.0,
                         video_source_type="hls",
                         audio_source_type="hls",
+                        client_address="127.0.0.1",
                     )
                 )
             finally:

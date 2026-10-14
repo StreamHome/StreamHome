@@ -35,8 +35,12 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_bootstrap_import_does_not_import_application_modules(self) -> None:
-        forbidden = {"config", "db", "main", "application", "models", "services", "routes"}
-        self.assertTrue(forbidden.isdisjoint(sys.modules))
+        result = subprocess.run([sys.executable, "-c",
+            "import sys; from lifecycle import bootstrap; "
+            "assert {'config','db','main','application','models','services','routes'}.isdisjoint(sys.modules); "
+            "assert not any(name.startswith(('services.','routes.')) for name in sys.modules)"],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_missing_state_is_normal_and_read_only(self) -> None:
         context = bootstrap.evaluate_startup(self.root, {}, install=False)

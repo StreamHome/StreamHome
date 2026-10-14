@@ -46,19 +46,18 @@ def test_local_publication_can_roll_back_and_finalize() -> None:
             staging = root / "temp" / "ingestion" / "task-1" / "Movies" / "Movie_TMDB_1"
             staging.mkdir(parents=True)
             (staging / "movie.mp4").write_bytes(b"replacement")
-            backup = manager._publish_local_directory(str(staging), str(destination), "task-1")
-            assert backup is not None
+            from lifecycle.media_publication import MediaMutation
+            operation = MediaMutation("m_1")
+            operation.publish_directory(str(staging), str(destination))
             assert (destination / "movie.mp4").read_bytes() == b"replacement"
-            manager._rollback_local_publication(str(destination), backup, "task-1")
+            asyncio.run(operation.compensate())
+            asyncio.run(operation.cleanup())
             assert (destination / "movie.mp4").read_bytes() == b"previous"
 
-            staging = root / "temp" / "ingestion" / "task-2" / "Movies" / "Movie_TMDB_1"
-            staging.mkdir(parents=True)
-            (staging / "movie.mp4").write_bytes(b"committed")
-            backup = manager._publish_local_directory(str(staging), str(destination), "task-2")
-            manager._finalize_local_publication("task-2")
-            assert (destination / "movie.mp4").read_bytes() == b"committed"
-            assert backup is not None and not Path(backup).exists()
+            operation = MediaMutation("m_1")
+            operation.publish_directory(str(staging), str(destination))
+            asyncio.run(operation.cleanup())
+            assert (destination / "movie.mp4").read_bytes() == b"replacement"
     finally:
         settings.MEDIA_DIR = original_media_dir
         settings.TEMP_DIR = original_temp_dir
@@ -131,35 +130,9 @@ def test_completed_task_rejects_late_failure() -> None:
     asyncio.run(_completed_task_rejects_late_failure())
 
 
-def test_queue_source_keeps_post_publication_work_best_effort() -> None:
-    source = Path(queue_module.__file__).read_text(encoding="utf-8")
-    final_fingerprint = source.index("            final_fingerprint = prepared_fingerprint")
-    finalization_start = source.index(
-        "            async with AsyncSession(engine, expire_on_commit=False) as db:",
-        final_fingerprint,
-    )
-    finalization = source[finalization_start:source.index("            if uploaded_to_cloud", finalization_start)]
-    commit = finalization.index("await db.commit()")
-    completion_guard = finalization.index("task_completed = True", commit)
-    playback_schedule = finalization.index("await self._schedule_playback_baseline", completion_guard)
-    assert commit < completion_guard < playback_schedule
-    assert "AsyncSession(engine, expire_on_commit=False)" in finalization
-    assert "created_artifacts.clear()" in finalization[commit:playback_schedule]
-    assert "if task.status == \"COMPLETED\"" in source
-    assert "shutil.rmtree(dest_dir)" not in source
-    assert '"sync",\n                local_dir,\n                staging_remote,' in source
-    assert 'rclone_service.run("moveto", target_remote, backup_remote' in source
-    assert "await self._rollback_cloud_publication" in source
-    recovery = source[source.index("    async def sync_media_from_disk"):]
-    assert '"lsf",' in recovery
-    assert "cloud_inventory" in recovery
-    assert "await verify_media_exists(rel_path)" not in recovery
-
-
 if __name__ == "__main__":
     test_atomic_json_replacement()
     test_local_publication_can_roll_back_and_finalize()
     test_storage_reservations_cover_concurrent_capacity()
     test_completed_task_rejects_late_failure()
-    test_queue_source_keeps_post_publication_work_best_effort()
     print("Queue publication regression checks passed.")

@@ -215,7 +215,13 @@ Possible source types include:
 * direct MP4 files;
 * direct WebM files;
 * HLS manifests;
-* other formats supported by the installed FFmpeg version.
+* direct Matroska, AVI, MPEG, MPEG-TS, FLV, H.264 and HEVC media supported by the installed FFmpeg version.
+
+HTTP sources and every HLS playlist, key and segment are fetched by the server's
+validated source transport. Native media tools receive temporary local relay
+inputs and do not inherit ambient proxy settings. DASH, concat playlists and
+other external-loader formats are unavailable; downloading or disguising one as
+a completed local media file does not grant permission to load its resources.
 
 Direct file example:
 

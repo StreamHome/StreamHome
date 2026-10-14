@@ -8,11 +8,14 @@ import aiofiles
 import traceback
 import uuid
 import subprocess
+from contextlib import AsyncExitStack
 from typing import Dict, Any, Optional
 from services.state import update_task_metrics, remove_task_metrics, register_process, unregister_process, ACTIVE_PROCESSES
 from services.logger import logger
 from services.ingestion_errors import IngestionFailure, classify_failure, sanitize_url, write_task_diagnostics
-from services.ffmpeg_input import ffmpeg_network_input_options, is_http_media_source
+from services.ffmpeg_input import ffmpeg_network_input_options, is_http_media_source, local_media_input_options, native_media_environment
+from services.controlled_source import controlled_media_input
+from services.ingestion_security import UnsafeIngestionSource, source_request_failure
 from services.ingest_preview import ingest_preview_service
 from services.media_timing import canonical_audio_filter_chain
 from lifecycle.coordination import run_cancellation_safe_thread
@@ -103,6 +106,7 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float, preview_enab
         # Popen kullanarak süreci başlatıyoruz. Windows'ta ekstra CMD penceresi açılmasını engelliyoruz.
         process = subprocess.Popen(
             cmd,
+            env=native_media_environment(),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
@@ -233,6 +237,40 @@ async def download_and_merge(
     audio_source_type: str = "auto",
     preview_enabled: bool = True,
     audio_timeline_offset: float = 0.0,
+    client_address: str = "",
+) -> tuple[bool, Optional[IngestionFailure]]:
+    """Give FFmpeg only scoped local inputs whose upstream fetches are pinned."""
+    try:
+        async with AsyncExitStack() as inputs:
+            selected_video = video_url
+            selected_audio = audio_url
+            if is_http_media_source(video_url):
+                selected_video = await inputs.enter_async_context(controlled_media_input(
+                    video_url, headers=headers, client_address=client_address, source_type=video_source_type,
+                ))
+            if audio_url and is_http_media_source(audio_url):
+                selected_audio = await inputs.enter_async_context(controlled_media_input(
+                    audio_url, headers=headers, client_address=client_address, source_type=audio_source_type,
+                ))
+            return await _download_and_merge_controlled(
+                task_id, selected_video, selected_audio, {}, output_path, duration_secs,
+                video_source_type, audio_source_type, preview_enabled, audio_timeline_offset,
+            )
+    except (UnsafeIngestionSource, httpx.HTTPError, TimeoutError) as error:
+        return False, source_request_failure(error)
+
+
+async def _download_and_merge_controlled(
+    task_id: str,
+    video_url: str,
+    audio_url: Optional[str],
+    headers: Dict[str, str],
+    output_path: str,
+    duration_secs: float,
+    video_source_type: str = "auto",
+    audio_source_type: str = "auto",
+    preview_enabled: bool = True,
+    audio_timeline_offset: float = 0.0,
 ) -> tuple[bool, Optional[IngestionFailure]]:
     """Download video/audio streams, merge losslessly, inject headers, track progress."""
     
@@ -249,14 +287,14 @@ async def download_and_merge(
     is_video_http = is_http_media_source(video_url)
     if headers_str.strip() and is_video_http:
         input_cmd.extend(["-headers", headers_str])
-    input_cmd.extend(ffmpeg_network_input_options(video_url, video_source_type))
+    input_cmd.extend(ffmpeg_network_input_options(video_url, video_source_type) if is_video_http else local_media_input_options())
     input_cmd.extend(["-i", video_url])
     
     if audio_url:
         is_audio_http = is_http_media_source(audio_url)
         if headers_str.strip() and is_audio_http:
             input_cmd.extend(["-headers", headers_str])
-        input_cmd.extend(ffmpeg_network_input_options(audio_url, audio_source_type))
+        input_cmd.extend(ffmpeg_network_input_options(audio_url, audio_source_type) if is_audio_http else local_media_input_options())
         input_cmd.extend(["-i", audio_url])
         
     output_root, output_ext = os.path.splitext(abs_output_path)

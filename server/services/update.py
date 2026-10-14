@@ -170,7 +170,7 @@ def read_update_state_strict() -> dict[str, Any]:
 
 @contextmanager
 def _update_state_lock():
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    RUN_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     with STATUS_LOCK_PATH.open("a+b") as lock_file:
         if sys.platform == "win32":
             import msvcrt
@@ -1209,7 +1209,7 @@ async def reconcile_orphaned_update() -> bool:
     safe_transaction = transaction if transaction.replace("-", "").isalnum() else "legacy"
     request_path = RUN_DIR / f"update-recovery.{safe_transaction}.requested"
     try:
-        request_path.parent.mkdir(parents=True, exist_ok=True)
+        request_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with request_path.open("x", encoding="utf-8") as request_file:
             request_file.write(f"{time.time():.6f}\n")
     except FileExistsError:
@@ -1320,6 +1320,9 @@ async def queue_update(
             raise RuntimeError(str(status.get("error") or "no_update_available"))
         if target == status.get("failed_target") and not allow_failed_target:
             raise RuntimeError("failed_target_suppressed")
+        previous = await current_commit()
+        if not COMMIT_RE.fullmatch(previous):
+            raise RuntimeError("invalid_installed_commit")
         claimed = _reserve_update_lifecycle()
         operation = claimed.active_operation
         if operation is None:  # pragma: no cover - claim contract
@@ -1346,7 +1349,8 @@ async def queue_update(
                 transaction_id=operation.operation_id,
                 lifecycle_generation=claimed.generation,
                 lifecycle_phase=lifecycle_state.LifecyclePhase.RESERVED.value,
-                previous_commit="",
+                current_commit=previous,
+                previous_commit=previous,
                 staging_dir="",
                 web_artifacts_swapped=False,
                 web_dependencies_swapped=False,
@@ -1470,6 +1474,9 @@ async def prepare_update_cutover(
         operation = current.active_operation
         if operation is None or operation.operation_type is not lifecycle_state.OperationType.UPDATE:
             raise RuntimeError("lifecycle_conflict")
+        previous = str(journal.get("previous_commit") or "")
+        if not COMMIT_RE.fullmatch(previous) or await current_commit() != previous:
+            raise RuntimeError("invalid_installed_commit")
         coordinator = get_runtime_coordinator()
         snapshot = coordinator.close_admission(
             list(EffectClass),
@@ -1484,6 +1491,8 @@ async def prepare_update_cutover(
             if cancellation_path.exists() or cancellation_path.is_symlink():
                 coordinator.release_fence(snapshot)
                 raise RuntimeError("update_cancelled")
+            if await current_commit() != previous:
+                raise RuntimeError("invalid_installed_commit")
             lifecycle_state.transition_operation_with_credential(
                 WORKSPACE_ROOT,
                 operation_id=operation_id,
@@ -1622,7 +1631,12 @@ async def launch_queued_update_if_ready() -> bool:
             return False
         target = str(status.get("target_commit") or "")
         current = await current_commit()
-        if not COMMIT_RE.fullmatch(target) or not COMMIT_RE.fullmatch(current):
+        previous = str(status.get("previous_commit") or "")
+        if (
+            not COMMIT_RE.fullmatch(target)
+            or not COMMIT_RE.fullmatch(current)
+            or current != previous
+        ):
             _record_terminal_update(
                 status,
                 phase="failed",
@@ -1682,7 +1696,7 @@ async def launch_queued_update_if_ready() -> bool:
                     operation_id=lifecycle_identity[0],
                     generation=lifecycle_identity[1],
                     target_commit=target,
-                    previous_commit=current,
+                    previous_commit=previous,
                     automatic=bool(status.get("automatic")),
                     install_mode=str(status.get("install_mode") or "when_idle"),
                     update_branch=str(status.get("update_branch") or settings.UPDATE_BRANCH),

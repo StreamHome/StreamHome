@@ -1,5 +1,6 @@
 import os
 import sys
+import unittest
 from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -99,13 +100,25 @@ def test_ingestion_and_hevc_commands_preserve_stream_contracts() -> None:
     assert '"-c:s", "mov_text"' in ffmpeg_source
     assert '"-map",\n                    "0"' in hevc_source
     assert '"-c",\n                    "copy"' in hevc_source
-    assert "os.link(file_path, rollback_file)" in hevc_source
     assert "without generating lossy sidecars" in audio_source
     assert '"libmp3lame"' not in audio_source
+
+
+def test_hevc_publication_settles_acceptance_and_compensation() -> None:
+    # Actual filesystem/SQLite outcomes remain authoritative when capture moves
+    # into cancellation-safe thread settlement; source spelling is not proof.
+    from tests.media.test_hevc_mutation import HEVCMutationTests
+
+    suite = unittest.TestSuite(HEVCMutationTests(name) for name in (
+        "test_cancel_immediately_after_replace_restores_original",
+        "test_cancel_during_successful_commit_retains_accepted_video",
+    ))
+    assert unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful()
 
 
 if __name__ == "__main__":
     test_hevc_validation_requires_complete_stream_preservation()
     test_embedded_audio_uses_absolute_ffmpeg_stream_identity()
     test_ingestion_and_hevc_commands_preserve_stream_contracts()
+    test_hevc_publication_settles_acceptance_and_compensation()
     print("Media preservation regression checks passed.")

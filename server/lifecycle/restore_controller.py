@@ -30,7 +30,8 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 import uuid
 
-from . import backup_manifest, state
+from . import backup_manifest, database_lineage, state
+from .configuration_paths import ConfigurationPathError, resolve_temp_directory
 
 
 JOURNAL_SCHEMA_VERSION = 1
@@ -684,6 +685,57 @@ def update_restore_journal(
         os.close(descriptor)
 
 
+def accept_guarded_runtime(
+    root: str | os.PathLike[str], operation_id: str, *, generation: int, decision: str
+) -> dict[str, Any]:
+    """Commit or repeat one exact acceptance without rewinding recovery progress."""
+    if decision not in {"accept", "rollback"}:
+        raise RestoreConflictError("unsupported restore acceptance decision")
+    paths = restore_paths(root, operation_id)
+    descriptor = _journal_lock(paths)
+    try:
+        # Generation transfer takes journal then authority locks as well. Holding
+        # both prevents a stale guarded request from accepting a transferred owner.
+        with state.hold_operation_with_credential(
+            root, operation_id=operation_id, generation=generation,
+            expected_phase=state.LifecyclePhase.VERIFYING,
+            expected_operation_type=state.OperationType.RESTORE,
+        ) as authority:
+            if authority.active_operation.owner_kind is not state.OwnerKind.RESTORE_CONTROLLER:
+                raise RestoreConflictError("restore acceptance owner does not match")
+            before = _validate_journal(_read_json(paths.journal_path), paths)
+            if before["generation"] != generation:
+                raise RestoreConflictError("restore acceptance generation does not match")
+            outcome = "accepted" if decision == "accept" else "rolled_back"
+            if before["accepted"]:
+                if before["outcome"] != outcome:
+                    raise RestoreConflictError("restore acceptance decision cannot change")
+                if before["progress"] not in {RestoreProgress.ACCEPTED.value, RestoreProgress.NORMAL_RECOVERY.value}:
+                    raise RestoreConflictError("restore acceptance progress is not resumable")
+                # An interrupted earlier response may have followed an uncertain
+                # fsync outcome. Reaffirm durability before acknowledging a retry.
+                try:
+                    journal_fd = os.open(paths.journal_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                    try:
+                        os.fsync(journal_fd)
+                    finally:
+                        os.close(journal_fd)
+                    _fsync_directory(paths.operation_dir)
+                except OSError as exc:
+                    raise RestorePersistenceError("restore acceptance durability could not be reaffirmed") from exc
+                return before
+            payload = {**before, "accepted": True, "outcome": outcome,
+                       "progress": (RestoreProgress.ACCEPTED.value if decision == "accept" else RestoreProgress.NORMAL_RECOVERY.value),
+                       "updated_at": time.time()}
+            validated = _validate_journal(payload, paths)
+            _validate_journal_transition(before, validated)
+            _atomic_write_json(paths.journal_path, validated)
+            return validated
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def record_restore_completion_intent(
     paths: RestorePaths, *, generation: int, outcome: str
 ) -> None:
@@ -692,11 +744,6 @@ def record_restore_completion_intent(
     journal = read_restore_journal(paths.root, paths.operation_id)
     current = state.inspect_state(paths.root)
     operation = current.active_operation
-    expected = (
-        (journal.get("staged_size"), journal.get("staged_sha256"))
-        if outcome == "succeeded"
-        else (journal.get("rollback_activation_size"), journal.get("rollback_activation_sha256"))
-    )
     if (
         operation is None
         or operation.operation_id != paths.operation_id
@@ -707,17 +754,21 @@ def record_restore_completion_intent(
         or not journal["accepted"]
         or journal["outcome"] != ("accepted" if outcome == "succeeded" else "rolled_back")
         or outcome not in {"succeeded", "rolled_back"}
-        or expected[1] is None
-        or artifact_identity(paths.database_path) != expected
+        or not installed_database_is_recognized(paths, journal)
     ):
         raise RestoreConflictError("restore completion evidence is not exact")
+    completion_snapshot = paths.operation_dir / "completion.db"
+    _copy_sqlite(paths.database_path, completion_snapshot, source_standalone=False)
+    size, digest = artifact_identity(completion_snapshot)
+    if not installed_database_is_recognized(paths, journal):
+        raise RestoreConflictError("restore database continuity changed during completion")
     marker = {
-        "schema_version": 1,
+        "schema_version": 2,
         "operation_id": paths.operation_id,
         "generation": generation,
         "outcome": outcome,
-        "canonical_size": expected[0],
-        "canonical_sha256": expected[1],
+        "canonical_size": size,
+        "canonical_sha256": digest,
     }
     _atomic_write_json(paths.operation_dir / "completion-intent.json", marker)
 
@@ -740,7 +791,7 @@ def reconcile_restore_completion_intent(
             "canonical_size", "canonical_sha256",
         } or (
             type(marker["schema_version"]) is not int
-            or marker["schema_version"] != 1
+            or marker["schema_version"] not in {1, 2}
             or marker["operation_id"] != operation_id
             or type(marker["generation"]) is not int
             or marker["generation"] != generation
@@ -764,10 +815,20 @@ def reconcile_restore_completion_intent(
             or journal["outcome"] != (
                 "accepted" if marker["outcome"] == "succeeded" else "rolled_back"
             )
-            or expected != (marker["canonical_size"], marker["canonical_sha256"])
-            or artifact_identity(paths.database_path) != expected
+            or not installed_database_is_recognized(paths, journal)
         ):
             return False
+        if marker["schema_version"] == 1:
+            if expected != (marker["canonical_size"], marker["canonical_sha256"]) or artifact_identity(paths.database_path) != expected:
+                return False
+        else:
+            # Once authority completes, normal coordinated writers may resume.
+            # The immutable, private snapshot authenticates the exact completion
+            # point; activation lineage authenticates continuity of the live DB.
+            snapshot = paths.operation_dir / "completion.db"
+            validate_sqlite_database(snapshot, standalone=True)
+            if artifact_identity(snapshot) != (marker["canonical_size"], marker["canonical_sha256"]):
+                return False
         update_restore_journal(
             paths.root,
             operation_id,
@@ -909,6 +970,47 @@ def artifact_identity(path: Path) -> tuple[int, str]:
     if not stat.S_ISREG(st.st_mode) or path.is_symlink():
         raise RestoreValidationError("restore artifact is not a regular file")
     return st.st_size, _sha256(path)
+
+
+def installed_database_is_recognized(paths: RestorePaths, journal: Mapping[str, Any]) -> bool:
+    """Verify activation continuity; legacy artifacts retain exact-hash semantics."""
+    rollback = journal.get("outcome") == "rolled_back" or journal.get("activation_state") in {
+        ActivationState.ROLLBACK_STARTED.value, ActivationState.ROLLBACK_COMPLETED.value,
+    }
+    kind = "rollback" if rollback else "candidate"
+    expected = (
+        (journal.get("rollback_activation_size"), journal.get("rollback_activation_sha256"))
+        if rollback else (journal.get("staged_size"), journal.get("staged_sha256"))
+    )
+    input_digest = journal.get("rollback_sha256") if rollback else journal.get("candidate_sha256")
+    binding = paths.operation_dir / f"{kind}-lineage.json"
+    try:
+        if not expected[1]:
+            return False
+        validate_sqlite_database(paths.database_path)
+        if not binding.exists() and not binding.is_symlink():
+            return artifact_identity(paths.database_path) == expected
+        database_lineage.verify_installed(
+            paths.database_path, binding, operation_id=paths.operation_id,
+            generation=int(journal["generation"]), kind=kind,
+            input_sha256=str(input_digest), activation_identity=expected,
+        )
+        return True
+    except (RestoreError, database_lineage.LineageError, OSError, sqlite3.Error, ValueError, TypeError):
+        return False
+
+
+def consistent_database_identity(paths: RestorePaths) -> tuple[int, str]:
+    """Hash a SQLite backup snapshot, including committed WAL, under writer drain."""
+    snapshot = paths.operation_dir / f".completion-snapshot.{secrets.token_hex(8)}.db"
+    try:
+        _copy_sqlite(paths.database_path, snapshot, source_standalone=False)
+        return artifact_identity(snapshot)
+    finally:
+        try:
+            snapshot.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def captured_work_has_effect(
@@ -1074,6 +1176,7 @@ def _close_sqlite_journal(database_path: Path) -> None:
 
 
 def create_rollback_checkpoint(paths: RestorePaths) -> tuple[int, str, int, str]:
+    require_no_media_publication_evidence(paths.root)
     _close_sqlite_journal(paths.database_path)
     previous_size, previous_hash = artifact_identity(paths.database_path)
     _copy_sqlite(paths.database_path, paths.rollback_path, source_standalone=True)
@@ -1095,10 +1198,17 @@ def stage_candidate(paths: RestorePaths, journal: Mapping[str, Any]) -> tuple[in
     if paths.candidate_path.stat().st_dev != paths.database_path.parent.stat().st_dev:
         raise RestorePersistenceError("restore staging is not on the canonical database filesystem")
     validate_sqlite_database(paths.candidate_path, standalone=True)
-    return artifact_identity(paths.candidate_path)
+    return database_lineage.stamp_candidate(
+        paths.candidate_path, operation_id=paths.operation_id,
+        generation=int(journal["generation"]), kind="candidate",
+        input_sha256=str(journal["candidate_sha256"]),
+        binding_path=paths.operation_dir / "candidate-lineage.json",
+        write_binding=_atomic_write_json,
+    )
 
 
 def activate_staged_candidate(paths: RestorePaths, journal: Mapping[str, Any]) -> None:
+    require_no_media_publication_evidence(paths.root)
     size, digest = artifact_identity(paths.candidate_path)
     if size != journal.get("staged_size") or not hmac.compare_digest(
         digest, str(journal.get("staged_sha256") or "")
@@ -1122,6 +1232,7 @@ def activate_staged_candidate(paths: RestorePaths, journal: Mapping[str, Any]) -
 
 
 def restore_rollback_checkpoint(paths: RestorePaths, journal: Mapping[str, Any]) -> None:
+    require_no_media_publication_evidence(paths.root)
     size, digest = artifact_identity(paths.rollback_path)
     if size != journal.get("rollback_size") or not hmac.compare_digest(
         digest, str(journal.get("rollback_sha256") or "")
@@ -1132,16 +1243,26 @@ def restore_rollback_checkpoint(paths: RestorePaths, journal: Mapping[str, Any])
     # against the rollback database.
     _close_sqlite_journal(paths.database_path)
     staged = paths.operation_dir / "rollback-activation.db"
-    _copy_sqlite(paths.rollback_path, staged)
-    activation_size, activation_hash = artifact_identity(staged)
-    update_restore_journal(
-        paths.root,
-        paths.operation_id,
-        progress=RestoreProgress.ROLLBACK_STARTED.value,
-        activation_state=ActivationState.ROLLBACK_STARTED.value,
-        rollback_activation_size=activation_size,
-        rollback_activation_sha256=activation_hash,
-    )
+    if journal["activation_state"] == ActivationState.ROLLBACK_STARTED.value:
+        if artifact_identity(staged) != (journal["rollback_activation_size"], journal["rollback_activation_sha256"]):
+            raise RestoreRecoveryRequired("pending rollback activation identity is ambiguous")
+    else:
+        _copy_sqlite(paths.rollback_path, staged)
+        activation_size, activation_hash = database_lineage.stamp_candidate(
+            staged, operation_id=paths.operation_id,
+            generation=int(journal["generation"]), kind="rollback",
+            input_sha256=str(journal["rollback_sha256"]),
+            binding_path=paths.operation_dir / "rollback-lineage.json",
+            write_binding=_atomic_write_json,
+        )
+        update_restore_journal(
+            paths.root,
+            paths.operation_id,
+            progress=RestoreProgress.ROLLBACK_STARTED.value,
+            activation_state=ActivationState.ROLLBACK_STARTED.value,
+            rollback_activation_size=activation_size,
+            rollback_activation_sha256=activation_hash,
+        )
     os.replace(staged, paths.database_path)
     os.chmod(paths.database_path, 0o600)
     _fsync_directory(paths.database_path.parent)
@@ -1151,6 +1272,22 @@ def restore_rollback_checkpoint(paths: RestorePaths, journal: Mapping[str, Any])
         progress=RestoreProgress.ROLLBACK_ACTIVATED.value,
         activation_state=ActivationState.ROLLBACK_COMPLETED.value,
     )
+
+
+def require_no_media_publication_evidence(root: Path) -> None:
+    """Never replace DB receipts while media publication recovery remains pending."""
+    try:
+        operations = resolve_temp_directory(root) / "media-operations"
+        if not operations.exists() and not operations.is_symlink():
+            return
+        if operations.is_symlink() or not operations.is_dir():
+            raise RestoreRecoveryRequired("media publication evidence root is ambiguous")
+        if any(operations.iterdir()):
+            raise RestoreRecoveryRequired("media publication recovery must finish before database restore")
+    except RestoreError:
+        raise
+    except (ConfigurationPathError, OSError) as exc:
+        raise RestoreRecoveryRequired("media publication evidence cannot be inspected safely") from exc
 
 
 def public_restore_status(root: str | os.PathLike[str], operation_id: str) -> dict[str, Any]:
@@ -1423,7 +1560,7 @@ def _start_backend(root: Path, operation_id: str, generation: int) -> tuple[subp
     try:
         os.fchmod(descriptor, 0o600)
         process = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000"],
+            [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000", "--no-proxy-headers"],
             cwd=str(root / "server"),
             env=environment,
             stdin=subprocess.DEVNULL,
@@ -1546,6 +1683,7 @@ def _start_web(root: Path, web_port: int, build: str) -> subprocess.Popen[bytes]
             "WEB_PORT": str(web_port),
             "SETUP": _read_env_value(root, "SETUP", "false"),
             "PUBLIC_URL": _read_env_value(root, "PUBLIC_URL", f"http://localhost:{web_port}"),
+            "TRUSTED_PROXY_CIDRS": _read_env_value(root, "TRUSTED_PROXY_CIDRS", "127.0.0.1/32,::1/128"),
             "STREAMHOME_BUILD_ID": build,
             "STREAMHOME_INSTANCE_ROOT": str(root),
             "STREAMHOME_INSTANCE_TOKEN": token,
@@ -1710,6 +1848,7 @@ def _recover_activation_state(paths: RestorePaths, journal: dict[str, Any]) -> d
             journal.get("rollback_activation_sha256"),
         )
         if rollback_activation.is_file() and artifact_identity(rollback_activation) == expected:
+            require_no_media_publication_evidence(paths.root)
             os.replace(rollback_activation, paths.database_path)
             os.chmod(paths.database_path, 0o600)
             _fsync_directory(paths.database_path.parent)
@@ -1769,10 +1908,15 @@ def _complete_automatic_rollback(
 
     journal = read_restore_journal(root, operation_id)
     _verify_authority(root, operation_id, generation, capability)
-    restore_rollback_checkpoint(paths, journal)
-    update_restore_journal(
-        root, operation_id, progress=RestoreProgress.VERIFYING_ROLLBACK.value
-    )
+    if journal["activation_state"] != ActivationState.ROLLBACK_COMPLETED.value:
+        restore_rollback_checkpoint(paths, journal)
+        journal = read_restore_journal(root, operation_id)
+    elif not installed_database_is_recognized(paths, journal):
+        raise RestoreRecoveryRequired("activated rollback continuity is ambiguous")
+    if journal["progress"] != RestoreProgress.VERIFYING_ROLLBACK.value:
+        update_restore_journal(
+            root, operation_id, progress=RestoreProgress.VERIFYING_ROLLBACK.value
+        )
     _start_backend(root, operation_id, generation)
     build = _build_id(root)
     _wait_guarded_ready(root, operation_id, generation, build)
@@ -1956,6 +2100,14 @@ def _run_controller(
             accepted = bool(journal["accepted"])
             accepted_on_entry = accepted
             progress = RestoreProgress(journal["progress"])
+            if (
+                journal["activation_state"] in {
+                    ActivationState.COMPLETED.value,
+                    ActivationState.ROLLBACK_COMPLETED.value,
+                }
+                and not installed_database_is_recognized(paths, journal)
+            ):
+                raise RestoreRecoveryRequired("installed restore database continuity is ambiguous")
 
             if not accepted and (
                 ActivationState(journal["activation_state"])
@@ -2048,11 +2200,7 @@ def _run_controller(
             # Once accepted, rollback is forbidden. Resume or complete normal recovery.
             build = _build_id(root)
             accepted_decision = "rollback" if journal.get("outcome") == "rolled_back" else "accept"
-            accepted_phase = (
-                state.LifecyclePhase.EXCLUSIVE
-                if accepted_decision == "rollback"
-                else state.LifecyclePhase.VERIFYING
-            )
+            accepted_phase = state.LifecyclePhase.VERIFYING
             code, live = _request_json("http://127.0.0.1:8000/api/health/live")
             if accepted_on_entry or code != 200 or live.get("mode") != "restore_verify":
                 _verify_authority(root, operation_id, generation, capability)
@@ -2060,8 +2208,7 @@ def _run_controller(
                 maintenance = _start_maintenance(root, operation_id, web_port)
                 current = _verify_authority(root, operation_id, generation, capability)
                 if (
-                    accepted_decision == "accept"
-                    and current.active_operation
+                    current.active_operation
                     and current.active_operation.phase is state.LifecyclePhase.EXCLUSIVE
                 ):
                     state.transition_operation_with_credential(

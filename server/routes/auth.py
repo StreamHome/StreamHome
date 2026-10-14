@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, update
+from sqlalchemy import case, delete, func, update
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -200,17 +200,42 @@ def check_lockout(user: User) -> None:
         raise lockout_exception(user)
 
 
+def password_matches(password: str, password_hash: str) -> bool:
+    """Reject unsupported bcrypt inputs without truncating credentials."""
+    try:
+        encoded = password.encode("utf-8")
+        if len(encoded) > 72:
+            return False
+        return bcrypt.checkpw(encoded, password_hash.encode("utf-8"))
+    except (UnicodeError, ValueError, TypeError):
+        return False
+
+
 async def register_failure(user: User, db: AsyncSession, request: Request, event_type: str) -> None:
-    user.failed_login_attempts += 1
-    if user.failed_login_attempts >= LOCKOUT_ATTEMPTS:
-        user.lockout_until = now() + LOCKOUT_SECONDS
+    # Increment the stored counter, not the request's possibly stale ORM snapshot.
+    incremented = User.failed_login_attempts + 1
+    await db.execute(
+        update(User)
+        .where(User.id == user.id)
+        .values(
+            failed_login_attempts=incremented,
+            lockout_until=case(
+                (incremented >= LOCKOUT_ATTEMPTS, now() + LOCKOUT_SECONDS),
+                else_=User.lockout_until,
+            ),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await db.refresh(user)
+    if user.lockout_until:
         logger.warning(f"[Security] Account {user.email} locked for {LOCKOUT_SECONDS} seconds")
-    db.add(user)
     await add_event(db, request, event_type, "failure", user.id, details={"locked": bool(user.lockout_until)})
     await db.commit()
 
 
-async def create_challenge(user: User, purpose: str, db: AsyncSession) -> str:
+async def create_challenge(user: User, purpose: str, db: AsyncSession, *, auth_session_id: Optional[str] = None) -> str:
+    if purpose == "reauthentication" and not auth_session_id:
+        raise ValueError("Reauthentication challenges require an initiating session.")
     raw = secrets.token_urlsafe(32)
     timestamp = now()
     await db.execute(delete(AuthChallenge).where(AuthChallenge.expires_at < timestamp))
@@ -219,6 +244,7 @@ async def create_challenge(user: User, purpose: str, db: AsyncSession) -> str:
         token_hash=token_hash(raw),
         user_id=user.id,
         purpose=purpose,
+        auth_session_id=auth_session_id,
         created_at=timestamp,
         expires_at=timestamp + settings.AUTH_CHALLENGE_MINUTES * 60,
     ))
@@ -424,7 +450,7 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
         await fail_rate_limit(db, "login_ip", request_ip, limit=30, window_seconds=LOCKOUT_SECONDS)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "invalid_credentials", "message": "Invalid email or password."})
     check_lockout(user)
-    if not bcrypt.checkpw(req.password.encode("utf-8"), user.password_hash.encode("utf-8")):
+    if not password_matches(req.password, user.password_hash):
         await register_failure(user, db, request, "login_failure")
         await fail_rate_limit(db, "login_ip", request_ip, limit=30, window_seconds=LOCKOUT_SECONDS)
         if user.lockout_until:
@@ -447,6 +473,13 @@ async def verify(req: VerifyRequest, request: Request, credentials: Optional[HTT
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "challenge_expired", "message": "This verification request expired. Sign in again."})
     check_lockout(user)
+    auth_session = None
+    if challenge.purpose == "reauthentication":
+        _, auth_session = await resolve_auth(request, credentials, db)
+        if auth_session.user_id != user.id or challenge.auth_session_id != auth_session.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Challenge does not belong to this session")
+    elif challenge.purpose != "login":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported challenge purpose")
     method = req.method.lower()
     valid = False
     used_recovery: Optional[RecoveryCode] = None
@@ -460,8 +493,12 @@ async def verify(req: VerifyRequest, request: Request, credentials: Optional[HTT
         used_recovery = code_result.scalars().first()
         valid = used_recovery is not None
     if not valid:
-        challenge.attempts += 1
-        db.add(challenge)
+        await db.execute(
+            update(AuthChallenge)
+            .where(AuthChallenge.id == challenge.id, AuthChallenge.used_at == None)
+            .values(attempts=AuthChallenge.attempts + 1)
+            .execution_options(synchronize_session=False)
+        )
         await register_failure(user, db, request, "factor_failure")
         if user.lockout_until:
             raise lockout_exception(user)
@@ -470,7 +507,7 @@ async def verify(req: VerifyRequest, request: Request, credentials: Optional[HTT
     consumed_at = now()
     challenge_claim = await db.execute(
         update(AuthChallenge)
-        .where(AuthChallenge.id == challenge.id, AuthChallenge.used_at == None, AuthChallenge.attempts < LOCKOUT_ATTEMPTS)
+        .where(AuthChallenge.id == challenge.id, AuthChallenge.used_at == None, AuthChallenge.attempts < LOCKOUT_ATTEMPTS, AuthChallenge.expires_at > consumed_at)
         .values(used_at=consumed_at)
     )
     if challenge_claim.rowcount != 1:
@@ -492,9 +529,6 @@ async def verify(req: VerifyRequest, request: Request, credentials: Optional[HTT
     if challenge.purpose == "login":
         return await issue_session(user, db, request)
     if challenge.purpose == "reauthentication":
-        _, auth_session = await resolve_auth(request, credentials, db)
-        if auth_session.user_id != user.id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Challenge does not belong to this session")
         auth_session.reauthenticated_at = now()
         db.add(auth_session)
         await add_event(db, request, "reauthentication", "success", user.id, auth_session.id)
@@ -506,13 +540,13 @@ async def verify(req: VerifyRequest, request: Request, credentials: Optional[HTT
 @router.post("/reauthenticate")
 async def reauthenticate(req: ReauthenticateRequest, request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(get_current_session), db: AsyncSession = Depends(get_session)):
     check_lockout(user)
-    if not bcrypt.checkpw(req.password.encode("utf-8"), user.password_hash.encode("utf-8")):
+    if not password_matches(req.password, user.password_hash):
         await register_failure(user, db, request, "reauthentication_failure")
         if user.lockout_until:
             raise lockout_exception(user)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"code": "invalid_credentials", "message": "The password was not accepted."})
     if user.two_factor_enabled:
-        challenge = await create_challenge(user, "reauthentication", db)
+        challenge = await create_challenge(user, "reauthentication", db, auth_session_id=session.id)
         return {"requires2fa": True, "challengeToken": challenge, "email": user.email, "expiresInSeconds": settings.AUTH_CHALLENGE_MINUTES * 60}
     session.reauthenticated_at = now()
     db.add(session)
@@ -554,7 +588,8 @@ async def security_summary(user: User = Depends(get_current_user), session: Auth
 
 @router.put("/security/email")
 async def update_email(req: UpdateEmailRequest, response: Response, request: Request, user: User = Depends(get_current_user), current: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
-    if not bcrypt.checkpw(req.current_password.encode("utf-8"), user.password_hash.encode("utf-8")):
+    check_lockout(user)
+    if not password_matches(req.current_password, user.password_hash):
         await register_failure(user, db, request, "email_change_failure")
         if user.lockout_until:
             raise lockout_exception(user)
@@ -586,9 +621,12 @@ async def update_email(req: UpdateEmailRequest, response: Response, request: Req
 
 @router.put("/security/password")
 async def update_password(req: UpdatePasswordRequest, request: Request, user: User = Depends(get_current_user), current: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
-    current_password = req.current_password.encode("utf-8")
-    new_password = req.new_password.encode("utf-8")
-    if not bcrypt.checkpw(current_password, user.password_hash.encode("utf-8")):
+    check_lockout(user)
+    try:
+        new_password = req.new_password.encode("utf-8")
+    except UnicodeError as exc:
+        raise HTTPException(status_code=422, detail={"code": "invalid_password", "message": "The new password must contain valid UTF-8 characters."}) from exc
+    if not password_matches(req.current_password, user.password_hash):
         await register_failure(user, db, request, "password_change_failure")
         if user.lockout_until:
             raise lockout_exception(user)
@@ -1004,9 +1042,16 @@ async def cancel_totp_enrollment(
 
 @router.post("/2fa/disable")
 async def disable_totp(req: TOTPDisableRequest, request: Request, user: User = Depends(get_current_user), session: AuthSession = Depends(require_recent_reauth), db: AsyncSession = Depends(get_session)):
+    check_lockout(user)
+    identity = f"{user.id}:{session.id}:{client_ip(request)}"
+    await enforce_rate_limit(db, "totp_disable", identity)
     if not user.two_factor_enabled or not user.totp_secret:
         return {"message": "TOTP is already disabled."}
     if not pyotp.TOTP(reveal_secret(user.totp_secret)).verify(req.code, valid_window=1):
+        await register_failure(user, db, request, "totp_disable_failure")
+        await fail_rate_limit(db, "totp_disable", identity, limit=5, window_seconds=300)
+        if user.lockout_until:
+            raise lockout_exception(user)
         raise HTTPException(status_code=400, detail="Invalid verification code")
     user.two_factor_enabled = False
     user.totp_secret = None
@@ -1020,6 +1065,7 @@ async def disable_totp(req: TOTPDisableRequest, request: Request, user: User = D
         db.add(item)
     await add_event(db, request, "totp_disabled", "success", user.id, session.id)
     await db.commit()
+    await clear_rate_limit(db, "totp_disable", identity)
     return {"message": "TOTP successfully disabled."}
 
 

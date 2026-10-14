@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
+from services.logger import redact_diagnostic
 
 @dataclass(frozen=True)
 class IngestionFailure:
@@ -39,11 +40,10 @@ def sanitize_url(value: str) -> str:
         return "<redacted-url>"
 
 
-_URL_PATTERN = re.compile(r"https?://[^\s'\"]+", re.IGNORECASE)
-
-
 def redact_diagnostics(value: str) -> str:
-    return _URL_PATTERN.sub(lambda match: sanitize_url(match.group(0)), value or "")
+    # Signed sources can put credentials in the path as well as the query. Apply
+    # the same complete source/header redaction to durable diagnostics as logs.
+    return redact_diagnostic(value or "")
 
 
 def compact_diagnostics(value: str, limit: int = 280) -> str:

@@ -4,6 +4,8 @@ import asyncio
 from contextlib import contextmanager
 from dataclasses import replace
 import importlib.util
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
 import sys
@@ -80,9 +82,16 @@ class WriterBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 "services.media_timing",
                 canonical_audio_filter_chain=lambda *args, **kwargs: [],
             ),
+            "services.ffmpeg_input": module_stub(
+                "services.ffmpeg_input",
+                generated_hls_input_options=lambda: [],
+                local_media_input_options=lambda: [],
+                native_media_environment=lambda: {},
+            ),
             "services.media_source": module_stub(
                 "services.media_source",
                 ResolvedMediaSource=object,
+                clear_cloud_object_cache=lambda *_args, **_kwargs: None,
                 playback_source_fingerprint=lambda *args, **kwargs: "a" * 32,
                 resolve_media_source=lambda *args, **kwargs: None,
             ),
@@ -463,6 +472,42 @@ class WriterBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     manifest.chmod(0o600)
                     self.assertFalse(await module.sync_backups_to_cloud())
                     rclone.run.assert_not_awaited()
+
+    async def test_backup_retention_and_schedule_ignore_invalid_databases(self) -> None:
+        rclone = SimpleNamespace(cloud_write_available=lambda: True, cloud_health=lambda: {}, run=mock.AsyncMock())
+        with tempfile.TemporaryDirectory() as temporary:
+            with loaded_module("services/backup.py", "backup_eligibility_test", self.backup_stubs(temporary, rclone)) as module:
+                backup_dir = Path(temporary) / "backup"
+                backup_dir.mkdir(mode=0o700)
+                old = backup_dir / "backup_20260920_120000.db"
+                newer = backup_dir / "backup_20260921_120000.db"
+                invalid = backup_dir / "backup_20260922_120000.db"
+                invalid_manifest = backup_dir / "backup_v1_20260922_120001.db"
+                self._backup_database(old, "old")
+                self._backup_database(newer, "new")
+                invalid.write_bytes(b"not SQLite")
+                invalid.chmod(0o600)
+                invalid_manifest.write_bytes(b"corrupt SQLite with matching manifest")
+                invalid_manifest.chmod(0o600)
+                module.backup_manifest.create_manifest(invalid_manifest, application_build_id="test")
+                now = datetime.now()
+                for age, path in ((72, old), (48, newer)):
+                    timestamp = (now - timedelta(hours=age)).timestamp()
+                    os.utime(path, (timestamp, timestamp))
+                with mock.patch.object(module, "get_backup_dir", return_value=str(backup_dir)):
+                    listed = module.get_local_backups()
+                    self.assertEqual(sum(item["valid"] for item in listed), 2)
+                    self.assertTrue(module.backup_due(listed, now=now))
+                    module._prune_old_backups(keep_count=1)
+                    self.assertFalse(old.exists())
+                    self.assertTrue(newer.exists())
+                    self.assertTrue(invalid.exists())
+                    self.assertTrue(invalid_manifest.exists())
+                    snapshot = module._prepare_cloud_snapshot(backup_dir)
+                    try:
+                        self.assertEqual({path.name for path in snapshot.iterdir()}, {newer.name})
+                    finally:
+                        module._remove_cloud_snapshot(snapshot)
 
 
 if __name__ == "__main__":

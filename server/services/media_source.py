@@ -210,7 +210,7 @@ def clear_cloud_object_cache() -> None:
     _cloud_object_cache.clear()
 
 
-async def cloud_object_info(remote_path: str) -> Optional[CloudObjectInfo]:
+async def cloud_object_info(remote_path: str, *, refresh: bool = False) -> Optional[CloudObjectInfo]:
     if settings.STORAGE_ENGINE != "CLOUD" or not rclone_service.executable():
         return None
     now = time.monotonic()
@@ -219,8 +219,10 @@ async def cloud_object_info(remote_path: str) -> Optional[CloudObjectInfo]:
         for expired_path in expired_paths:
             _cloud_object_cache.pop(expired_path, None)
     cached = _cloud_object_cache.get(remote_path)
-    if cached and cached[0] > now:
+    if not refresh and cached and cached[0] > now:
         return cached[1]
+    if refresh:
+        _cloud_object_cache.pop(remote_path, None)
     result = await rclone_service.run("lsjson", remote_path, "--stat", timeout=30)
     if not result.ok or not result.stdout.strip():
         return None
@@ -261,7 +263,7 @@ async def cloud_object_identity(remote_path: str) -> Optional[str]:
     return info.identity if info else None
 
 
-async def resolve_media_source(catalog_path: str, *, check_cloud: bool = True) -> ResolvedMediaSource:
+async def resolve_media_source(catalog_path: str, *, check_cloud: bool = True, require_cloud: bool = False, refresh_cloud: bool = False) -> ResolvedMediaSource:
     canonical = canonicalize_catalog_path(catalog_path)
     relative = canonical[len(CANONICAL_MEDIA_PREFIX):]
     local_path = local_path_for(canonical)
@@ -269,8 +271,8 @@ async def resolve_media_source(catalog_path: str, *, check_cloud: bool = True) -
     remote = cloud_path_for(canonical) if settings.STORAGE_ENGINE == "CLOUD" else None
     cloud_identity: Optional[str] = None
     cloud_size: Optional[int] = None
-    if check_cloud and not local_exists and remote:
-        cloud_info = await cloud_object_info(remote)
+    if check_cloud and (not local_exists or require_cloud) and remote:
+        cloud_info = await cloud_object_info(remote, refresh=refresh_cloud)
         cloud_identity = cloud_info.identity if cloud_info else None
         cloud_size = cloud_info.size if cloud_info else None
     return ResolvedMediaSource(

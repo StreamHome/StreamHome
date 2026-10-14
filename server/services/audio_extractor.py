@@ -1,14 +1,14 @@
+from lifecycle.media_work import supervised_output
 import os
 import json
 import shutil
 import asyncio
 import subprocess
-import re
 from typing import List, Dict, Any, Optional
+from services.ffmpeg_input import local_media_input_options, native_media_environment
 from services.logger import logger
 from services.languages import language_label, normalize_language_tag
 from services.state import register_process, unregister_process
-from lifecycle.coordination import run_cancellation_safe_thread
 
 def get_ffmpeg_path() -> str:
     return shutil.which("ffmpeg") or r"C:\ffmpeg\bin\ffmpeg.exe"
@@ -23,111 +23,85 @@ def normalize_language_code(value: Optional[str], fallback: str = "und") -> str:
     return normalize_language_tag(value, fallback)
 
 
-def apply_primary_audio_language(audio_metadata: List[Dict[str, Any]], selected_language: Optional[str]) -> List[Dict[str, Any]]:
+def apply_primary_audio_language(
+    audio_metadata: List[Dict[str, Any]], selected_language: Optional[str], *, record_submission: bool = True,
+) -> List[Dict[str, Any]]:
     """Make the submitted language authoritative for the default embedded track."""
 
-    if not selected_language or not audio_metadata:
+    primary_index = primary_embedded_audio_index(audio_metadata)
+    if not selected_language or primary_index is None:
         return audio_metadata
     language = normalize_language_code(selected_language, "en")
     corrected = [dict(item) for item in audio_metadata]
-    primary_index = next((idx for idx, item in enumerate(corrected) if item.get("default")), 0)
     corrected[primary_index]["language"] = language
     corrected[primary_index]["label"] = language_label(language)
+    if record_submission:
+        corrected[primary_index]["languageOverride"] = {"source": "sender", "language": language}
+    elif corrected[primary_index].get("languageOverride", {}).get("language") != language:
+        corrected[primary_index].pop("languageOverride", None)
     return corrected
 
 
-def _repair_portable_metadata(video_url: str, selected_language: str, languages: List[str], audio_metadata: List[Dict[str, Any]]) -> None:
-    if not video_url.startswith("/media/"):
-        return
-    from services.media_source import local_path_for
+def primary_embedded_audio_index(audio_metadata: List[Dict[str, Any]]) -> Optional[int]:
+    embedded = [idx for idx, item in enumerate(audio_metadata)
+        if str(item.get("source") or "embedded").lower() == "embedded"]
+    return next((idx for idx in embedded if audio_metadata[idx].get("default")),
+        embedded[0] if embedded else None)
 
-    media_path = local_path_for(video_url)
-    metadata_dir = media_path.parent / ".metadata"
-    if not metadata_dir.is_dir():
-        return
-    for metadata_path in metadata_dir.glob("metadata*.json"):
-        try:
-            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-            payload["language"] = selected_language
-            payload["original_language"] = selected_language
-            payload["languages"] = languages
-            payload["audio_metadata"] = audio_metadata
-            temporary = metadata_path.with_suffix(f"{metadata_path.suffix}.tmp")
-            temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-            os.replace(temporary, metadata_path)
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning(f"[Audio Language Repair] Could not update {metadata_path}: {exc}")
+
+def retained_primary_audio_language(
+    measured_audio: List[Dict[str, Any]],
+    *retained_audio: List[Dict[str, Any]],
+    same_video: bool,
+) -> List[Dict[str, Any]]:
+    """Keep accepted semantics for the identical primary stream of the same video.
+
+    The source proof belongs to the accepting caller. Historical accepted labels
+    remain labels; only an actual submitted override carries sender provenance.
+    Physical stream manifests and every nonprimary/external track stay measured.
+    """
+    primary = primary_embedded_audio_index(measured_audio)
+    if not same_video or primary is None:
+        return measured_audio
+    current = measured_audio[primary]
+    stream_index = current.get("streamIndex", current.get("stream_index"))
+    if stream_index is None:
+        return measured_audio
+    for tracks in retained_audio:
+        previous_index = primary_embedded_audio_index(tracks)
+        if previous_index is None:
+            continue
+        previous = tracks[previous_index]
+        if previous.get("streamIndex", previous.get("stream_index")) != stream_index:
+            continue
+        language = normalize_language_code(previous.get("language"), "")
+        if not language:
+            continue
+        corrected = [dict(item) for item in measured_audio]
+        corrected[primary]["language"] = language
+        corrected[primary]["label"] = previous.get("label") or language_label(language)
+        override = previous.get("languageOverride")
+        if isinstance(override, dict) and override.get("source") == "sender" and normalize_language_code(override.get("language"), "") == language:
+            corrected[primary]["languageOverride"] = {"source": "sender", "language": language}
+        return corrected
+    return measured_audio
+
+
+def audio_languages(audio_metadata: List[Dict[str, Any]]) -> List[str]:
+    return list(dict.fromkeys(normalize_language_code(item.get("language")) for item in audio_metadata))
 
 
 async def repair_completed_ingestion_languages() -> int:
-    """Repair catalog rows created before submitted languages overrode bad source tags."""
+    """Keep the startup hook without guessing accepted language from task history.
 
-    from db import engine
-    from models import DownloadTask, Episode, Movie
-    from services.playback_prep import playback_prep_service
-    from sqlmodel import select
-    from sqlmodel.ext.asyncio.session import AsyncSession
+    DownloadTask has no immutable association with its accepted output or primary
+    stream. Replacements and task deletion make the remaining task order ambiguous,
+    even for unmarked legacy labels. It cannot authorize catalog or portable writes.
+    Source-bound reconstruction and measurement refresh preserve accepted semantics
+    independently; an unresolvable historical language correction remains deferred.
+    """
 
-    async with AsyncSession(engine, expire_on_commit=False) as db:
-        result = await db.exec(
-            select(DownloadTask).where(
-                DownloadTask.status == "COMPLETED",
-                DownloadTask.language.is_not(None),
-            )
-        )
-        tasks = sorted(result.all(), key=lambda task: str(task.created_at or ""), reverse=True)
-        seen: set[str] = set()
-        repaired: list[tuple[str, str, List[str], List[Dict[str, Any]]]] = []
-        for task in tasks:
-            identity = (
-                f"m_{task.tmdb_id}"
-                if task.media_type == "movie"
-                else f"ep_{task.tmdb_id}_s{task.season or 1}_e{task.episode or 1}"
-            )
-            if identity in seen:
-                continue
-            seen.add(identity)
-            selected_language = normalize_language_code(task.language, "en")
-            entity = await db.get(Movie if task.media_type == "movie" else Episode, identity)
-            if not entity or not entity.video_url.startswith("/media/"):
-                continue
-            current_languages = [normalize_language_tag(value) for value in entity.languages]
-            corrected_languages = [selected_language] + [
-                value for value in current_languages if value not in {selected_language, "und"}
-            ]
-            corrected_audio = apply_primary_audio_language(entity.audio_metadata, selected_language)
-            changed = entity.languages != corrected_languages or entity.audio_metadata != corrected_audio
-            if isinstance(entity, Movie) and entity.original_language != selected_language:
-                entity.original_language = selected_language
-                changed = True
-            if not isinstance(entity, Movie):
-                show = await db.get(Movie, entity.movie_id)
-                if show and show.original_language != selected_language:
-                    show.original_language = selected_language
-                    db.add(show)
-                    changed = True
-            if not changed:
-                continue
-            entity.languages = corrected_languages
-            entity.audio_metadata = corrected_audio
-            db.add(entity)
-            repaired.append((entity.id, entity.video_url, corrected_languages, corrected_audio))
-        if repaired:
-            await db.commit()
-
-    for media_id, video_url, languages, audio_metadata in repaired:
-        playback_prep_service.cancel_media(media_id)
-        shutil.rmtree(playback_prep_service.cache_dir / re.sub(r"[^a-zA-Z0-9_.-]", "_", media_id), ignore_errors=True)
-        await run_cancellation_safe_thread(
-            _repair_portable_metadata,
-            video_url,
-            languages[0],
-            languages,
-            audio_metadata,
-        )
-    if repaired:
-        logger.info(f"[Audio Language Repair] Corrected {len(repaired)} completed catalog item(s).")
-    return len(repaired)
+    return 0
 
 
 def audio_track_labels(
@@ -181,12 +155,13 @@ async def extract_audio_and_strip_video(
     cmd_probe = [
         ffprobe, "-v", "error", "-select_streams", "a",
         "-show_entries", "stream=index:tags=language:stream_disposition=default",
-        "-of", "json", video_path
+        "-of", "json", *local_media_input_options(), video_path
     ]
     
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd_probe,
+            env=native_media_environment(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
@@ -194,7 +169,7 @@ async def extract_audio_and_strip_video(
         process_key = f"audio-probe:{id(proc)}"
         register_process(process_key, proc)
         try:
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = await supervised_output(proc, timeout=60.0)
         finally:
             unregister_process(process_key)
         if proc.returncode != 0:

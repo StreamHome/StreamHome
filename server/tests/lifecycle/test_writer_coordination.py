@@ -131,7 +131,13 @@ class WriterCoordinationContractTests(unittest.TestCase):
     def test_progressive_response_owns_actual_stream_lifetime(self) -> None:
         calls = called_names("routes/playback.py", "seekable_source_response")
         self.assertIn("admit", calls)
-        self.assertIn("bind", calls)
+        self.assertIn("LeaseBoundPlaybackResponse", calls)
+        response_class = next(node for node in parsed("routes/playback.py").body
+            if isinstance(node, ast.ClassDef) and node.name == "LeaseBoundPlaybackResponse")
+        response_calls = {node.func.attr for node in ast.walk(response_class)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        self.assertIn("bind", response_calls)
+        self.assertIn("release", response_calls)
         self.assertIn("release", calls)
         self.assertEqual(
             effect_names("routes/playback.py", "seekable_source_response"),
@@ -148,13 +154,19 @@ class WriterCoordinationContractTests(unittest.TestCase):
         ):
             with self.subTest(function=function):
                 calls = called_names("routes/playback.py", function)
+                if function == "serve_playback_subtitles":
+                    self.assertIn("_serve_playback_subtitles_locked", calls)
+                    self.assertIn("media_lock", calls)
+                    calls |= called_names("routes/playback.py", "_serve_playback_subtitles_locked")
                 self.assertIn("playback_response_lease", calls)
                 self.assertIn("LeaseBoundPlaybackResponse", calls)
 
     def test_threaded_ingestion_preserves_context_for_child_association(self) -> None:
-        node = function_node("services/ffmpeg.py", "download_and_merge")
-        self.assertIn("run_cancellation_safe_thread", called_names("services/ffmpeg.py", "download_and_merge"))
-        calls = [child for child in ast.walk(node) if isinstance(child, ast.Call)]
+        wrapper = function_node("services/ffmpeg.py", "download_and_merge")
+        node = function_node("services/ffmpeg.py", "_download_and_merge_controlled")
+        self.assertIn("_download_and_merge_controlled", called_names("services/ffmpeg.py", "download_and_merge"))
+        self.assertIn("run_cancellation_safe_thread", called_names("services/ffmpeg.py", "_download_and_merge_controlled"))
+        calls = [child for tree in (wrapper, node) for child in ast.walk(tree) if isinstance(child, ast.Call)]
         self.assertFalse(
             any(
                 isinstance(call.func, ast.Attribute)
@@ -171,7 +183,12 @@ class WriterCoordinationContractTests(unittest.TestCase):
         }
         for path, function in expected:
             with self.subTest(path=path, function=function):
-                self.assertIn("run_cancellation_safe_thread", called_names(path, function))
+                calls = called_names(path, function)
+                if path == "services/vibe_analysis.py":
+                    self.assertIn("_analyze_owned_entity", calls)
+                    self.assertIn("media_ownership", calls)
+                    calls |= called_names(path, "_analyze_owned_entity")
+                self.assertIn("run_cancellation_safe_thread", calls)
 
     def test_backup_verification_listing_and_pair_mutations_use_threaded_lock_boundary(self) -> None:
         admitted = function_node("services/backup.py", "_create_admitted_backup")

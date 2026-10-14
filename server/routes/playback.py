@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import time
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -26,16 +27,21 @@ from models import APIModel, AuthSession, DownloadTask, Episode, Movie, Playback
 from routes.auth import get_current_user
 from services.logger import logger
 from services.languages import language_label, normalize_language_tag
+from services.audio_extractor import audio_languages, primary_embedded_audio_index, retained_primary_audio_language
 from services.media_source import MediaSourceError, ResolvedMediaSource, playback_source_fingerprint, resolve_media_source
 from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
+from services.media_analysis import current_duration_analysis, duration_label, refreshed_analysis, stored_analysis
+from services.media_updates import atomic_json_write, metadata_payload, persist_portable_metadata
 from services.playback_prep import playback_prep_service
-from services.playback_source import PlaybackSourceFailure, source_reader
+from services.playback_source import LocalPlaybackSource, PlaybackSourceFailure, source_reader
 from services.ingest_preview import IngestPreviewError, ingest_preview_service
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
 from services.profile_security import require_profile_access
 from services.rclone import rclone_service
 from services.recommendation import record_playback_progress
 from lifecycle.coordination import EffectClass, WorkLease, get_runtime_coordinator, runtime_work
+from lifecycle.media_work import MediaRecoveryRequired, media_lock, media_ownership, require_resolved_media, settle
+from lifecycle.media_publication import MediaMutation
 
 
 router = APIRouter(prefix="/api/playback", tags=["Playback"])
@@ -68,7 +74,29 @@ class LeaseBoundPlaybackResponse(Response):
             with coordinator.bind(self._lease):
                 await self._response(scope, receive, send)
         finally:
-            self._lease.release()
+            iterator = getattr(self._response, "body_iterator", None)
+            close = getattr(iterator, "aclose", None)
+            try:
+                if close is not None:
+                    await settle(close())
+            finally:
+                self._lease.release()
+
+
+class MediaBoundPlaybackResponse(Response):
+    """Retain a pinned inode or cloud ownership until the response has ended."""
+
+    def __init__(self, response: Response, cleanup):
+        super().__init__(content=b"", status_code=response.status_code, media_type=response.media_type, background=response.background)
+        self.raw_headers = response.raw_headers
+        self._response = response
+        self._cleanup = cleanup
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await self._response(scope, receive, send)
+        finally:
+            await settle(self._cleanup())
 
 
 def playback_response_lease(
@@ -192,10 +220,37 @@ def playback_error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message})
 
 
+def require_playable_media(*media_ids: str) -> None:
+    try:
+        for media_id in media_ids:
+            require_resolved_media(media_id)
+    except MediaRecoveryRequired as exc:
+        raise playback_error(status.HTTP_503_SERVICE_UNAVAILABLE, "MEDIA_RECOVERY_REQUIRED", "This media publication requires recovery before playback.") from exc
+
+
+async def run_media_ownership_ids(db: AsyncSession, run_id: str) -> tuple[str, ...]:
+    # Release this lookup connection before waiting for a publisher. The actual
+    # session/profile/source authorization is repeated inside the ownership scope.
+    async with AsyncSession(db.bind) as lookup:
+        run = await lookup.get(PlaybackRun, run_id)
+        if run is None:
+            raise playback_error(status.HTTP_404_NOT_FOUND, "PLAYBACK_RUN_NOT_FOUND", "The playback run does not exist.")
+        return (run.movie_id, run.episode_id) if run.episode_id else (run.movie_id,)
+
+
 def current_auth_session(request: Request) -> AuthSession:
     auth_session = getattr(request.state, "auth_session", None)
     if not isinstance(auth_session, AuthSession):
         raise playback_error(status.HTTP_401_UNAUTHORIZED, "AUTHENTICATION_REQUIRED", "A valid signed-in session is required.")
+    return auth_session
+
+
+async def active_auth_session(db: AsyncSession, request: Request) -> AuthSession:
+    identity = current_auth_session(request).id
+    auth_session = await db.get(AuthSession, identity, populate_existing=True)
+    if not auth_session or auth_session.revoked_at or auth_session.expires_at <= time.time():
+        raise playback_error(status.HTTP_401_UNAUTHORIZED, "PLAYBACK_SESSION_REVOKED", "The signed-in session has expired or was revoked.")
+    request.state.auth_session = auth_session
     return auth_session
 
 
@@ -238,7 +293,7 @@ async def validate_playback_ticket(ticket: str, media_id: str, db: AsyncSession)
         raise playback_error(status.HTTP_403_FORBIDDEN, "PLAYBACK_TICKET_SCOPE_MISMATCH", "The playback ticket does not permit this media.")
 
     run = await db.get(PlaybackRun, str(payload["run_id"]))
-    auth_session = await db.get(AuthSession, str(payload["jti"]))
+    auth_session = await db.get(AuthSession, str(payload["jti"]), populate_existing=True)
     if not run or not auth_session:
         raise playback_error(status.HTTP_403_FORBIDDEN, "PLAYBACK_SESSION_INACTIVE", "The playback session is no longer active.")
     now = time.time()
@@ -252,6 +307,7 @@ async def validate_playback_ticket(ticket: str, media_id: str, db: AsyncSession)
         or (run.episode_id or run.movie_id) != media_id
     ):
         raise playback_error(status.HTTP_403_FORBIDDEN, "PLAYBACK_TICKET_SCOPE_MISMATCH", "The playback ticket scope is invalid.")
+    await require_profile_access(db, auth_session, run.profile_id)
 
     media_obj = await db.get(Episode, run.episode_id) if run.episode_id else await db.get(Movie, run.movie_id)
     if not media_obj:
@@ -282,7 +338,7 @@ async def resolve_run_media(db: AsyncSession, movie_id: str, episode_id: Optiona
 
 async def require_available_source(media_obj: Any) -> ResolvedMediaSource:
     try:
-        source = await resolve_media_source(media_obj.video_url)
+        source = await resolve_media_source(media_obj.video_url, refresh_cloud=True)
     except MediaSourceError as exc:
         raise playback_error(status.HTTP_409_CONFLICT, "INVALID_MEDIA_PATH", "The catalog contains an invalid playback path.") from exc
     if not source.available:
@@ -452,28 +508,15 @@ async def _synchronize_source_fingerprint_admitted(
     source: ResolvedMediaSource,
     fingerprint: str,
 ) -> None:
-    if media_obj.source_fingerprint:
-        playback_prep_service.cancel_media(media_obj.id, media_obj.source_fingerprint)
-    media_obj.source_fingerprint = fingerprint
-    db.add(media_obj)
-    await db.commit()
-    if source.local_exists:
-        metadata_path = source.local_path.parent / ".metadata" / "metadata.json"
-        try:
-            if metadata_path.is_file():
-                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-                payload["audio_metadata"] = list(media_obj.audio_metadata or [])
-                payload["source_fingerprint"] = fingerprint
-                languages = [
-                    normalize_language_tag(item.get("language"))
-                    for item in (media_obj.audio_metadata or [])
-                ]
-                payload["languages"] = list(dict.fromkeys([*languages, *(payload.get("languages") or [])]))
-                temporary = metadata_path.with_suffix(f"{metadata_path.suffix}.tmp")
-                temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-                os.replace(temporary, metadata_path)
-        except (OSError, json.JSONDecodeError, TypeError) as exc:
-            logger.warning(f"[Playback Metadata] Could not synchronize {metadata_path}: {exc}")
+    # Changing a ticket identity must never promote unbound historical proof.
+    # The shared repair path measures changed video and republishes sidecar-only
+    # identity changes while preserving proof for the same inspected video.
+    old_fingerprint = media_obj.source_fingerprint
+    await _ensure_source_metadata_admitted(db, media_obj, source)
+    if media_obj.source_fingerprint != playback_source_fingerprint(source, media_obj.audio_metadata or []):
+        raise playback_error(status.HTTP_409_CONFLICT, "MEDIA_SOURCE_CHANGED", "The inspected media source changed before acceptance.")
+    if old_fingerprint and old_fingerprint != media_obj.source_fingerprint:
+        playback_prep_service.cancel_media(media_obj.id, old_fingerprint)
 
 
 async def ensure_source_metadata(
@@ -487,12 +530,35 @@ async def ensure_source_metadata(
         "playback.metadata-repair",
         [EffectClass.DB_WRITE, EffectClass.DURABLE_MEDIA_WRITE],
     ):
-        await _ensure_source_metadata_admitted(
-            db,
-            media_obj,
-            source,
-            refresh_sidecars=refresh_sidecars,
-        )
+        try:
+            await _ensure_source_metadata_admitted(
+                db,
+                media_obj,
+                source,
+                refresh_sidecars=refresh_sidecars,
+            )
+        except MediaRecoveryRequired as exc:
+            raise playback_error(status.HTTP_503_SERVICE_UNAVAILABLE, "MEDIA_RECOVERY_REQUIRED", "The inspected media publication needs recovery.") from exc
+
+
+async def _read_cloud_portable_metadata(source: ResolvedMediaSource, temporary: Path) -> dict[str, Any]:
+    remote = f"{source.cloud_path.rsplit('/', 1)[0]}/.metadata/metadata.json"
+    destination = temporary / "previous-metadata.json"
+    state = await rclone_service.run("lsjson", remote, "--stat", timeout=30)
+    if not state.ok:
+        if state.error_code == "drive_not_found":
+            return {}
+        raise playback_error(status.HTTP_503_SERVICE_UNAVAILABLE, "CLOUD_METADATA_UNAVAILABLE", "The cloud metadata could not be inspected safely.")
+    result = await rclone_service.copyto_atomic(remote, str(destination), timeout=60)
+    if not result.ok:
+        raise playback_error(status.HTTP_503_SERVICE_UNAVAILABLE, "CLOUD_METADATA_UNAVAILABLE", "The cloud metadata could not be inspected safely.")
+    try:
+        value = json.loads(destination.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            return value
+    except (OSError, ValueError, TypeError):
+        pass
+    raise playback_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "PORTABLE_METADATA_INVALID", "The portable media metadata is invalid.")
 
 
 async def _ensure_source_metadata_admitted(
@@ -502,74 +568,137 @@ async def _ensure_source_metadata_admitted(
     *,
     refresh_sidecars: bool = False,
 ) -> None:
-    if not source.local_exists:
-        last_probe = _cloud_audio_probe_times.get(str(media_obj.id), 0)
-        if source.cloud_path and (refresh_sidecars or time.monotonic() - last_probe >= CLOUD_AUDIO_PROBE_TTL_SECONDS):
-            audio_metadata = await probe_cloud_external_audio(source.cloud_path, list(media_obj.audio_metadata or []))
-            _cloud_audio_probe_times[str(media_obj.id)] = time.monotonic()
-            if audio_metadata != list(media_obj.audio_metadata or []):
-                media_obj.audio_metadata = audio_metadata
-                db.add(media_obj)
-                await db.commit()
-        return
     previous_audio = list(media_obj.audio_metadata or [])
-    refreshed_audio = merge_local_external_audio(str(source.local_path), previous_audio)
-    audio_changed = refreshed_audio != previous_audio
-    if audio_changed:
-        media_obj.audio_metadata = refreshed_audio
-        db.add(media_obj)
-        await db.commit()
+    previous_analysis = stored_analysis(media_obj.analysis_metadata_str)
     metadata_missing = not media_obj.probed_duration or not media_obj.codec or not media_obj.width or not media_obj.height
-    source_replaced = media_obj.source_fingerprint != playback_source_fingerprint(source, media_obj.audio_metadata or [])
-    metadata_path = source.local_path.parent / ".metadata" / "metadata.json"
-    portable_metadata: dict[str, Any] | None = None
-    if metadata_path.is_file():
-        try:
-            loaded_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            if isinstance(loaded_metadata, dict):
-                portable_metadata = loaded_metadata
-        except (OSError, json.JSONDecodeError, TypeError) as exc:
-            logger.warning(f"[Playback Metadata] Could not inspect {metadata_path}: {exc}")
-    stored_video_fingerprint = str((portable_metadata or {}).get("video_fingerprint") or "")
-    video_identity_stale = portable_metadata is not None and stored_video_fingerprint != source.video_fingerprint
-    source_change_requires_probe = source_replaced and not (
-        portable_metadata is not None
-        and stored_video_fingerprint == source.video_fingerprint
-    )
-    if not metadata_missing and not video_identity_stale and not source_change_requires_probe:
+    video_identity_stale = previous_analysis.get("video_fingerprint") != source.video_fingerprint
+    requires_probe = metadata_missing or video_identity_stale or not current_duration_analysis(previous_analysis)
+    local_portable_metadata = None
+    if source.local_exists:
+        metadata_path = source.local_path.parent / ".metadata" / "metadata.json"
+        if metadata_path.is_file():
+            try:
+                local_portable_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if not isinstance(local_portable_metadata, dict):
+                    raise ValueError("Invalid portable metadata object")
+            except (OSError, ValueError, TypeError) as exc:
+                raise playback_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "PORTABLE_METADATA_INVALID", "The portable media metadata is invalid.") from exc
+            requires_probe = requires_probe or local_portable_metadata.get("video_fingerprint") != source.video_fingerprint
+        refreshed_audio = merge_local_external_audio(str(source.local_path), previous_audio)
+    else:
+        if not source.cloud_exists or not source.cloud_path:
+            raise playback_error(status.HTTP_409_CONFLICT, "MEDIA_SOURCE_MISSING", "The media source is no longer available.")
+        last_probe = _cloud_audio_probe_times.get(str(media_obj.id), 0)
+        refreshed_audio = previous_audio
+        if not requires_probe and (refresh_sidecars or time.monotonic() - last_probe >= CLOUD_AUDIO_PROBE_TTL_SECONDS):
+            refreshed_audio = await probe_cloud_external_audio(source.cloud_path, previous_audio)
+            _cloud_audio_probe_times[str(media_obj.id)] = time.monotonic()
+    source_replaced = media_obj.source_fingerprint != playback_source_fingerprint(source, refreshed_audio)
+    proof_unbound = previous_analysis.get("source_fingerprint") != media_obj.source_fingerprint
+    if not requires_probe and refreshed_audio == previous_audio and not source_replaced and not proof_unbound:
         return
-    probe = await probe_completed_media(str(source.local_path))
-    if not probe:
-        raise playback_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "MEDIA_PROBE_FAILED", "The media file could not be inspected for playback.")
-    for field in ("probed_duration", "container", "codec", "width", "height", "frame_rate"):
-        setattr(media_obj, field, probe.get(field))
-    media_obj.audio_metadata = probe.get("audio_metadata", [])
-    db.add(media_obj)
-    await db.commit()
-    if portable_metadata is not None:
-        try:
-            for field in (
-                "probed_duration",
-                "container",
-                "codec",
-                "width",
-                "height",
-                "frame_rate",
-                "source_fingerprint",
-                "video_fingerprint",
-                "audio_metadata",
-                "stream_manifest",
+
+    # Read/copy/probe every remote asset before starting a SQLite write. The
+    # immutable private spool is tied to this video's provider identity, rather
+    # than a previous catalog fingerprint or mutable remote input URL.
+    Path(settings.TEMP_DIR).mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="playback-metadata-", dir=settings.TEMP_DIR) as directory:
+        temporary = Path(directory)
+        metadata_path = source.local_path.parent / ".metadata" / "metadata.json"
+        if source.local_exists:
+            portable_metadata = local_portable_metadata or {}
+            probe = await probe_completed_media(str(source.local_path)) if requires_probe else None
+        else:
+            portable_metadata = await _read_cloud_portable_metadata(source, temporary)
+            probe = None
+            if requires_probe:
+                try:
+                    spool, process = await playback_prep_service._input_process(source, str(media_obj.id), source.video_fingerprint)
+                    if process is not None:
+                        raise RuntimeError("Cloud inspection requires a seekable spool")
+                    probe = await probe_completed_media(spool)
+                except Exception as exc:
+                    raise playback_error(status.HTTP_503_SERVICE_UNAVAILABLE, "CLOUD_PROBE_FAILED", "The cloud video could not be staged for inspection.") from exc
+                observed = await resolve_media_source(source.catalog_path, require_cloud=True, refresh_cloud=True)
+                if not observed.cloud_exists or observed.video_fingerprint != source.video_fingerprint:
+                    raise playback_error(status.HTTP_409_CONFLICT, "MEDIA_SOURCE_CHANGED", "The cloud video changed during inspection.")
+        if requires_probe and (not probe or probe.get("valid_video") is not True):
+            raise playback_error(status.HTTP_422_UNPROCESSABLE_ENTITY, "MEDIA_PROBE_FAILED", "The selected video duration could not be measured for playback.")
+        if probe:
+            refreshed_audio = list(probe.get("audio_metadata") or [])
+            retained_audio = []
+            retained_analysis = {}
+            if (
+                previous_analysis.get("video_fingerprint") == source.video_fingerprint
+                or media_obj.source_fingerprint == playback_source_fingerprint(source, previous_audio)
             ):
-                portable_metadata[field] = probe.get(field)
-            portable_metadata["languages"] = list(dict.fromkeys([
-                normalize_language_tag(item.get("language"))
-                for item in (probe.get("audio_metadata") or [])
-            ]))
-            temporary = metadata_path.with_suffix(f"{metadata_path.suffix}.tmp")
-            temporary.write_text(json.dumps(portable_metadata, indent=2, ensure_ascii=False), encoding="utf-8")
-            os.replace(temporary, metadata_path)
-        except (OSError, TypeError) as exc:
-            logger.warning(f"[Playback Metadata] Could not refresh {metadata_path}: {exc}")
+                retained_audio.append(previous_audio)
+                retained_analysis = refreshed_analysis(None, previous_analysis)
+            portable_audio = portable_metadata.get("audio_metadata") or []
+            if (
+                portable_metadata.get("video_fingerprint") == source.video_fingerprint
+                or portable_metadata.get("source_fingerprint") == playback_source_fingerprint(source, portable_audio)
+            ):
+                retained_audio.append(portable_audio)
+                if "sender_quality" not in retained_analysis:
+                    retained_analysis = refreshed_analysis(None, portable_metadata.get("analysis"))
+            refreshed_audio = retained_primary_audio_language(
+                refreshed_audio, *retained_audio, same_video=bool(retained_audio),
+            )
+            if not source.local_exists:
+                refreshed_audio = await probe_cloud_external_audio(source.cloud_path, refreshed_audio)
+                _cloud_audio_probe_times[str(media_obj.id)] = time.monotonic()
+            analysis = refreshed_analysis(probe.get("analysis"), retained_analysis)
+        else:
+            analysis = dict(previous_analysis)
+        fingerprint = playback_source_fingerprint(source, refreshed_audio)
+        analysis["video_fingerprint"] = source.video_fingerprint
+        analysis["source_fingerprint"] = fingerprint
+        payload = dict(portable_metadata) if portable_metadata else {}
+        # The current catalog owner supplies alias identity and accepted mutables;
+        # a legacy portable copy cannot select a different episode's alias.
+        payload.update(metadata_payload(media_obj))
+        if not portable_metadata:
+            series = isinstance(media_obj, Episode) or getattr(media_obj, "media_type", "movie") == "series"
+            tmdb_id = getattr(media_obj, "tmdb_id", None)
+            catalog_id = str(media_obj.movie_id if isinstance(media_obj, Episode) else media_obj.id)
+            if not tmdb_id:
+                match = re.fullmatch(r"(?:m_|tv_)([1-9][0-9]*)", catalog_id)
+                tmdb_id = int(match.group(1)) if match else None
+            payload.update(video_url=media_obj.video_url, catalog_source=getattr(media_obj, "catalog_source", "server"),
+                media_type="series" if series else "movie", release_year=getattr(media_obj, "release_year", None), tmdb_id=tmdb_id)
+            if isinstance(media_obj, Episode):
+                payload.update(season=media_obj.season_number, episode=media_obj.episode_number)
+        payload.update(analysis=analysis, source_fingerprint=fingerprint,
+            video_fingerprint=source.video_fingerprint, audio_metadata=refreshed_audio,
+            languages=audio_languages(refreshed_audio) or list(media_obj.languages))
+        primary = primary_embedded_audio_index(refreshed_audio)
+        sender_language = None
+        if primary is not None:
+            payload["language"] = refreshed_audio[primary]["language"]
+            if refreshed_audio[primary].get("languageOverride", {}).get("source") == "sender":
+                sender_language = refreshed_audio[primary]["language"]
+                payload["original_language"] = sender_language
+        if probe:
+            for field in ("probed_duration", "container", "codec", "width", "height", "frame_rate", "stream_manifest"):
+                payload[field] = probe.get(field)
+            payload["quality"] = probe.get("quality") or "Source"
+            payload["duration"] = duration_label(probe.get("probed_duration"))
+        async with MediaMutation(str(media_obj.id)) as mutation:
+            await persist_portable_metadata(source, payload, temporary)
+            if probe:
+                for field in ("probed_duration", "container", "codec", "width", "height", "frame_rate"):
+                    setattr(media_obj, field, probe.get(field))
+                media_obj.duration = payload["duration"]
+                media_obj.quality = payload["quality"]
+            media_obj.source_fingerprint = fingerprint
+            media_obj.audio_metadata = refreshed_audio
+            media_obj.languages = payload["languages"]
+            if sender_language and isinstance(media_obj, Movie):
+                media_obj.original_language = sender_language
+            media_obj.analysis_metadata_str = json.dumps(analysis)
+            db.add(media_obj)
+            await mutation.commit(db)
 
 
 async def next_playable_episode(db: AsyncSession, movie_id: str, current_id: str) -> Optional[str]:
@@ -654,6 +783,9 @@ def source_metadata(media_obj: Any) -> PlaybackSourceMetadata:
         (suffix == ".mp4" or "mp4" in container.lower())
         and str(media_obj.codec or "").lower() in {"h264", "avc", "avc1"}
         and audio_codec in {"", "aac", "mp4a", "mp3"}
+        and stored_analysis(getattr(media_obj, "analysis_metadata_str", None)).get("direct_timeline_compatible") is True
+        and current_duration_analysis(getattr(media_obj, "analysis_metadata_str", None))
+        and stored_analysis(getattr(media_obj, "analysis_metadata_str", None)).get("source_fingerprint") == media_obj.source_fingerprint
     )
     return PlaybackSourceMetadata(
         duration=media_duration_seconds(media_obj),
@@ -915,7 +1047,10 @@ async def build_run_response(
         ticket=ticket,
         ticket_expires_at=expires_at,
         manifest_url=manifest_url,
-        progressive_url=f"/api/playback/progressive/{quote(media_obj.id, safe='')}?ticket={encoded_ticket}",
+        progressive_url=(
+            f"/api/playback/progressive/{quote(media_obj.id, safe='')}?ticket={encoded_ticket}"
+            if direct_ready else ""
+        ),
         next_episode_id=next_episode_id,
         preparation_state=preparation_state,
         preparation_error=preparation_error,
@@ -932,14 +1067,15 @@ async def build_run_response(
     )
 
 
-async def authorized_run(db: AsyncSession, request: Request, run_id: str) -> PlaybackRun:
+async def authorized_run(db: AsyncSession, request: Request, run_id: str, *, allow_abandoned: bool = False) -> PlaybackRun:
     run = await db.get(PlaybackRun, run_id)
-    auth_session = current_auth_session(request)
+    auth_session = await active_auth_session(db, request)
     if not run:
         raise playback_error(status.HTTP_404_NOT_FOUND, "PLAYBACK_RUN_NOT_FOUND", "The playback run does not exist.")
     if run.auth_session_id != auth_session.id:
         raise playback_error(status.HTTP_403_FORBIDDEN, "PLAYBACK_RUN_FORBIDDEN", "This playback run belongs to another session.")
-    if run.lifecycle_state in {"expired", "abandoned"}:
+    await require_profile_access(db, auth_session, run.profile_id)
+    if run.lifecycle_state == "expired" or (run.lifecycle_state == "abandoned" and not allow_abandoned):
         raise playback_error(status.HTTP_410_GONE, "PLAYBACK_RUN_EXPIRED", "The playback run is no longer active.")
     return run
 
@@ -951,8 +1087,15 @@ async def create_playback_run(
     db: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> PlaybackRunResponse:
+    media_ids = (req.movie_id, req.episode_id) if req.episode_id else (req.movie_id,)
+    async with media_ownership(*media_ids):
+        require_playable_media(*media_ids)
+        return await _create_playback_run_locked(req, request, db, user)
+
+
+async def _create_playback_run_locked(req: PlaybackRunRequest, request: Request, db: AsyncSession, user: User) -> PlaybackRunResponse:
     run_started_at = time.monotonic()
-    auth_session = current_auth_session(request)
+    auth_session = await active_auth_session(db, request)
     await require_profile_access(db, auth_session, req.profile_id)
     movie, media_obj = await resolve_run_media(db, req.movie_id, req.episode_id)
     preview_task: Optional[DownloadTask] = None
@@ -1027,12 +1170,23 @@ async def get_playback_run(
     db: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> PlaybackRunResponse:
+    media_ids = await run_media_ownership_ids(db, run_id)
+    async with media_ownership(*media_ids):
+        require_playable_media(*media_ids)
+        return await _get_playback_run_locked(run_id, request, retry, db, user)
+
+
+async def _get_playback_run_locked(run_id: str, request: Request, retry: bool, db: AsyncSession, user: User) -> PlaybackRunResponse:
     run = await authorized_run(db, request, run_id)
     movie, media_obj = await resolve_run_media(db, run.movie_id, run.episode_id)
     if not retry and run.source_kind != "ingest_preview" and str(media_obj.video_url or "").startswith("/media/"):
         source = await require_available_source(media_obj)
         observed_fingerprint = playback_source_fingerprint(source, media_obj.audio_metadata or [])
-        if observed_fingerprint != str(media_obj.source_fingerprint or ""):
+        analysis = stored_analysis(media_obj.analysis_metadata_str)
+        if (observed_fingerprint != str(media_obj.source_fingerprint or "")
+                or not current_duration_analysis(analysis)
+                or analysis.get("video_fingerprint") != source.video_fingerprint
+                or analysis.get("source_fingerprint") != media_obj.source_fingerprint):
             await ensure_source_metadata(db, media_obj, source)
             await synchronize_source_fingerprint(db, media_obj, source)
     if retry and run.source_kind != "ingest_preview":
@@ -1068,6 +1222,13 @@ async def select_playback_quality(
     db: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> dict[str, str]:
+    media_ids = await run_media_ownership_ids(db, run_id)
+    async with media_ownership(*media_ids):
+        require_playable_media(*media_ids)
+        return await _select_playback_quality_locked(run_id, req, request, db, user)
+
+
+async def _select_playback_quality_locked(run_id: str, req: PlaybackQualityRequest, request: Request, db: AsyncSession, user: User) -> dict[str, str]:
     del user
     run = await authorized_run(db, request, run_id)
     if run.source_kind == "ingest_preview":
@@ -1208,7 +1369,9 @@ async def close_playback_run(
     db: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    run = await authorized_run(db, request, run_id)
+    run = await authorized_run(db, request, run_id, allow_abandoned=True)
+    if run.lifecycle_state == "abandoned":
+        return {"status": "abandoned", "nextSequenceNumber": run.sequence_number}
     if run.lifecycle_state == "finished":
         return {"status": "sticky_finished", "nextSequenceNumber": run.sequence_number}
     close_request = req.model_copy(update={"sequence_number": run.sequence_number, "event": "exit"})
@@ -1555,23 +1718,79 @@ async def seekable_source_response(reader: Any, request: Request):
     lease = coordinator.admit("playback.progressive-stream", [EffectClass.PLAYBACK_STREAM])
 
     async def coordinated_chunks() -> AsyncIterator[bytes]:
+        iterator = reader.open_range(start, length).__aiter__()
         try:
-            with coordinator.bind(lease):
-                async for chunk in reader.open_range(start, length):
-                    yield chunk
+            async for chunk in iterator:
+                yield chunk
         finally:
-            lease.release()
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                await settle(close())
 
     try:
-        return StreamingResponse(
-            coordinated_chunks(),
-            status_code=response_status,
-            media_type=source_stat.content_type,
-            headers=headers,
+        return LeaseBoundPlaybackResponse(
+            StreamingResponse(
+                coordinated_chunks(),
+                status_code=response_status,
+                media_type=source_stat.content_type,
+                headers=headers,
+            ),
+            lease,
         )
-    except Exception:
+    except BaseException:
         lease.release()
         raise
+
+
+async def protected_source_response(media_id: str, request: Request, ticket: str, db: AsyncSession, *, source_id: str = "main", require_progressive: bool = False):
+    # Ticket routes arrive without DB work. Acquire ownership before taking a
+    # SQLite snapshot, so waiting for a publisher never retains a DB transaction.
+    lock = media_lock(media_id)
+    await lock.acquire()
+    reader = None
+    handed_off = False
+    try:
+        require_playable_media(media_id)
+        _, _, media_obj = await validate_playback_ticket(ticket, media_id, db)
+        source = await require_available_source(media_obj)
+        observed = playback_source_fingerprint(source, media_obj.audio_metadata or [])
+        if observed != str(media_obj.source_fingerprint or ""):
+            raise playback_error(status.HTTP_409_CONFLICT, "PLAYBACK_SOURCE_CHANGED", "The media source changed. Start playback again.")
+        if require_progressive and not progressive_source_compatible(media_obj):
+            raise playback_error(
+                status.HTTP_409_CONFLICT,
+                "PROGRESSIVE_SOURCE_INCOMPATIBLE",
+                "This source requires a verified adaptive rendition for the selected video timeline.",
+            )
+        selected_source = source
+        if source_id != "main":
+            audio = next((item for item in playback_prep_service.audio_renditions(media_obj) if item.name == source_id), None)
+            if not audio or audio.source != "external":
+                raise playback_error(status.HTTP_404_NOT_FOUND, "AUDIO_SOURCE_NOT_FOUND", "The requested audio source does not exist.")
+            external_path = playback_prep_service._external_audio_path(source, audio)
+            selected_source = playback_prep_service._external_audio_source(source, audio, external_path)
+            if not selected_source:
+                raise playback_error(status.HTTP_404_NOT_FOUND, "AUDIO_SOURCE_MISSING", "The selected audio source is unavailable.")
+        reader = source_reader(selected_source, loopback_url=settings.PLAYBACK_LOOPBACK_URL)
+        if isinstance(reader, LocalPlaybackSource):
+            await reader.pin()
+            response = await seekable_source_response(reader, request)
+            lock.release()
+            cleanup = reader.close
+        else:
+            response = await seekable_source_response(reader, request)
+
+            async def cleanup():
+                lock.release()
+
+        handed_off = True
+        return MediaBoundPlaybackResponse(response, cleanup)
+    finally:
+        if not handed_off:
+            if isinstance(reader, LocalPlaybackSource):
+                await reader.close()
+            if lock.locked():
+                lock.release()
 
 
 @router.api_route("/source/{media_id}", methods=["GET", "HEAD"])
@@ -1582,23 +1801,7 @@ async def playback_source_bridge(
     source_id: str = Query("main"),
     db: AsyncSession = Depends(get_session),
 ):
-    _, _, media_obj = await validate_playback_ticket(ticket, media_id, db)
-    source = await require_available_source(media_obj)
-    selected_source = source
-    if source_id != "main":
-        audio = next(
-            (item for item in playback_prep_service.audio_renditions(media_obj) if item.name == source_id),
-            None,
-        )
-        if not audio or audio.source != "external":
-            raise playback_error(status.HTTP_404_NOT_FOUND, "AUDIO_SOURCE_NOT_FOUND", "The requested audio source does not exist.")
-        external_path = playback_prep_service._external_audio_path(source, audio)
-        external_source = playback_prep_service._external_audio_source(source, audio, external_path)
-        if not external_source:
-            raise playback_error(status.HTTP_404_NOT_FOUND, "AUDIO_SOURCE_MISSING", "The selected audio source is unavailable.")
-        selected_source = external_source
-    reader = source_reader(selected_source, loopback_url=settings.PLAYBACK_LOOPBACK_URL)
-    return await seekable_source_response(reader, request)
+    return await protected_source_response(media_id, request, ticket, db, source_id=source_id)
 
 
 @router.api_route("/progressive/{media_id}", methods=["GET", "HEAD"])
@@ -1608,10 +1811,7 @@ async def progressive_playback(
     ticket: str = Query(...),
     db: AsyncSession = Depends(get_session),
 ):
-    _, _, media_obj = await validate_playback_ticket(ticket, media_id, db)
-    source = await require_available_source(media_obj)
-    reader = source_reader(source, loopback_url=settings.PLAYBACK_LOOPBACK_URL)
-    return await seekable_source_response(reader, request)
+    return await protected_source_response(media_id, request, ticket, db, require_progressive=True)
 
 
 @router.get("/subtitles/{media_id}/{track_id}")
@@ -1621,6 +1821,16 @@ async def serve_playback_subtitles(
     ticket: str = Query(...),
     db: AsyncSession = Depends(get_session),
 ):
+    lock = media_lock(media_id)
+    await lock.acquire()
+    try:
+        require_playable_media(media_id)
+        return await _serve_playback_subtitles_locked(media_id, track_id, ticket, db)
+    finally:
+        lock.release()
+
+
+async def _serve_playback_subtitles_locked(media_id: str, track_id: str, ticket: str, db: AsyncSession):
     _, _, media_obj = await validate_playback_ticket(ticket, media_id, db)
     if not SAFE_SUBTITLE_LANGUAGE_RE.fullmatch(track_id):
         raise playback_error(status.HTTP_400_BAD_REQUEST, "INVALID_SUBTITLE_LANGUAGE", "The subtitle language is invalid.")
@@ -1631,8 +1841,11 @@ async def serve_playback_subtitles(
     if not file_name:
         raise playback_error(status.HTTP_404_NOT_FOUND, "SUBTITLE_NOT_FOUND", "The requested subtitle track is unavailable.")
     source = await require_available_source(media_obj)
+    if playback_source_fingerprint(source, media_obj.audio_metadata or []) != str(media_obj.source_fingerprint or ""):
+        raise playback_error(status.HTTP_409_CONFLICT, "PLAYBACK_SOURCE_CHANGED", "The media source changed. Start playback again.")
     subtitle_path = source.local_path.parent / file_name
     lease = playback_response_lease("playback.subtitle", disposable_cache=True)
+    reader = None
     try:
         if not subtitle_path.is_file() and source.cloud_path:
             remote_subtitle = f"{source.cloud_path.rsplit('/', 1)[0]}/{file_name}"
@@ -1642,10 +1855,18 @@ async def serve_playback_subtitles(
                 subtitle_path = cache_path
         if not subtitle_path.is_file():
             raise playback_error(status.HTTP_404_NOT_FOUND, "SUBTITLE_NOT_FOUND", "The requested subtitle track is unavailable.")
-        return LeaseBoundPlaybackResponse(
-            FileResponse(subtitle_path, media_type="text/vtt", headers={"Cache-Control": "private, max-age=900"}),
-            lease,
+        reader = LocalPlaybackSource(subtitle_path, file_name)
+        await reader.pin()
+        file_stat = await reader.stat()
+        return MediaBoundPlaybackResponse(
+            LeaseBoundPlaybackResponse(
+                StreamingResponse(reader.open_range(0, file_stat.size), media_type="text/vtt", headers={"Cache-Control": "private, max-age=900", "Content-Length": str(file_stat.size)}),
+                lease,
+            ),
+            reader.close,
         )
-    except Exception:
+    except BaseException:
+        if reader is not None:
+            await reader.close()
         lease.release()
         raise

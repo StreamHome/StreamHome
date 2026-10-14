@@ -16,7 +16,7 @@ from lifecycle.bootstrap import (
     require_current_guarded_authority,
     require_startup_context,
 )
-from lifecycle.restore_controller import RestoreError, RestoreProgress, update_restore_journal
+from lifecycle.restore_controller import RestoreConflictError, RestoreError, accept_guarded_runtime, read_restore_journal
 import services.state as service_state
 
 
@@ -69,10 +69,21 @@ async def commit_restored_runtime(
             or operation.owner_kind is not lifecycle_state.OwnerKind.RESTORE_CONTROLLER
         ):
             raise lifecycle_state.OwnershipError("restore authority does not match")
-        readiness = current_readiness_projection(get_startup_readiness())
+        startup_readiness = get_startup_readiness()
+        readiness = current_readiness_projection(startup_readiness)
         if not readiness["guardedReady"]:
-            raise StartupAuthorityChangedError("guarded restore readiness is unavailable")
-    except (StartupAuthorityChangedError, lifecycle_state.LifecycleError, ValueError) as exc:
+            # Normal recovery intentionally clears guardedReady before the
+            # controller completes. Only an already accepted decision may retry
+            # through that private completion window; public readiness stays shut.
+            journal = read_restore_journal(context.installation_root, payload.operation_id)
+            accepted_retry = (
+                startup_readiness.projection()["generalReady"]
+                and journal["accepted"]
+                and journal["generation"] == payload.generation
+            )
+            if not accepted_retry:
+                raise StartupAuthorityChangedError("guarded restore readiness is unavailable")
+    except (StartupAuthorityChangedError, lifecycle_state.LifecycleError, RestoreError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
@@ -81,18 +92,15 @@ async def commit_restored_runtime(
             },
         ) from exc
     try:
-        update_restore_journal(
+        accept_guarded_runtime(
             context.installation_root,
             payload.operation_id,
-            accepted=True,
-            outcome="accepted" if payload.decision == "accept" else "rolled_back",
-            progress=(
-                RestoreProgress.ACCEPTED.value
-                if payload.decision == "accept"
-                else RestoreProgress.NORMAL_RECOVERY.value
-            ),
+            generation=payload.generation,
+            decision=payload.decision,
         )
-    except RestoreError as exc:
+    except RestoreConflictError as exc:
+        raise HTTPException(status_code=409, detail={"code": "restore_commit_conflict", "message": "The restore acceptance does not match the recorded decision or recovery phase."}) from exc
+    except (RestoreError, lifecycle_state.LifecycleError) as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={

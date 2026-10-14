@@ -1,3 +1,4 @@
+from lifecycle.media_work import supervised_output
 import os
 import shutil
 import asyncio
@@ -8,11 +9,16 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from config import settings
 from services.logger import logger
+from services.media_analysis import measured_analysis, resolution_label, stream_duration, direct_timeline_compatible
 from services.languages import language_label, normalize_language_tag
 from services.media_source import EXTERNAL_AUDIO_EXTENSIONS, local_playback_fingerprint, local_video_fingerprint
-from services.ingestion_errors import IngestionFailure, classify_failure, compact_diagnostics, sanitize_url, write_task_diagnostics
+from services.ingestion_errors import IngestionFailure, classify_failure, compact_diagnostics, write_task_diagnostics
+from services.ingestion_security import source_request_failure
+from services.controlled_source import controlled_media_input, is_controlled_input
 from services.ffmpeg_input import (
     ffmpeg_network_input_options,
+    local_media_input_options,
+    native_media_environment,
     is_hls_media_source,
     is_http_media_source,
     normalize_source_type,
@@ -31,16 +37,72 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+async def _measure_packet_endpoints(source: str, streams: list[dict], source_type: str = "auto") -> None:
+    """Scan complete native packets with fixed time/output budgets, then publish proof.
+
+    A partial scan cannot authorize a selected duration. Matroska DURATION tags
+    are optional metadata and may be stale; endpoint evidence comes from packets.
+    """
+    options = ffmpeg_network_input_options(source, source_type) if is_http_media_source(source) else local_media_input_options()
+    command = [shutil.which("ffprobe") or r"C:\ffmpeg\bin\ffprobe.exe", "-v", "error",
+        "-show_entries", "packet=stream_index,pts_time,duration_time", "-of", "csv=p=0",
+        *options, source]
+    for stream in streams:
+        stream["_packet_start_measured"] = False
+        stream["_packet_endpoint_measured"] = False
+    try:
+        process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, env=native_media_environment(),
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        key = f"packet-endpoint-probe:{id(process)}"
+        register_process(key, process)
+        try:
+            stdout, _ = await supervised_output(process, timeout=120.0, stdout_limit=64 * 1024 * 1024)
+        finally:
+            unregister_process(key)
+        if process.returncode != 0:
+            return
+        endpoints: dict[int, dict[str, Any]] = {}
+        for line in stdout.splitlines():
+            parts = line.split(b",")
+            if len(parts) < 3:
+                continue
+            try:
+                index = int(parts[0])
+            except ValueError:
+                continue
+            start = _finite_float(parts[1], float("nan"))
+            length = _finite_float(parts[2], float("nan"))
+            record = endpoints.setdefault(index, {"start": float("inf"), "end": -float("inf"), "invalid": False})
+            if start != start or length != length or length <= 0:
+                record["invalid"] = True
+                continue
+            record["start"] = min(record["start"], start)
+            record["end"] = max(record["end"], start + length)
+        for stream in streams:
+            record = endpoints.get(int(stream.get("index") or 0))
+            if record and not record["invalid"] and record["end"] > record["start"]:
+                stream["start_time"] = record["start"]
+                stream["_packet_start_measured"] = True
+                stream["_packet_endpoint_measured"] = True
+                stream["_packet_elapsed"] = record["end"] - record["start"]
+    except (OSError, ValueError, TimeoutError):
+        # Bounded inspection failure leaves no measured duration or direct proof.
+        # The supervisor reaps the registered child before returning.
+        pass
+
+
 def _probe_local_audio_timing(file_path: str) -> dict[str, Any]:
     ffprobe_path = shutil.which("ffprobe") or r"C:\ffmpeg\bin\ffprobe.exe"
     try:
         result = subprocess.run(
             [
-                ffprobe_path, "-v", "error", "-select_streams", "a:0",
-                "-show_entries", "stream=start_time,duration,time_base:format=duration",
+                ffprobe_path, "-v", "error", *local_media_input_options(), "-select_streams", "a:0",
+                "-show_entries", "stream=start_time,duration,duration_ts,time_base:stream_tags=DURATION:format=duration,format_name",
                 "-of", "json", file_path,
             ],
             check=False,
+            env=native_media_environment(),
             capture_output=True,
             text=True,
             timeout=15,
@@ -52,7 +114,7 @@ def _probe_local_audio_timing(file_path: str) -> dict[str, Any]:
         stream = next(iter(payload.get("streams") or []), {})
         return {
             "startTime": _finite_float(stream.get("start_time")),
-            "duration": max(0.0, _finite_float(stream.get("duration"), _finite_float((payload.get("format") or {}).get("duration")))),
+            "duration": stream_duration(stream, payload.get("format") or {})[0] or 0.0,
             "timeBase": str(stream.get("time_base") or ""),
         }
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
@@ -136,6 +198,7 @@ async def probe_media_stream(
     task_id: Optional[str] = None,
     video_source_type: str = "auto",
     audio_source_type: str = "auto",
+    client_address: str = "",
 ) -> Dict[str, Any]:
     """
     Probes remote or local video and audio streams using ffprobe to detect
@@ -159,28 +222,38 @@ async def probe_media_stream(
                 "failure": IngestionFailure("MISSING_SOURCE", "No media source URL was supplied."),
             }
             
+        if is_http_media_source(url) and not is_controlled_input(url):
+            try:
+                async with controlled_media_input(url, headers=headers, client_address=client_address, source_type=normalized_source_type) as local_url:
+                    return await run_ffprobe(local_url, normalized_source_type)
+            except Exception as error:
+                return {"has_video": False, "has_audio": False, "height": 0,
+                        "source_type": normalized_source_type, "diagnostics": type(error).__name__,
+                        "failure": source_request_failure(error)}
+
         cmd = [
             ffprobe_path,
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type,height,width,start_time,duration,time_base:format=format_name,duration",
+            "stream=index,codec_type,height,width,start_time,duration,duration_ts,time_base:stream_tags=DURATION:format=format_name,duration",
             "-of",
             "json",
         ]
         
         is_http = is_http_media_source(url)
-        if headers_str.strip() and is_http:
+        if headers_str.strip() and is_http and not is_controlled_input(url):
             cmd.extend(["-headers", headers_str])
-        cmd.extend(ffmpeg_network_input_options(url, normalized_source_type))
+        cmd.extend(ffmpeg_network_input_options(url, normalized_source_type) if is_http else local_media_input_options())
         cmd.append(url)
         
-        logger.info(f"[Media Probe] Probing source: {sanitize_url(url)[:120]}")
+        logger.info("[Media Probe] Probing media source.")
         
         try:
             # Run ffprobe process without opening a window on Windows
             process = await asyncio.create_subprocess_exec(
                 *cmd,
+                env=native_media_environment(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
@@ -188,7 +261,7 @@ async def probe_media_stream(
             process_key = f"source-probe:{id(process)}"
             register_process(process_key, process)
             try:
-                stdout, stderr = await process.communicate()
+                stdout, stderr = await supervised_output(process, timeout=60.0)
             finally:
                 unregister_process(process_key)
             
@@ -220,19 +293,25 @@ async def probe_media_stream(
             
             # Find the max height among video streams
             heights = [int(s.get("height", 0)) for s in streams if s.get("codec_type") == "video" and s.get("height")]
-            max_height = max(heights) if heights else 0
             video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
             audio_stream = next((stream for stream in streams if stream.get("codec_type") == "audio"), {})
+            if has_video or has_audio:
+                await _measure_packet_endpoints(url, streams, normalized_source_type)
             
             return {
                 "has_video": has_video,
                 "has_audio": has_audio,
-                "height": max_height,
+                "height": int(video_stream.get("height") or 0),
+                "width": int(video_stream.get("width") or 0),
+                "video_stream_index": int(video_stream.get("index") or 0),
                 "source_type": detected_source_type,
                 "diagnostics": "",
                 "failure": None,
                 "start_time": _finite_float((video_stream if has_video else audio_stream).get("start_time")),
-                "duration": max(0.0, _finite_float((video_stream if has_video else audio_stream).get("duration"), _finite_float((data.get("format") or {}).get("duration")))),
+                "duration": (stream_duration(video_stream if has_video else audio_stream, data.get("format") or {})[0] or 0.0)
+                    if (video_stream if has_video else audio_stream).get("_packet_endpoint_measured") else 0.0,
+                "duration_provenance": "selected_stream_packets" if (video_stream if has_video else audio_stream).get("_packet_endpoint_measured") else "unknown",
+                "estimated_duration": None if (video_stream if has_video else audio_stream).get("_packet_endpoint_measured") else stream_duration(video_stream if has_video else audio_stream, data.get("format") or {})[0],
                 "time_base": str((video_stream if has_video else audio_stream).get("time_base") or ""),
             }
             
@@ -261,7 +340,7 @@ async def probe_media_stream(
         if not should_force_hls:
             return result
 
-        logger.info(f"[Media Probe] Retrying ambiguous HTTP source as an HLS manifest: {sanitize_url(url)[:120]}")
+        logger.info("[Media Probe] Retrying ambiguous HTTP source as an HLS manifest.")
         forced_result = await run_ffprobe(url, "hls")
         if forced_result.get(f"has_{expected_stream}") and not forced_result.get("failure"):
             return forced_result
@@ -293,21 +372,8 @@ async def probe_media_stream(
             diagnostics_path = write_task_diagnostics(task_id, "ffprobe", diagnostics)
             failure = IngestionFailure(failure.code, failure.message, failure.retryable, diagnostics_path)
     
-    # Map height to quality string
-    quality = "Source"
-    if has_video:
-        if height >= 1080:
-            quality = "1080p"
-        elif height >= 720:
-            quality = "720p"
-        elif height >= 480:
-            quality = "480p"
-        elif height > 0:
-            quality = f"{height}p"
-    else:
-        if has_audio:
-            quality = "Audio Only"
-            
+    quality = resolution_label(video_res.get("width"), height) if has_video else ("Audio Only" if has_audio else "Source")
+
     if not failure:
         logger.info(f"[Media Probe] Scan complete. Video: {has_video}, Audio: {has_audio}, Quality: {quality} (Height: {height})")
     
@@ -315,6 +381,9 @@ async def probe_media_stream(
         "has_video": has_video,
         "has_audio": has_audio,
         "scan_quality": quality,
+        "width": video_res.get("width", 0),
+        "height": height,
+        "video_stream_index": video_res.get("video_stream_index", 0),
         "video_source_type": video_res.get("source_type", normalize_source_type(video_source_type)),
         "audio_source_type": audio_res.get("source_type", normalize_source_type(audio_source_type)),
         "video_start_time": _finite_float(video_res.get("start_time")),
@@ -323,6 +392,8 @@ async def probe_media_stream(
         # epoch. Each stream is normalized to zero before the merge.
         "audio_timeline_offset": 0.0,
         "video_duration": max(0.0, _finite_float(video_res.get("duration"))),
+        "video_duration_provenance": video_res.get("duration_provenance", "unknown"),
+        "video_estimated_duration": video_res.get("estimated_duration"),
         "audio_duration": max(0.0, _finite_float(audio_res.get("duration"))),
         "failure": failure,
     }
@@ -350,7 +421,7 @@ async def notify_video_sender(
         "quality": quality
     }
     
-    logger.info(f"[Media Probe] Dispatching media scan notification to sender: {sanitize_url(url)}")
+    logger.info("[Media Probe] Dispatching media scan notification to sender.")
     
     try:
         async with httpx.AsyncClient() as client:
@@ -378,13 +449,14 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
     
     cmd = [
         ffprobe_path, "-v", "error",
-        "-show_entries", "format=duration,format_name:stream=index,codec_type,codec_name,width,height,r_frame_rate,channels,start_time,duration,time_base:stream_tags=language,title:stream_disposition=default",
-        "-of", "json", file_path
+        "-show_entries", "format=duration,format_name,bit_rate:stream=index,codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,bit_rate,channels,start_time,duration,duration_ts,time_base:stream_tags=language,title,DURATION:stream_disposition",
+        "-of", "json", *local_media_input_options(), file_path
     ]
     
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,
+            env=native_media_environment(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
@@ -392,7 +464,7 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
         process_key = f"catalog-probe:{id(process)}"
         register_process(process_key, process)
         try:
-            stdout, stderr = await process.communicate()
+            stdout, stderr = await supervised_output(process, timeout=60.0)
         finally:
             unregister_process(process_key)
         if process.returncode != 0:
@@ -403,11 +475,14 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
         fmt = data.get("format", {})
         streams = data.get("streams", [])
         
-        duration = float(fmt.get("duration") or 0.0)
         container = fmt.get("format_name", "")
         
         video_streams = [s for s in streams if s.get("codec_type") == "video"]
         audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+        if video_streams:
+            await _measure_packet_endpoints(file_path, streams)
+        analysis = measured_analysis(video_streams[0] if video_streams else {}, fmt)
+        duration = analysis.get("probed_duration") or 0.0
         
         codec = ""
         width = 0
@@ -420,7 +495,7 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
             width = int(v.get("width") or 0)
             height = int(v.get("height") or 0)
             
-            r_fr = v.get("r_frame_rate", "")
+            r_fr = v.get("avg_frame_rate") or v.get("r_frame_rate", "")
             if "/" in r_fr:
                 try:
                     num, den = map(float, r_fr.split("/"))
@@ -450,7 +525,7 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
                 "channels": channels,
                 "default": bool((a.get("disposition") or {}).get("default")),
                 "startTime": start_time,
-                "duration": max(0.0, _finite_float(a.get("duration"), duration)),
+                "duration": stream_duration(a, fmt)[0] or 0.0,
                 "timeBase": str(a.get("time_base") or ""),
                 "timelineOffset": start_time - video_start_time,
                 "timelineOffsetSource": "embedded",
@@ -467,8 +542,9 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
                 "language": normalize_language_tag((stream.get("tags") or {}).get("language")),
                 "title": str((stream.get("tags") or {}).get("title") or ""),
                 "default": bool((stream.get("disposition") or {}).get("default")),
+                "disposition": dict(stream.get("disposition") or {}),
                 "startTime": _finite_float(stream.get("start_time")),
-                "duration": max(0.0, _finite_float(stream.get("duration"), duration)),
+                "duration": stream_duration(stream, fmt)[0] or 0.0,
                 "timeBase": str(stream.get("time_base") or ""),
             }
             for position, stream in enumerate(streams)
@@ -478,8 +554,15 @@ async def probe_completed_media(file_path: str) -> Dict[str, Any]:
         source_fingerprint = local_playback_fingerprint(media_path, audio_meta)
         video_fingerprint = local_video_fingerprint(media_path)
         
+        analysis["frame_rate"] = frame_rate if frame_rate > 0 else None
+        analysis["video_fingerprint"] = video_fingerprint
+        analysis["source_fingerprint"] = source_fingerprint
+        analysis["direct_timeline_compatible"] = direct_timeline_compatible(video_streams[0] if video_streams else {}, streams, fmt, analysis)
         return {
-            "probed_duration": duration,
+            **analysis,
+            "analysis": analysis,
+            "valid_video": bool(video_streams and width > 0 and height > 0 and duration > 0 and analysis["duration_provenance"] == "selected_stream_packets" and not (video_streams[0].get("disposition") or {}).get("attached_pic")),
+            "probed_duration": analysis.get("probed_duration"),
             "container": container,
             "codec": codec,
             "width": width,
@@ -524,7 +607,6 @@ async def probe_cloud_external_audio(cloud_video_path: str, embedded_audio: list
             continue
         external_languages.add(language)
         existing = embedded_by_language.get(language)
-        merged = [entry for entry in merged if str(entry.get("language") or "und") != language]
         merged.append({
             "index": 0,
             "streamIndex": 0,

@@ -529,6 +529,7 @@ class RecoveryPlannerTests(unittest.TestCase):
             )
 
     def test_execute_accepted_restore_continue_uses_canonical_controller(self) -> None:
+        (self.root / ".env").write_text("TRUSTED_PROXY_CIDRS=192.0.2.0/24\n", encoding="utf-8")
         claimed = state.claim_operation_with_credential(
             self.root,
             operation_type="restore",
@@ -605,8 +606,26 @@ class RecoveryPlannerTests(unittest.TestCase):
         runtime = SimpleNamespace(
             terminate_owned_service=lambda *_args: True,
             port_is_available=lambda *_args: True,
+            record_service=mock.Mock(),
         )
+        frontend = mock.Mock(pid=12345)
+        frontend.poll.return_value = None
+        response = mock.MagicMock()
+        response.__enter__.return_value.headers = {"X-StreamHome-Web-Build": "test-build"}
+        opener = mock.Mock()
+        opener.open.return_value = response
+        launch = mock.Mock(return_value=frontend)
+        original_start_web = restore_controller._start_web
+
+        def start_web(*args):
+            with (
+                mock.patch.object(restore_controller.subprocess, "Popen", new=launch),
+                mock.patch.object(restore_controller.urlrequest, "build_opener", return_value=opener),
+            ):
+                return original_start_web(*args)
+
         with (
+            mock.patch.dict(os.environ, {}, clear=True),
             mock.patch.object(recovery, "_runtime_status", return_value="offline"),
             mock.patch.object(restore_controller, "_web_port", return_value=3000),
             mock.patch.object(restore_controller, "_stop_supported_runtime"),
@@ -615,7 +634,7 @@ class RecoveryPlannerTests(unittest.TestCase):
             mock.patch.object(restore_controller, "_wait_guarded_ready"),
             mock.patch.object(restore_controller, "_commit_guarded_runtime"),
             mock.patch.object(restore_controller, "_wait_general_ready"),
-            mock.patch.object(restore_controller, "_start_web"),
+            mock.patch.object(restore_controller, "_start_web", side_effect=start_web),
             mock.patch.object(restore_controller, "_request_json", return_value=(503, {})),
             mock.patch.object(restore_controller, "_build_id", return_value="test-build"),
             mock.patch.object(restore_controller, "_runtime_control", return_value=runtime),
@@ -632,6 +651,9 @@ class RecoveryPlannerTests(unittest.TestCase):
                 action="continue_recovery",
                 evidence_identity=plan["evidenceIdentity"],
             )
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.kwargs["env"]["TRUSTED_PROXY_CIDRS"], "192.0.2.0/24")
+        runtime.record_service.assert_called_once()
         self.assertIsNone(state.inspect_state(self.root).active_operation)
         terminal = restore_controller.inspect_restore_journal(
             self.root, operation.operation_id
@@ -640,6 +662,7 @@ class RecoveryPlannerTests(unittest.TestCase):
         self.assertEqual(result["resultCode"], "operator_recovery_completed")
 
     def test_execute_preacceptance_restore_rollback_uses_canonical_controller(self) -> None:
+        (self.root / ".env").write_text("TRUSTED_PROXY_CIDRS=2001:db8::/32\n", encoding="utf-8")
         claimed = state.claim_operation_with_credential(
             self.root,
             operation_type="restore",
@@ -680,8 +703,25 @@ class RecoveryPlannerTests(unittest.TestCase):
             progress="recovery_required",
             error_code="restore_controller_failed",
         )
-        runtime = SimpleNamespace(terminate_owned_service=lambda *_args: True)
+        runtime = SimpleNamespace(terminate_owned_service=lambda *_args: True, record_service=mock.Mock())
+        frontend = mock.Mock(pid=12345)
+        frontend.poll.return_value = None
+        response = mock.MagicMock()
+        response.__enter__.return_value.headers = {"X-StreamHome-Web-Build": "test-build"}
+        opener = mock.Mock()
+        opener.open.return_value = response
+        launch = mock.Mock(return_value=frontend)
+        original_start_web = restore_controller._start_web
+
+        def start_web(*args):
+            with (
+                mock.patch.object(restore_controller.subprocess, "Popen", new=launch),
+                mock.patch.object(restore_controller.urlrequest, "build_opener", return_value=opener),
+            ):
+                return original_start_web(*args)
+
         with (
+            mock.patch.dict(os.environ, {}, clear=True),
             mock.patch.object(recovery, "_runtime_status", return_value="offline"),
             mock.patch.object(restore_controller, "_web_port", return_value=3000),
             mock.patch.object(restore_controller, "_stop_supported_runtime"),
@@ -690,7 +730,7 @@ class RecoveryPlannerTests(unittest.TestCase):
             mock.patch.object(restore_controller, "_wait_guarded_ready"),
             mock.patch.object(restore_controller, "_commit_guarded_runtime"),
             mock.patch.object(restore_controller, "_wait_general_ready"),
-            mock.patch.object(restore_controller, "_start_web"),
+            mock.patch.object(restore_controller, "_start_web", side_effect=start_web),
             mock.patch.object(restore_controller, "_build_id", return_value="test-build"),
             mock.patch.object(restore_controller, "_runtime_control", return_value=runtime),
         ):
@@ -707,6 +747,9 @@ class RecoveryPlannerTests(unittest.TestCase):
                 action="rollback",
                 evidence_identity=plan["evidenceIdentity"],
             )
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.kwargs["env"]["TRUSTED_PROXY_CIDRS"], "2001:db8::/32")
+        runtime.record_service.assert_called_once()
         self.assertIsNone(state.inspect_state(self.root).active_operation)
         terminal = restore_controller.inspect_restore_journal(
             self.root, operation.operation_id

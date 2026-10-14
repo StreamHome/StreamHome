@@ -60,17 +60,42 @@ def client_ip(request: Request) -> str:
     """Return a forwarded address only when the immediate peer is trusted."""
     peer = request.client.host if request.client else ""
     if _trusted_proxy(peer):
-        forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-        if _address(forwarded):
-            return forwarded[:64]
+        chain = _forwarded_chain(request)
+        if chain:
+            return chain[_client_boundary(chain)][:64]
     return peer[:64] or "Unknown"
+
+
+def _forwarded_chain(request: Request) -> list[str]:
+    chain = [value.strip() for value in request.headers.get("x-forwarded-for", "").split(",")]
+    return chain if chain and all(_address(value) for value in chain) else []
+
+
+def _client_boundary(chain: list[str]) -> int:
+    for index in range(len(chain) - 1, -1, -1):
+        if not _trusted_proxy(chain[index]):
+            return index
+    return 0
+
+
+def _forwarded_value(request: Request, header: str) -> Optional[str]:
+    """Use the value at the trusted chain's client boundary; reject ambiguity."""
+    peer = request.client.host if request.client else ""
+    if not _trusted_proxy(peer):
+        return None
+    values = [value.strip() for value in request.headers.get(header, "").split(",")]
+    if len(values) == 1:
+        return values[0] or None
+    chain = _forwarded_chain(request)
+    if not chain or len(values) != len(chain):
+        return None
+    return values[_client_boundary(chain)] or None
 
 
 def request_is_secure(request: Request) -> bool:
     if request.url.scheme == "https":
         return True
-    peer = request.client.host if request.client else ""
-    return _trusted_proxy(peer) and request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "https"
+    return (_forwarded_value(request, "x-forwarded-proto") or "").lower() == "https"
 
 
 def address_is_loopback(value: str) -> bool:
@@ -83,8 +108,8 @@ def trusted_proxy_origin(request: Request) -> Optional[str]:
     peer = request.client.host if request.client else ""
     if not _trusted_proxy(peer):
         return None
-    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
-    forwarded_host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    forwarded_proto = (_forwarded_value(request, "x-forwarded-proto") or "").lower()
+    forwarded_host = _forwarded_value(request, "x-forwarded-host") or ""
     if forwarded_proto not in {"http", "https"} or not forwarded_host:
         return None
     return normalize_origin(f"{forwarded_proto}://{forwarded_host}")

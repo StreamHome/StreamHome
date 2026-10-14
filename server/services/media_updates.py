@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from lifecycle.media_work import supervised_output, media_lock as shared_media_lock, settle
+from lifecycle.media_publication import MediaMutation, current_mutation
+
 import asyncio
 import json
 import os
@@ -18,14 +21,17 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from models import Episode, Movie
-from services.ffmpeg_input import ffmpeg_network_input_options
+from services.controlled_source import controlled_media_input
+from services.ffmpeg_input import ffmpeg_network_input_options, native_media_environment
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url, validated_stream_request
 from services.languages import normalize_language_tag
 from services.logger import logger
+from services.media_analysis import stored_analysis
 from services.media_probe import merge_local_external_audio, probe_cloud_external_audio, probe_completed_media
 from services.media_source import (
     EXTERNAL_AUDIO_EXTENSIONS,
     ResolvedMediaSource,
+    canonicalize_catalog_path,
     local_playback_fingerprint,
     playback_source_fingerprint,
     resolve_media_source,
@@ -39,8 +45,6 @@ TRACK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 SUBTITLE_LIMIT_BYTES = 10 * 1024 * 1024
 AUDIO_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
 DOWNLOAD_CHUNK_BYTES = 256 * 1024
-_media_locks: dict[str, asyncio.Lock] = {}
-_media_locks_guard = asyncio.Lock()
 
 
 class MediaUpdateFailure(RuntimeError):
@@ -59,14 +63,22 @@ class MutableMedia:
 
 
 async def media_lock(media_id: str) -> asyncio.Lock:
-    async with _media_locks_guard:
-        return _media_locks.setdefault(media_id, asyncio.Lock())
+    return shared_media_lock(media_id)
 
 
 def temporary_update_directory() -> tempfile.TemporaryDirectory[str]:
     root = Path(settings.TEMP_DIR)
     root.mkdir(parents=True, exist_ok=True)
     return tempfile.TemporaryDirectory(prefix="streamhome-media-update-", dir=root)
+
+
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _temporary_update_scope():
+    with temporary_update_directory() as temporary:
+        yield temporary
 
 
 async def require_mutable_media(media_id: str, db: AsyncSession) -> MutableMedia:
@@ -89,7 +101,7 @@ async def require_mutable_media(media_id: str, db: AsyncSession) -> MutableMedia
 
 
 def metadata_payload(item: Movie | Episode) -> dict:
-    return {
+    payload = {
         "title": item.title,
         "description": item.description,
         "quality": item.quality,
@@ -98,7 +110,92 @@ def metadata_payload(item: Movie | Episode) -> dict:
         "skip_markers": item.skip_markers,
         "audio_metadata": item.audio_metadata,
         "source_fingerprint": item.source_fingerprint,
+        "analysis": json.loads(item.analysis_metadata_str or "{}"),
+        "video_url": item.video_url,
     }
+    catalog_id = item.movie_id if isinstance(item, Episode) else item.id
+    match = re.fullmatch(r"(?:m_|tv_)([1-9][0-9]*)", str(catalog_id))
+    payload.update(tmdb_id=int(match.group(1)) if match else getattr(item, "tmdb_id", None),
+        media_type="series" if isinstance(item, Episode) or item.type == "series" else "movie")
+    if isinstance(item, Episode):
+        payload.update(season=item.season_number, episode=item.episode_number)
+    return payload
+
+
+def portable_metadata_names(metadata: dict) -> tuple[str, ...]:
+    """Return only this owner's supported portable names, never unrelated aliases."""
+    names = ("metadata.json",)
+    if metadata.get("media_type") not in {"series", "tv"}:
+        return names
+    season, episode = metadata.get("season"), metadata.get("episode")
+    if type(season) is int and season > 0 and type(episode) is int and episode > 0:
+        names += (f"metadata_s{season}_e{episode}.json",)
+    return names
+
+
+def _legacy_episode_alias(source: ResolvedMediaSource, metadata: dict) -> tuple[Path, str | None] | None:
+    names = portable_metadata_names(metadata)
+    if len(names) != 2:
+        return None
+    season, episode = metadata["season"], metadata["episode"]
+    relative = Path(source.relative_path)
+    if len(relative.parts) != 5 or relative.parts[0] != "Series" or relative.parts[2:4] != (f"Season_{season}", f"Episode_{episode}"):
+        return None
+    local = source.local_path.parent.parent.parent / ".metadata" / names[1]
+    remote = f"{source.cloud_path.rsplit('/', 3)[0]}/.metadata/{names[1]}" if source.cloud_path else None
+    return local, remote
+
+
+def _same_episode_alias(data: object, metadata: dict, source: ResolvedMediaSource) -> bool:
+    if not isinstance(data, dict) or data.get("media_type") not in {"series", "tv"}:
+        return False
+    try:
+        for field in ("tmdb_id", "season", "episode"):
+            value = data.get(field)
+            if value is None and field != "tmdb_id":
+                continue  # The supported alias filename supplies legacy numbering.
+            if type(value) is not int and (not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value)):
+                return False
+            if int(value) != metadata.get(field):
+                return False
+        video_url = data.get("video_url")
+        return not video_url or canonicalize_catalog_path(video_url) == source.catalog_path
+    except (TypeError, ValueError):
+        return False
+
+
+async def _existing_legacy_aliases(source: ResolvedMediaSource, metadata: dict, temporary_root: Path, *, publish_cloud: bool) -> tuple[list[Path], list[str]]:
+    legacy = _legacy_episode_alias(source, metadata)
+    local_paths, remote_paths = [], []
+    if legacy is None:
+        return local_paths, remote_paths
+    local, remote = legacy
+    if local.exists():
+        if local.is_symlink() or local.parent.is_symlink() or not local.is_file():
+            raise MediaUpdateFailure(409, "portable_alias_invalid", "The legacy metadata alias is not a regular file.")
+        try:
+            data = json.loads(local.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = None
+        if _same_episode_alias(data, metadata, source):
+            local_paths.append(local)
+    if publish_cloud and settings.STORAGE_ENGINE == "CLOUD" and remote:
+        state = await rclone_service.run("lsjson", remote, "--stat", timeout=60)
+        if not state.ok:
+            if state.error_code == "drive_not_found":
+                return local_paths, remote_paths
+            raise MediaUpdateFailure(503, "portable_alias_unavailable", "The legacy metadata alias could not be inspected.")
+        downloaded = temporary_root / "legacy-episode-alias.json"
+        result = await rclone_service.copyto_atomic(remote, str(downloaded), timeout=60)
+        if not result.ok or not downloaded.is_file():
+            raise MediaUpdateFailure(503, "portable_alias_unavailable", "The legacy metadata alias could not be inspected.")
+        try:
+            data = json.loads(downloaded.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = None
+        if _same_episode_alias(data, metadata, source):
+            remote_paths.append(remote)
+    return local_paths, remote_paths
 
 
 async def load_portable_metadata(source: ResolvedMediaSource, temporary_root: Path) -> dict:
@@ -122,6 +219,22 @@ async def load_portable_metadata(source: ResolvedMediaSource, temporary_root: Pa
     return {}
 
 
+def synchronize_local_asset(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+    from lifecycle.media_publication import _sync_directory
+    parent = path.parent.resolve()
+    _sync_directory(parent)
+    media_root = Path(settings.MEDIA_DIR).resolve()
+    if parent.is_relative_to(media_root):
+        # Newly created sidecar/media directories need durable parent entries,
+        # in addition to the file inode and its immediate directory contents.
+        while parent != media_root:
+            parent = parent.parent
+            _sync_directory(parent)
+        _sync_directory(media_root.parent)
+
+
 def atomic_json_write(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -131,11 +244,15 @@ def atomic_json_write(path: Path, value: dict) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+    synchronize_local_asset(path)
 
 
 async def upload_cloud_file(local_path: Path, remote_path: str) -> None:
     if not rclone_service.cloud_write_available():
         raise MediaUpdateFailure(503, "cloud_write_unavailable", "Cloud storage is not accepting writes.")
+    mutation = current_mutation.get()
+    if mutation is not None:
+        await mutation.capture_cloud(remote_path)
     staging = f"{settings.RCLONE_REMOTE_PATH.rstrip('/')}/.streamhome-media-updates/{uuid.uuid4().hex}/{local_path.name}"
     copied = await rclone_service.run("copyto", str(local_path), staging, timeout=900)
     if not copied.ok:
@@ -146,13 +263,35 @@ async def upload_cloud_file(local_path: Path, remote_path: str) -> None:
         raise MediaUpdateFailure(502, published.error_code or "cloud_publish_failed", "The sidecar could not be published to cloud storage.")
 
 
-async def persist_portable_metadata(source: ResolvedMediaSource, metadata: dict, temporary_root: Path) -> None:
+async def persist_portable_metadata(source: ResolvedMediaSource, metadata: dict, temporary_root: Path, *, publish_cloud: bool = True) -> None:
     serialized = temporary_root / "portable-metadata.json"
     atomic_json_write(serialized, metadata)
-    if source.local_exists:
-        atomic_json_write(source.local_path.parent / ".metadata" / "metadata.json", metadata)
-    if settings.STORAGE_ENGINE == "CLOUD" and source.cloud_path:
-        remote = f"{source.cloud_path.rsplit('/', 1)[0]}/.metadata/metadata.json"
+    names = portable_metadata_names(metadata)
+    local_paths = [source.local_path.parent / ".metadata" / name for name in names] if source.local_exists else []
+    remote_paths = [f"{source.cloud_path.rsplit('/', 1)[0]}/.metadata/{name}" for name in names] if publish_cloud and settings.STORAGE_ENGINE == "CLOUD" and source.cloud_path else []
+    legacy_local, legacy_remote = await _existing_legacy_aliases(source, metadata, temporary_root, publish_cloud=publish_cloud)
+    local_paths.extend(legacy_local)
+    remote_paths.extend(legacy_remote)
+    mutation = current_mutation.get()
+    # Capture the complete alias surface before its first effect. All aliases
+    # share the caller's receipt, compensation and accepted-cleanup decision.
+    if mutation is not None:
+        def capture_local_metadata():
+            for path in local_paths:
+                mutation.capture_local(str(path))
+        _, cancelled = await settle(asyncio.to_thread(capture_local_metadata))
+        if cancelled:
+            raise asyncio.CancelledError
+        for remote in remote_paths:
+            await mutation.capture_cloud(remote)
+    if local_paths:
+        def publish_local_metadata():
+            for path in local_paths:
+                atomic_json_write(path, metadata)
+        _, cancelled = await settle(asyncio.to_thread(publish_local_metadata))
+        if cancelled:
+            raise asyncio.CancelledError
+    for remote in remote_paths:
         await upload_cloud_file(serialized, remote)
 
 
@@ -237,17 +376,25 @@ async def transcode_remote_audio(
     *,
     headers: dict[str, str],
     source_type: str,
+    client_address: str = "",
 ) -> None:
+    try:
+        async with controlled_media_input(url, headers=headers, client_address=client_address, source_type=source_type) as local_url:
+            await _transcode_controlled_audio(local_url, destination, source_type=source_type)
+    except (httpx.HTTPError, UnsafeIngestionSource) as error:
+        raise MediaUpdateFailure(502, "audio_source_unavailable", "The remote audio source could not be fetched safely.") from error
+
+
+async def _transcode_controlled_audio(url: str, destination: Path, *, source_type: str) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise MediaUpdateFailure(503, "ffmpeg_unavailable", "FFmpeg is required for this audio source.")
     command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
-    if headers:
-        command.extend(["-headers", "".join(f"{name}: {value}\r\n" for name, value in headers.items())])
     command.extend(ffmpeg_network_input_options(url, source_type))
     command.extend(["-i", url, "-map", "0:a:0", "-vn", "-c:a", "aac", "-b:a", "192k", str(destination)])
     process = await asyncio.create_subprocess_exec(
         *command,
+        env=native_media_environment(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
@@ -255,7 +402,7 @@ async def transcode_remote_audio(
     process_key = f"media-update-audio:{id(process)}"
     register_process(process_key, process)
     try:
-        _, stderr = await process.communicate()
+        _, stderr = await supervised_output(process, timeout=900.0, output_path=destination, maximum_bytes=AUDIO_LIMIT_BYTES)
     finally:
         unregister_process(process_key)
     if process.returncode != 0:
@@ -287,7 +434,7 @@ async def prepare_audio_asset(
         )
     else:
         destination = temporary_root / "audio.m4a"
-        await transcode_remote_audio(url, destination, headers=headers, source_type=source_type)
+        await transcode_remote_audio(url, destination, headers=headers, source_type=source_type, client_address=client_address)
     probe = await probe_completed_media(str(destination))
     if not probe.get("audio_metadata"):
         raise MediaUpdateFailure(422, "audio_stream_missing", "The supplied dubbing asset contains no audio stream.")
@@ -296,16 +443,22 @@ async def prepare_audio_asset(
 
 def install_local_asset(source: ResolvedMediaSource, relative_path: str, prepared: Path) -> Path:
     destination = source.local_path.parent / Path(relative_path)
+    mutation = current_mutation.get()
+    if mutation is not None:
+        mutation.capture_local(str(destination))
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     shutil.copyfile(prepared, temporary)
     os.replace(temporary, destination)
+    synchronize_local_asset(destination)
     return destination
 
 
 async def install_asset(source: ResolvedMediaSource, relative_path: str, prepared: Path) -> None:
     if source.local_exists:
-        install_local_asset(source, relative_path, prepared)
+        _, cancelled = await settle(asyncio.to_thread(install_local_asset, source, relative_path, prepared))
+        if cancelled:
+            raise asyncio.CancelledError
     if settings.STORAGE_ENGINE == "CLOUD" and source.cloud_path:
         remote_parent = source.cloud_path.rsplit("/", 1)[0]
         await upload_cloud_file(prepared, f"{remote_parent}/{relative_path.replace(os.sep, '/')}")
@@ -313,14 +466,25 @@ async def install_asset(source: ResolvedMediaSource, relative_path: str, prepare
 
 async def delete_asset(source: ResolvedMediaSource, relative_path: str) -> None:
     if source.local_exists:
-        path = source.local_path.parent / Path(relative_path)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        def remove_local():
+            path = source.local_path.parent / Path(relative_path)
+            mutation = current_mutation.get()
+            if mutation is not None:
+                mutation.capture_local(str(path))
+            path.unlink(missing_ok=True)
+            if path.parent.exists():
+                from lifecycle.media_publication import _sync_directory
+                _sync_directory(path.parent)
+        _, cancelled = await settle(asyncio.to_thread(remove_local))
+        if cancelled:
+            raise asyncio.CancelledError
     if settings.STORAGE_ENGINE == "CLOUD" and source.cloud_path:
         remote_parent = source.cloud_path.rsplit("/", 1)[0]
-        result = await rclone_service.run("deletefile", f"{remote_parent}/{relative_path.replace(os.sep, '/')}", timeout=60)
+        remote = f"{remote_parent}/{relative_path.replace(os.sep, '/')}"
+        mutation = current_mutation.get()
+        if mutation is not None:
+            await mutation.capture_cloud(remote)
+        result = await rclone_service.run("deletefile", remote, timeout=60)
         if not result.ok and result.error_code != "drive_not_found":
             raise MediaUpdateFailure(502, result.error_code or "cloud_delete_failed", "The cloud sidecar could not be deleted.")
 
@@ -336,14 +500,14 @@ async def update_skip_markers(media_id: str, markers: dict, db: AsyncSession) ->
     lock = await media_lock(media_id)
     async with lock:
         mutable = await require_mutable_media(media_id, db)
-        with temporary_update_directory() as temporary:
+        async with MediaMutation(media_id) as mutation, _temporary_update_scope() as temporary:
             temporary_root = Path(temporary)
             metadata = await load_portable_metadata(mutable.source, temporary_root)
             mutable.item.skip_markers = markers
             metadata.update(metadata_payload(mutable.item))
             await persist_portable_metadata(mutable.source, metadata, temporary_root)
             db.add(mutable.item)
-            await db.commit()
+            await mutation.commit(db)
         return {"mediaId": media_id, "skipMarkers": mutable.item.skip_markers}
 
 
@@ -363,7 +527,7 @@ async def upsert_subtitle(
     lock = await media_lock(media_id)
     async with lock:
         mutable = await require_mutable_media(media_id, db)
-        with temporary_update_directory() as temporary:
+        async with MediaMutation(media_id) as mutation, _temporary_update_scope() as temporary:
             temporary_root = Path(temporary)
             prepared = temporary_root / f"subtitle_{track_id}.vtt"
             await prepare_subtitle_asset(url, prepared, headers=headers, client_address=client_address)
@@ -386,7 +550,7 @@ async def upsert_subtitle(
             mutable.item.vibe_analysis_status = "queued"
             mutable.item.vibe_analysis_version = 0
             db.add(mutable.item)
-            await db.commit()
+            await mutation.commit(db)
         return {"mediaId": media_id, "subtitle": entry, "subtitles": mutable.item.subtitles}
 
 
@@ -402,7 +566,7 @@ async def remove_subtitle(media_id: str, track_id: str, db: AsyncSession) -> dic
         file_name = str(matched.get("fileName") or matched.get("file_name") or f"subtitle_{track_id}.vtt")
         if Path(file_name).name != file_name:
             raise MediaUpdateFailure(409, "subtitle_path_invalid", "The stored subtitle path is invalid.")
-        with temporary_update_directory() as temporary:
+        async with MediaMutation(media_id) as mutation, _temporary_update_scope() as temporary:
             temporary_root = Path(temporary)
             await delete_asset(mutable.source, file_name)
             mutable.item.subtitles = [entry for entry in mutable.item.subtitles if not portable_subtitle_match(entry, track_id)]
@@ -412,14 +576,16 @@ async def remove_subtitle(media_id: str, track_id: str, db: AsyncSession) -> dic
             mutable.item.vibe_analysis_status = "queued" if mutable.item.subtitles else "unavailable"
             mutable.item.vibe_analysis_version = 0
             db.add(mutable.item)
-            await db.commit()
+            await mutation.commit(db)
         return {"mediaId": media_id, "removedTrackId": track_id, "subtitles": mutable.item.subtitles}
 
 
 async def refresh_audio_state(mutable: MutableMedia) -> None:
     embedded = [entry for entry in mutable.item.audio_metadata if str(entry.get("source") or "embedded").lower() != "external"]
     if mutable.source.local_exists:
-        audio_metadata = merge_local_external_audio(str(mutable.source.local_path), embedded)
+        audio_metadata, cancelled = await settle(asyncio.to_thread(merge_local_external_audio, str(mutable.source.local_path), embedded))
+        if cancelled:
+            raise asyncio.CancelledError
         fingerprint = local_playback_fingerprint(mutable.source.local_path, audio_metadata)
     elif mutable.source.cloud_path:
         audio_metadata = await probe_cloud_external_audio(mutable.source.cloud_path, embedded)
@@ -430,6 +596,12 @@ async def refresh_audio_state(mutable: MutableMedia) -> None:
     mutable.item.audio_metadata = audio_metadata
     mutable.item.languages = list(dict.fromkeys(str(entry.get("language") or "und") for entry in audio_metadata))
     mutable.item.source_fingerprint = fingerprint
+    analysis = stored_analysis(mutable.item.analysis_metadata_str)
+    if analysis.get("video_fingerprint") == mutable.source.video_fingerprint:
+        # Sidecar identity changes the playback bundle, while the independently
+        # measured video and its historical claim remain bound to these bytes.
+        analysis["source_fingerprint"] = fingerprint
+        mutable.item.analysis_metadata_str = json.dumps(analysis)
 
 
 async def remove_other_audio_extensions(source: ResolvedMediaSource, language: str, retained_extension: str | None) -> None:
@@ -471,7 +643,7 @@ async def upsert_audio(
     async with lock:
         mutable = await require_mutable_media(media_id, db)
         previous_fingerprint = mutable.item.source_fingerprint
-        with temporary_update_directory() as temporary:
+        async with MediaMutation(media_id) as mutation, _temporary_update_scope() as temporary:
             temporary_root = Path(temporary)
             prepared = await prepare_audio_asset(
                 url,
@@ -488,7 +660,7 @@ async def upsert_audio(
             metadata.update(metadata_payload(mutable.item))
             await persist_portable_metadata(mutable.source, metadata, temporary_root)
             db.add(mutable.item)
-            await db.commit()
+            await mutation.commit(db)
         await schedule_audio_preparation(media_id, mutable, previous_fingerprint)
         track = next(
             (entry for entry in mutable.item.audio_metadata if entry.get("source") == "external" and entry.get("language") == normalized_language),
@@ -512,7 +684,7 @@ async def remove_audio(media_id: str, language: str, db: AsyncSession) -> dict:
         file_name = str(existing.get("fileName") or "")
         if Path(file_name).name != file_name or Path(file_name).suffix.lower() not in EXTERNAL_AUDIO_EXTENSIONS:
             raise MediaUpdateFailure(409, "audio_path_invalid", "The stored dubbing path is invalid.")
-        with temporary_update_directory() as temporary:
+        async with MediaMutation(media_id) as mutation, _temporary_update_scope() as temporary:
             temporary_root = Path(temporary)
             await delete_asset(mutable.source, f"audio/{file_name}")
             await refresh_audio_state(mutable)
@@ -520,7 +692,7 @@ async def remove_audio(media_id: str, language: str, db: AsyncSession) -> dict:
             metadata.update(metadata_payload(mutable.item))
             await persist_portable_metadata(mutable.source, metadata, temporary_root)
             db.add(mutable.item)
-            await db.commit()
+            await mutation.commit(db)
         await schedule_audio_preparation(media_id, mutable, previous_fingerprint)
         return {"mediaId": media_id, "removedLanguage": normalized_language, "languages": mutable.item.languages}
 

@@ -22,7 +22,9 @@ engine = create_async_engine(
 def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA synchronous=NORMAL")
+    # Media receipts authorize consuming filesystem rollback evidence. Their
+    # WAL commit must be synchronized before the caller may discard originals.
+    cursor.execute("PRAGMA synchronous=FULL")
     cursor.execute("PRAGMA busy_timeout=5000")
     cursor.close()
 
@@ -95,6 +97,11 @@ async def init_db(
                     sync_conn.exec_driver_sql("ALTER TABLE authsession ADD COLUMN selected_profile_id TEXT")
                 if "selected_profile_pin_version" not in auth_session_columns:
                     sync_conn.exec_driver_sql("ALTER TABLE authsession ADD COLUMN selected_profile_pin_version INTEGER")
+            if "authchallenge" in inspector.get_table_names():
+                challenge_columns = [col["name"] for col in inspector.get_columns("authchallenge")]
+                if "auth_session_id" not in challenge_columns:
+                    sync_conn.exec_driver_sql("ALTER TABLE authchallenge ADD COLUMN auth_session_id TEXT")
+                sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_authchallenge_auth_session_id ON authchallenge (auth_session_id)")
             if "integrationcredential" in inspector.get_table_names():
                 integration_columns = [col["name"] for col in inspector.get_columns("integrationcredential")]
                 if "token_hint" not in integration_columns:
@@ -215,6 +222,7 @@ async def init_db(
                     "width": "INTEGER",
                     "height": "INTEGER",
                     "frame_rate": "FLOAT",
+                    "analysis_metadata_str": "TEXT NOT NULL DEFAULT '{}'",
                     "source_fingerprint": "TEXT",
                     "audio_metadata_str": "TEXT DEFAULT '[]'",
                     "preview_task_id": "TEXT",
@@ -227,8 +235,11 @@ async def init_db(
                 # Existing IDs are already stable TMDB-derived identifiers. Backfill them once,
                 # then classify rows by actual playable media instead of their folder location.
                 sync_conn.exec_driver_sql(
-                    "UPDATE movie SET tmdb_id = CAST(SUBSTR(id, 3) AS INTEGER) "
-                    "WHERE tmdb_id IS NULL AND (id LIKE 'm_%' OR id LIKE 'tv_%')"
+                    "UPDATE movie SET tmdb_id = CAST(CASE WHEN id GLOB 'tv_[0-9]*' "
+                    "THEN SUBSTR(id, 4) ELSE SUBSTR(id, 3) END AS INTEGER) "
+                    "WHERE (tmdb_id IS NULL OR (tmdb_id = 0 AND id GLOB 'tv_[0-9]*')) "
+                    "AND ((id GLOB 'm_[0-9]*' AND SUBSTR(id, 3) NOT GLOB '*[^0-9]*') "
+                    "OR (id GLOB 'tv_[0-9]*' AND SUBSTR(id, 4) NOT GLOB '*[^0-9]*'))"
                 )
                 sync_conn.exec_driver_sql(
                     "UPDATE movie SET catalog_source = 'tmdb_cache', availability = 'cached' "
@@ -273,6 +284,7 @@ async def init_db(
                     "width": "INTEGER",
                     "height": "INTEGER",
                     "frame_rate": "FLOAT",
+                    "analysis_metadata_str": "TEXT NOT NULL DEFAULT '{}'",
                     "source_fingerprint": "TEXT",
                     "audio_metadata_str": "TEXT DEFAULT '[]'",
                     "dialogue_wpm": "FLOAT",

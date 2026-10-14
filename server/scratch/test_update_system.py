@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -19,6 +20,10 @@ from lifecycle.coordination import EffectClass, RuntimeCoordinator
 from routes import update as update_route
 from services import state
 from services import update
+
+
+REAL_CURRENT_COMMIT = update.current_commit
+REAL_RUN_GIT_CMD = update.run_git_cmd
 
 
 class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
@@ -43,6 +48,9 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
             patch.object(update, "WORKSPACE_ROOT", self.workspace_root),
             patch.object(update, "START_SCRIPT", self.workspace_root / "start.sh"),
             patch.object(update, "UPDATE_SCRIPT", self.workspace_root / "update.sh"),
+            patch.object(update, "current_commit", AsyncMock(return_value="a" * 40)),
+            patch.object(update, "UPDATE_QUEUE_LOCK", asyncio.Lock()),
+            patch.object(update, "UPDATE_CUTOVER_LOCK", asyncio.Lock()),
         ]
         for active_patch in self.patches:
             active_patch.start()
@@ -264,6 +272,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         target = "c" * 40
         state.UPDATE_COMMIT_TOKEN = "commit-token"
         state.UPDATE_TRANSACTION_ID = transaction
+        state.MAINTENANCE_MODE = True
         with (
             patch.object(update_route, "require_current_guarded_authority"),
             patch.object(update_route, "get_startup_readiness", return_value=object()),
@@ -297,8 +306,8 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         read_journal.assert_not_called()
         mutate_journal.assert_not_called()
         self.assertTrue(state.MAINTENANCE_MODE)
-        self.assertEqual(state.UPDATE_TRANSACTION_ID, "")
-        self.assertEqual(state.UPDATE_COMMIT_TOKEN, "")
+        self.assertEqual(state.UPDATE_TRANSACTION_ID, transaction)
+        self.assertEqual(state.UPDATE_COMMIT_TOKEN, "commit-token")
 
     async def test_stale_guarded_authority_cannot_mutate_update_journal(self) -> None:
         transaction = "failed-recovery-transaction"
@@ -497,7 +506,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
 
     def test_managed_updates_refuse_a_concurrent_public_installer(self) -> None:
         workspace = Path(self.temporary.name) / "StreamHome"
-        workspace.mkdir()
+        workspace.mkdir(exist_ok=True)
         lock_path = workspace.with_name(f"{workspace.name}.install.lock")
         lock_path.mkdir()
         (lock_path / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
@@ -592,13 +601,51 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(operation.operation_id, queued["transaction_id"])
         self.assertEqual(authority.generation, queued["lifecycle_generation"])
         self.assertEqual(queued["lifecycle_phase"], "reserved")
-        self.assertEqual(queued["previous_commit"], "")
+        self.assertEqual(queued["previous_commit"], "a" * 40)
         self.assertEqual(queued["staging_dir"], "")
         self.assertEqual(queued["diagnostic_id"], "")
         self.assertIsNone(queued["recovery_requested_at"])
         credential = lifecycle_state.lifecycle_paths(self.workspace_root).credential_path(operation.operation_id)
         raw_capability = credential.read_text(encoding="ascii").strip()
         self.assertNotIn(raw_capability, self.status_path.read_text(encoding="utf-8"))
+
+    async def test_real_queue_producer_survives_restart_before_controller_launch(self) -> None:
+        def git(*arguments: str) -> str:
+            return subprocess.run(["git", "-C", str(self.workspace_root), *arguments],
+                check=True, capture_output=True, text=True).stdout.strip()
+        git("init")
+        git("config", "user.name", "Isolated Test")
+        git("config", "user.email", "isolated@example.invalid")
+        git("add", "start.sh", "update.sh")
+        git("commit", "-m", "Initial isolated installation")
+        previous = git("rev-parse", "HEAD")
+        (self.workspace_root / "target.txt").write_text("candidate\n", encoding="utf-8")
+        git("add", "target.txt")
+        git("commit", "-m", "Isolated target")
+        target = git("rev-parse", "HEAD")
+        git("checkout", "--detach", previous)
+        update.write_update_state(phase="update_available", target_commit=target, update_available=True)
+        with (patch.object(update, "current_commit", REAL_CURRENT_COMMIT),
+              patch.object(update, "run_git_cmd", new=lambda args, **kwargs: REAL_RUN_GIT_CMD(args, cwd=self.workspace_root, **kwargs))):
+            queued = await update.queue_update(automatic=False)
+        self.assertEqual(queued["previous_commit"], previous)
+        self.assertEqual(queued["current_commit"], previous)
+        recovered = update_controller._recover_identity(self.workspace_root)
+        self.assertEqual(recovered[:4], (queued["transaction_id"], queued["lifecycle_generation"], target, previous))
+        self.assertTrue(recovered[-1])
+        self.assertEqual(lifecycle_state.inspect_state(self.workspace_root).active_operation.phase,
+            lifecycle_state.LifecyclePhase.RESERVED)
+
+    async def test_queued_launch_rejects_changed_installed_baseline(self) -> None:
+        update.write_update_state(phase="update_available", target_commit="b" * 40, update_available=True)
+        queued = await update.queue_update(automatic=False)
+        self.assertEqual(queued["previous_commit"], "a" * 40)
+        with (patch.object(update, "current_commit", AsyncMock(return_value="c" * 40)),
+              patch.object(update, "queued_launch_blockers", AsyncMock(return_value=[])),
+              patch.object(update, "spawn_update_controller") as launch):
+            self.assertFalse(await update.launch_queued_update_if_ready())
+        launch.assert_not_called()
+        self.assertEqual(update.read_update_state()["error"], "invalid_update_state")
 
     async def test_new_exact_update_transaction_may_reset_prior_commit_boundary(self) -> None:
         previous_transaction = str(uuid.uuid4())
@@ -762,6 +809,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         operation = claimed.state.active_operation
         update.write_update_state(
             phase="waiting_for_idle",
+            previous_commit="a" * 40,
             transaction_id=operation.operation_id,
             lifecycle_generation=claimed.state.generation,
             lifecycle_phase="reserved",
@@ -799,7 +847,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         update.write_update_state(
             phase="waiting_for_idle",
             target_commit="d" * 40,
-            previous_commit="c" * 40,
+            previous_commit="a" * 40,
             runtime_committed=False,
             transaction_id=operation.operation_id,
             lifecycle_generation=claimed.state.generation,
@@ -897,7 +945,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         update.write_update_state(
             phase="waiting_for_idle",
             target_commit="d" * 40,
-            previous_commit="c" * 40,
+            previous_commit="a" * 40,
             runtime_committed=False,
             transaction_id=operation.operation_id,
             lifecycle_generation=claimed.state.generation,
@@ -1122,6 +1170,13 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
             )
             controller_leases.append(lease)
             self.assertEqual(transferred.state.generation, handoff.generation)
+            update_controller._record_transferred_generation(self.workspace_root,
+                operation_id=queued["transaction_id"], previous_generation=queued["lifecycle_generation"],
+                generation=handoff.generation, lifecycle_phase=lifecycle_state.LifecyclePhase.RESERVED,
+                target_commit=target, previous_commit=current)
+            update_controller.mutate_update_journal(self.workspace_root,
+                operation_id=queued["transaction_id"], generation=handoff.generation,
+                expected_lifecycle_phase="reserved", changes={"controller_pid": 4321})
             return handoff
 
         try:
@@ -1141,12 +1196,12 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
 
         persisted = update.read_update_state()
         self.assertEqual(persisted["phase"], "queued")
-        self.assertEqual(persisted["updater_pid"], 4321)
+        self.assertEqual(persisted["controller_pid"], 4321)
         launch.assert_called_once()
         self.assertEqual(launch.call_args.kwargs["operation_id"], queued["transaction_id"])
         self.assertEqual(launch.call_args.kwargs["generation"], queued["lifecycle_generation"])
-        chmod.assert_called_once()
-        self.assertEqual(chmod.call_args.args[1] & 0o111, 0o111)
+        updater_chmod = next(call for call in chmod.call_args_list if Path(call.args[0]) == update_script)
+        self.assertEqual(updater_chmod.args[1] & 0o111, 0o111)
         self.assertEqual(update.read_update_state()["lifecycle_generation"], handoff.generation)
 
     async def test_orphaned_target_is_reconciled_without_rollback_when_both_services_are_healthy(self) -> None:
@@ -1250,7 +1305,6 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(update, "START_SCRIPT", start_script),
-            patch.object(update, "WORKSPACE_ROOT", Path(self.temporary.name)),
             patch.object(update, "update_lock_active", return_value=False),
             patch.object(update, "orphaned_controller_stale", return_value=True),
             patch.object(update, "current_commit", AsyncMock(return_value=target)),

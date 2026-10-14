@@ -92,6 +92,26 @@ class UpdateControllerTests(unittest.TestCase):
         )
         return result.stdout.strip()
 
+    def test_old_blank_queued_previous_commit_has_narrow_pre_cutover_adoption(self) -> None:
+        payload = json.loads(self.journal.read_text(encoding="utf-8"))
+        payload.update(previous_commit="", current_commit=self.previous)
+        self.journal.write_text(json.dumps(payload), encoding="utf-8")
+        identity = update_controller._recover_identity(self.root)
+        self.assertEqual(identity[3], self.previous)
+        self.assertTrue(identity[-1])
+        self.assertEqual(state.inspect_state(self.root).active_operation.phase, state.LifecyclePhase.RESERVED)
+        (self.root / ".run" / "pre-update-database.db").write_bytes(b"ambiguous-checkpoint")
+        with self.assertRaises(update_controller.UpdateControllerConflict):
+            update_controller._recover_identity(self.root)
+        self.assertEqual(state.inspect_state(self.root).active_operation.phase, state.LifecyclePhase.RECOVERY_REQUIRED)
+
+    def test_old_blank_queued_previous_commit_rejects_changed_installed_head(self) -> None:
+        payload = json.loads(self.journal.read_text(encoding="utf-8"))
+        payload.update(previous_commit="", current_commit=self.target)
+        self.journal.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(update_controller.UpdateControllerConflict):
+            update_controller._recover_identity(self.root)
+
     def _spawn(self, generation: int) -> update_controller.UpdateControllerHandoff:
         log = (self.root / "update.log").open("ab", buffering=0)
         try:

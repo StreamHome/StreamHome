@@ -3,7 +3,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { readFileSync } from "fs";
 import { createServer as createViteServer } from "vite";
-import { createProxyMiddleware } from "http-proxy-middleware";
+import { createTrustedProxy } from "./proxySecurity";
 
 
 
@@ -41,16 +41,9 @@ async function startServer() {
   });
 
   // Proxy /api and /media requests to the live Python FastAPI backend
-  app.use("/api", createProxyMiddleware({
-    target: "http://127.0.0.1:8000/api",
-    changeOrigin: true,
-    xfwd: true
-  }));
-  app.use("/media", createProxyMiddleware({
-    target: "http://127.0.0.1:8000/media",
-    changeOrigin: true,
-    xfwd: true
-  }));
+  const trustedProxyCidrs = process.env.TRUSTED_PROXY_CIDRS ?? "127.0.0.1/32,::1/128";
+  app.use("/api", createTrustedProxy("http://127.0.0.1:8000/api", trustedProxyCidrs));
+  app.use("/media", createTrustedProxy("http://127.0.0.1:8000/media", trustedProxyCidrs));
 
   // Setup basic middlewares
   app.use(express.json());

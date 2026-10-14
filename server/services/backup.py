@@ -59,6 +59,23 @@ def validate_backup_database(path: Path) -> None:
     except RestoreValidationError as exc:
         raise ValueError("Backup database validation failed.") from exc
 
+
+def eligible_backup(path: Path) -> backup_manifest.BackupEvidence:
+    """Require both exact pair identity and a usable standalone SQLite database."""
+    evidence = backup_manifest.validate_backup_pair(path)
+    validate_backup_database(path)
+    if backup_manifest.validate_backup_pair(path) != evidence:
+        raise ValueError("Backup identity changed during validation.")
+    return evidence
+
+
+def backup_due(backups: list[dict], *, now: datetime | None = None) -> bool:
+    valid = [item for item in backups if item.get("valid") is True]
+    if not valid:
+        return True
+    newest = max(datetime.fromisoformat(item["timestamp"]) for item in valid)
+    return ((now or datetime.now()) - newest).total_seconds() >= 24 * 60 * 60
+
 async def is_database_idle() -> bool:
     """
     Checks if the database is currently not in use.
@@ -221,22 +238,29 @@ async def delete_backup(path: Path) -> None:
 
 
 def _prune_old_backups(keep_count: int = 7) -> None:
-    """Keep only the last keep_count backup files locally."""
+    """Retain invalid evidence and apply the quota only to usable backup pairs."""
+    if type(keep_count) is not int or keep_count < 1:
+        raise ValueError("Backup retention count must be positive.")
     try:
-        backup_dir = get_backup_dir()
-        files = [
-            os.path.join(backup_dir, f)
-            for f in os.listdir(backup_dir)
-            if backup_manifest.is_supported_backup_name(f)
-        ]
-        # Sort files by creation time
-        files.sort(key=os.path.getmtime)
-        
-        if len(files) > keep_count:
-            files_to_delete = files[:-keep_count]
-            for file_path in files_to_delete:
-                delete_backup_pair(Path(file_path))
-                logger.info(f"[Backup Service] Pruned old backup file: {os.path.basename(file_path)}")
+        valid: list[tuple[Path, backup_manifest.BackupEvidence]] = []
+        for path in Path(get_backup_dir()).iterdir():
+            if not backup_manifest.is_supported_backup_name(path.name):
+                continue
+            try:
+                valid.append((path, eligible_backup(path)))
+            except (backup_manifest.BackupManifestError, ValueError, OSError):
+                continue
+        valid.sort(key=lambda item: item[0].stat().st_mtime_ns)
+        targets = valid[:-keep_count]
+        # Validate the entire selection before the first deletion, then check each
+        # exact pair again immediately before deleting it.
+        if any(eligible_backup(path) != evidence for path, evidence in targets):
+            raise ValueError("Backup retention evidence changed.")
+        for path, evidence in targets:
+            if eligible_backup(path) != evidence:
+                raise ValueError("Backup retention evidence changed.")
+            delete_backup_pair(path)
+            logger.info("[Backup Service] Pruned old backup file: %s", path.name)
     except Exception as e:
         logger.error(f"[Backup Service] Error pruning old backups: {e}")
 
@@ -263,11 +287,11 @@ def get_local_backups() -> list:
             mtime = file_state.st_mtime
             size = file_state.st_size if stat.S_ISREG(file_state.st_mode) else 0
             try:
-                evidence = backup_manifest.validate_backup_pair(file_path)
+                evidence = eligible_backup(file_path)
                 backup_format = evidence.format
                 manifest_status = "valid" if evidence.manifest else "legacy"
                 valid = True
-            except backup_manifest.BackupManifestError:
+            except (backup_manifest.BackupManifestError, ValueError, OSError):
                 backup_format = "manifest_v1" if backup_manifest.is_manifest_backup_name(f) else "legacy"
                 manifest_status = "invalid"
                 valid = False
@@ -304,27 +328,21 @@ def _prepare_cloud_snapshot(backup_dir: Path) -> Path:
         for entry in entries
         if backup_manifest.is_supported_backup_name(entry.name)
     }
-    manifest_names = {
-        entry.name
-        for entry in entries
-        if entry.name.endswith(".db.manifest.json")
-    }
-    expected_manifest_names: set[str] = set()
-    evidence: list[tuple[Path, Path | None]] = []
+    evidence: list[tuple[Path, Path | None, backup_manifest.BackupEvidence]] = []
     for name, database_path in sorted(database_paths.items()):
         try:
-            pair = backup_manifest.validate_backup_pair(database_path)
-            validate_backup_database(database_path)
-        except (backup_manifest.BackupManifestError, ValueError) as exc:
-            raise ValueError("Cloud backup selection found invalid backup evidence.") from exc
+            pair = eligible_backup(database_path)
+        except (backup_manifest.BackupManifestError, ValueError, OSError):
+            logger.warning("[Backup Service] Invalid local backup retained and excluded from cloud selection: %s", database_path.name)
+            continue
         manifest_path = backup_manifest.manifest_path_for(database_path)
         if pair.manifest is not None:
-            expected_manifest_names.add(manifest_path.name)
-            evidence.append((database_path, manifest_path))
+            evidence.append((database_path, manifest_path, pair))
         else:
-            evidence.append((database_path, None))
-    if manifest_names != expected_manifest_names:
-        raise ValueError("Cloud backup selection found incomplete backup evidence.")
+            evidence.append((database_path, None, pair))
+    # Orphaned/invalid manifests remain visible locally, outside the cloud snapshot.
+    if not evidence:
+        raise ValueError("Cloud backup selection has no usable backup pairs.")
 
     snapshot = Path(
         tempfile.mkdtemp(
@@ -334,10 +352,12 @@ def _prepare_cloud_snapshot(backup_dir: Path) -> Path:
     )
     os.chmod(snapshot, 0o700)
     try:
-        for database_path, manifest_path in evidence:
+        for database_path, manifest_path, pair in evidence:
             os.link(database_path, snapshot / database_path.name, follow_symlinks=False)
             if manifest_path is not None:
                 os.link(manifest_path, snapshot / manifest_path.name, follow_symlinks=False)
+        if any(eligible_backup(snapshot / database_path.name) != pair for database_path, _, pair in evidence):
+            raise ValueError("Cloud backup snapshot identity changed.")
         return snapshot
     except BaseException:
         shutil.rmtree(snapshot, ignore_errors=True)

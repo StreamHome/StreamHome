@@ -139,6 +139,10 @@ class UpdateControllerConflict(UpdateControllerError):
     code = "update_controller_conflict"
 
 
+class UpdateBaselineConflict(UpdateControllerConflict):
+    code = "update_installed_baseline_conflict"
+
+
 class UpdateControllerPersistenceError(UpdateControllerError):
     code = "update_controller_persistence_error"
 
@@ -263,6 +267,56 @@ def read_update_journal(path: Path) -> dict[str, Any]:
     """Strictly decode one authority-sensitive update journal."""
 
     return _read_update_journal(path)
+
+
+def pre_cutover_previous_commit(root: Path, payload: Mapping[str, Any], authority: state.LifecycleState) -> str | None:
+    """Recognize the old blank queued identity only with unchanged Git evidence."""
+    previous = payload.get("previous_commit")
+    if isinstance(previous, str) and COMMIT_RE.fullmatch(previous):
+        return previous
+    operation = authority.active_operation
+    if ((previous is not None and previous != "") or operation is None
+            or operation.operation_type is not state.OperationType.UPDATE
+            or operation.phase not in {state.LifecyclePhase.RESERVED, state.LifecyclePhase.RECOVERY_REQUIRED}
+            or payload.get("transaction_id") != operation.operation_id
+            or payload.get("phase") not in {"queued", "preflight", "waiting_for_idle", "failed"}
+            or payload.get("runtime_committed") is not False
+            or payload.get("staging_dir") or payload.get("web_artifacts_swapped")
+            or payload.get("web_dependencies_swapped") or payload.get("controller_pid")
+            or any((root / ".run" / name).exists() or (root / ".run" / name).is_symlink()
+                for name in ("pre-update-database.db", "update-transaction.json"))):
+        return None
+    lease = state.read_controller_lease(root)
+    if lease is not None and state.controller_lease_is_current(lease):
+        return None
+    recorded = payload.get("current_commit")
+    if not isinstance(recorded, str) or not COMMIT_RE.fullmatch(recorded):
+        return None
+    try:
+        result = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return recorded if result.returncode == 0 and result.stdout.strip() == recorded else None
+
+
+def validate_pre_cutover_baseline(root: Path, previous_commit: str) -> None:
+    """Require the producer's installed HEAD before any update cutover effects."""
+    if not isinstance(previous_commit, str) or not COMMIT_RE.fullmatch(previous_commit):
+        raise UpdateBaselineConflict("update installed baseline is invalid")
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise UpdateBaselineConflict("update installed baseline is unavailable") from exc
+    if result.returncode != 0 or result.stdout.strip() != previous_commit:
+        raise UpdateBaselineConflict("update installed baseline changed or is unavailable")
 
 
 def _validate_update_journal_semantics(
@@ -489,11 +543,13 @@ def reconcile_operator_journal_recovery_required(
     operation_id: str,
     generation: int,
     current_phase: state.LifecyclePhase,
+    pre_cutover_baseline_rejected: bool = False,
 ) -> None:
-    """Reconcile only the subordinate phase after a dead operator controller.
+    """Reconcile only the subordinate phase after rejected or dead control.
 
-    The caller holds controller.lock and proves the exact operator action is no
-    longer running.  No update action is resumed by this journal-only operation.
+    A dead operator's caller holds controller.lock. A rejected pre-cutover
+    baseline has not launched a child and retains the exact transaction identity.
+    No update action is resumed by this journal-only operation.
     """
 
     journal_path, lock_path, _ = _update_paths(root, operation_id, generation)
@@ -517,11 +573,18 @@ def reconcile_operator_journal_recovery_required(
         ):
             raise UpdateControllerConflict("interrupted operator update identity changed")
         journal_phase = state.LifecyclePhase(str(payload.get("lifecycle_phase")))
-        if journal_phase not in {
+        allowed_phases = {
             state.LifecyclePhase.RECOVERY_REQUIRED,
             state.LifecyclePhase.EXCLUSIVE,
             state.LifecyclePhase.VERIFYING,
-        }:
+        }
+        if (
+            pre_cutover_baseline_rejected
+            and payload.get("runtime_committed") is False
+            and payload.get("phase") in {"queued", "preflight", "waiting_for_idle"}
+        ):
+            allowed_phases.add(state.LifecyclePhase.RESERVED)
+        if journal_phase not in allowed_phases:
             raise UpdateControllerConflict("interrupted operator journal phase is invalid")
         prior = state.LifecycleState(
             current.schema_version,
@@ -538,7 +601,8 @@ def reconcile_operator_journal_recovery_required(
         if journal_phase is not state.LifecyclePhase.RECOVERY_REQUIRED:
             updated = dict(payload)
             updated["lifecycle_phase"] = state.LifecyclePhase.RECOVERY_REQUIRED.value
-            updated["updated_at"] = time.time()
+            if not pre_cutover_baseline_rejected:
+                updated["updated_at"] = time.time()
             recovery_authority = state.LifecycleState(
                 current.schema_version,
                 generation,
@@ -551,10 +615,17 @@ def reconcile_operator_journal_recovery_required(
                 ),
             )
             _validate_update_journal_semantics(updated, authority=recovery_authority)
-            _private_atomic_write(
-                journal_path,
-                (json.dumps(updated, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-            )
+            with state.hold_operation_with_credential(
+                root,
+                operation_id=operation_id,
+                generation=generation,
+                expected_phase=current_phase,
+                expected_operation_type=state.OperationType.UPDATE,
+            ):
+                _private_atomic_write(
+                    journal_path,
+                    (json.dumps(updated, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+                )
     except (OSError, ValueError) as exc:
         raise UpdateControllerConflict("interrupted operator journal is unavailable") from exc
     finally:
@@ -777,6 +848,23 @@ def _mark_recovery_required(
         pass
 
 
+def _mark_pre_cutover_baseline_rejected(root: Path, operation_id: str, generation: int) -> None:
+    """Retain exact evidence and expose explicit recovery without starting a child."""
+    _mark_recovery_required(root, operation_id, generation, state.LifecyclePhase.RESERVED)
+    try:
+        reconcile_operator_journal_recovery_required(
+            root,
+            operation_id=operation_id,
+            generation=generation,
+            current_phase=state.LifecyclePhase.RECOVERY_REQUIRED,
+            pre_cutover_baseline_rejected=True,
+        )
+    except (UpdateControllerError, state.LifecycleError, OSError):
+        # If phase normalization itself is uncertain, keep both original evidence
+        # and durable recovery authority fail-closed. No baseline is invented.
+        pass
+
+
 def _run_controller(
     root: Path,
     *,
@@ -816,6 +904,13 @@ def _run_controller(
         raise UpdateControllerConflict("operator update action is unsupported")
     if operator_action is not None and operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED:
         raise UpdateControllerConflict("operator update action requires recovery-required authority")
+    pre_cutover = operation.phase is state.LifecyclePhase.RESERVED
+    if pre_cutover:
+        try:
+            validate_pre_cutover_baseline(root, previous_commit)
+        except UpdateControllerError:
+            _mark_pre_cutover_baseline_rejected(root, operation_id, generation)
+            raise
     capability = state.load_controller_capability(
         root, operation_id=operation_id, generation=generation
     )
@@ -945,6 +1040,10 @@ def _run_controller(
             automatic=automatic,
             install_mode=install_mode,
         )
+        if pre_cutover:
+            # Materialization and ownership handoff may outlive an owner's clean
+            # checkout change. The process-local cutover checks again after drain.
+            validate_pre_cutover_baseline(root, previous_commit)
         controller_process = subprocess.Popen(
             command,
             cwd=str(root),
@@ -982,7 +1081,7 @@ def _run_controller(
                     current_operation.phase,
                 )
         return return_code
-    except Exception:
+    except Exception as exc:
         if controller_process is not None and controller_process.poll() is None:
             controller_process.terminate()
             try:
@@ -1003,7 +1102,10 @@ def _run_controller(
                     failure_phase = failed_operation.phase
             except state.LifecycleError:
                 pass
-        _mark_recovery_required(root, operation_id, current_generation, failure_phase)
+        if isinstance(exc, UpdateBaselineConflict) and pre_cutover and controller_process is None:
+            _mark_pre_cutover_baseline_rejected(root, operation_id, current_generation)
+        else:
+            _mark_recovery_required(root, operation_id, current_generation, failure_phase)
         raise
     finally:
         if acknowledgement_fd is not None:
@@ -1046,6 +1148,9 @@ def _operator_recovery_identity(
         expected_journal_generation,
         current.active_operation,
     )
+    previous = pre_cutover_previous_commit(root, payload, journal_authority)
+    if previous is not None:
+        payload["previous_commit"] = previous
     _validate_update_journal_semantics(payload, authority=journal_authority)
     target = payload.get("target_commit")
     previous = payload.get("previous_commit")
@@ -1245,6 +1350,9 @@ def _recover_identity(root: Path) -> tuple[str, int, str, str, bool, str, str, b
     reconciled = dict(payload)
     reconciled["lifecycle_generation"] = current.generation
     reconciled["lifecycle_phase"] = operation.phase.value
+    previous = pre_cutover_previous_commit(root, payload, current)
+    if previous is not None:
+        reconciled["previous_commit"] = previous
     try:
         _validate_update_journal_semantics(reconciled, authority=current)
     except UpdateControllerError:
@@ -1265,7 +1373,7 @@ def _recover_identity(root: Path) -> tuple[str, int, str, str, bool, str, str, b
         _mark_recovery_required(root, operation.operation_id, current.generation, operation.phase)
         raise UpdateControllerConflict("update journal is not safely resumable")
     target = payload.get("target_commit")
-    previous = payload.get("previous_commit")
+    previous = reconciled.get("previous_commit")
     install_mode = payload.get("install_mode") or "when_idle"
     update_branch = payload.get("update_branch") or "main"
     if (
@@ -1280,6 +1388,12 @@ def _recover_identity(root: Path) -> tuple[str, int, str, str, bool, str, str, b
     ):
         _mark_recovery_required(root, operation.operation_id, current.generation, operation.phase)
         raise UpdateControllerConflict("update recovery journal identity is invalid")
+    if operation.phase is state.LifecyclePhase.RESERVED:
+        try:
+            validate_pre_cutover_baseline(root, previous)
+        except UpdateControllerError:
+            _mark_pre_cutover_baseline_rejected(root, operation.operation_id, current.generation)
+            raise
     return (
         operation.operation_id,
         current.generation,

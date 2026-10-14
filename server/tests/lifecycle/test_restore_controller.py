@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import closing
 import os
 from pathlib import Path
 import sqlite3
@@ -10,7 +11,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from lifecycle import backup_manifest, coordination, restore_controller, state
+from lifecycle import backup_manifest, coordination, recovery, restore_controller, state
+from lifecycle.configuration_paths import ConfigurationPathError, resolve_temp_directory
 from scratch import maintenance_server, runtime_control
 
 
@@ -228,6 +230,167 @@ class RestoreControllerTests(unittest.TestCase):
         self.assertEqual(final["activation_state"], "completed")
         self.assertEqual(read_marker(self.database), "candidate")
         self.assertEqual(restore_controller.artifact_identity(self.backup), source_hash)
+
+    def _accept_candidate(self) -> dict:
+        journal = self._prepare_artifacts()
+        restore_controller.activate_staged_candidate(self.paths, journal)
+        for before, after in (("reserved", "exclusive"), ("exclusive", "verifying")):
+            state.transition_operation_with_credential(self.root, operation_id=self.operation_id,
+                generation=self.generation, expected_phase=before, next_phase=after)
+        restore_controller.update_restore_journal(self.root, self.operation_id, progress="verifying_candidate")
+        restore_controller.update_restore_journal(self.root, self.operation_id,
+            progress="accepted", accepted=True, outcome="accepted")
+        return restore_controller.update_restore_journal(self.root, self.operation_id, progress="normal_recovery")
+
+    def test_accepted_database_writes_preserve_lineage_and_operator_continue(self) -> None:
+        journal = self._accept_candidate()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("UPDATE user SET value='recovered' WHERE id='marker'")
+            connection.execute("CREATE TABLE migration_evidence (id INTEGER)")
+            connection.commit()
+            self.assertTrue(restore_controller.installed_database_is_recognized(self.paths, journal))
+            restore_controller._mark_recovery_required(self.paths, self.generation, "normal_recovery_failed")
+            artifacts, accepted, _, actions = recovery._restore_plan(self.root, self.operation_id,
+                self.generation, controller_status="inactive", runtime_status="offline")
+            self.assertTrue(accepted)
+            self.assertEqual(actions, ["continue_recovery"])
+            self.assertEqual(artifacts["canonicalDatabase"], "valid")
+
+    def test_same_contents_replacement_and_foreign_provenance_fail_closed(self) -> None:
+        journal = self._accept_candidate()
+        replacement = self.paths.operation_dir / "foreign.db"
+        restore_controller._copy_sqlite(self.database, replacement, source_standalone=False)
+        os.replace(replacement, self.database)
+        self.assertFalse(restore_controller.installed_database_is_recognized(self.paths, journal))
+
+    def test_restore_rejects_pending_media_receipts_before_candidate_replace(self) -> None:
+        journal = self._prepare_artifacts()
+        pending = self.root / "server" / "temp" / "media-operations" / "pending"
+        pending.mkdir(parents=True)
+        (pending / "operation.json").write_text('{"accepted": true}', encoding="utf-8")
+        original = restore_controller.artifact_identity(self.database)
+        with self.assertRaises(restore_controller.RestoreRecoveryRequired):
+            restore_controller.activate_staged_candidate(self.paths, journal)
+        self.assertEqual(restore_controller.artifact_identity(self.database), original)
+        self.assertEqual(restore_controller.read_restore_journal(self.root, self.operation_id)["activation_state"], "not_started")
+        self.assertTrue((pending / "operation.json").is_file())
+
+    def test_rollback_rejects_pending_media_receipts_in_custom_temp_directory(self) -> None:
+        journal = self._prepare_artifacts()
+        restore_controller.activate_staged_candidate(self.paths, journal)
+        custom = self.root / "configured-temp"
+        pending = custom / "media-operations" / "pending"
+        pending.mkdir(parents=True)
+        original = restore_controller.artifact_identity(self.database)
+        with mock.patch.dict(os.environ, {"TEMP_DIR": str(custom)}):
+            with self.assertRaises(restore_controller.RestoreRecoveryRequired):
+                restore_controller.restore_rollback_checkpoint(self.paths,
+                    restore_controller.read_restore_journal(self.root, self.operation_id))
+        self.assertEqual(restore_controller.artifact_identity(self.database), original)
+
+    def test_temp_path_resolution_matches_environment_and_dotenv_precedence(self) -> None:
+        (self.root / ".env").write_text('TEMP_DIR="root-temp" # configured\n', encoding="utf-8")
+        (self.root / "server" / ".env").write_text("TEMP_DIR=server-temp\n", encoding="utf-8")
+        self.assertEqual(resolve_temp_directory(self.root, environment={}), self.root / "server" / "root-temp")
+        self.assertEqual(resolve_temp_directory(self.root, environment={"TEMP_DIR": "environment-temp"}), self.root / "server" / "environment-temp")
+        (self.root / ".env").write_text("TEMP_DIR=${UNRESOLVED}/temp\n", encoding="utf-8")
+        with self.assertRaises(ConfigurationPathError):
+            resolve_temp_directory(self.root, environment={})
+
+    def test_modified_lineage_nonce_fails_closed(self) -> None:
+        journal = self._accept_candidate()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("UPDATE streamhome_restore_lineage SET nonce=?", ("f" * 64,))
+        self.assertFalse(restore_controller.installed_database_is_recognized(self.paths, journal))
+
+    def test_completion_intent_hashes_fresh_consistent_wal_snapshot(self) -> None:
+        journal = self._accept_candidate()
+        connection = sqlite3.connect(self.database)
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+            connection.execute("UPDATE user SET value='normal-recovery' WHERE id='marker'")
+            connection.commit()
+            self.assertNotEqual(restore_controller.consistent_database_identity(self.paths),
+                (journal["staged_size"], journal["staged_sha256"]))
+            restore_controller.record_restore_completion_intent(self.paths, generation=self.generation, outcome="succeeded")
+            state.complete_operation_with_credential(self.root, operation_id=self.operation_id,
+                generation=self.generation, expected_phase="verifying")
+            self.assertTrue(restore_controller.reconcile_restore_completion_intent(self.root, self.operation_id, self.generation))
+            self.assertEqual(restore_controller.read_restore_journal(self.root, self.operation_id)["progress"], "succeeded")
+        finally:
+            connection.close()
+
+    def test_completion_intent_accepts_owned_writes_after_authority_completion(self) -> None:
+        self._accept_candidate()
+        restore_controller.record_restore_completion_intent(self.paths, generation=self.generation, outcome="succeeded")
+        state.complete_operation_with_credential(self.root, operation_id=self.operation_id,
+            generation=self.generation, expected_phase="verifying")
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("UPDATE user SET value='normal-post-completion-write' WHERE id='marker'")
+        self.assertTrue(restore_controller.reconcile_restore_completion_intent(self.root, self.operation_id, self.generation))
+
+    def test_completion_intent_rejects_mutated_completion_snapshot(self) -> None:
+        self._accept_candidate()
+        restore_controller.record_restore_completion_intent(self.paths, generation=self.generation, outcome="succeeded")
+        state.complete_operation_with_credential(self.root, operation_id=self.operation_id,
+            generation=self.generation, expected_phase="verifying")
+        with closing(sqlite3.connect(self.paths.operation_dir / "completion.db")) as connection, connection:
+            connection.execute("UPDATE user SET value='tampered-completion' WHERE id='marker'")
+        self.assertFalse(restore_controller.reconcile_restore_completion_intent(self.root, self.operation_id, self.generation))
+
+    def test_resumed_activated_rollback_is_not_replaced_or_rewound(self) -> None:
+        journal = self._prepare_artifacts()
+        restore_controller.activate_staged_candidate(self.paths, journal)
+        restore_controller.restore_rollback_checkpoint(self.paths,
+            restore_controller.read_restore_journal(self.root, self.operation_id))
+        inode = self.database.stat().st_ino
+        # Runtime I/O is isolated; actual journal transitions, SQLite identities
+        # and shared-authority completion execute here.
+        with (mock.patch.object(restore_controller, "_stop_supported_runtime"),
+              mock.patch.object(restore_controller, "_start_maintenance"),
+              mock.patch.object(restore_controller, "_start_backend"),
+              mock.patch.object(restore_controller, "_build_id", return_value="test-build"),
+              mock.patch.object(restore_controller, "_wait_guarded_ready"),
+              mock.patch.object(restore_controller, "_commit_guarded_runtime"),
+              mock.patch.object(restore_controller, "_wait_general_ready"),
+              mock.patch.object(restore_controller, "_start_web"),
+              mock.patch.object(runtime_control, "terminate_owned_service", return_value=True)):
+            self.assertEqual(restore_controller._complete_automatic_rollback(self.paths,
+                self.generation, self.claim.owner_capability, 3000), 0)
+        self.assertEqual(self.database.stat().st_ino, inode)
+        self.assertEqual(restore_controller.read_restore_journal(self.root, self.operation_id)["progress"], "rolled_back")
+
+    def test_accepted_rollback_controller_restart_completes_under_verifying(self) -> None:
+        journal = self._prepare_artifacts()
+        restore_controller.activate_staged_candidate(self.paths, journal)
+        restore_controller.restore_rollback_checkpoint(self.paths,
+            restore_controller.read_restore_journal(self.root, self.operation_id))
+        restore_controller.update_restore_journal(self.root, self.operation_id, progress="verifying_rollback")
+        restore_controller.update_restore_journal(self.root, self.operation_id,
+            progress="normal_recovery", accepted=True, outcome="rolled_back")
+        for before, after in (("reserved", "exclusive"), ("exclusive", "verifying")):
+            state.transition_operation_with_credential(self.root, operation_id=self.operation_id,
+                generation=self.generation, expected_phase=before, next_phase=after)
+        inode = self.database.stat().st_ino
+        with (mock.patch.object(restore_controller, "_stop_supported_runtime"),
+              mock.patch.object(restore_controller, "_start_maintenance"),
+              mock.patch.object(restore_controller, "_start_backend"),
+              mock.patch.object(restore_controller, "_build_id", return_value="test-build"),
+              mock.patch.object(restore_controller, "_request_json", return_value=(0, {})),
+              mock.patch.object(restore_controller, "_wait_guarded_ready"),
+              mock.patch.object(restore_controller, "_commit_guarded_runtime"),
+              mock.patch.object(restore_controller, "_wait_general_ready"),
+              mock.patch.object(restore_controller, "_start_web"),
+              mock.patch.object(runtime_control, "port_is_available", return_value=True),
+              mock.patch.object(runtime_control, "terminate_owned_service", return_value=True)):
+            result = restore_controller._run_controller(self.root, self.operation_id,
+                self.generation, self.claim.owner_capability, acknowledgement_fd=None, gate_fd=None)
+        self.assertEqual(result, 0)
+        self.assertIsNone(state.inspect_state(self.root).active_operation)
+        self.assertEqual(self.database.stat().st_ino, inode)
+        self.assertEqual(restore_controller.read_restore_journal(self.root, self.operation_id)["progress"], "rolled_back")
 
     def test_failed_candidate_can_restore_exact_checkpoint(self) -> None:
         journal = self._prepare_artifacts()

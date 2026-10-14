@@ -90,6 +90,21 @@ export interface SubtitleInfo {
   path?: string;
 }
 
+export interface MediaAnalysis {
+  quality: string;
+  qualityProvenance: string;
+  senderQuality: string | null;
+  width: number | null;
+  height: number | null;
+  videoStreamIndex: number | null;
+  frameRate: number | null;
+  videoBitrate: number | null;
+  containerBitrate: number | null;
+  bitrateUnit: "bits_per_second";
+  durationSeconds: number | null;
+  durationProvenance: string;
+}
+
 export interface Episode {
   id: string;
   movieId?: string;
@@ -101,6 +116,7 @@ export interface Episode {
   videoUrl: string;
   duration: string;
   quality: string;
+  analysis?: MediaAnalysis | null;
   languages: string[];
   subtitles: SubtitleInfo[];
   skipMarkers: Record<string, unknown>;
@@ -128,6 +144,7 @@ export interface Movie {
   director: string | null;
   type: "movie" | "series";
   quality: string;
+  analysis?: MediaAnalysis | null;
   languages: string[];
   subtitles: SubtitleInfo[];
   voteAverage: number;
