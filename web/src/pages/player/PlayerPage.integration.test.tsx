@@ -9,6 +9,7 @@ import type { Profile } from "../../types/api";
 import * as moviesApi from "../../api/movies";
 import * as playbackApi from "../../api/playback";
 import { getPlaybackSessionRevision, subscribePlaybackSessions } from "../../api/playbackSessionEvents";
+import { PLAYER_SKIP_COUNTDOWN_DELAY_MS, PLAYER_SKIP_COUNTDOWN_DURATION_MS } from "./PlayerMarkerControls";
 import {
   PLAYER_CONTROLS_IDLE_MS,
   PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS,
@@ -424,6 +425,81 @@ describe("mounted player lifecycle", () => {
     } finally {
       view.unmount();
       useThemeStore.setState({ activeTheme: previousTheme });
+    }
+  });
+
+  it("dismisses Intro only after chrome idle and countdown, then restores it on activity without changing playback", async () => {
+    const fixture: ResolvedPlayback = { ...markerPlayback, asset: { ...markerPlayback.asset, skipMarkers: { intro: [{ start: 0, end: 100 }] } } };
+    const player = await mountFramePlayer(fixture);
+    try {
+      player.frame();
+      const source = player.video.getAttribute("src");
+      const loads = videoCallCount("load", player.video);
+      const plays = videoCallCount("play", player.video);
+      const start = player.video.currentTime;
+      const control = player.view.container.querySelector<HTMLElement>(".player-skip-control")!;
+      player.advance(PLAYER_CONTROLS_IDLE_MS, true);
+      expect(player.root.dataset.controlsVisible).toBe("false");
+      expect(control.dataset.countdownStage).toBe("waiting");
+      player.advance(PLAYER_SKIP_COUNTDOWN_DELAY_MS - 1, true);
+      expect(control.dataset.countdownStage).toBe("waiting");
+      player.advance(1, true);
+      expect(control.dataset.countdownStage).toBe("filling");
+      player.advance(PLAYER_SKIP_COUNTDOWN_DURATION_MS - 1, true);
+      expect(screen.getByRole("button", { name: "Skip intro" })).toBeTruthy();
+      player.advance(1, true);
+      expect(screen.queryByRole("button", { name: "Skip intro" })).toBeNull();
+      expect(control.hidden).toBe(true);
+      expect(player.video.currentTime).toBeCloseTo(start + (PLAYER_CONTROLS_IDLE_MS + PLAYER_SKIP_COUNTDOWN_DELAY_MS + PLAYER_SKIP_COUNTDOWN_DURATION_MS) / 1000);
+      expect(player.root.dataset.playerPhase).toBe("playing");
+      fireEvent.mouseMove(player.root, { clientX: 50, clientY: 40 });
+      expect(player.root.dataset.controlsVisible).toBe("true");
+      expect(screen.getByRole("button", { name: "Skip intro" })).toBeTruthy();
+      expect(control.dataset.countdownStage).toBe("idle");
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      fireEvent.pause(player.video);
+      const pausedAt = player.video.currentTime;
+      player.advance(12_000, true, false);
+      expect(player.video.currentTime).toBe(pausedAt);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(control.hidden).toBe(false);
+      expect(control.dataset.countdownStage).toBe("idle");
+      expect(player.view.container.querySelector("video")).toBe(player.video);
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+    } finally {
+      player.close();
+    }
+  });
+
+  it("starts a fresh Intro action after a confirmed seek within a dismissed region", async () => {
+    const fixture: ResolvedPlayback = { ...markerPlayback, asset: { ...markerPlayback.asset, skipMarkers: { intro: [{ start: 0, end: 100 }] } } };
+    const player = await mountFramePlayer(fixture);
+    try {
+      player.frame();
+      const source = player.video.getAttribute("src");
+      const loads = videoCallCount("load", player.video);
+      const plays = videoCallCount("play", player.video);
+      player.advance(PLAYER_CONTROLS_IDLE_MS, true);
+      player.advance(PLAYER_SKIP_COUNTDOWN_DELAY_MS, true);
+      player.advance(PLAYER_SKIP_COUNTDOWN_DURATION_MS, true);
+      expect(screen.queryByRole("button", { name: "Skip intro" })).toBeNull();
+      const oldAction = player.view.container.querySelector(".player-skip-control");
+      fireEvent.keyDown(player.root, { key: "ArrowRight" });
+      expect(screen.queryByRole("button", { name: "Skip intro" })).toBeNull();
+      fireEvent.seeked(player.video);
+      player.frame();
+      const action = player.view.container.querySelector<HTMLElement>(".player-skip-control")!;
+      expect(action).not.toBe(oldAction);
+      expect(action.dataset.countdownStage).toBe("idle");
+      expect(screen.getByRole("button", { name: "Skip intro" })).toBeTruthy();
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+    } finally {
+      player.close();
     }
   });
 

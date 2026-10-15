@@ -400,51 +400,77 @@
 .player-skip-control {
   position: absolute;
   z-index: 40;
+  display: grid;
+  gap: .25rem;
   right: 1.5rem;
   bottom: 8rem;
   max-width: calc(100% - 2rem);
   cursor: auto;
 }
 
-.player-skip-button {
+.player-skip-control[hidden] { display: none; }
+
+.player-control-button.player-skip-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: .8rem;
+  width: auto;
+  min-width: 2.75rem;
   min-height: 2.75rem;
   max-width: 100%;
   padding: .65rem 1rem;
-  border: 1px solid var(--player-border);
-  border-radius: var(--player-control-radius);
-  background: var(--player-control);
-  color: var(--player-menu-text);
-  box-shadow: 0 3px 16px rgba(0, 0, 0, .24);
   font-family: var(--player-font);
   font-size: .82rem;
   font-weight: 600;
   line-height: 1.25;
   text-align: start;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, .8);
   cursor: pointer;
   user-select: none;
   -webkit-user-select: none;
-  transition: background-color 140ms ease, border-color 140ms ease;
 }
 
 .player-skip-button .player-icon {
   flex-shrink: 0;
   width: 1.05rem;
   height: 1.05rem;
-  color: var(--player-menu-selected);
 }
 
 .player-skip-button > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.player-skip-button:hover {
-  background: color-mix(in srgb, var(--player-control) 88%, var(--player-accent) 12%);
-  border-color: color-mix(in srgb, var(--player-accent) 60%, var(--player-border));
+.player-skip-countdown {
+  display: block;
+  height: 3px;
+  overflow: hidden;
+  border-radius: var(--player-control-radius);
+  background: color-mix(in srgb, var(--player-accent) 24%, transparent);
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.player-skip-countdown[data-active="true"] { visibility: visible; }
+
+.player-skip-countdown__fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--player-accent);
+  transform: scaleX(0);
+  transform-origin: left center;
+  animation: player-skip-countdown var(--player-skip-countdown-duration, 4000ms) linear forwards;
 }
 
 .player-skip-button[data-reduced-motion="true"] { transition: none; }
+
+.player-skip-control[data-reduced-motion="true"] .player-skip-countdown__fill {
+  animation: none;
+  transform: none;
+}
+
+@keyframes player-skip-countdown {
+  to { transform: scaleX(1); }
+}
 
 .player-timeline-shell { position: relative; min-width: 0; }
 
@@ -1131,6 +1157,11 @@ body[data-player-viewport-fullscreen="true"] {
   .player-control-menu__trigger:hover {
     transform: none;
   }
+
+  .player-skip-countdown__fill {
+    animation: none;
+    transform: none;
+  }
 }
 
 @keyframes player-menu-enter {
@@ -1233,14 +1264,14 @@ button:disabled {
   pointer-events: auto;
 }
 
-.player-view :is(.player-topbar__exit, .mobile-player-exit) {
+.player-view :is(.player-topbar__exit, .mobile-player-exit, .player-skip-button) {
   background: transparent;
   border-color: transparent;
   box-shadow: none;
   backdrop-filter: none;
 }
 
-.player-view :is(.player-topbar__exit, .mobile-player-exit):hover {
+.player-view :is(.player-topbar__exit, .mobile-player-exit, .player-skip-button):hover {
   background: rgba(255, 255, 255, 0.1);
   border-color: rgba(255, 255, 255, 0.16);
 }

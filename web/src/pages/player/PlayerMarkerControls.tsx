@@ -1,7 +1,12 @@
-import React, { memo, useLayoutEffect, useRef } from "react";
+import React, { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { formatDuration } from "../../utils/format";
 import { restorePlayerPointerClickFocus, restorePlayerPointerFocus } from "./playerKeyboard";
 import { activeMarkerRegion, type MarkerRegion } from "./playerMarkers";
+
+export const PLAYER_SKIP_COUNTDOWN_DELAY_MS = 1500;
+export const PLAYER_SKIP_COUNTDOWN_DURATION_MS = 4000;
+
+type SkipCountdownStage = "idle" | "waiting" | "filling" | "hidden";
 
 const TimelineRegions = memo(function TimelineRegions({ regions, duration, activeId }: {
   regions: readonly MarkerRegion[];
@@ -43,7 +48,7 @@ export function PlayerTimelineShell({ regions, duration, time, preview, obstacle
     const center = Math.max(half, Math.min(preview.x, shell.clientWidth - half));
     tooltip.style.left = `${center}px`;
     const frame = shell.getBoundingClientRect();
-    const obstacles = Array.from(root?.querySelectorAll(".player-skip-control, .player-caption-layer > span") ?? []).map((element) => {
+    const obstacles = Array.from(root?.querySelectorAll(".player-skip-control:not([hidden]), .player-caption-layer > span") ?? []).map((element) => {
       const rect = element.getBoundingClientRect();
       const left = rotated ? rect.top - frame.top : rect.left - frame.left;
       const top = rotated ? frame.right - rect.right : rect.top - frame.top;
@@ -67,20 +72,55 @@ export function PlayerTimelineShell({ regions, duration, time, preview, obstacle
   </div>;
 }
 
-export function PlayerSkipControl({ region, captionSignature, mobile, reduced, onSkip, onFocus, onBlur }: {
+export function PlayerSkipControl({ region, captionSignature, mobile, reduced, controlsVisible = true,
+  countdownEnabled = false, onVisibilityChange, onSkip, onFocus, onBlur }: {
   region: MarkerRegion;
   captionSignature: string;
   mobile: boolean;
   reduced: boolean;
+  controlsVisible?: boolean;
+  countdownEnabled?: boolean;
+  onVisibilityChange?: (visible: boolean) => void;
   onSkip: () => void;
   onFocus: () => void;
   onBlur: () => void;
 }) {
   const controlRef = useRef<HTMLDivElement>(null);
+  const [countdownStage, setCountdownStage] = useState<SkipCountdownStage>("idle");
+  const [hovered, setHovered] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const [documentVisible, setDocumentVisible] = useState(() => document.visibilityState !== "hidden");
+  const intro = region.kind.toLowerCase() === "intro";
+  const countdownActive = intro && countdownEnabled && !controlsVisible && !hovered && !focused && documentVisible;
+  const hidden = countdownActive && countdownStage === "hidden";
+  const stage = countdownActive ? countdownStage : "idle";
+
+  useEffect(() => {
+    const updateVisibility = () => setDocumentVisible(document.visibilityState !== "hidden");
+    document.addEventListener("visibilitychange", updateVisibility);
+    return () => document.removeEventListener("visibilitychange", updateVisibility);
+  }, []);
+
+  useLayoutEffect(() => {
+    setCountdownStage(countdownActive ? "waiting" : "idle");
+    if (!countdownActive) return;
+    let hideTimer: number | undefined;
+    const delayTimer = window.setTimeout(() => {
+      setCountdownStage("filling");
+      hideTimer = window.setTimeout(() => setCountdownStage("hidden"), PLAYER_SKIP_COUNTDOWN_DURATION_MS);
+    }, PLAYER_SKIP_COUNTDOWN_DELAY_MS);
+    return () => {
+      window.clearTimeout(delayTimer);
+      if (hideTimer !== undefined) window.clearTimeout(hideTimer);
+    };
+  }, [countdownActive, region.id]);
+
+  useLayoutEffect(() => { onVisibilityChange?.(!hidden); }, [hidden, onVisibilityChange]);
+
   useLayoutEffect(() => {
     const control = controlRef.current;
     const root = control?.closest<HTMLElement>("[data-player-root='true']");
-    if (!root || !control) return;
+    if (!root || !control || hidden) return;
     const timeline = root.querySelector<HTMLElement>(".player-timeline-shell");
     const captions = root.querySelector<HTMLElement>(".player-caption-layer");
     const position = () => {
@@ -124,7 +164,7 @@ export function PlayerSkipControl({ region, captionSignature, mobile, reduced, o
     [root, control, timeline, captions].forEach((element) => { if (element) observer?.observe(element); });
     window.addEventListener("resize", position);
     return () => { observer?.disconnect(); window.removeEventListener("resize", position); };
-  }, [captionSignature, mobile, region.id]);
+  }, [captionSignature, hidden, mobile, region.id]);
 
   useLayoutEffect(() => {
     const control = controlRef.current;
@@ -134,13 +174,34 @@ export function PlayerSkipControl({ region, captionSignature, mobile, reduced, o
     };
   }, []);
 
-  return <div ref={controlRef} className="player-skip-control" onFocusCapture={onFocus} onBlurCapture={onBlur}>
-    <button type="button" className="player-skip-button" data-reduced-motion={reduced ? "true" : undefined}
+  return <div ref={controlRef} className="player-skip-control" hidden={hidden}
+    data-countdown-stage={stage} data-reduced-motion={reduced ? "true" : undefined}
+    style={{ "--player-skip-countdown-duration": `${PLAYER_SKIP_COUNTDOWN_DURATION_MS}ms` } as React.CSSProperties}
+    onPointerEnter={(event) => {
+      if (event.pointerType === "touch") return;
+      setHovered(true);
+      onFocus();
+    }}
+    onPointerLeave={(event) => {
+      if (event.pointerType === "touch") return;
+      setHovered(false);
+      onBlur();
+    }}
+    onFocusCapture={() => { setFocused(true); onFocus(); }}
+    onBlurCapture={(event) => {
+      if (event.currentTarget.contains(event.relatedTarget)) return;
+      setFocused(false);
+      onBlur();
+    }}>
+    <button type="button" className="player-control-button player-skip-button" data-reduced-motion={reduced ? "true" : undefined}
       onClick={(event) => { onSkip(); restorePlayerPointerClickFocus(event); }}>
       <span>Skip {region.label.toLowerCase()}</span>
       <svg className="player-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
         <path d="m5 5 10 7-10 7V5Z" /><path d="M19 5v14" />
       </svg>
     </button>
+    {intro && <span className="player-skip-countdown" aria-hidden="true" data-active={stage === "filling" ? "true" : undefined}>
+      {stage === "filling" && <span className="player-skip-countdown__fill" />}
+    </span>}
   </div>;
 }

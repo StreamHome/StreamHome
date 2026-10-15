@@ -90,7 +90,8 @@
 .profile-tile .profile-preview,.profile-create-mark,.profile-editor__themes .profile-preview,.profile-editor__avatars button i { transition: transform var(--interaction-exit) var(--interaction-ease); }
 .profile-tile__edit { transition: color var(--interaction-exit) var(--interaction-ease),background-color var(--interaction-exit) var(--interaction-ease),border-color var(--interaction-exit) var(--interaction-ease); }
 
-.player-controls button { border: 1px solid transparent; border-radius: 7px; padding: 7px 9px; color: rgba(255,255,255,.78); background: rgba(255,255,255,0); }
+.player-controls button { border: 1px solid transparent; padding: 7px 9px; color: rgba(255,255,255,.78); background: rgba(255,255,255,0); }
+.player-controls button,.player-control-button.player-skip-button { border-radius: 7px; }
 .player-controls select { transition: border-color var(--interaction-exit) var(--interaction-ease),background-color var(--interaction-exit) var(--interaction-ease); }
 
 @media (hover: hover) and (pointer: fine) {

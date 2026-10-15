@@ -1,7 +1,7 @@
 import React from "react";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PlayerSkipControl, PlayerTimelineShell } from "./PlayerMarkerControls";
+import { PLAYER_SKIP_COUNTDOWN_DELAY_MS, PLAYER_SKIP_COUNTDOWN_DURATION_MS, PlayerSkipControl, PlayerTimelineShell } from "./PlayerMarkerControls";
 import type { MarkerRegion } from "./playerMarkers";
 
 const region: MarkerRegion = { id: "credits:80:100:0", kind: "credits", label: "Credits", start: 80, end: 100 };
@@ -100,6 +100,143 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
+});
+
+const intro: MarkerRegion = { id: "intro:0:30:0", kind: "intro", label: "Intro", start: 0, end: 30 };
+
+function CountdownFixture(props: Partial<React.ComponentProps<typeof PlayerSkipControl>>) {
+  return <div data-player-root="true"><PlayerSkipControl region={intro} captionSignature="" mobile={false}
+    reduced={false} controlsVisible={false} countdownEnabled onSkip={() => undefined}
+    onFocus={() => undefined} onBlur={() => undefined} {...props} /></div>;
+}
+
+describe("intro action countdown", () => {
+  it("waits for hidden chrome, then fills for four seconds and hides without skipping", () => {
+    vi.useFakeTimers();
+    const onSkip = vi.fn();
+    const view = render(<CountdownFixture controlsVisible onSkip={onSkip} />);
+    const control = view.container.querySelector<HTMLElement>(".player-skip-control")!;
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(control.dataset.countdownStage).toBe("idle");
+    expect(view.getByRole("button", { name: "Skip intro" })).toBeTruthy();
+    view.rerender(<CountdownFixture onSkip={onSkip} />);
+    expect(control.dataset.countdownStage).toBe("waiting");
+    act(() => vi.advanceTimersByTime(PLAYER_SKIP_COUNTDOWN_DELAY_MS - 1));
+    expect(control.dataset.countdownStage).toBe("waiting");
+    expect(control.querySelector(".player-skip-countdown__fill")).toBeNull();
+    act(() => vi.advanceTimersByTime(1));
+    expect(control.dataset.countdownStage).toBe("filling");
+    expect(control.querySelector(".player-skip-countdown")?.getAttribute("data-active")).toBe("true");
+    expect(view.queryByRole("progressbar")).toBeNull();
+    act(() => vi.advanceTimersByTime(PLAYER_SKIP_COUNTDOWN_DURATION_MS - 1));
+    expect(view.getByRole("button", { name: "Skip intro" })).toBeTruthy();
+    act(() => vi.advanceTimersByTime(1));
+    expect(control.hidden).toBe(true);
+    expect(view.queryByRole("button", { name: "Skip intro" })).toBeNull();
+    expect(onSkip).not.toHaveBeenCalled();
+  });
+
+  it("reappears on chrome reveal and restarts a complete cycle", () => {
+    vi.useFakeTimers();
+    const view = render(<CountdownFixture />);
+    const control = view.container.querySelector<HTMLElement>(".player-skip-control")!;
+    act(() => vi.advanceTimersByTime(PLAYER_SKIP_COUNTDOWN_DELAY_MS));
+    act(() => vi.advanceTimersByTime(PLAYER_SKIP_COUNTDOWN_DURATION_MS));
+    expect(control.hidden).toBe(true);
+    view.rerender(<CountdownFixture controlsVisible />);
+    expect(control.hidden).toBe(false);
+    expect(control.dataset.countdownStage).toBe("idle");
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(control.hidden).toBe(false);
+    view.rerender(<CountdownFixture />);
+    act(() => vi.advanceTimersByTime(PLAYER_SKIP_COUNTDOWN_DELAY_MS - 1));
+    expect(control.dataset.countdownStage).toBe("waiting");
+    act(() => vi.advanceTimersByTime(1));
+    expect(control.dataset.countdownStage).toBe("filling");
+  });
+
+  it("cancels a filling cycle while paused or buffering and starts fresh when eligible", () => {
+    vi.useFakeTimers();
+    const view = render(<CountdownFixture />);
+    const control = view.container.querySelector<HTMLElement>(".player-skip-control")!;
+    act(() => vi.advanceTimersByTime(PLAYER_SKIP_COUNTDOWN_DELAY_MS));
+    act(() => vi.advanceTimersByTime(2_000));
+    view.rerender(<CountdownFixture countdownEnabled={false} />);
+    act(() => vi.advanceTimersByTime(20_000));
+    expect(control.dataset.countdownStage).toBe("idle");
+    expect(control.hidden).toBe(false);
+    view.rerender(<CountdownFixture />);
+    act(() => vi.advanceTimersByTime(PLAYER_SKIP_COUNTDOWN_DELAY_MS));
+    act(() => vi.advanceTimersByTime(PLAYER_SKIP_COUNTDOWN_DURATION_MS - 1));
+    expect(control.hidden).toBe(false);
+  });
+
+  it("keeps hover and keyboard focus safe from dismissal", () => {
+    vi.useFakeTimers();
+    const onFocus = vi.fn();
+    const view = render(<CountdownFixture onFocus={onFocus} />);
+    const control = view.container.querySelector<HTMLElement>(".player-skip-control")!;
+    act(() => vi.advanceTimersByTime(PLAYER_SKIP_COUNTDOWN_DELAY_MS));
+    fireEvent.pointerEnter(control, { pointerType: "mouse" });
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(control.hidden).toBe(false);
+    expect(control.dataset.countdownStage).toBe("idle");
+    fireEvent.pointerLeave(control, { pointerType: "mouse" });
+    const button = view.getByRole("button", { name: "Skip intro" });
+    act(() => button.focus());
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(control.hidden).toBe(false);
+    expect(document.activeElement).toBe(button);
+    expect(onFocus).toHaveBeenCalled();
+  });
+
+  it("cancels when the tab is hidden and resets when it returns", () => {
+    vi.useFakeTimers();
+    const descriptor = Object.getOwnPropertyDescriptor(document, "visibilityState");
+    const view = render(<CountdownFixture />);
+    try {
+      const control = view.container.querySelector<HTMLElement>(".player-skip-control")!;
+      act(() => vi.advanceTimersByTime(PLAYER_SKIP_COUNTDOWN_DELAY_MS));
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+      fireEvent(document, new Event("visibilitychange"));
+      act(() => vi.advanceTimersByTime(10_000));
+      expect(control.hidden).toBe(false);
+      expect(control.dataset.countdownStage).toBe("idle");
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+      fireEvent(document, new Event("visibilitychange"));
+      expect(control.dataset.countdownStage).toBe("waiting");
+    } finally {
+      view.unmount();
+      if (descriptor) Object.defineProperty(document, "visibilityState", descriptor);
+      else Reflect.deleteProperty(document, "visibilityState");
+    }
+  });
+
+  it("resets for a new intro and keeps credits outside the countdown", () => {
+    vi.useFakeTimers();
+    const view = render(<CountdownFixture />);
+    const control = view.container.querySelector<HTMLElement>(".player-skip-control")!;
+    act(() => vi.advanceTimersByTime(PLAYER_SKIP_COUNTDOWN_DELAY_MS));
+    view.rerender(<CountdownFixture region={{ ...intro, id: "intro:40:50:0", start: 40, end: 50 }} />);
+    expect(control.dataset.countdownStage).toBe("waiting");
+    view.rerender(<CountdownFixture region={region} />);
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(view.getByRole("button", { name: "Skip credits" })).toBeTruthy();
+    expect(control.querySelector(".player-skip-countdown")).toBeNull();
+  });
+
+  it("keeps reduced-motion dismissal functional and clears timers on unmount", () => {
+    vi.useFakeTimers();
+    const view = render(<CountdownFixture reduced />);
+    const control = view.container.querySelector<HTMLElement>(".player-skip-control")!;
+    act(() => vi.advanceTimersByTime(PLAYER_SKIP_COUNTDOWN_DELAY_MS));
+    expect(control.dataset.reducedMotion).toBe("true");
+    expect(control.querySelector(".player-skip-countdown")?.getAttribute("aria-hidden")).toBe("true");
+    expect(vi.getTimerCount()).toBe(1);
+    view.unmount();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });
 
 describe("contextual player marker layout", () => {

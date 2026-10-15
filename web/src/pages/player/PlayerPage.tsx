@@ -902,6 +902,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [volume, setVolume] = useState(initialPreferences.volume);
   const [muted, setMuted] = useState(initialPreferences.muted);
   const [showControls, setShowControls] = useState(true);
+  const [skipControlVisible, setSkipControlVisible] = useState(true);
   const [controlMenuOpen, setControlMenuOpen] = useState(false);
   const [timelineScrubbing, setTimelineScrubbing] = useState(false);
   const [availableQualities, setAvailableQualities] = useState<ReturnType<typeof playbackQualityOptions>>([{ id: "auto", label: "Auto", height: "auto", index: -1, ready: true, status: "ready" }]);
@@ -3763,7 +3764,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     && currentMarker && canSkipMarkerRegion(currentMarker) ? currentMarker : null;
   const timelineRegion = activeMarkerRegion(markerRegions, currentTime);
   const captionSignature = captionLines.map((line) => line.key).join("|");
-  const timelineObstacleKey = `${skipMarker?.id ?? ""}:${captionSignature}:${mobilePlayer}`;
+  const timelineObstacleKey = `${skipMarker?.id ?? ""}:${skipControlVisible}:${captionSignature}:${mobilePlayer}`;
   const timelineValueText = `${formatDuration(currentTime)}${timelineRegion ? ` · ${timelineRegion.label}` : ""}`;
   const activeQuality = availableQualities.find((item) => item.id === activeQualityId);
   const qualityStatus = qualitySwitching || (selectedQualityId !== "auto" && activeQualityId !== selectedQualityId)
@@ -4449,10 +4450,14 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       </AnimatePresence>
 
       {skipMarker && <PlayerSkipControl
+        key={`${runResponse.runId}:${skipMarker.id}:${positionGenerationRef.current}`}
         region={skipMarker}
         captionSignature={captionSignature}
         mobile={mobilePlayer}
         reduced={reduced}
+        controlsVisible={showControls}
+        countdownEnabled={phase === "playing" && !controlMenuOpen && !timelineScrubbing}
+        onVisibilityChange={setSkipControlVisible}
         onSkip={() => seek(skipMarker.end)}
         onFocus={revealControls}
         onBlur={handleControlsBlur}
