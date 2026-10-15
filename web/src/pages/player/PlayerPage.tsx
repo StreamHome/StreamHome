@@ -802,6 +802,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const externalAudioRef = useRef<HTMLAudioElement>(null);
   const lastFrameCanvasRef = useRef<HTMLCanvasElement>(null);
+  const alternateFrameCanvasRef = useRef<HTMLCanvasElement>(null);
+  const activeFrameCanvasRef = useRef(0);
+  const framePublicationPendingRef = useRef(false);
+  const queuedPausedFrameCaptureRef = useRef(false);
+  const frameSnapshotRef = useRef<{ time: number; width: number; height: number; transport: number; position: number } | null>(null);
   const timelineRef = useRef<HTMLInputElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const hlsAudioOptionsRef = useRef<PlayerAudioOption[]>([]);
@@ -851,7 +856,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const stallRecoveryTimerRef = useRef<number | null>(null);
   const stallRecoveryAttemptsRef = useRef(0);
   const frameStalledRef = useRef(false);
-  const receivedVideoFrameRef = useRef(false);
   const lastFrameCaptureAtRef = useRef(0);
   const hasLastFrameRef = useRef(false);
   const resumeAppliedRef = useRef(false);
@@ -929,6 +933,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       : current?.message === message && current.severity === severity ? current : { message, severity });
   }, []);
   const [hasLastFrame, setHasLastFrame] = useState(false);
+  const [activeFrameCanvas, setActiveFrameCanvas] = useState(0);
+  const [pausedFrameValid, setPausedFrameValid] = useState(false);
   const [mobilePlayer, setMobilePlayer] = useState(() => typeof window !== "undefined" && isPhonePlayerViewport(readMobileViewport(window)));
   const [forcedLandscape, setForcedLandscape] = useState(() => typeof window !== "undefined" && isForcedLandscape(window.innerWidth, window.innerHeight, isPhonePlayerViewport(readMobileViewport(window))));
   const [mobileSeekFeedback, setMobileSeekFeedback] = useState<{
@@ -1218,8 +1224,15 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     lastFrameCaptureAtRef.current = 0;
     hasLastFrameRef.current = false;
     setHasLastFrame(false);
-    const frameCanvas = lastFrameCanvasRef.current;
-    frameCanvas?.getContext("2d")?.clearRect(0, 0, frameCanvas.width, frameCanvas.height);
+    setPausedFrameValid(false);
+    frameSnapshotRef.current = null;
+    activeFrameCanvasRef.current = 0;
+    framePublicationPendingRef.current = false;
+    queuedPausedFrameCaptureRef.current = false;
+    setActiveFrameCanvas(0);
+    for (const frameCanvas of [lastFrameCanvasRef.current, alternateFrameCanvasRef.current]) {
+      frameCanvas?.getContext("2d")?.clearRect(0, 0, frameCanvas.width, frameCanvas.height);
+    }
     sequenceNumberRef.current = 1;
     pendingWatchedSecondsRef.current = 0;
     completedRef.current = false;
@@ -1300,25 +1313,46 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     };
   }, [closeActiveRun, mediaId, profile?.id, retryVersion, visualFixture]);
 
-  const captureLastFrame = useCallback((force = false) => {
+  const pausedFrameMatches = useCallback((video: HTMLVideoElement) => {
+    const snapshot = frameSnapshotRef.current;
+    return hasLastFrameRef.current && snapshot !== null && !video.seeking
+      && !transportResettingRef.current && pendingSeekTargetRef.current === null
+      && snapshot.transport === transportGenerationRef.current
+      && snapshot.position === positionGenerationRef.current
+      && Math.abs(snapshot.time - video.currentTime) <= 0.1
+      && snapshot.width === video.videoWidth && snapshot.height === video.videoHeight;
+  }, []);
+
+  const captureLastFrame = useCallback((force = false, presentationTime?: number) => {
+    if (framePublicationPendingRef.current) {
+      if (presentationTime !== undefined) queuedPausedFrameCaptureRef.current = true;
+      return hasLastFrameRef.current;
+    }
     const video = videoRef.current;
-    const canvas = lastFrameCanvasRef.current;
+    const nextCanvas = activeFrameCanvasRef.current === 0 ? 1 : 0;
+    const canvas = nextCanvas === 0 ? lastFrameCanvasRef.current : alternateFrameCanvasRef.current;
     if (!video || !canvas || video.videoWidth <= 0 || video.videoHeight <= 0 || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return false;
-    if (hasLastFrameRef.current && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return true;
+    if (hasLastFrameRef.current && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA && presentationTime === undefined) return true;
     const now = performance.now();
     if (!force && now - lastFrameCaptureAtRef.current < 500) return hasLastFrameRef.current;
-    const scale = Math.min(1, 1280 / video.videoWidth);
+    const scale = Math.min(1, 1280 / video.videoWidth, 720 / video.videoHeight);
     const width = Math.max(1, Math.round(video.videoWidth * scale));
     const height = Math.max(1, Math.round(video.videoHeight * scale));
-    if (canvas.width !== width) canvas.width = width;
-    if (canvas.height !== height) canvas.height = height;
-    const context = canvas.getContext("2d");
-    if (!context) return false;
     try {
+      // Publish only a completed inactive buffer; failed draws cannot erase the visible bitmap.
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (!context) return false;
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
     } catch {
       return false;
     }
+    frameSnapshotRef.current = { time: presentationTime ?? video.currentTime, width: video.videoWidth, height: video.videoHeight,
+      transport: transportGenerationRef.current, position: positionGenerationRef.current };
+    framePublicationPendingRef.current = true;
+    activeFrameCanvasRef.current = nextCanvas;
+    setActiveFrameCanvas(nextCanvas);
     lastFrameCaptureAtRef.current = now;
     if (!hasLastFrameRef.current) {
       hasLastFrameRef.current = true;
@@ -1326,6 +1360,34 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     }
     return true;
   }, []);
+
+  const capturePausedFrame = useCallback((presentationTime?: number) => {
+    const video = videoRef.current;
+    if (!video || (playbackIntentRef.current && !video.paused) || video.seeking
+      || transportResettingRef.current || pendingSeekTargetRef.current !== null) {
+      setPausedFrameValid(false);
+      return;
+    }
+    const matches = pausedFrameMatches(video);
+    if (presentationTime !== undefined && Math.abs(presentationTime - video.currentTime) > 0.1) {
+      setPausedFrameValid(matches);
+      return;
+    }
+    if (matches) {
+      setPausedFrameValid(true);
+      return;
+    }
+    captureLastFrame(true, presentationTime ?? video.currentTime);
+    setPausedFrameValid(pausedFrameMatches(video));
+  }, [captureLastFrame, pausedFrameMatches]);
+
+  useLayoutEffect(() => {
+    framePublicationPendingRef.current = false;
+    if (queuedPausedFrameCaptureRef.current) {
+      queuedPausedFrameCaptureRef.current = false;
+      capturePausedFrame();
+    }
+  }, [activeFrameCanvas, capturePausedFrame]);
 
   const syncExternalAudio = useCallback((force = false, targetOverride: number | null = null) => {
     const video = videoRef.current;
@@ -2673,17 +2735,18 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     playbackIntentRef.current = false;
     cancelPendingVideoPlay();
     pauseExternalAudio();
+    capturePausedFrame();
     videoRef.current?.pause();
     settlePausedPlayback();
-  }, [cancelPendingVideoPlay, pauseExternalAudio, settlePausedPlayback]);
+  }, [cancelPendingVideoPlay, capturePausedFrame, pauseExternalAudio, settlePausedPlayback]);
 
   const scheduleStallRecovery = useCallback((clockBaseline: number | null = null, pictureOnly = false) => {
-    if (!playbackIntentRef.current || stallRecoveryTimerRef.current !== null) return;
+    if (document.visibilityState === "hidden" || !playbackIntentRef.current || stallRecoveryTimerRef.current !== null) return;
     const positionGeneration = positionGenerationRef.current;
     stallRecoveryTimerRef.current = window.setTimeout(() => {
       stallRecoveryTimerRef.current = null;
       const video = videoRef.current;
-      if (!video || !playbackIntentRef.current || positionGenerationRef.current !== positionGeneration) return;
+      if (document.visibilityState === "hidden" || !video || !playbackIntentRef.current || positionGenerationRef.current !== positionGeneration) return;
       if (pictureOnly && !frameStalledRef.current) return;
       const clockStillFrozen = clockBaseline !== null && video.currentTime <= clockBaseline + 0.05;
       if (!pictureOnly && !clockStillFrozen && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) return;
@@ -2729,47 +2792,92 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     }, PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS);
   }, [clearPlaybackClockAdvanceWatchdog, scheduleStallRecovery]);
 
-  useEffect(() => { receivedVideoFrameRef.current = false; }, [runResponse?.runId]);
   const frameCaptionUpdateRef = useRef(updateCaptionOverlay);
   frameCaptionUpdateRef.current = updateCaptionOverlay;
   const videoMounted = Boolean(runResponse && asset && !fatal && phase !== "resolving" && phase !== "preparing");
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
+    let active = true;
     let lastFrameAt = performance.now();
-    let receivedFrame = receivedVideoFrameRef.current;
+    let receivedFrame = false;
+    let firstFrameDeadlineAt: number | null = null;
+    let healthStartedAt: number | null = null;
+    let healthFirstMediaTime = 0;
+    let healthLastMediaTime: number | null = null;
+    let healthFrames = 0;
+    let framePositionGeneration = positionGenerationRef.current;
     let frameRequest: number | null = null;
     frameStalledRef.current = false;
+    const resetFrameHealth = () => {
+      healthStartedAt = null;
+      healthLastMediaTime = null;
+      healthFrames = 0;
+    };
     const visible = () => {
       lastFrameAt = performance.now();
-      if (frameStalledRef.current) clearStallRecovery();
+      firstFrameDeadlineAt = null;
+      resetFrameHealth();
+      clearStallRecovery();
       frameStalledRef.current = false;
-      if (document.visibilityState === "hidden") clearPlaybackClockAdvanceWatchdog();
+      if (document.visibilityState === "hidden") {
+        if (video.paused) capturePausedFrame();
+        else captureLastFrame(true);
+        clearPlaybackClockAdvanceWatchdog();
+      }
       else if (playbackIntentRef.current && !video.paused) armPlaybackClockAdvanceWatchdog();
     };
     const frame = (_now: number, metadata: VideoFrameCallbackMetadata) => {
-      lastFrameAt = performance.now();
-      receivedFrame = true;
-      receivedVideoFrameRef.current = true;
-      stallRecoveryAttemptsRef.current = 0;
-      if (frameStalledRef.current) {
-        frameStalledRef.current = false;
-        clearStallRecovery();
-        if (playbackIntentRef.current && !video.paused && !video.seeking && pendingSeekTargetRef.current === null) {
-          setPhase("playing");
+      if (!active || videoRef.current !== video) return;
+      const now = performance.now();
+      if (document.visibilityState !== "hidden") {
+        if (framePositionGeneration !== positionGenerationRef.current) {
+          framePositionGeneration = positionGenerationRef.current;
+          resetFrameHealth();
         }
+        const advancing = healthLastMediaTime === null || metadata.mediaTime > healthLastMediaTime + 0.0001;
+        if (advancing) {
+          if (now - lastFrameAt > PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS) resetFrameHealth();
+          lastFrameAt = now;
+          receivedFrame = true;
+          firstFrameDeadlineAt = null;
+          if (playbackIntentRef.current && !video.paused && !video.seeking
+            && !transportResettingRef.current && pendingSeekTargetRef.current === null) {
+            if (healthStartedAt === null) {
+              healthStartedAt = now;
+              healthFirstMediaTime = metadata.mediaTime;
+            }
+            healthFrames += 1;
+            healthLastMediaTime = metadata.mediaTime;
+            if (healthFrames >= 3 && now - healthStartedAt >= 2_000 && metadata.mediaTime - healthFirstMediaTime >= 0.5) {
+              stallRecoveryAttemptsRef.current = 0;
+            }
+          }
+          if (frameStalledRef.current) {
+            frameStalledRef.current = false;
+            clearStallRecovery();
+            if (playbackIntentRef.current && !video.paused && !video.seeking && pendingSeekTargetRef.current === null) {
+              setPhase("playing");
+            }
+          }
+        }
+        if (video.paused || !playbackIntentRef.current) capturePausedFrame(metadata.mediaTime);
+        if (preferencesRef.current.subtitleOffset !== 0) frameCaptionUpdateRef.current(metadata.mediaTime);
       }
-      if (preferencesRef.current.subtitleOffset !== 0) frameCaptionUpdateRef.current(metadata.mediaTime);
       frameRequest = video.requestVideoFrameCallback(frame);
     };
     if (typeof video.requestVideoFrameCallback === "function") frameRequest = video.requestVideoFrameCallback(frame);
     const timer = frameRequest !== null ? window.setInterval(() => {
       if (document.visibilityState === "hidden" || !playbackIntentRef.current || video.paused || video.seeking || completedRef.current || transportResettingRef.current || pendingSeekTargetRef.current !== null) {
         lastFrameAt = performance.now();
+        firstFrameDeadlineAt = null;
+        resetFrameHealth();
         frameStalledRef.current = false;
         return;
       }
-      if (receivedFrame && performance.now() - lastFrameAt > PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS) {
+      const now = performance.now();
+      if (!receivedFrame && firstFrameDeadlineAt === null) firstFrameDeadlineAt = now;
+      if (now - (receivedFrame ? lastFrameAt : firstFrameDeadlineAt!) > PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS) {
         frameStalledRef.current = true;
         setPhase("buffering");
         scheduleStallRecovery(null, true);
@@ -2777,16 +2885,18 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     }, 1_000) : null;
     document.addEventListener("visibilitychange", visible);
     return () => {
+      active = false;
       frameStalledRef.current = false;
       document.removeEventListener("visibilitychange", visible);
       if (timer !== null) window.clearInterval(timer);
       if (frameRequest !== null) video.cancelVideoFrameCallback(frameRequest);
     };
-  }, [armPlaybackClockAdvanceWatchdog, clearPlaybackClockAdvanceWatchdog, clearStallRecovery, runResponse?.runId, scheduleStallRecovery, transportRevision, videoMounted]);
+  }, [armPlaybackClockAdvanceWatchdog, captureLastFrame, capturePausedFrame, clearPlaybackClockAdvanceWatchdog, clearStallRecovery, runResponse?.runId, scheduleStallRecovery, transportRevision, videoMounted]);
 
   const seek = useCallback((nextTime: number, report = true) => {
     const video = videoRef.current;
     if (!video) return;
+    setPausedFrameValid(false);
     captureWatchedTime();
     frameStalledRef.current = false;
     clearPlaybackClockAdvanceWatchdog();
@@ -3629,7 +3739,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     fatal: "Playback interrupted",
   };
   const preparationDetail = preparationStatusMessage(runResponse?.preparationProgress);
-  const holdLastFrame = hasLastFrame && ["loading", "buffering", "recovering"].includes(phase);
+  const holdLastFrame = hasLastFrame && (["loading", "buffering", "recovering"].includes(phase)
+    || (phase === "paused" && pausedFrameValid && videoRef.current !== null && pausedFrameMatches(videoRef.current)));
 
   if (phase === "resolving" || phase === "preparing" || (phase === "loading" && !asset)) {
     return (
@@ -3714,6 +3825,15 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       <canvas
         ref={lastFrameCanvasRef}
         className="player-last-frame"
+        data-frame-active={activeFrameCanvas === 0 ? "true" : "false"}
+        style={{ visibility: activeFrameCanvas === 0 ? "visible" : "hidden" }}
+        aria-hidden="true"
+      />
+      <canvas
+        ref={alternateFrameCanvasRef}
+        className="player-last-frame"
+        data-frame-active={activeFrameCanvas === 1 ? "true" : "false"}
+        style={{ visibility: activeFrameCanvas === 1 ? "visible" : "hidden" }}
         aria-hidden="true"
       />
       <video
@@ -3722,8 +3842,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         crossOrigin="anonymous"
         preload="auto"
         playsInline
-        onLoadedData={syncRenderedQuality}
-        onResize={syncRenderedQuality}
+        onLoadedData={() => { syncRenderedQuality(); capturePausedFrame(); }}
+        onResize={() => { syncRenderedQuality(); capturePausedFrame(); }}
         onLoadedMetadata={() => {
           const video = videoRef.current;
           if (!video) return;
@@ -3768,6 +3888,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             playbackIntentRef.current = false;
             cancelPendingVideoPlay();
           }
+          capturePausedFrame();
           settlePausedPlayback();
           if (!completedRef.current) {
             setPhase("paused");
@@ -3846,6 +3967,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             video.pause();
             transportResettingRef.current = false;
             markPlaybackStartupReady();
+            capturePausedFrame();
             setPhase("paused");
             return;
           }
@@ -3949,6 +4071,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           setCurrentTime(nextTime);
           transportResettingRef.current = false;
           markPlaybackStartupReady();
+          capturePausedFrame();
           syncExternalAudio(true, nextTime);
           if (activeExternalAudioTrackIdRef.current && !video.paused) {
             requestExternalAudioPlay("Press play once to allow the selected dubbing track.");
@@ -3966,6 +4089,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           }
         }}
         onSeeking={() => {
+          setPausedFrameValid(false);
           pauseExternalAudio();
           const video = videoRef.current;
           if (!video || transportResettingRef.current || !resumeAppliedRef.current || pendingSeekTargetRef.current !== null || video.error) return;

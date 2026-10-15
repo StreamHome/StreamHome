@@ -132,6 +132,137 @@ function showPlayingVideo(video: HTMLVideoElement, time = 30) {
   fireEvent.timeUpdate(video);
 }
 
+function frameCanvasHarness() {
+  const pixels = new WeakMap<HTMLCanvasElement, string>();
+  const contexts = new WeakMap<HTMLCanvasElement, CanvasRenderingContext2D>();
+  let presented = "initial picture";
+  let rejectCapture = false;
+  const draws = vi.fn();
+  const publishedMutations = vi.fn();
+  const recordMutation = (canvas: HTMLCanvasElement, operation: string) => {
+    if (canvas.dataset.frameActive === "true" && canvas.closest("[data-frame-hold='true']")) publishedMutations(canvas, operation);
+  };
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(function (this: HTMLCanvasElement) {
+    let context = contexts.get(this);
+    if (!context) {
+      const canvas = this;
+      context = {
+        drawImage: (source: CanvasImageSource) => {
+          draws(canvas, source);
+          if (source instanceof HTMLVideoElement && rejectCapture) throw new DOMException("Frame unavailable", "InvalidStateError");
+          recordMutation(canvas, "draw");
+          const picture = source instanceof HTMLCanvasElement ? pixels.get(source) : presented;
+          if (picture === undefined) pixels.delete(canvas);
+          else pixels.set(canvas, picture);
+        },
+        clearRect: () => pixels.delete(canvas),
+      } as unknown as CanvasRenderingContext2D;
+      contexts.set(canvas, context);
+    }
+    return context;
+  });
+  for (const dimension of ["width", "height"] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, dimension)!;
+    vi.spyOn(HTMLCanvasElement.prototype, dimension, "set").mockImplementation(function (this: HTMLCanvasElement, value: number) {
+      recordMutation(this, dimension);
+      pixels.delete(this);
+      descriptor.set!.call(this, value);
+    });
+  }
+  return {
+    draws,
+    publishedMutations,
+    picture: (canvas: HTMLCanvasElement | null) => canvas ? pixels.get(canvas) : undefined,
+    present: (picture: string) => { presented = picture; },
+    reject: (value: boolean) => { rejectCapture = value; },
+  };
+}
+
+async function mountFramePlayer(fixture: ResolvedPlayback = playback) {
+  vi.useFakeTimers();
+  vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+  const visibility = Object.getOwnPropertyDescriptor(document, "visibilityState");
+  Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+  const frameRequests = new Map<number, VideoFrameRequestCallback>();
+  let nextFrameId = 0;
+  let presentedFrames = 0;
+  const requestFrame = vi.fn((callback: VideoFrameRequestCallback) => {
+    frameRequests.set(++nextFrameId, callback);
+    return nextFrameId;
+  });
+  Object.defineProperty(HTMLVideoElement.prototype, "requestVideoFrameCallback", { configurable: true, value: requestFrame });
+  Object.defineProperty(HTMLVideoElement.prototype, "cancelVideoFrameCallback", { configurable: true, value: vi.fn((id: number) => frameRequests.delete(id)) });
+  const canvas = frameCanvasHarness();
+  const view = render(<MemoryRouter><PlayerPage visualFixture={fixture} /></MemoryRouter>);
+  await act(async () => { await import("hls.js"); });
+  const video = view.container.querySelector("video") as HTMLVideoElement;
+  const root = view.container.querySelector<HTMLElement>("[data-player-root]")!;
+  Object.defineProperties(video, {
+    duration: { configurable: true, value: 120 },
+    readyState: { configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA },
+    paused: { configurable: true, value: false },
+    videoWidth: { configurable: true, value: 640 },
+    videoHeight: { configurable: true, value: 360 },
+    seekable: { configurable: true, value: { length: 1, start: () => 0, end: () => 120 } },
+  });
+  const settle = () => {
+    fireEvent.loadedMetadata(video);
+    fireEvent.seeked(video);
+    fireEvent.playing(video);
+    video.currentTime += 0.1;
+    fireEvent.timeUpdate(video);
+  };
+  const frame = (time = video.currentTime) => {
+    const request = frameRequests.entries().next().value as [number, VideoFrameRequestCallback] | undefined;
+    expect(request).toBeTruthy();
+    frameRequests.delete(request![0]);
+    canvas.present(`picture at ${time.toFixed(2)}`);
+    act(() => request![1](performance.now(), {
+      mediaTime: time,
+      presentedFrames: ++presentedFrames,
+      presentationTime: performance.now(),
+      expectedDisplayTime: performance.now(),
+      width: video.videoWidth,
+      height: video.videoHeight,
+    } as VideoFrameCallbackMetadata));
+  };
+  const advance = (milliseconds: number, frames = false, clock = true) => {
+    for (let elapsed = 0; elapsed < milliseconds; elapsed += 200) {
+      act(() => vi.advanceTimersByTime(Math.min(200, milliseconds - elapsed)));
+      if (!view.container.querySelector("video")) break;
+      if (clock) {
+        video.currentTime += Math.min(200, milliseconds - elapsed) / 1000;
+        fireEvent.timeUpdate(video);
+      }
+      if (frames) frame();
+    }
+  };
+  const nextRecovery = () => {
+    const baseline = videoCallCount("load", video);
+    for (let elapsed = 0; elapsed < 12_000; elapsed += 200) {
+      advance(200);
+      if (videoCallCount("load", video) > baseline || view.container.querySelector(".player-state-view")) break;
+    }
+    return videoCallCount("load", video) - baseline;
+  };
+  const setVisibility = (state: "visible" | "hidden") => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: state });
+    act(() => { fireEvent(document, new Event("visibilitychange")); });
+  };
+  settle();
+  return {
+    view, video, root, canvas, frame, advance, settle, nextRecovery, requestFrame, setVisibility,
+    activeCanvas: () => view.container.querySelector<HTMLCanvasElement>(".player-last-frame[data-frame-active='true']"),
+    close: () => {
+      view.unmount();
+      Reflect.deleteProperty(HTMLVideoElement.prototype, "requestVideoFrameCallback");
+      Reflect.deleteProperty(HTMLVideoElement.prototype, "cancelVideoFrameCallback");
+      if (visibility) Object.defineProperty(document, "visibilityState", visibility);
+      else Reflect.deleteProperty(document, "visibilityState");
+    },
+  };
+}
+
 
 describe("mounted player lifecycle", () => {
   beforeEach(() => {
@@ -1431,6 +1562,282 @@ describe("mounted player lifecycle", () => {
     await act(async () => { heartbeat(); await Promise.resolve(); });
     for (const [,request] of progress.mock.calls) expect(request.timestamp).toBe(0);
     view.unmount();
+  });
+
+  it.each([
+    { label: "no frames", oneFramePerTransport: false },
+    { label: "one isolated frame", oneFramePerTransport: true },
+  ])("bounds picture recovery when each transport presents $label", async ({ oneFramePerTransport }) => {
+    const player = await mountFramePlayer();
+    try {
+      const initialLoads = videoCallCount("load", player.video);
+      let recoveryLoads = 0;
+      if (oneFramePerTransport) player.frame();
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const loads = player.nextRecovery();
+        expect(loads).toBeGreaterThan(0);
+        recoveryLoads += loads;
+        player.settle();
+        if (oneFramePerTransport) player.frame();
+      }
+      expect(player.nextRecovery()).toBe(0);
+      expect(videoCallCount("load", player.video)).toBe(initialLoads + recoveryLoads);
+      expect(player.view.container.querySelector(".player-state-view")?.textContent).toMatch(/stalled/i);
+    } finally {
+      player.close();
+    }
+  });
+
+  it("renews the picture recovery budget only after sustained advancing rendered frames", async () => {
+    const player = await mountFramePlayer();
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        expect(player.nextRecovery()).toBeGreaterThan(0);
+        player.settle();
+        player.frame();
+      }
+      const loads = videoCallCount("load", player.video);
+      player.advance(3_200, true);
+      expect(player.root.dataset.playerPhase).toBe("playing");
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(player.nextRecovery()).toBeGreaterThan(0);
+      expect(videoCallCount("load", player.video)).toBeGreaterThan(loads);
+      expect(player.view.container.querySelector(".player-state-view")).toBeNull();
+    } finally {
+      player.close();
+    }
+  });
+
+  it.each(["clock", "picture"])("cancels pending %s recovery while hidden and lets Pause cancel its fresh visible deadline", async (kind) => {
+    const player = await mountFramePlayer();
+    const timeouts = vi.spyOn(window, "setTimeout");
+    try {
+      if (kind === "picture") player.frame();
+      player.advance(3_200, false, kind === "picture");
+      expect(player.root.dataset.playerPhase).toBe("buffering");
+      const recovery = timeouts.mock.calls.filter(([, delay]) => delay === 4_000).slice(-1)[0]?.[0];
+      expect(typeof recovery).toBe("function");
+      const loads = videoCallCount("load", player.video);
+      player.setVisibility("hidden");
+      act(() => { (recovery as () => void)(); });
+      player.advance(8_000, false, false);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(player.view.container.querySelector(".player-state-view")).toBeNull();
+
+      player.setVisibility("visible");
+      player.advance(1_000, false, kind === "picture");
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      player.advance(3_200, false, kind === "picture");
+      expect(player.root.dataset.playerPhase).toBe("buffering");
+      const freshRecovery = timeouts.mock.calls.filter(([, delay]) => delay === 4_000).slice(-1)[0]?.[0];
+      expect(typeof freshRecovery).toBe("function");
+      expect(freshRecovery).not.toBe(recovery);
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      act(() => { (freshRecovery as () => void)(); });
+      player.advance(12_000, false, false);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(player.view.container.querySelector(".player-state-view")).toBeNull();
+    } finally {
+      player.close();
+    }
+  });
+
+  it("holds the paused presented frame across visibility changes without playing, loading, or seeking", async () => {
+    const player = await mountFramePlayer();
+    try {
+      player.frame();
+      let position = player.video.currentTime;
+      const seek = vi.fn((value: number) => { position = value; });
+      Object.defineProperty(player.video, "currentTime", { configurable: true, get: () => position, set: seek });
+      const source = player.video.getAttribute("src");
+      const loads = videoCallCount("load", player.video);
+      const plays = videoCallCount("play", player.video);
+      const pauses = videoCallCount("pause", player.video);
+      const expectedPicture = `picture at ${position.toFixed(2)}`;
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      fireEvent.pause(player.video);
+      expect(player.root.dataset.frameHold).toBe("true");
+      expect(player.canvas.picture(player.activeCanvas())).toBe(expectedPicture);
+
+      player.setVisibility("hidden");
+      player.setVisibility("visible");
+      const draws = player.canvas.draws.mock.calls.length;
+      player.advance(6_000, false, false);
+      expect(player.canvas.draws).toHaveBeenCalledTimes(draws);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(player.root.dataset.frameHold).toBe("true");
+      expect(player.canvas.picture(player.activeCanvas())).toBe(expectedPicture);
+      expect(player.view.container.querySelector("video")).toBe(player.video);
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(videoCallCount("pause", player.video)).toBe(pauses + 1);
+      expect(seek).not.toHaveBeenCalled();
+    } finally {
+      player.close();
+    }
+  });
+
+  it("invalidates the paused snapshot during a seek and publishes the newly presented paused frame", async () => {
+    const player = await mountFramePlayer();
+    try {
+      player.frame();
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      fireEvent.pause(player.video);
+      const oldPicture = player.canvas.picture(player.activeCanvas());
+      const source = player.video.getAttribute("src");
+      const loads = videoCallCount("load", player.video);
+      const plays = videoCallCount("play", player.video);
+      pointerClick(screen.getByRole("button", { name: "Forward 10 seconds" }));
+      expect(player.root.dataset.frameHold).toBe("false");
+      player.canvas.present(`picture at ${player.video.currentTime.toFixed(2)}`);
+      fireEvent.seeked(player.video);
+      player.frame();
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(player.root.dataset.frameHold).toBe("true");
+      expect(player.canvas.picture(player.activeCanvas())).not.toBe(oldPicture);
+      expect(player.canvas.picture(player.activeCanvas())).toBe(`picture at ${player.video.currentTime.toFixed(2)}`);
+
+      let position = player.video.currentTime + 5;
+      const nativeTarget = position;
+      const unexpectedSeek = vi.fn((value: number) => { position = value; });
+      Object.defineProperty(player.video, "currentTime", { configurable: true, get: () => position, set: unexpectedSeek });
+      Object.defineProperty(player.video, "seeking", { configurable: true, value: true });
+      fireEvent.seeking(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      player.advance(1_000, false, false);
+      expect(player.root.dataset.frameHold).toBe("false");
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(player.video.currentTime).toBe(nativeTarget);
+      expect(unexpectedSeek).not.toHaveBeenCalled();
+      Object.defineProperty(player.video, "seeking", { configurable: true, value: false });
+      player.canvas.present(`picture at ${nativeTarget.toFixed(2)}`);
+      fireEvent.seeked(player.video);
+      player.frame();
+      expect(player.root.dataset.frameHold).toBe("true");
+      expect(player.canvas.picture(player.activeCanvas())).toBe(`picture at ${nativeTarget.toFixed(2)}`);
+      expect(unexpectedSeek).not.toHaveBeenCalled();
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+    } finally {
+      player.close();
+    }
+  });
+
+  it("replaces a paused quality snapshot only after a frame from the new native transport", async () => {
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("probably");
+    const native: ResolvedPlayback = {
+      ...playback,
+      runResponse: {
+        ...playback.runResponse,
+        progressiveUrl: "",
+        manifestUrl: "/api/playback/streams/paused-picture/manifest",
+        sourceMetadata: { ...playback.runResponse.sourceMetadata, progressiveCompatible: false },
+        renditions: [
+          ...playback.runResponse.renditions,
+          { id: "video_240p", label: "240p", height: 240, width: 426, original: false, ready: true, status: "ready" },
+        ],
+      },
+    };
+    const player = await mountFramePlayer(native);
+    try {
+      expect(player.root.dataset.playerTransport).toBe("native-hls");
+      player.frame();
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      fireEvent.pause(player.video);
+      expect(player.root.dataset.frameHold).toBe("true");
+      const plays = videoCallCount("play", player.video);
+      pointerClick(screen.getByRole("button", { name: /^Quality:/ }));
+      pointerClick(screen.getByRole("option", { name: "240p" }));
+      expect(player.root.dataset.frameHold).toBe("false");
+      Object.defineProperties(player.video, {
+        videoWidth: { configurable: true, value: 426 },
+        videoHeight: { configurable: true, value: 240 },
+      });
+      player.canvas.present("fresh 240p picture");
+      fireEvent.loadedMetadata(player.video);
+      fireEvent.seeked(player.video);
+      fireEvent.loadedData(player.video);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(player.root.dataset.frameHold).toBe("true");
+      expect(player.canvas.picture(player.activeCanvas())).toBe("fresh 240p picture");
+      expect(player.view.container.querySelector("video")).toBe(player.video);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+    } finally {
+      player.close();
+    }
+  });
+
+  it.each([false, true])("keeps paused capture failure safe when a valid snapshot already exists: %s", async (existingSnapshot) => {
+    const player = await mountFramePlayer();
+    try {
+      player.frame();
+      if (existingSnapshot) {
+        pointerClick(screen.getByRole("button", { name: "Pause" }));
+        Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+        fireEvent.pause(player.video);
+      }
+      const oldCanvas = player.activeCanvas();
+      const oldPicture = player.canvas.picture(oldCanvas);
+      const oldWidth = oldCanvas?.width;
+      const oldHeight = oldCanvas?.height;
+      player.canvas.reject(true);
+      if (existingSnapshot) player.setVisibility("visible");
+      else {
+        pointerClick(screen.getByRole("button", { name: "Pause" }));
+        Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+        fireEvent.pause(player.video);
+      }
+      expect(player.root.dataset.frameHold).toBe(existingSnapshot ? "true" : "false");
+      expect(player.canvas.picture(player.activeCanvas())).toBe(oldPicture);
+      Object.defineProperties(player.video, {
+        videoWidth: { configurable: true, value: 1280 },
+        videoHeight: { configurable: true, value: 720 },
+      });
+      fireEvent.resize(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      if (existingSnapshot) {
+        expect(player.canvas.picture(oldCanvas)).toBe(oldPicture);
+        expect(oldCanvas?.width).toBe(oldWidth);
+        expect(oldCanvas?.height).toBe(oldHeight);
+      }
+      expect(player.root.dataset.playerPhase).toBe("paused");
+    } finally {
+      player.close();
+    }
+  });
+
+  it("does not mutate the painted canvas when a second capture fails in the same event batch", async () => {
+    const player = await mountFramePlayer();
+    try {
+      player.frame();
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("true");
+      player.canvas.publishedMutations.mockClear();
+      act(() => {
+        player.canvas.present("valid refreshed picture");
+        fireEvent.waiting(player.video);
+        player.canvas.reject(true);
+        Object.defineProperties(player.video, {
+          videoWidth: { configurable: true, value: 1280 },
+          videoHeight: { configurable: true, value: 720 },
+        });
+        fireEvent.stalled(player.video);
+      });
+      expect(player.canvas.publishedMutations).not.toHaveBeenCalled();
+      expect(player.canvas.picture(player.activeCanvas())).toBe("valid refreshed picture");
+      expect(player.activeCanvas()?.width).toBe(640);
+      expect(player.activeCanvas()?.height).toBe(360);
+      expect(player.root.dataset.frameHold).toBe("true");
+    } finally {
+      player.close();
+    }
   });
 
   it("detects a stopped frame callback while the media clock keeps advancing", () => {
