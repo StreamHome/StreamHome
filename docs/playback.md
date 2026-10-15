@@ -32,7 +32,7 @@ The adaptive forward-buffer target is 30 seconds with a bounded 60-second ceilin
 
 ## Startup path and diagnostics
 
-The browser requests catalog metadata and the authenticated playback run concurrently, and mounts playable media as soon as the run resolves without waiting for catalog presentation data. It also begins loading hls.js as soon as the player route mounts, so API and player-engine work do not form a serial startup waterfall.
+The browser requests catalog metadata and the authenticated playback run concurrently, and mounts playable media as soon as the run resolves without waiting for catalog presentation data. It also begins loading hls.js as soon as the player route mounts, so API and player-engine work do not form a serial startup waterfall. Multiple dubbings use hls.js from the first frame when native HLS lacks audio-track selection; changing languages then preserves the mounted source. Browsers with actionable native audio tracks retain native HLS. A selected hls.js transport waits for the already-started engine import rather than briefly mounting native playback first.
 
 Adaptive startup records transport initialization, media attachment, manifest, level/audio playlist, fragment load/buffer, `canplay`, and `playing` stages. If the bounded retry cannot start playback, the client posts the exact last stage, sanitized hls.js error token, HTTP status, media element state, position, buffer edge, and elapsed time to `/api/playback/runs/{runId}/diagnostics`. The server writes this ticket-free diagnostic to `backend.log`, allowing an operator to distinguish a manifest failure, fragment HTTP failure, decode failure, or genuine no-progress timeout.
 

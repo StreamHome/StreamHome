@@ -154,6 +154,7 @@ test('aligns browser-decoded flash and impulse markers in both HLS dubbings', as
   test.skip(!process.env.STREAMHOME_SEMANTIC_FIXTURE,'Requires the isolated backend semantic HLS fixture export.');
   await ready(page,'?fixture=semantic');
   const video=page.locator('video');
+  const mountedSource=await video.getAttribute('src');
   await video.evaluate(async (element:HTMLVideoElement)=>{
     const context=new AudioContext(); const source=context.createMediaElementSource(element);
     const code=`class Marker extends AudioWorkletProcessor { last=-1; process(inputs) { const data=inputs[0]?.[0]; if(data) { for(let i=0;i<data.length;i++) { if(Math.abs(data[i])>.2 && currentTime-this.last>.5) {this.last=currentTime;this.port.postMessage({time:currentTime+i/sampleRate});break;} } } return true; } } registerProcessor('player-marker',Marker);`;
@@ -184,6 +185,7 @@ test('aligns browser-decoded flash and impulse markers in both HLS dubbings', as
       await page.getByRole('button',{name:/Audio language/}).click();await page.getByRole('option',{name:language,exact:true}).click();
     }
     await expect(page.getByRole('button',{name:/Audio language/})).toContainText(language);
+    expect(await video.getAttribute('src')).toBe(mountedSource);
     await expect.poll(()=>video.evaluate((element:HTMLVideoElement)=>element.readyState)).toBeGreaterThanOrEqual(2);
     await page.getByRole('button',{name:'Rewind 10 seconds',exact:true}).click();
     await expect.poll(()=>video.evaluate((element:HTMLVideoElement)=>element.seeking)).toBe(false);

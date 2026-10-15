@@ -614,7 +614,7 @@ export function initialPlaybackMode(
 ): StreamMode {
   const capability = mediaElement ?? (typeof document !== "undefined" ? document.createElement("video") : null);
   const preferredTrack = progressiveAudioTrack(response.tracks, preferredTrackId, preferredLanguage);
-  const requiresTrackSelection = preferredTrack && !preferredTrack.default && response.tracks.length > 1;
+  const requiresTrackSelection = response.tracks.length > 1;
   const nativeCanSelectAudio = capability && "audioTracks" in capability;
   const adaptiveMode: StreamMode = response.manifestUrl && capability?.canPlayType("application/vnd.apple.mpegurl") && (!requiresTrackSelection || nativeCanSelectAudio) ? "native-hls" : "hls";
   if (
@@ -878,6 +878,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [phase, setPhase] = useState<PlayerPhase>("resolving");
   const [streamMode, setStreamMode] = useState<StreamMode>("hls");
   const [hlsEngine, setHlsEngine] = useState<typeof import("hls.js").default | null>(null);
+  const [hlsEngineFailed, setHlsEngineFailed] = useState(false);
   const [transportRevision, setTransportRevision] = useState(0);
   const [fatal, setFatal] = useState<FatalState | null>(null);
   const [retryVersion, setRetryVersion] = useState(0);
@@ -968,7 +969,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     void import("hls.js").then((module) => {
       if (active) setHlsEngine(() => module.default);
     }).catch(() => {
-      if (active) setPlayerNotice("The adaptive playback engine could not be loaded.");
+      if (active) {
+        setHlsEngineFailed(true);
+        setPlayerNotice("The adaptive playback engine could not be loaded.");
+      }
     });
     return () => {
       active = false;
@@ -1614,7 +1618,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (!runResponse || !video) return;
     const transportReady = playbackTransportIsReady(runResponse, streamMode);
     if (!transportReady) return;
-    if (streamMode === "hls" && !hlsEngine && !video.canPlayType("application/vnd.apple.mpegurl")) return;
+    if (streamMode === "hls" && !hlsEngine) {
+      if (!hlsEngineFailed) return;
+      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        setStreamMode("native-hls");
+        return;
+      }
+      setFatal({ title: "Playback engine unavailable", message: "The adaptive playback engine could not be loaded. Reload this page to retry.", retryable: false });
+      setPhase("fatal");
+      return;
+    }
     const transportGeneration = ++transportGenerationRef.current;
     const transportPreferences = preferencesRef.current;
     preservePlaybackPosition();
@@ -2193,6 +2206,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     clearPlaybackStartupWatchdog,
     clearPlaybackClockAdvanceWatchdog,
     streamMode === "native-hls" ? null : hlsEngine,
+    streamMode === "native-hls" ? null : hlsEngineFailed,
     markPlaybackStartupProgress,
     preservePlaybackPosition,
     runResponse?.manifestUrl,

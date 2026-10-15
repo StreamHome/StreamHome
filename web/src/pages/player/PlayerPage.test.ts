@@ -223,6 +223,22 @@ describe("player interaction contracts", () => {
     expect(initialPlaybackMode({ ...externalReady, preparationState: "preparing" }, "audio_0_tr", "tr")).toBe("progressive");
   });
 
+  it("keeps multiple dubbings on a selectable transport from the first frame", () => {
+    const response = {
+      manifestUrl: "/api/playback/streams/test-run/manifest", progressiveUrl: "",
+      sourceMetadata: { progressiveCompatible: false },
+      tracks: [
+        { id: "audio_en", language: "en", default: true, source: "embedded" },
+        { id: "audio_tr", language: "tr", default: false, source: "embedded" },
+      ],
+    } as unknown as PlaybackRunResponse;
+    const native = { canPlayType: () => "probably" as CanPlayTypeResult };
+    expect(initialPlaybackMode(response, "audio_en", "en", native)).toBe("hls");
+    expect(initialPlaybackMode(response, "audio_tr", "tr", native)).toBe("hls");
+    expect(initialPlaybackMode(response, "audio_en", "en", Object.assign({}, native, { audioTracks: [] }))).toBe("native-hls");
+    expect(initialPlaybackMode({ ...response, tracks: response.tracks.slice(0,1) }, "audio_en", "en", native)).toBe("native-hls");
+  });
+
   it("recognizes growing HLS and extends startup only while bounded progress continues", () => {
     const response = {
       renditions: [{ id: "video_480p", status: "streamable" }],
