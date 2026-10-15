@@ -796,6 +796,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const framePublicationPendingRef = useRef(false);
   const queuedPausedFrameCaptureRef = useRef(false);
   const frameSnapshotRef = useRef<{ time: number; width: number; height: number; transport: number; position: number } | null>(null);
+  const pendingSeekFrameRef = useRef<{
+    target: number;
+    presented: { time: number; transport: number; position: number } | null;
+    decodedSeeked: { transport: number; position: number } | null;
+  } | null>(null);
   const timelineRef = useRef<HTMLInputElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const hlsAudioOptionsRef = useRef<PlayerAudioOption[]>([]);
@@ -1216,6 +1221,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     setHasLastFrame(false);
     setPausedFrameValid(false);
     frameSnapshotRef.current = null;
+    pendingSeekFrameRef.current = null;
     activeFrameCanvasRef.current = 0;
     framePublicationPendingRef.current = false;
     queuedPausedFrameCaptureRef.current = false;
@@ -1314,6 +1320,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, []);
 
   const captureLastFrame = useCallback((force = false, presentationTime?: number) => {
+    // currentTime changes before the seek's pixels do. Never label that old bitmap
+    // with the new position, including captures queued by buffering or publication.
+    if (pendingSeekFrameRef.current !== null) return false;
     if (framePublicationPendingRef.current) {
       if (presentationTime !== undefined) queuedPausedFrameCaptureRef.current = true;
       return hasLastFrameRef.current;
@@ -1370,6 +1379,42 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     captureLastFrame(true, presentationTime ?? video.currentTime);
     setPausedFrameValid(pausedFrameMatches(video));
   }, [captureLastFrame, pausedFrameMatches]);
+
+  const invalidateSeekFrame = useCallback((target: number) => {
+    pendingSeekFrameRef.current = { target, presented: null, decodedSeeked: null };
+    frameSnapshotRef.current = null;
+    hasLastFrameRef.current = false;
+    setHasLastFrame(false);
+    setPausedFrameValid(false);
+  }, []);
+
+  const settleSeekFrame = useCallback((presentationTime?: number, decodedBoundary: "seeked" | "ready" | null = null) => {
+    const pending = pendingSeekFrameRef.current;
+    const video = videoRef.current;
+    if (!pending || !video) return;
+    const transport = transportGenerationRef.current;
+    const position = positionGenerationRef.current;
+    if (decodedBoundary === "seeked") pending.decodedSeeked = { transport, position };
+    if (presentationTime !== undefined
+      && Math.abs(presentationTime - video.currentTime) <= 0.1
+      && presentationTime >= pending.target - 0.1
+      && (pendingSeekTargetRef.current === null || Math.abs(video.currentTime - pending.target) <= 1)) {
+      pending.presented = { time: presentationTime, transport, position };
+    }
+    if (video.seeking || transportResettingRef.current || pendingSeekTargetRef.current !== null
+      || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+    // A seeked event is the native decoded-frame boundary on browsers without
+    // frame callbacks. With callbacks, retain the barrier until target pixels
+    // have actually been presented, even if timeupdate/playing settled the clock.
+    const presentedTime = typeof video.requestVideoFrameCallback === "function"
+      ? pending.presented?.transport === transport && pending.presented.position === position ? pending.presented.time : null
+      : decodedBoundary !== null && pending.decodedSeeked?.transport === transport && pending.decodedSeeked.position === position ? video.currentTime : null;
+    if (presentedTime === null || Math.abs(presentedTime - video.currentTime) > 0.1
+      || video.currentTime < pending.target - 0.1) return;
+    pendingSeekFrameRef.current = null;
+    captureLastFrame(true, presentedTime);
+    if (video.paused || !playbackIntentRef.current) capturePausedFrame(presentedTime);
+  }, [captureLastFrame, capturePausedFrame]);
 
   useLayoutEffect(() => {
     framePublicationPendingRef.current = false;
@@ -2823,6 +2868,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       if (!active || videoRef.current !== video) return;
       const now = performance.now();
       if (document.visibilityState !== "hidden") {
+        settleSeekFrame(metadata.mediaTime);
         if (framePositionGeneration !== positionGenerationRef.current) {
           framePositionGeneration = positionGenerationRef.current;
           resetFrameHealth();
@@ -2883,7 +2929,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       if (timer !== null) window.clearInterval(timer);
       if (frameRequest !== null) video.cancelVideoFrameCallback(frameRequest);
     };
-  }, [armPlaybackClockAdvanceWatchdog, captureLastFrame, capturePausedFrame, clearPlaybackClockAdvanceWatchdog, clearStallRecovery, runResponse?.runId, scheduleStallRecovery, transportRevision, videoMounted]);
+  }, [armPlaybackClockAdvanceWatchdog, captureLastFrame, capturePausedFrame, clearPlaybackClockAdvanceWatchdog, clearStallRecovery, runResponse?.runId, scheduleStallRecovery, settleSeekFrame, transportRevision, videoMounted]);
 
   const seek = useCallback((nextTime: number, report = true) => {
     const video = videoRef.current;
@@ -2902,6 +2948,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (bounded + 0.1 < requested) {
       setPlayerNotice("The download is still expanding. Jumped to the latest available point.");
     }
+    invalidateSeekFrame(bounded);
     pendingSeekTargetRef.current = bounded;
     pendingPositionKindRef.current = "seek";
     resumePositionRef.current = bounded;
@@ -2934,7 +2981,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         hlsRef.current?.startLoad(bounded);
       }
     }
-  }, [cancelPendingVideoPlay, captureLastFrame, captureWatchedTime, clearPlaybackClockAdvanceWatchdog, clearStallRecovery, duration, pauseExternalAudio, preferences.audioLanguage, preferences.audioTrackId, runResponse, streamMode]);
+  }, [cancelPendingVideoPlay, captureLastFrame, captureWatchedTime, clearPlaybackClockAdvanceWatchdog, clearStallRecovery, duration, invalidateSeekFrame, pauseExternalAudio, preferences.audioLanguage, preferences.audioTrackId, runResponse, streamMode]);
 
   const reportConfirmedSeek = useCallback(() => {
     if (pendingSeekTargetRef.current !== null) {
@@ -3738,7 +3785,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     fatal: "Playback interrupted",
   };
   const preparationDetail = preparationStatusMessage(runResponse?.preparationProgress);
-  const holdLastFrame = hasLastFrame && (["loading", "buffering", "recovering"].includes(phase)
+  const holdLastFrame = hasLastFrame && pendingSeekFrameRef.current === null && (["loading", "buffering", "recovering"].includes(phase)
     || (phase === "paused" && pausedFrameValid && videoRef.current !== null && pausedFrameMatches(videoRef.current)));
 
   if (phase === "resolving" || phase === "preparing" || (phase === "loading" && !asset)) {
@@ -3841,7 +3888,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         crossOrigin="anonymous"
         preload="auto"
         playsInline
-        onLoadedData={() => { syncRenderedQuality(); capturePausedFrame(); }}
+        onLoadedData={() => { syncRenderedQuality(); settleSeekFrame(undefined, "ready"); capturePausedFrame(); }}
         onResize={() => { syncRenderedQuality(); capturePausedFrame(); }}
         onLoadedMetadata={() => {
           const video = videoRef.current;
@@ -3960,6 +4007,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         onCanPlay={() => {
           const video = videoRef.current;
           if (!video) return;
+          settleSeekFrame(undefined, "ready");
           markPlaybackStartupProgress("can-play");
           if (!playbackIntentRef.current) {
             cancelPendingVideoPlay();
@@ -4040,6 +4088,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             setPhase("playing");
             armPlaybackClockAdvanceWatchdog();
           }
+          settleSeekFrame();
           if (confirmedPendingSeek && playbackIntentRef.current && video.paused) requestVideoPlay();
           if (confirmedPendingSeek && pendingSeekReportRef.current) {
             pendingSeekReportRef.current = false;
@@ -4070,6 +4119,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           setCurrentTime(nextTime);
           transportResettingRef.current = false;
           markPlaybackStartupReady();
+          settleSeekFrame(undefined, "seeked");
           capturePausedFrame();
           syncExternalAudio(true, nextTime);
           if (activeExternalAudioTrackIdRef.current && !video.paused) {
@@ -4095,6 +4145,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           // Native controls issue a seek without going through the application command.
           // Transport resets retain their own target and cannot acquire native intent.
           const target = clampPlaybackTime(video.currentTime, video.duration, duration);
+          invalidateSeekFrame(target);
           pendingSeekTargetRef.current = target;
           pendingPositionKindRef.current = "seek";
           resumePositionRef.current = target;

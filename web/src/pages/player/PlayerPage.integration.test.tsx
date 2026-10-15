@@ -213,7 +213,7 @@ function frameCanvasHarness() {
   };
 }
 
-async function mountFramePlayer(fixture: ResolvedPlayback = playback) {
+async function mountFramePlayer(fixture: ResolvedPlayback = playback, frameCallbacks = true) {
   vi.useFakeTimers();
   vi.spyOn(performance, "now").mockImplementation(() => Date.now());
   const visibility = Object.getOwnPropertyDescriptor(document, "visibilityState");
@@ -225,8 +225,10 @@ async function mountFramePlayer(fixture: ResolvedPlayback = playback) {
     frameRequests.set(++nextFrameId, callback);
     return nextFrameId;
   });
-  Object.defineProperty(HTMLVideoElement.prototype, "requestVideoFrameCallback", { configurable: true, value: requestFrame });
-  Object.defineProperty(HTMLVideoElement.prototype, "cancelVideoFrameCallback", { configurable: true, value: vi.fn((id: number) => frameRequests.delete(id)) });
+  if (frameCallbacks) {
+    Object.defineProperty(HTMLVideoElement.prototype, "requestVideoFrameCallback", { configurable: true, value: requestFrame });
+    Object.defineProperty(HTMLVideoElement.prototype, "cancelVideoFrameCallback", { configurable: true, value: vi.fn((id: number) => frameRequests.delete(id)) });
+  }
   const canvas = frameCanvasHarness();
   const view = render(<MemoryRouter><PlayerPage visualFixture={fixture} /></MemoryRouter>);
   await act(async () => { await import("hls.js"); });
@@ -247,20 +249,23 @@ async function mountFramePlayer(fixture: ResolvedPlayback = playback) {
     video.currentTime += 0.1;
     fireEvent.timeUpdate(video);
   };
-  const frame = (time = video.currentTime) => {
+  const takeFrame = () => {
     const request = frameRequests.entries().next().value as [number, VideoFrameRequestCallback] | undefined;
     expect(request).toBeTruthy();
     frameRequests.delete(request![0]);
-    canvas.present(`picture at ${time.toFixed(2)}`);
-    act(() => request![1](performance.now(), {
-      mediaTime: time,
-      presentedFrames: ++presentedFrames,
-      presentationTime: performance.now(),
-      expectedDisplayTime: performance.now(),
-      width: video.videoWidth,
-      height: video.videoHeight,
-    } as VideoFrameCallbackMetadata));
+    return (time = video.currentTime) => {
+      canvas.present(`picture at ${time.toFixed(2)}`);
+      act(() => request![1](performance.now(), {
+        mediaTime: time,
+        presentedFrames: ++presentedFrames,
+        presentationTime: performance.now(),
+        expectedDisplayTime: performance.now(),
+        width: video.videoWidth,
+        height: video.videoHeight,
+      } as VideoFrameCallbackMetadata));
+    };
   };
+  const frame = (time = video.currentTime) => takeFrame()(time);
   const advance = (milliseconds: number, frames = false, clock = true) => {
     for (let elapsed = 0; elapsed < milliseconds; elapsed += 200) {
       act(() => vi.advanceTimersByTime(Math.min(200, milliseconds - elapsed)));
@@ -286,7 +291,7 @@ async function mountFramePlayer(fixture: ResolvedPlayback = playback) {
   };
   settle();
   return {
-    view, video, root, canvas, frame, advance, settle, nextRecovery, requestFrame, setVisibility,
+    view, video, root, canvas, frame, takeFrame, advance, settle, nextRecovery, requestFrame, setVisibility,
     activeCanvas: () => view.container.querySelector<HTMLCanvasElement>(".player-last-frame[data-frame-active='true']"),
     close: () => {
       view.unmount();
@@ -2063,6 +2068,252 @@ describe("mounted player lifecycle", () => {
       expect(player.root.dataset.frameHold).toBe("true");
       expect(player.canvas.picture(player.activeCanvas())).toBe(`picture at ${nativeTarget.toFixed(2)}`);
       expect(unexpectedSeek).not.toHaveBeenCalled();
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+    } finally {
+      player.close();
+    }
+  });
+
+  it.each([
+    { origin: "application", readyState: HTMLMediaElement.HAVE_METADATA, snapshot: "pause" },
+    { origin: "application", readyState: HTMLMediaElement.HAVE_CURRENT_DATA, snapshot: "visibility" },
+    { origin: "native", readyState: HTMLMediaElement.HAVE_METADATA, snapshot: "visibility" },
+    { origin: "native", readyState: HTMLMediaElement.HAVE_CURRENT_DATA, snapshot: "pause" },
+  ])("keeps the old $snapshot picture hidden throughout a playing $origin seek at readyState $readyState", async ({ origin, readyState, snapshot }) => {
+    const player = await mountFramePlayer();
+    try {
+      player.frame();
+      if (snapshot === "pause") {
+        pointerClick(screen.getByRole("button", { name: "Pause" }));
+        Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+        fireEvent.pause(player.video);
+        expect(player.root.dataset.frameHold).toBe("true");
+        pointerClick(screen.getByRole("button", { name: "Play" }));
+        Object.defineProperty(player.video, "paused", { configurable: true, value: false });
+        fireEvent.play(player.video);
+        fireEvent.playing(player.video);
+      } else {
+        player.setVisibility("hidden");
+        player.setVisibility("visible");
+      }
+      const oldPicture = player.canvas.picture(player.activeCanvas());
+      expect(oldPicture).toBeDefined();
+      player.video.currentTime += 0.2;
+      fireEvent.timeUpdate(player.video);
+      expect(player.root.dataset.playerPhase).toBe("playing");
+      const oldTime = player.video.currentTime;
+      const source = player.video.getAttribute("src");
+      const loads = videoCallCount("load", player.video);
+      const plays = videoCallCount("play", player.video);
+      const draws = player.canvas.draws.mock.calls.length;
+      Object.defineProperty(player.video, "readyState", { configurable: true, value: readyState });
+
+      if (origin === "application") pointerClick(screen.getByRole("button", { name: "Forward 10 seconds" }));
+      else player.video.currentTime += 10;
+      const target = player.video.currentTime;
+      Object.defineProperty(player.video, "seeking", { configurable: true, value: true });
+      fireEvent.seeking(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      fireEvent.stalled(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+
+      Object.defineProperty(player.video, "seeking", { configurable: true, value: false });
+      fireEvent.seeked(player.video);
+      fireEvent.playing(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      fireEvent.timeUpdate(player.video);
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      Object.defineProperty(player.video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_CURRENT_DATA });
+      player.frame(oldTime);
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      expect(player.canvas.draws).toHaveBeenCalledTimes(draws);
+
+      player.frame(target);
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("true");
+      expect(player.canvas.picture(player.activeCanvas())).toBe(`picture at ${target.toFixed(2)}`);
+      expect(player.canvas.picture(player.activeCanvas())).not.toBe(oldPicture);
+      fireEvent.playing(player.video);
+      player.video.currentTime += 0.1;
+      fireEvent.timeUpdate(player.video);
+      const playingDraws = player.canvas.draws.mock.calls.length;
+      player.advance(1_200, true);
+      expect(player.canvas.draws).toHaveBeenCalledTimes(playingDraws);
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      fireEvent.pause(player.video);
+      player.frame();
+      const pausedDraws = player.canvas.draws.mock.calls.length;
+      player.advance(1_200, true, false);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(player.root.dataset.frameHold).toBe("true");
+      expect(player.canvas.draws).toHaveBeenCalledTimes(pausedDraws);
+      expect(player.view.container.querySelector("video")).toBe(player.video);
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+    } finally {
+      player.close();
+    }
+  });
+
+  it("rejects delayed frames from earlier rapid seeks without reviving their old picture", async () => {
+    const player = await mountFramePlayer();
+    try {
+      player.frame();
+      player.setVisibility("hidden");
+      player.setVisibility("visible");
+      const oldPicture = player.canvas.picture(player.activeCanvas());
+      const source = player.video.getAttribute("src");
+      const loads = videoCallCount("load", player.video);
+      const plays = videoCallCount("play", player.video);
+      const delayedFrame = player.takeFrame();
+      Object.defineProperty(player.video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_CURRENT_DATA });
+      pointerClick(screen.getByRole("button", { name: "Forward 10 seconds" }));
+      const firstTarget = player.video.currentTime;
+      fireEvent.seeked(player.video);
+      pointerClick(screen.getByRole("button", { name: "Forward 10 seconds" }));
+      const finalTarget = player.video.currentTime;
+      fireEvent.seeked(player.video);
+      fireEvent.playing(player.video);
+      delayedFrame(firstTarget);
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      player.frame(firstTarget);
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      player.frame(finalTarget);
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("true");
+      expect(player.canvas.picture(player.activeCanvas())).toBe(`picture at ${finalTarget.toFixed(2)}`);
+      expect(player.canvas.picture(player.activeCanvas())).not.toBe(oldPicture);
+      expect(player.view.container.querySelector("video")).toBe(player.video);
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+    } finally {
+      player.close();
+    }
+  });
+
+  it("keeps a seek-invalidated picture hidden when the fresh capture fails and Pause remains authoritative", async () => {
+    const player = await mountFramePlayer();
+    try {
+      player.frame();
+      player.setVisibility("hidden");
+      player.setVisibility("visible");
+      const oldCanvas = player.activeCanvas();
+      const oldPicture = player.canvas.picture(oldCanvas);
+      const source = player.video.getAttribute("src");
+      const loads = videoCallCount("load", player.video);
+      const plays = videoCallCount("play", player.video);
+      pointerClick(screen.getByRole("button", { name: "Forward 10 seconds" }));
+      Object.defineProperty(player.video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_CURRENT_DATA });
+      fireEvent.seeked(player.video);
+      player.canvas.reject(true);
+      player.frame();
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      expect(player.canvas.picture(oldCanvas)).toBe(oldPicture);
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      fireEvent.pause(player.video);
+      fireEvent.playing(player.video);
+      fireEvent.canPlay(player.video);
+      player.advance(1_000, false, false);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(player.root.dataset.frameHold).toBe("false");
+      player.canvas.reject(false);
+      player.frame();
+      expect(player.root.dataset.frameHold).toBe("true");
+      expect(player.canvas.picture(player.activeCanvas())).toBe(`picture at ${player.video.currentTime.toFixed(2)}`);
+      expect(player.view.container.querySelector("video")).toBe(player.video);
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+    } finally {
+      player.close();
+    }
+  });
+
+  it("keeps Pause authoritative while a playing seek waits for its first target frame", async () => {
+    const player = await mountFramePlayer();
+    try {
+      player.frame();
+      player.setVisibility("hidden");
+      player.setVisibility("visible");
+      const oldTime = player.video.currentTime;
+      const source = player.video.getAttribute("src");
+      const loads = videoCallCount("load", player.video);
+      const plays = videoCallCount("play", player.video);
+      pointerClick(screen.getByRole("button", { name: "Forward 10 seconds" }));
+      Object.defineProperty(player.video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_CURRENT_DATA });
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      fireEvent.pause(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      fireEvent.seeked(player.video);
+      fireEvent.playing(player.video);
+      fireEvent.waiting(player.video);
+      player.frame(oldTime);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(player.root.dataset.frameHold).toBe("false");
+      player.frame();
+      expect(player.root.dataset.frameHold).toBe("true");
+      expect(player.canvas.picture(player.activeCanvas())).toBe(`picture at ${player.video.currentTime.toFixed(2)}`);
+      player.advance(2_000, true, false);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(player.view.container.querySelector("video")).toBe(player.video);
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+    } finally {
+      player.close();
+    }
+  });
+
+  it("uses fresh decoded-data readiness after a metadata-only seek when frame callbacks are unavailable", async () => {
+    const player = await mountFramePlayer(playback, false);
+    try {
+      player.canvas.present("old picture before native seek");
+      player.setVisibility("hidden");
+      player.setVisibility("visible");
+      const source = player.video.getAttribute("src");
+      const loads = videoCallCount("load", player.video);
+      const plays = videoCallCount("play", player.video);
+      Object.defineProperty(player.video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_METADATA });
+      player.video.currentTime += 10;
+      Object.defineProperty(player.video, "seeking", { configurable: true, value: true });
+      fireEvent.seeking(player.video);
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      Object.defineProperty(player.video, "seeking", { configurable: true, value: false });
+      fireEvent.seeked(player.video);
+      fireEvent.playing(player.video);
+      fireEvent.timeUpdate(player.video);
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      Object.defineProperty(player.video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_CURRENT_DATA });
+      fireEvent.timeUpdate(player.video);
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      player.canvas.present("fresh decoded native-seek picture");
+      fireEvent.loadedData(player.video);
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.frameHold).toBe("true");
+      expect(player.canvas.picture(player.activeCanvas())).toBe("fresh decoded native-seek picture");
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      fireEvent.pause(player.video);
+      player.advance(2_000, false, false);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(player.view.container.querySelector("video")).toBe(player.video);
       expect(player.video.getAttribute("src")).toBe(source);
       expect(videoCallCount("load", player.video)).toBe(loads);
       expect(videoCallCount("play", player.video)).toBe(plays);
