@@ -1271,6 +1271,7 @@ button:disabled {
   backdrop-filter: none;
 }
 
+.player-view .player-skip-button,
 .player-view :is(.player-topbar__exit, .mobile-player-exit, .player-skip-button):hover {
   background: rgba(255, 255, 255, 0.1);
   border-color: rgba(255, 255, 255, 0.16);
