@@ -1126,12 +1126,16 @@ button:disabled {
   pointer-events: auto;
 }
 
-.player-view :is(.player-topbar__exit, .mobile-player-exit),
-.player-view :is(.player-topbar__exit, .mobile-player-exit):hover {
+.player-view :is(.player-topbar__exit, .mobile-player-exit) {
   background: transparent;
   border-color: transparent;
   box-shadow: none;
   backdrop-filter: none;
+}
+
+.player-view :is(.player-topbar__exit, .mobile-player-exit):hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.16);
 }
 
 .player-topbar__title {
