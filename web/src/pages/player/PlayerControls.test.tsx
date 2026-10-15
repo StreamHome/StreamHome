@@ -146,6 +146,25 @@ describe("player volume control", () => {
     }
   });
 
+  it("dismisses a hover-open volume with Escape from another focused menu without reopening", () => {
+    render(<PlayerMenuProvider onOpenChange={() => undefined}>
+      <VolumeFixture />
+      <PlayerControlMenu label="Quality" icon="quality" value="auto" options={[{ value: "auto", label: "Auto" }]} onSelect={() => undefined} />
+    </PlayerMenuProvider>);
+
+    const quality = screen.getByRole("button", { name: "Quality: Auto" });
+    const volume = screen.getByRole("button", { name: "Volume" });
+    act(() => quality.focus());
+    fireEvent.pointerEnter(volume, { pointerType: "mouse" });
+    expect(screen.getByRole("dialog", { name: "Volume" })).not.toBeNull();
+    expect(document.activeElement).toBe(quality);
+
+    fireEvent.keyDown(quality, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
+    expect(volume.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(volume);
+  });
+
   it("retains the popup while keyboard focus is on the speaker or range", () => {
     vi.useFakeTimers();
     try {

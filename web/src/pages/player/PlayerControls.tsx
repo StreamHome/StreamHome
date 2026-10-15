@@ -252,13 +252,25 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
       document.removeEventListener("pointercancel", release);
     };
   }, [popup.open, popup.popupRef, popup.rootRef, popup.updateOpen]);
-  const dismiss = () => {
+  const dismiss = useCallback(() => {
     clearClose();
     keyboardFocusRef.current = false;
     dismissingRef.current = true;
-    popup.dismiss();
+    popup.updateOpen(false);
+    popup.triggerRef.current?.focus();
     dismissingRef.current = false;
-  };
+  }, [clearClose, popup.triggerRef, popup.updateOpen]);
+  useEffect(() => {
+    if (!popup.open) return;
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      event.preventDefault();
+      event.stopPropagation();
+      dismiss();
+    };
+    document.addEventListener("keydown", escape, true);
+    return () => document.removeEventListener("keydown", escape, true);
+  }, [dismiss, popup.open]);
   const openAndFocus = () => {
     clearClose();
     pointerFocusRef.current = false;
