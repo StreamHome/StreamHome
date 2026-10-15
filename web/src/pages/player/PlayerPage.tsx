@@ -31,7 +31,7 @@ import type {
   PlaybackRunResponse,
 } from "../../types/api";
 import { formatDuration } from "../../utils/format";
-import { hasSubtitleOptions, PlayerControlMenu, PlayerIcon, PlayerIconButton, PlayerMenuProvider, PlayerSettings } from "./PlayerControls";
+import { hasSubtitleOptions, PlayerControlMenu, PlayerIcon, PlayerIconButton, PlayerMenuProvider, PlayerSettings, PlayerVolume } from "./PlayerControls";
 import { languageDisplayName, normalizeLanguageTag } from "./language";
 import {
   playerFullscreenMode,
@@ -4511,8 +4511,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                 <PlayerIconButton icon={playbackControlShowsPause ? "pause" : "play"} label={playbackControlShowsPause ? "Pause" : "Play"} onClick={() => playbackControlShowsPause ? pausePlayback() : safePlay()} />
                 <PlayerIconButton icon="rewind" label="Rewind 10 seconds" onClick={() => seek(currentTimeRef.current - 10)} />
                 <PlayerIconButton icon="forward" label="Forward 10 seconds" onClick={() => seek(currentTimeRef.current + 10)} />
-                <PlayerIconButton icon={muted ? "mute" : "volume"} label={muted ? "Unmute" : "Mute"} onClick={toggleOutputMute} />
-                <input aria-label="Volume" type="range" min={0} max={1} step={0.01} value={muted ? 0 : volume} onChange={(event) => setOutputVolume(Number(event.target.value), false)} className="player-volume" />
+                <PlayerVolume volume={volume} muted={muted} onVolumeChange={(value) => setOutputVolume(value, false)} onToggleMute={toggleOutputMute} onOpenChange={handleControlMenuOpenChange} />
                 <span className="player-controls__time min-w-[8.5rem] text-xs tabular-nums text-white/65 md:text-sm">{formatDuration(currentTime)} / {duration ? formatDuration(duration) : asset.durationLabel}</span>
 
                 <div className="player-control-menus ml-auto flex flex-wrap items-center justify-end gap-2">

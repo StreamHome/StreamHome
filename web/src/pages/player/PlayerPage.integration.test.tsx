@@ -295,9 +295,10 @@ describe("mounted player lifecycle", () => {
     await waitFor(() => expect(play).toHaveBeenCalled());
 
     fireEvent.keyDown(document.body, { key: "ArrowDown" });
-    await waitFor(() => expect((screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement).value).toBe("0.95"));
+    await waitFor(() => expect(video.volume).toBe(0.95));
     fireEvent.keyDown(document.body, { key: "ArrowUp" });
-    await waitFor(() => expect((screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement).value).toBe("1"));
+    await waitFor(() => expect(video.volume).toBe(1));
+    expect(screen.queryByRole("slider", { name: "Volume" })).toBeNull();
 
     video.currentTime = 30;
     fireEvent.timeUpdate(video);
@@ -369,7 +370,7 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
-  it("restores the profile audio level before playback and preserves changes across titles", async () => {
+  it("restores the profile audio level and preserves popup changes across titles without replacing transport", async () => {
     localStorage.setItem(playerPreferencesKey, JSON.stringify({ volume: 0.36, muted: false }));
     const firstView = render(
       <MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=mounted-player-media"]}>
@@ -377,7 +378,15 @@ describe("mounted player lifecycle", () => {
       </MemoryRouter>,
     );
 
+    await act(async () => { await import("hls.js"); });
     const firstVideo = firstView.container.querySelector("video") as HTMLVideoElement;
+    await waitFor(() => expect(firstVideo.volume).toBe(0.36));
+    const source = firstVideo.getAttribute("src");
+    const loadCalls = vi.mocked(HTMLMediaElement.prototype.load).mock.calls.length;
+    const playCalls = vi.mocked(HTMLMediaElement.prototype.play).mock.calls.length;
+    const pauseCalls = vi.mocked(HTMLMediaElement.prototype.pause).mock.calls.length;
+    expect(screen.queryByRole("slider", { name: "Volume" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Volume" }));
     const firstVolume = screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement;
     await waitFor(() => expect(firstVolume.value).toBe("0.36"));
     expect(firstVideo.volume).toBe(0.36);
@@ -387,6 +396,18 @@ describe("mounted player lifecycle", () => {
       volume: 0.24,
       muted: false,
     }));
+    expect(firstVideo.volume).toBe(0.24);
+    fireEvent.click(screen.getByRole("button", { name: "Mute" }));
+    expect(firstVideo.muted).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Unmute" }));
+    expect(firstVideo.muted).toBe(false);
+    expect(firstVideo.volume).toBe(0.24);
+    fireEvent.keyDown(firstVolume, { key: "Escape" });
+    expect(screen.queryByRole("slider", { name: "Volume" })).toBeNull();
+    expect(firstVideo.getAttribute("src")).toBe(source);
+    expect(HTMLMediaElement.prototype.load).toHaveBeenCalledTimes(loadCalls);
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(playCalls);
+    expect(HTMLMediaElement.prototype.pause).toHaveBeenCalledTimes(pauseCalls);
     firstView.unmount();
 
     const nextTitle: ResolvedPlayback = {
@@ -405,6 +426,8 @@ describe("mounted player lifecycle", () => {
     );
 
     const secondVideo = secondView.container.querySelector("video") as HTMLVideoElement;
+    expect(screen.queryByRole("slider", { name: "Volume" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Volume" }));
     await waitFor(() => expect((screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement).value).toBe("0.24"));
     expect(secondVideo.volume).toBe(0.24);
     secondView.unmount();

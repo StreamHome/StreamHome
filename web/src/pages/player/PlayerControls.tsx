@@ -183,6 +183,71 @@ function usePlayerPopup(onOpenChange?: (open: boolean) => void, preferredWidth?:
   return { id, open, updateOpen, rootRef, triggerRef, popupRef, style, render, dismiss, onBlur };
 }
 
+export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOpenChange }: {
+  volume: number;
+  muted: boolean;
+  onVolumeChange: (value: number) => void;
+  onToggleMute: () => void;
+  onOpenChange?: (open: boolean) => void;
+}) {
+  const popup = usePlayerPopup(onOpenChange, 224);
+  const sliderRef = useRef<HTMLInputElement>(null);
+  const level = muted ? 0 : volume;
+  const percentage = `${Math.round(level * 100)}%`;
+  const openAndFocus = () => {
+    popup.updateOpen(true);
+    window.requestAnimationFrame(() => sliderRef.current?.focus());
+  };
+
+  return <div className="player-control-menu" ref={popup.rootRef} onBlur={popup.onBlur} data-open={popup.open}>
+    <button
+      ref={popup.triggerRef}
+      type="button"
+      className="player-control-button player-control-menu__trigger player-volume-trigger"
+      aria-label="Volume"
+      aria-description={muted ? "Muted" : percentage}
+      aria-haspopup="dialog"
+      aria-expanded={popup.open}
+      aria-controls={popup.id}
+      onClick={() => popup.open ? popup.updateOpen(false) : openAndFocus()}
+      onKeyDown={(event) => {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          openAndFocus();
+        } else if (event.key === "Escape" && popup.open) {
+          event.preventDefault();
+          popup.dismiss();
+        }
+      }}
+    >
+      <PlayerIcon name={level === 0 ? "mute" : "volume"} />
+    </button>
+    {popup.open && popup.render(<div
+      ref={popup.popupRef}
+      id={popup.id}
+      role="dialog"
+      aria-label="Volume"
+      className="player-control-menu__list player-volume-panel"
+      style={popup.style}
+      onBlur={popup.onBlur}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          popup.dismiss();
+        }
+      }}
+    >
+      <span className="player-control-menu__label">Volume</span>
+      <div className="player-volume-panel__row">
+        <PlayerIconButton icon={muted ? "mute" : "volume"} label={muted ? "Unmute" : "Mute"} onClick={onToggleMute} />
+        <input ref={sliderRef} aria-label="Volume" aria-valuetext={percentage} type="range" min={0} max={1} step={0.01} value={level} onChange={(event) => onVolumeChange(Number(event.currentTarget.value))} className="player-volume" />
+        <span className="player-volume-panel__value" aria-hidden="true">{percentage}</span>
+      </div>
+    </div>)}
+  </div>;
+}
+
 export function PlayerSettings({ playbackRate, onRateChange, captions, captionScale, onCaptionScaleChange, subtitleOffset, onSubtitleOffsetChange, onOpenChange }: {
   playbackRate: number; onRateChange: (value: number) => void; captions: boolean;
   captionScale: number; onCaptionScaleChange: (value: number) => void;

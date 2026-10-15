@@ -1,8 +1,8 @@
 import React, { useState } from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import { hasSubtitleOptions, PlayerControlMenu, PlayerIconButton, PlayerMenuProvider, PlayerSettings } from "./PlayerControls";
+import { hasSubtitleOptions, PlayerControlMenu, PlayerIconButton, PlayerMenuProvider, PlayerSettings, PlayerVolume } from "./PlayerControls";
 
 describe("subtitle control availability", () => {
   it("hides the subtitle menu on every presentation when no tracks exist", () => {
@@ -19,6 +19,119 @@ describe("player icon controls", () => {
     expect(button.getAttribute("data-tooltip")).toBe("Play");
     expect(button.querySelector("svg[aria-hidden='true']")).not.toBeNull();
     expect(button.textContent).toBe("");
+  });
+});
+
+describe("player volume control", () => {
+  function VolumeFixture({
+    onVolumeChange = () => undefined,
+    onToggleMute = () => undefined,
+    onOpenChange,
+  }: {
+    onVolumeChange?: (value: number) => void;
+    onToggleMute?: () => void;
+    onOpenChange?: (open: boolean) => void;
+  }) {
+    const [volume, setVolume] = useState(0.65);
+    const [muted, setMuted] = useState(false);
+    return <PlayerVolume
+      volume={volume}
+      muted={muted}
+      onVolumeChange={(value) => { setVolume(value); onVolumeChange(value); }}
+      onToggleMute={() => { setMuted((current) => !current); onToggleMute(); }}
+      onOpenChange={onOpenChange}
+    />;
+  }
+
+  it("keeps the slider hidden until requested without changing volume or mute", () => {
+    const onVolumeChange = vi.fn();
+    const onToggleMute = vi.fn();
+    render(<VolumeFixture onVolumeChange={onVolumeChange} onToggleMute={onToggleMute} />);
+
+    const trigger = screen.getByRole("button", { name: "Volume" });
+    expect(trigger.getAttribute("aria-haspopup")).toBe("dialog");
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("slider", { name: "Volume" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
+
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("dialog", { name: "Volume" })).not.toBeNull();
+    expect((screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement).value).toBe("0.65");
+    expect(onVolumeChange).not.toHaveBeenCalled();
+    expect(onToggleMute).not.toHaveBeenCalled();
+
+    fireEvent.click(trigger);
+    expect(screen.queryByRole("slider", { name: "Volume" })).toBeNull();
+    expect(onVolumeChange).not.toHaveBeenCalled();
+    expect(onToggleMute).not.toHaveBeenCalled();
+  });
+
+  it("changes volume and toggles mute through the open dialog", () => {
+    const onVolumeChange = vi.fn();
+    const onToggleMute = vi.fn();
+    render(<VolumeFixture onVolumeChange={onVolumeChange} onToggleMute={onToggleMute} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Volume" }));
+    const slider = screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement;
+    fireEvent.change(slider, { target: { value: "0.37" } });
+    expect(onVolumeChange).toHaveBeenCalledWith(0.37);
+    expect(slider.value).toBe("0.37");
+
+    fireEvent.click(screen.getByRole("button", { name: "Mute" }));
+    expect(onToggleMute).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("dialog", { name: "Volume" })).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Unmute" }));
+    expect(onToggleMute).toHaveBeenCalledTimes(2);
+    expect(slider.value).toBe("0.37");
+    expect(onVolumeChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("supports keyboard focus, Escape, outside dismissal, and focus dismissal", async () => {
+    const onOpenChange = vi.fn();
+    render(<><VolumeFixture onOpenChange={onOpenChange} /><button type="button">Outside</button></>);
+
+    const trigger = screen.getByRole("button", { name: "Volume" });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("slider", { name: "Volume" })));
+    fireEvent.keyDown(screen.getByRole("dialog", { name: "Volume" }), { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    expect(onOpenChange).toHaveBeenLastCalledWith(false);
+
+    fireEvent.click(trigger);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Outside" }));
+    expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
+
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("slider", { name: "Volume" })));
+    fireEvent.blur(screen.getByRole("slider", { name: "Volume" }), { relatedTarget: screen.getByRole("button", { name: "Outside" }) });
+    expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
+    expect(onOpenChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("shares the menu owner with quality and settings", () => {
+    render(<PlayerMenuProvider onOpenChange={() => undefined}>
+      <VolumeFixture />
+      <PlayerControlMenu label="Quality" icon="quality" value="auto" options={[{ value: "auto", label: "Auto" }]} onSelect={() => undefined} />
+      <PlayerSettings playbackRate={1} onRateChange={() => undefined} captions={false} captionScale={1} onCaptionScaleChange={() => undefined} subtitleOffset={0} onSubtitleOffsetChange={() => undefined} />
+    </PlayerMenuProvider>);
+
+    const volume = screen.getByRole("button", { name: "Volume" });
+    const quality = screen.getByRole("button", { name: "Quality: Auto" });
+    fireEvent.click(volume);
+    fireEvent.click(quality);
+    expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
+    expect(screen.getByRole("listbox", { name: "Quality" })).not.toBeNull();
+
+    fireEvent.click(volume);
+    expect(screen.queryByRole("listbox", { name: "Quality" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Volume" })).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Player settings" }));
+    expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Player settings" })).not.toBeNull();
+    expect(volume.getAttribute("aria-expanded")).toBe("false");
   });
 });
 

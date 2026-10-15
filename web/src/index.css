@@ -395,6 +395,37 @@
   accent-color: var(--player-accent);
 }
 
+.player-volume-trigger {
+  justify-content: center;
+}
+
+.player-volume-panel__row {
+  display: grid;
+  grid-template-columns: 2.75rem minmax(0, 1fr) 4ch;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0 0.4rem 0.4rem;
+}
+
+.player-volume-panel__row > .player-control-button {
+  width: 2.75rem;
+  min-height: 2.75rem;
+}
+
+.player-volume-panel .player-volume {
+  width: 100%;
+  min-width: 0;
+  height: 2.75rem;
+  cursor: pointer;
+}
+
+.player-volume-panel__value {
+  color: var(--player-menu-muted);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
 .player-timeline:hover,
 .player-timeline:focus-visible {
   --player-timeline-track-size: 0.26rem;
