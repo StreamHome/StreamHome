@@ -780,6 +780,10 @@ function errorState(error: unknown): FatalState {
   };
 }
 
+function PlayerLoadingSpinner({ reduced }: { reduced: boolean }) {
+  return <span className="player-loading-spinner" data-reduced-motion={reduced} aria-hidden="true" />;
+}
+
 export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -3631,6 +3635,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     return (
       <motion.div
         className="player-view player-state-view fixed inset-0 grid min-h-screen place-items-center bg-black px-6 text-white"
+        data-theme={theme}
+        data-player-theme={definition.playerVariant}
         data-mobile-player={mobilePlayer ? "true" : "false"}
         data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
         initial={{ opacity: 0 }}
@@ -3639,7 +3645,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       >
         <div className="max-w-lg text-center">
           <div role="status" aria-live="polite">
-            <motion.i className="mx-auto block h-11 w-11 rounded-full border-2 border-white/20 border-t-white" animate={reduced ? undefined : { rotate: 360 }} transition={{ duration: 0.8, repeat: Infinity, ease: "linear" }} />
+            <PlayerLoadingSpinner reduced={reduced} />
             <p className="mt-5 text-sm tracking-[0.16em] text-white/70">{phaseMessage[phase]}</p>
             {phase === "preparing" && (
               <>
@@ -4262,11 +4268,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
       <AnimatePresence>
         {["buffering", "recovering"].includes(phase) && (
-          <motion.div className="pointer-events-none absolute inset-0 z-20 grid place-items-center bg-black/10" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-            <div className="rounded-xl bg-black/65 px-5 py-4 text-center backdrop-blur-md">
-              <motion.i className="mx-auto block h-10 w-10 rounded-full border-2 border-white/20 border-t-white" animate={reduced ? undefined : { rotate: 360 }} transition={{ duration: 0.8, repeat: Infinity, ease: "linear" }} />
-              <span className="mt-3 block text-xs tracking-[0.12em] text-white/70">{phaseMessage[phase]}</span>
-            </div>
+          <motion.div className="player-loading-overlay" aria-hidden="true" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+            <PlayerLoadingSpinner reduced={reduced} />
           </motion.div>
         )}
       </AnimatePresence>

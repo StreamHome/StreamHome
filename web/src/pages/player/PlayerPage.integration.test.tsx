@@ -689,8 +689,18 @@ describe("mounted player lifecycle", () => {
 
     fireEvent.loadedMetadata(video);
     expect(video.currentTime).toBe(107);
+    const source = video.getAttribute("src");
+    const loads = videoCallCount("load", video);
     video.currentTime = 0;
     fireEvent.playing(video);
+    expect(view.container.querySelector("[data-player-root]")?.getAttribute("data-player-phase")).toBe("recovering");
+    const indicator = view.container.querySelector(".player-loading-overlay");
+    expect(indicator?.getAttribute("aria-hidden")).toBe("true");
+    expect(indicator?.textContent).toBe("");
+    expect(indicator?.querySelectorAll(".player-loading-spinner")).toHaveLength(1);
+    expect(screen.getByText("Switching to compatibility playback").classList.contains("sr-only")).toBe(true);
+    expect(video.getAttribute("src")).toBe(source);
+    expect(videoCallCount("load", video)).toBe(loads);
     fireEvent.timeUpdate(video);
     expect(timeline.value).toBe("107");
 
@@ -1060,8 +1070,12 @@ describe("mounted player lifecycle", () => {
     fireEvent.playing(video);
 
     expect(root.dataset.playerPhase).toBe("loading");
+    expect(view.container.querySelector(".player-loading-overlay")).toBeNull();
+    expect(screen.getByText("Loading stream").classList.contains("sr-only")).toBe(true);
     act(() => vi.advanceTimersByTime(PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS + 1));
     expect(root.dataset.playerPhase).toBe("buffering");
+    expect(view.container.querySelector(".player-loading-overlay .player-loading-spinner")).not.toBeNull();
+    expect(screen.getByText("Buffering").classList.contains("sr-only")).toBe(true);
 
     view.unmount();
   });
@@ -1496,9 +1510,10 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
-  it("reveals idle chrome when the master video begins buffering", () => {
+  it("reveals idle chrome when the master video begins buffering", async () => {
     vi.useFakeTimers();
     const view = render(<MemoryRouter><PlayerPage visualFixture={playback} /></MemoryRouter>);
+    await act(async () => { await import("hls.js"); });
     const video = view.container.querySelector("video")!;
     Object.defineProperty(video, "duration", { configurable: true, value: 120 });
     Object.defineProperty(video, "readyState", { configurable: true, value: 4 });
@@ -1512,9 +1527,41 @@ describe("mounted player lifecycle", () => {
       act(() => vi.advanceTimersByTime(800));
     }
     const root = view.container.querySelector("[data-player-root]") as HTMLElement;
+    const source = video.getAttribute("src");
+    const loads = videoCallCount("load", video);
     expect(root.dataset.controlsVisible).toBe("false");
     fireEvent.waiting(video);
     expect(root.dataset.controlsVisible).toBe("true");
+    const indicator = view.container.querySelector(".player-loading-overlay");
+    expect(indicator?.getAttribute("aria-hidden")).toBe("true");
+    expect(indicator?.textContent).toBe("");
+    expect(indicator?.querySelectorAll(".player-loading-spinner")).toHaveLength(1);
+    expect(indicator?.querySelector("button, input, a, [tabindex]")).toBeNull();
+    expect(screen.getByText("Buffering").classList.contains("sr-only")).toBe(true);
+
+    video.currentTime = 17;
+    fireEvent.playing(video);
+    fireEvent.timeUpdate(video);
+    await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+    expect(root.dataset.playerPhase).toBe("playing");
+    const playingExit = view.container.querySelector<HTMLElement>(".player-loading-overlay");
+    expect(playingExit === null || playingExit.style.opacity === "0").toBe(true);
+
+    fireEvent.waiting(video);
+    const pauses = videoCallCount("pause", video);
+    pointerClick(screen.getByRole("button", { name: "Pause" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+    expect(root.dataset.playerPhase).toBe("paused");
+    expect(videoCallCount("pause", video)).toBe(pauses + 1);
+    const pausedExit = view.container.querySelector<HTMLElement>(".player-loading-overlay");
+    expect(pausedExit === null || pausedExit.style.opacity === "0").toBe(true);
+    fireEvent.waiting(video);
+    expect(root.dataset.playerPhase).toBe("paused");
+    const lateExit = view.container.querySelector<HTMLElement>(".player-loading-overlay");
+    expect(lateExit === null || lateExit.style.opacity === "0").toBe(true);
+    expect(view.container.querySelector("video")).toBe(video);
+    expect(video.getAttribute("src")).toBe(source);
+    expect(videoCallCount("load", video)).toBe(loads);
     view.unmount();
   });
 

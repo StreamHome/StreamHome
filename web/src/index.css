@@ -118,6 +118,36 @@
   opacity: 1;
 }
 
+.player-loading-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+.player-loading-spinner {
+  display: block;
+  width: 2.5rem;
+  height: 2.5rem;
+  margin-inline: auto;
+  border: 2px solid color-mix(in srgb, var(--player-accent) 22%, transparent);
+  border-top-color: var(--player-accent);
+  border-radius: 50%;
+  background: none;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.65));
+  animation: player-loading-spin 0.8s linear infinite;
+}
+
+.player-loading-spinner[data-reduced-motion="true"] {
+  animation: none;
+}
+
+@keyframes player-loading-spin {
+  to { transform: rotate(360deg); }
+}
+
 .player-icon {
   width: 1.15rem;
   height: 1.15rem;
