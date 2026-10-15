@@ -358,6 +358,7 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
       }}
     >
       <input ref={sliderRef} aria-label="Volume" aria-orientation="vertical" aria-valuetext={percentage} type="range" min={0} max={1} step={0.01} value={level}
+        style={{ "--player-volume-fill": `${level * 100}%` } as React.CSSProperties}
         onPointerDown={() => { draggingRef.current = true; }}
         onChange={(event) => onVolumeChange(Number(event.currentTarget.value))} className="player-volume" />
     </div>)}

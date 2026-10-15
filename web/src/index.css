@@ -536,6 +536,7 @@
 }
 
 .player-volume-panel .player-volume {
+  --player-volume-fill-direction: to top;
   writing-mode: vertical-lr;
   direction: rtl;
   width: 2.75rem;
@@ -636,21 +637,29 @@
   height: var(--player-volume-track-size);
   border: 0;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.2);
+  background: linear-gradient(
+    var(--player-volume-fill-direction, to right),
+    var(--player-accent) 0 var(--player-volume-fill, 0%),
+    rgba(255, 255, 255, 0.2) var(--player-volume-fill, 0%) 100%
+  );
 }
 
 .player-volume::-moz-range-track {
   height: var(--player-volume-track-size);
   border: 0;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.2);
+  background: linear-gradient(
+    var(--player-volume-fill-direction, to right),
+    var(--player-accent) 0 var(--player-volume-fill, 0%),
+    rgba(255, 255, 255, 0.2) var(--player-volume-fill, 0%) 100%
+  );
 }
 
 .player-volume::-moz-range-progress {
   height: var(--player-volume-track-size);
   border: 0;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--player-accent) 72%, white 8%);
+  background: transparent;
 }
 
 .player-volume::-webkit-slider-thumb {
