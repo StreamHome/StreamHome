@@ -246,6 +246,13 @@ export function playbackQualityOptions(
   ];
 }
 
+function applyHlsQuality(hls: Hls, index: number): void {
+  // Pin an already playing level (or release Auto) without discarding its buffer.
+  if (hls.manualLevel === index) return;
+  if (index < 0 || hls.currentLevel === index) hls.loadLevel = index;
+  else hls.nextLevel = index;
+}
+
 export function applySubtitleTrackSelection(video: HTMLVideoElement, selectedTrackId: string): void {
   const elements = Array.from(video.querySelectorAll<HTMLTrackElement>("track[data-subtitle-id]"));
   const selected = selectedTrackId === "off" ? null : elements.find((element) => element.dataset.subtitleId === selectedTrackId)?.track;
@@ -1865,8 +1872,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         if (!shouldApplyDeferredStartupQuality(levelBitrate, hls.bandwidthEstimate, bufferedAhead)) return;
         deferredStartupQualityRef.current = null;
         pendingQualitySelectionRef.current = deferred.id;
-        hls.currentLevel = deferred.index;
-        hls.nextLevel = deferred.index;
+        applyHlsQuality(hls, deferred.index);
+        if (hls.currentLevel === deferred.index) {
+          pendingQualitySelectionRef.current = null;
+        }
       };
       hls.attachMedia(video);
       hls.on(HlsRuntime.Events.MEDIA_ATTACHED, () => {
@@ -1882,18 +1891,20 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           ? options.find((item) => item.id === pendingQualitySelectionRef.current && item.ready)
           : undefined;
         const readyOptions = options.filter((item) => item.ready && item.height !== "auto");
-        const preferred = requestedQuality || (transportPreferences.qualityHeight === "auto" || readyOptions.length === 0
+        const qualityPreference = userQualityRef.current;
+        const preferred = requestedQuality || (qualityPreference === "auto" || readyOptions.length === 0
           ? options[0]
-          : readyOptions.reduce((best, item) => Math.abs(Number(item.height) - Number(transportPreferences.qualityHeight)) < Math.abs(Number(best.height) - Number(transportPreferences.qualityHeight)) ? item : best));
+          : readyOptions.reduce((best, item) => Math.abs(Number(item.height) - Number(qualityPreference)) < Math.abs(Number(best.height) - Number(qualityPreference)) ? item : best));
+        setSelectedQualityId(preferred.id);
         if (requestedQuality && requestedQuality.index >= 0) {
           deferredStartupQualityRef.current = null;
-          hls.currentLevel = requestedQuality.index;
+          applyHlsQuality(hls, requestedQuality.index);
+          if (hls.currentLevel === requestedQuality.index) pendingQualitySelectionRef.current = null;
         } else {
-          hls.currentLevel = -1;
+          hls.loadLevel = -1;
           deferredStartupQualityRef.current = preferred && preferred.index >= 0
             ? { id: preferred.id, index: preferred.index }
             : null;
-          setSelectedQualityId("auto");
         }
         beginPlayback();
       });
@@ -1901,22 +1912,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         if (pendingQualitySelectionRef.current) setPlayerNotice("Switching video quality…");
       });
       hls.on(HlsRuntime.Events.LEVEL_SWITCHED, (_, data) => {
+        if (hlsRef.current !== hls) return;
         const selected = hlsQualityOptionsRef.current.find((item) => item.index === data.level);
-        const deferred = deferredStartupQualityRef.current;
-        if (deferred && data.level !== deferred.index) {
-          setSelectedQualityId("auto");
-          return;
-        }
         const requestedQuality = pendingQualitySelectionRef.current;
-        if (requestedQuality && requestedQuality !== "auto" && selected?.id !== requestedQuality) return;
-        const automatic = requestedQuality === "auto"
-          || (requestedQuality === null && userQualityRef.current === "auto");
-        const selectedId = automatic ? "auto" : selected?.id ?? "auto";
-        setSelectedQualityId(selectedId);
-        const explicitlyRequested = pendingQualitySelectionRef.current !== null;
+        // Decoded levels acknowledge a switch; they never own the saved policy.
+        if (!requestedQuality || selected?.id !== requestedQuality) return;
         pendingQualitySelectionRef.current = null;
-        setPreferences((current) => ({ ...current, qualityHeight: automatic ? "auto" : selected?.height ?? "auto" }));
-        if (explicitlyRequested) setPlayerNotice(automatic ? "Automatic quality active" : selected ? `${selected.label} quality active` : "Automatic quality active");
+        setPlayerNotice(`${selected.label} quality active`);
       });
       hls.on(HlsRuntime.Events.LEVEL_UPDATED, () => {
         markPlaybackStartupProgress("level-playlist");
@@ -3387,11 +3389,22 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const changeQuality = (renditionId: string) => {
     const selected = availableQualities.find((item) => item.id === renditionId);
     if (!selected) return;
+    if (selected.status === "failed" || !selected.ready) {
+      setPlayerNotice(selected.status === "failed"
+        ? `${selected.label} is unavailable for this source.`
+        : `${selected.label} is not present in the prepared adaptive stream.`);
+      return;
+    }
+    if (!hlsRef.current && !runResponse?.manifestUrl) {
+      setPlayerNotice("Adaptive quality switching is unavailable for the current transport.");
+      return;
+    }
     deferredStartupQualityRef.current = null;
     userQualityRef.current = selected.height;
     pendingQualitySelectionRef.current = renditionId;
+    setSelectedQualityId(renditionId);
+    setPreferences((current) => ({ ...current, qualityHeight: selected.height }));
     if (streamMode === "native-hls" && selected.ready && runResponse?.manifestUrl) {
-      setPreferences((current) => ({ ...current, qualityHeight: selected.height }));
       if (nativeQualityRef.current === renditionId) { pendingQualitySelectionRef.current = null; return; }
       nativeQualityRef.current = renditionId;
       captureLastFrame(true);
@@ -3404,28 +3417,23 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     setPlayerNotice(renditionId === "auto" ? "Enabling automatic quality…" : `Switching quality to ${selected.label}…`);
     if (renditionId === "auto") {
       if (hlsRef.current) {
-        hlsRef.current.currentLevel = -1;
-        hlsRef.current.nextLevel = -1;
+        applyHlsQuality(hlsRef.current, -1);
       }
-      setSelectedQualityId("auto");
-      setPreferences((current) => ({ ...current, qualityHeight: "auto" }));
       pendingQualitySelectionRef.current = null;
       setPlayerNotice("Automatic quality active");
       return;
     }
-    if (selected.status === "failed") {
-      pendingQualitySelectionRef.current = null;
-      setPlayerNotice(`${selected.label} is unavailable for this source.`);
-      return;
-    }
-    if (!selected.ready) {
-      pendingQualitySelectionRef.current = null;
-      setPlayerNotice(`${selected.label} is not present in the prepared adaptive stream.`);
-      return;
-    }
     if (hlsRef.current && selected.index >= 0) {
-      hlsRef.current.currentLevel = selected.index;
-      hlsRef.current.nextLevel = selected.index;
+      const hls = hlsRef.current;
+      applyHlsQuality(hls, selected.index);
+      if (hls.currentLevel === selected.index) {
+        pendingQualitySelectionRef.current = null;
+        setPlayerNotice(`${selected.label} quality active`);
+      }
+      return;
+    }
+    if (hlsRef.current) {
+      // Manifest parsing will resolve the requested rendition without remounting.
       return;
     }
     if (runResponse?.manifestUrl) {
