@@ -11,10 +11,11 @@ import subprocess
 import sys
 import time
 import weakref
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Iterator, Optional
 
 from config import settings
 from services.logger import logger
@@ -93,6 +94,18 @@ class PlaybackPreparationError(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class PlaylistReadiness:
+    ready: bool = False
+    duration: float = 0.0
+    segment_count: int = 0
+
+
+_readiness_snapshot: ContextVar[Optional[dict[tuple[int, str], PlaylistReadiness]]] = ContextVar(
+    "playback_readiness_snapshot", default=None,
+)
 
 
 class PlaybackPrepService:
@@ -376,33 +389,69 @@ class PlaybackPrepService:
             renditions[-1],
         )
 
-    def playlist_ready(self, media_id: str, fingerprint: str, rendition_name: str) -> bool:
+    @contextmanager
+    def readiness_snapshot(self) -> Iterator[None]:
+        """Deduplicate reads within one response, never across requests or writers."""
+        token = _readiness_snapshot.set({})
+        try:
+            yield
+        finally:
+            _readiness_snapshot.reset(token)
+
+    def playlist_readiness(self, media_id: str, fingerprint: str, rendition_name: str) -> PlaylistReadiness:
         rendition_dir = self.cache_path(media_id, fingerprint) / rendition_name
+        snapshot = _readiness_snapshot.get()
+        key = (id(self), str(rendition_dir))
+        if snapshot is not None and key in snapshot:
+            return snapshot[key]
+        result = self._read_playlist_readiness(rendition_dir)
+        if snapshot is not None:
+            snapshot[key] = result
+        return result
+
+    @staticmethod
+    def _read_playlist_readiness(rendition_dir: Path) -> PlaylistReadiness:
         playlist = rendition_dir / PLAYLIST_NAME
         try:
             content = playlist.read_text(encoding="utf-8")
         except OSError:
-            return False
+            return PlaylistReadiness()
+        duration = sum(float(value) for value in re.findall(r"^#EXTINF:([0-9]+(?:\.[0-9]+)?)", content, re.MULTILINE))
         init_match = re.search(r'#EXT-X-MAP:URI="([^"?#]+)"', content)
         segment_references = [
             line.strip().split("?", 1)[0]
             for line in content.splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
+        info = PlaylistReadiness(False, duration, len(segment_references))
         if not init_match or not segment_references or "#EXTINF:" not in content:
-            return False
+            return info
         references = [init_match.group(1), *segment_references]
+        try:
+            # DirEntry reuses file-type information; each flat asset needs one stat.
+            with os.scandir(rendition_dir) as directory:
+                entries = {entry.name: entry for entry in directory}
+        except OSError:
+            return info
         for reference in references:
             relative = PurePosixPath(reference)
             if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
-                return False
-            asset = rendition_dir / Path(*relative.parts)
+                return info
             try:
+                if len(relative.parts) == 1:
+                    entry = entries.get(reference)
+                    if entry is None or not entry.is_file() or entry.stat().st_size <= 0:
+                        return info
+                    continue
+                asset = rendition_dir / Path(*relative.parts)
                 if not asset.is_file() or asset.stat().st_size <= 0:
-                    return False
+                    return info
             except OSError:
-                return False
-        return True
+                return info
+        return PlaylistReadiness(True, duration, len(segment_references))
+
+    def playlist_ready(self, media_id: str, fingerprint: str, rendition_name: str) -> bool:
+        return self.playlist_readiness(media_id, fingerprint, rendition_name).ready
 
     def rendition_complete(self, media_id: str, fingerprint: str, rendition_name: str) -> bool:
         rendition_dir = self.cache_path(media_id, fingerprint) / rendition_name
@@ -538,10 +587,12 @@ class PlaybackPrepService:
         return "preparing" if key in self.active_jobs else "idle"
 
     def rendition_seekable_until(self, media_id: str, fingerprint: str, rendition_name: str) -> float:
+        if _readiness_snapshot.get() is not None:
+            return self.playlist_readiness(media_id, fingerprint, rendition_name).duration
+        # Preparation progress only needs durations, without validating every asset.
         playlist = self.cache_path(media_id, fingerprint) / rendition_name / PLAYLIST_NAME
         try:
-            durations = re.findall(r"^#EXTINF:([0-9]+(?:\.[0-9]+)?)", playlist.read_text(encoding="utf-8"), re.MULTILINE)
-            return sum(float(value) for value in durations)
+            return sum(float(value) for value in re.findall(r"^#EXTINF:([0-9]+(?:\.[0-9]+)?)", playlist.read_text(encoding="utf-8"), re.MULTILINE))
         except (OSError, ValueError):
             return 0.0
 
@@ -636,7 +687,10 @@ class PlaybackPrepService:
         default_audio = next((item for item in audios if item.default), audios[0] if audios else None)
         required_names = [baseline.name, *([default_audio.name] if default_audio else [])]
         required_keys = [f"{media_id}:{fingerprint}:{name}" for name in required_names]
-        ready_segments = len(list((self.cache_path(media_id, fingerprint) / baseline.name).glob("*.m4s")))
+        baseline_readiness = self.playlist_readiness(media_id, fingerprint, baseline.name)
+        ready_segments = baseline_readiness.segment_count if baseline_readiness.ready else len(list(
+            (self.cache_path(media_id, fingerprint) / baseline.name).glob("*.m4s")
+        ))
         failure = self.required_preparation_error(media_id, fingerprint, media_obj)
         state = self.preparation_state(media_id, fingerprint, media_obj)
         if failure or state == "error":
@@ -650,13 +704,17 @@ class PlaybackPrepService:
         else:
             stage = "queued"
 
+        active_jobs = dict(self.active_jobs)
+        running_jobs = set(self.running_jobs)
+        priorities = dict(self.job_priorities)
+        scheduled_at = dict(self.job_scheduled_at)
         waiting = [
             key
             for key in sorted(
-                (candidate for candidate in self.active_jobs if candidate not in self.running_jobs),
+                (candidate for candidate in active_jobs if candidate not in running_jobs),
                 key=lambda candidate: (
-                    self.job_priorities.get(candidate, BACKGROUND_PRIORITY),
-                    self.job_scheduled_at.get(candidate, 0),
+                    priorities.get(candidate, BACKGROUND_PRIORITY),
+                    scheduled_at.get(candidate, 0),
                 ),
             )
         ]
@@ -665,7 +723,7 @@ class PlaybackPrepService:
             "stage": stage,
             "queue_position": min(positions) if positions else 0,
             "ready_segments": ready_segments,
-            "active_workers": sum(key in self.running_jobs for key in required_keys),
+            "active_workers": sum(key in running_jobs for key in required_keys),
         }
 
     async def _preempt_background_jobs(self, required_keys: set[str]) -> None:

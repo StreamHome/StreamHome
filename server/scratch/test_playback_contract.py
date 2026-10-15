@@ -221,6 +221,21 @@ class PlaybackContractRegression(unittest.TestCase):
         obsolete_jit = self.client.get(f"/api/playback/jit/m_playback_contract/master.m3u8?ticket={run['ticket']}")
         self.assertEqual(obsolete_jit.status_code, 404)
 
+    def test_run_response_scans_playlists_once_outside_the_event_loop(self) -> None:
+        original = playback_prep_service._read_playlist_readiness
+        paths = []
+
+        def inspect(path):
+            with self.assertRaises(RuntimeError):
+                asyncio.get_running_loop()
+            paths.append(path)
+            return original(path)
+
+        with patch.object(playback_prep_service, "_read_playlist_readiness", side_effect=inspect):
+            self.create_run()
+        self.assertTrue(paths)
+        self.assertEqual(len(paths), len(set(paths)))
+
     def test_browser_urls_survive_ticket_expiry_and_keep_assets_run_scoped(self) -> None:
         run = self.create_run()
         base = run["streamBaseUrl"]

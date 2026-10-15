@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Literal, Optional
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import aiofiles
@@ -43,7 +44,7 @@ from services.ingestion_headers import copy_source_headers, decode_source_header
 from services.profile_security import require_profile_access
 from services.rclone import rclone_service
 from services.recommendation import record_playback_progress
-from lifecycle.coordination import EffectClass, WorkLease, get_runtime_coordinator, runtime_work
+from lifecycle.coordination import EffectClass, WorkLease, get_runtime_coordinator, run_cancellation_safe_thread, runtime_work
 from lifecycle.media_work import MediaRecoveryRequired, media_lock, media_ownership, require_resolved_media, settle
 from lifecycle.media_publication import MediaMutation
 
@@ -1033,65 +1034,77 @@ async def build_run_response(
     ticket, expires_at = issue_playback_ticket(user, auth_session, run.profile_id, run.id, media_obj.id, fingerprint)
     encoded_ticket = quote(ticket, safe="")
     next_episode_id = await next_playable_episode(db, run.movie_id, run.episode_id) if run.episode_id else None
-    tracks = track_contract(media_obj, media_obj.id, fingerprint, encoded_ticket)
-    renditions = rendition_contract(media_obj, media_obj.id, fingerprint)
-    manifest_url = ready_hls_manifest_url(media_obj, fingerprint, encoded_ticket, renditions)
-    duration = media_duration_seconds(media_obj)
-    direct_ready = progressive_source_compatible(media_obj)
-    adaptive_ready = bool(manifest_url)
-    required_failure = playback_prep_service.required_preparation_error(media_obj.id, fingerprint, media_obj)
-    preparation_error = (
-        PlaybackPreparationFailure(code=required_failure["code"], message=required_failure["message"])
-        if required_failure and not direct_ready
-        else None
-    )
-    if direct_ready or adaptive_ready:
-        preparation_state = "ready"
-    elif preparation_error:
-        preparation_state = "error"
-    else:
-        preparation_state = "preparing"
-    progress_payload = playback_prep_service.preparation_progress(media_obj.id, fingerprint, media_obj)
-    progress = PlaybackPreparationProgress(**progress_payload)
-    baseline = playback_prep_service.baseline_video(media_obj)
-    adaptive_seekable = playback_prep_service.rendition_seekable_until(
-        media_obj.id,
-        fingerprint,
-        baseline.name,
-    )
-    return PlaybackRunResponse(
-        stream_base_url=f"/api/playback/streams/{quote(run.id, safe='')}",
-        run_id=run.id,
-        media_id=media_obj.id,
-        movie_id=run.movie_id,
-        episode_id=run.episode_id,
-        source_fingerprint=fingerprint,
-        resume_position=initial_resume_position,
-        source_metadata=source_metadata(media_obj),
-        tracks=tracks,
-        renditions=renditions,
-        subtitles=subtitle_contract(media_obj),
-        ticket=ticket,
-        ticket_expires_at=expires_at,
-        manifest_url=manifest_url,
-        progressive_url=(
-            f"/api/playback/progressive/{quote(media_obj.id, safe='')}?ticket={encoded_ticket}"
-            if direct_ready else ""
-        ),
-        next_episode_id=next_episode_id,
-        preparation_state=preparation_state,
-        preparation_error=preparation_error,
-        preparation_progress=(
-            PlaybackPreparationProgress(stage="streamable", ready_segments=0, active_workers=0)
-            if direct_ready
-            else progress
-        ),
-        seekable_until=duration if direct_ready else adaptive_seekable,
-        resume_ready=direct_ready or adaptive_seekable >= initial_resume_position,
-        switching_ready=playback_prep_service.switching_ready(media_obj.id, fingerprint, media_obj),
-        fully_prepared=playback_prep_service.fully_prepared(media_obj.id, fingerprint, media_obj),
-        next_sequence_number=run.sequence_number,
-    )
+    # Copy loaded scalar/JSON fields before moving filesystem work off the loop.
+    media_obj = SimpleNamespace(**{name: getattr(media_obj, name, None) for name in (
+        "id", "source_fingerprint", "probed_duration", "duration", "video_url", "container",
+        "codec", "width", "height", "frame_rate", "quality", "analysis_metadata_str",
+        "audio_metadata", "languages", "subtitles",
+    )})
+    run = SimpleNamespace(id=run.id, movie_id=run.movie_id, episode_id=run.episode_id, sequence_number=run.sequence_number)
+
+    def catalog_response() -> PlaybackRunResponse:
+        with playback_prep_service.readiness_snapshot():
+            tracks = track_contract(media_obj, media_obj.id, fingerprint, encoded_ticket)
+            renditions = rendition_contract(media_obj, media_obj.id, fingerprint)
+            manifest_url = ready_hls_manifest_url(media_obj, fingerprint, encoded_ticket, renditions)
+            duration = media_duration_seconds(media_obj)
+            direct_ready = progressive_source_compatible(media_obj)
+            adaptive_ready = bool(manifest_url)
+            required_failure = playback_prep_service.required_preparation_error(media_obj.id, fingerprint, media_obj)
+            preparation_error = (
+                PlaybackPreparationFailure(code=required_failure["code"], message=required_failure["message"])
+                if required_failure and not direct_ready
+                else None
+            )
+            if direct_ready or adaptive_ready:
+                preparation_state = "ready"
+            elif preparation_error:
+                preparation_state = "error"
+            else:
+                preparation_state = "preparing"
+            progress_payload = playback_prep_service.preparation_progress(media_obj.id, fingerprint, media_obj)
+            progress = PlaybackPreparationProgress(**progress_payload)
+            baseline = playback_prep_service.baseline_video(media_obj)
+            adaptive_seekable = playback_prep_service.rendition_seekable_until(
+                media_obj.id,
+                fingerprint,
+                baseline.name,
+            )
+            return PlaybackRunResponse(
+                stream_base_url=f"/api/playback/streams/{quote(run.id, safe='')}",
+                run_id=run.id,
+                media_id=media_obj.id,
+                movie_id=run.movie_id,
+                episode_id=run.episode_id,
+                source_fingerprint=fingerprint,
+                resume_position=initial_resume_position,
+                source_metadata=source_metadata(media_obj),
+                tracks=tracks,
+                renditions=renditions,
+                subtitles=subtitle_contract(media_obj),
+                ticket=ticket,
+                ticket_expires_at=expires_at,
+                manifest_url=manifest_url,
+                progressive_url=(
+                    f"/api/playback/progressive/{quote(media_obj.id, safe='')}?ticket={encoded_ticket}"
+                    if direct_ready else ""
+                ),
+                next_episode_id=next_episode_id,
+                preparation_state=preparation_state,
+                preparation_error=preparation_error,
+                preparation_progress=(
+                    PlaybackPreparationProgress(stage="streamable", ready_segments=0, active_workers=0)
+                    if direct_ready
+                    else progress
+                ),
+                seekable_until=duration if direct_ready else adaptive_seekable,
+                resume_ready=direct_ready or adaptive_seekable >= initial_resume_position,
+                switching_ready=playback_prep_service.switching_ready(media_obj.id, fingerprint, media_obj),
+                fully_prepared=playback_prep_service.fully_prepared(media_obj.id, fingerprint, media_obj),
+                next_sequence_number=run.sequence_number,
+            )
+
+    return await run_cancellation_safe_thread(catalog_response)
 
 
 async def authorized_run(db: AsyncSession, request: Request, run_id: str, *, allow_abandoned: bool = False) -> PlaybackRun:
