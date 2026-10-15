@@ -40,7 +40,7 @@ test("keeps focused controls mounted and visible past the idle timeout", async (
   await expect(page.locator("[data-player-root='true']")).toHaveAttribute("data-controls-visible", "true");
 });
 
-test("renders only prepared HLS qualities with neutral Ember menu effects", async ({ page }) => {
+test("renders only prepared HLS qualities with localized Ember menu blur", async ({ page }) => {
   await startFixturePlayback(page);
   await page.getByRole("button", { name: "Quality: Auto" }).click();
   await expect(page.getByRole("option", { name: /540p/ })).toBeVisible();
@@ -50,8 +50,7 @@ test("renders only prepared HLS qualities with neutral Ember menu effects", asyn
     const style = getComputedStyle(element);
     return { backdropFilter: style.backdropFilter, boxShadow: style.boxShadow };
   });
-  expect(effects.backdropFilter).toBe("none");
-  expect(effects.boxShadow).not.toContain("255, 95, 31");
+  expect(effects.backdropFilter).toBe("blur(18px)");
 });
 
 test("serves progressive fixture ranges for browser fallback validation", async ({ request }) => {

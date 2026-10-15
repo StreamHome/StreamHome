@@ -26,15 +26,17 @@ describe("player control menu", () => {
   it("keeps one menu owner and releases an open control when it unmounts", () => {
     const owner=vi.fn();
     const fixture=(quality:boolean) => <PlayerMenuProvider onOpenChange={owner}>
-      {quality && <PlayerControlMenu label="Quality" icon="quality" value="auto" options={[{value:"auto",label:"Auto"}]} onSelect={() => undefined} />}
+      {quality && <PlayerControlMenu label="Quality" icon="quality" value="original" options={[{value:"original",label:"1080p · Original",shortLabel:"1080p"}]} status="Switching · Playing 720p" summary="Switching · Playing 720p" onSelect={() => undefined} />}
       <PlayerSettings playbackRate={1} onRateChange={() => undefined} captions={false} captionScale={1} onCaptionScaleChange={() => undefined} subtitleOffset={0} onSubtitleOffsetChange={() => undefined} />
     </PlayerMenuProvider>;
     const view=render(fixture(true));
-    fireEvent.click(screen.getByRole("button",{name:"Quality: Auto"}));
+    fireEvent.click(screen.getByRole("button",{name:"Quality: 1080p · Original"}));
+    expect(screen.getByRole("status").textContent).toBe("Switching · Playing 720p");
     fireEvent.click(screen.getByRole("button",{name:"Player settings"}));
     expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
     expect(screen.getByRole("dialog",{name:"Player settings"})).toBeTruthy();
-    fireEvent.click(screen.getByRole("button",{name:"Quality: Auto"}));
+    fireEvent.click(screen.getByRole("button",{name:"Quality: 1080p · Original"}));
     view.rerender(fixture(false));
     expect(owner).toHaveBeenLastCalledWith(false);
   });
@@ -48,6 +50,8 @@ describe("player control menu", () => {
         options={[{ value: -1, label: "Auto" }, { value: 1, label: "720p" }, { value: 2, label: "480p" }]}
         onSelect={setQuality}
         onOpenChange={onOpenChange}
+        status="Switching · Playing 480p"
+        summary="Switching · Playing 480p"
       />
     );
   }
@@ -73,14 +77,73 @@ describe("player control menu", () => {
     trigger.focus();
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     const listbox = screen.getByRole("listbox", { name: "Quality" });
+    expect(screen.getByRole("status").textContent).toBe("Switching · Playing 480p");
     fireEvent.keyDown(listbox, { key: "End" });
     expect(document.activeElement).toBe(screen.getByRole("option", { name: "480p" }));
 
     fireEvent.keyDown(listbox, { key: "Escape" });
     expect(document.activeElement).toBe(trigger);
     expect(screen.queryByRole("listbox", { name: "Quality" })).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
     expect(onOpenChange).toHaveBeenCalledWith(true);
     expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("keeps the selected quality compact without losing its accessible name or status", () => {
+    render(
+      <PlayerControlMenu
+        label="Quality"
+        icon="quality"
+        value="original"
+        options={[{ value: "original", label: "1080p · Original", shortLabel: "1080p" }]}
+        status="Playing 1080p · Original"
+        onSelect={() => undefined}
+      />,
+    );
+
+    const trigger = screen.getByRole("button", { name: "Quality: 1080p · Original" });
+    expect(trigger.textContent).toBe("1080p");
+    expect(trigger.getAttribute("aria-description")).toBe("Playing 1080p · Original");
+    expect(screen.queryByText("Playing 1080p · Original")).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+
+    fireEvent.click(trigger);
+    expect(screen.getByRole("option", { name: "1080p · Original" }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("shows the optional transition summary only while its menu is open", () => {
+    const onSelect = vi.fn();
+    const fixture = (summary?: string) => (
+      <PlayerControlMenu
+        label="Quality"
+        icon="quality"
+        value="original"
+        options={[
+          { value: "original", label: "1080p · Original", shortLabel: "1080p" },
+          { value: "720", label: "720p" },
+        ]}
+        status="Switching · Playing 720p"
+        summary={summary}
+        onSelect={onSelect}
+      />
+    );
+    const view = render(fixture("Switching to 1080p · Playing 720p"));
+    const trigger = screen.getByRole("button", { name: "Quality: 1080p · Original" });
+    expect(screen.queryByRole("status")).toBeNull();
+
+    fireEvent.click(trigger);
+    expect(screen.getByRole("status").textContent).toBe("Switching to 1080p · Playing 720p");
+    expect(screen.queryByText("Switching · Playing 720p")).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: "720p" }));
+    expect(onSelect).toHaveBeenCalledWith("720");
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+
+    view.rerender(fixture());
+    fireEvent.click(trigger);
+    expect(screen.getByRole("listbox", { name: "Quality" })).not.toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
   });
 
   it("allows a pending quality to be requested and prioritized", () => {

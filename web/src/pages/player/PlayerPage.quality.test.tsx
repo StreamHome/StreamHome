@@ -318,4 +318,34 @@ describe("mounted HLS quality policy", () => {
     expect(hls.audioTrack).toBe(1);
     expect(JSON.parse(localStorage.getItem(preferencesKey)!).audioLanguage).toBe("tr");
   });
+
+  it("keeps ordinary selection feedback off the picture and puts navigation above transport", async () => {
+    const { container } = await mountPlayer();
+    selectQuality("1080p · Original");
+    const quality = screen.getByRole("button", { name: "Quality: 1080p · Original" });
+    expect(quality.textContent).toBe("1080p");
+    expect(container.querySelector(".player-error-notice")).toBeNull();
+    expect(screen.getByText("1080p · Original quality active").classList.contains("sr-only")).toBe(true);
+    expect(screen.getByRole("button", { name: "Exit player" }).closest("header")).toBe(
+      screen.getByRole("heading", { name: "Quality regression" }).closest("header"),
+    );
+    expect(container.querySelector(".player-controls h1")).toBeNull();
+    expect(container.querySelector(".player-controls__source")).toBeNull();
+  });
+
+  it("shows a real playback denial and clears it when Play retries without replacing transport", async () => {
+    vi.mocked(HTMLMediaElement.prototype.play).mockRejectedValueOnce(new DOMException("Playback denied", "NotAllowedError"));
+    const { video, hls } = await mountPlayer();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Press play");
+    vi.useFakeTimers();
+    act(() => vi.advanceTimersByTime(5000));
+    expect(screen.getByRole("alert")).toBe(alert);
+    vi.useRealTimers();
+    const source = video.getAttribute("src");
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(video.getAttribute("src")).toBe(source);
+    expect(hls.startLoad).not.toHaveBeenCalled();
+  });
 });

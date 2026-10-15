@@ -537,6 +537,14 @@ describe("mounted player lifecycle", () => {
     expect(root.dataset.controlsVisible).toBe("true");
     expect(document.activeElement).toBe(audioMenu);
 
+    const exit = screen.getByRole("button", { name: "Exit player" });
+    act(() => exit.focus());
+    video.currentTime = 14;
+    fireEvent.timeUpdate(video);
+    act(() => vi.advanceTimersByTime(PLAYER_CONTROLS_IDLE_MS + 1));
+    expect(root.dataset.controlsVisible).toBe("true");
+    expect(document.activeElement).toBe(exit);
+
     expect(timeline.isConnected).toBe(true);
     view.unmount();
   });
@@ -574,6 +582,10 @@ describe("mounted player lifecycle", () => {
 
     expect(root.dataset.playerPhase).toBe("playing");
     expect(root.dataset.controlsVisible).toBe("false");
+    fireEvent.keyDown(document, { key: "Tab" });
+    act(() => vi.advanceTimersByTime(20));
+    expect(root.dataset.controlsVisible).toBe("true");
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Exit player" }));
     view.unmount();
   });
 

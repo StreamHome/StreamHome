@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 
 export type PlayerIconName =
   | "audio"
+  | "back"
   | "captions"
   | "check"
   | "chevron"
@@ -56,6 +57,7 @@ export function PlayerIcon({ name, className = "" }: PlayerIconProps) {
   if (name === "fullscreen") return <svg {...common}><path d="M8 4H4v4M16 4h4v4M8 20H4v-4M16 20h4v-4" /></svg>;
   if (name === "fullscreen-exit") return <svg {...common}><path d="M4 8h4V4M20 8h-4V4M4 16h4v4M20 16h-4v4" /></svg>;
   if (name === "exit") return <svg {...common}><path d="M14 5h5v14h-5M10 8l-4 4 4 4M6 12h9" /></svg>;
+  if (name === "back") return <svg {...common}><path d="m10 5-7 7 7 7M3 12h18" /></svg>;
   if (name === "chevron") return <svg {...common}><path d="m7 9 5 5 5-5" /></svg>;
   return <svg {...common}><path d="m7 12 3 3 7-7" /></svg>;
 }
@@ -108,7 +110,7 @@ export function PlayerMenuProvider({ children, onOpenChange }: { children: React
   return <MenuContext.Provider value={value}>{children}</MenuContext.Provider>;
 }
 
-function usePlayerPopup(onOpenChange?: (open: boolean) => void) {
+function usePlayerPopup(onOpenChange?: (open: boolean) => void, preferredWidth?: number) {
   const id = useId();
   const owner = useContext(MenuContext);
   const [localOpen, setLocalOpen] = useState(false);
@@ -143,7 +145,7 @@ function usePlayerPopup(onOpenChange?: (open: boolean) => void) {
       const y = rotated ? (frame?.right ?? window.innerWidth) - bounds.right : bounds.top - (frame?.top ?? 0);
       const anchorWidth = rotated ? bounds.height : bounds.width;
       const anchorHeight = rotated ? bounds.width : bounds.height;
-      const menuWidth = Math.max(1, Math.min(width - 24, player?.dataset.mobilePlayer === "true" ? 360 : 288));
+      const menuWidth = Math.max(1, Math.min(width - 24, preferredWidth ?? (player?.dataset.mobilePlayer === "true" ? 360 : 288)));
       const roomAbove = Math.max(0, y - 20);
       const roomBelow = Math.max(0, height - y - anchorHeight - 20);
       const above = roomAbove >= Math.min(popup.scrollHeight, 160) || roomAbove >= roomBelow;
@@ -159,8 +161,9 @@ function usePlayerPopup(onOpenChange?: (open: boolean) => void) {
     const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(position);
     if (player) observer?.observe(player);
     observer?.observe(anchor!);
+    if (popupRef.current) observer?.observe(popupRef.current);
     return () => { window.removeEventListener("resize", position); observer?.disconnect(); };
-  }, [host, open]);
+  }, [host, open, preferredWidth]);
 
   useEffect(() => {
     if (!open) return;
@@ -206,6 +209,7 @@ export function PlayerSettings({ playbackRate, onRateChange, captions, captionSc
 export interface PlayerMenuOption<T extends string | number> {
   value: T;
   label: string;
+  shortLabel?: string;
   disabled?: boolean;
   status?: string;
 }
@@ -218,6 +222,8 @@ interface PlayerControlMenuProps<T extends string | number> {
   onSelect: (value: T) => void;
   onOpenChange?: (open: boolean) => void;
   status?: string;
+  summary?: string;
+  compact?: boolean;
 }
 
 export function PlayerControlMenu<T extends string | number>({
@@ -228,8 +234,10 @@ export function PlayerControlMenu<T extends string | number>({
   onSelect,
   onOpenChange,
   status,
+  summary,
+  compact = false,
 }: PlayerControlMenuProps<T>) {
-  const popup = usePlayerPopup(onOpenChange);
+  const popup = usePlayerPopup(onOpenChange, compact ? 224 : undefined);
   const { open, rootRef, triggerRef, updateOpen } = popup;
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const listboxId = popup.id;
@@ -276,7 +284,7 @@ export function PlayerControlMenu<T extends string | number>({
         }}
       >
         <PlayerIcon name={icon} />
-        <span>{selected?.label ?? label}{status && <small className="player-control-menu__status" aria-hidden="true">{status}</small>}</span>
+        <span>{selected?.shortLabel ?? selected?.label ?? label}</span>
         <PlayerIcon name="chevron" className="player-control-menu__chevron" />
       </button>
 
@@ -311,7 +319,7 @@ export function PlayerControlMenu<T extends string | number>({
           }}
         >
           <span className="player-control-menu__label">{label}</span>
-          {status && <div className="player-control-menu__summary" role="status">{status}</div>}
+          {summary && <div className="player-control-menu__summary" role="status">{summary}</div>}
           {options.map((option, index) => {
             const isSelected = Object.is(option.value, value);
             return (

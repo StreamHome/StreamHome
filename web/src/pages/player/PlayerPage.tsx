@@ -918,7 +918,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [fullscreenActive, setFullscreenActive] = useState(false);
   const [fullscreenMode, setFullscreenMode] = useState<PlayerFullscreenMode>(null);
   const [fullscreenError, setFullscreenError] = useState("");
-  const [playerNotice, setPlayerNotice] = useState("");
+  const [playerNotice, updatePlayerNotice] = useState<{ message: string; severity: "info" | "error" } | null>(null);
+  const setPlayerNotice = useCallback((message: string, severity: "info" | "error" = "info") => {
+    updatePlayerNotice((current) => !message ? null
+      : current?.message === message && current.severity === severity ? current : { message, severity });
+  }, []);
   const [hasLastFrame, setHasLastFrame] = useState(false);
   const [mobilePlayer, setMobilePlayer] = useState(() => typeof window !== "undefined" && isPhonePlayerViewport(readMobileViewport(window)));
   const [forcedLandscape, setForcedLandscape] = useState(() => typeof window !== "undefined" && isForcedLandscape(window.innerWidth, window.innerHeight, isPhonePlayerViewport(readMobileViewport(window))));
@@ -983,7 +987,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [phase]);
 
   useEffect(() => {
-    if (!playerNotice) return;
+    if (!playerNotice || playerNotice.severity === "error") return;
     const timer = window.setTimeout(() => setPlayerNotice(""), 4_000);
     return () => window.clearTimeout(timer);
   }, [playerNotice]);
@@ -996,7 +1000,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     }).catch(() => {
       if (active) {
         setHlsEngineFailed(true);
-        setPlayerNotice("The adaptive playback engine could not be loaded.");
+        setPlayerNotice("The adaptive playback engine could not be loaded.", "error");
       }
     });
     return () => {
@@ -1411,7 +1415,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         if (request !== externalAudioPlayRequestRef.current || !playbackIntentRef.current) return;
         if ((error instanceof DOMException || error instanceof Error) && error.name === "AbortError") return;
         externalAudioBlockedRef.current = true;
-        setPlayerNotice(blockedNotice);
+        setPlayerNotice(blockedNotice, "error");
       })
       .finally(() => {
         if (pendingExternalAudioPlayRequestRef.current === request) pendingExternalAudioPlayRequestRef.current = null;
@@ -1588,7 +1592,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         if ((error instanceof DOMException || error instanceof Error) && error.name === "AbortError") return;
         playbackIntentRef.current = false;
         markPlaybackStartupReady();
-        setPlayerNotice(blockedNotice);
+        setPlayerNotice(blockedNotice, "error");
         setPhase("paused");
       })
       .finally(() => {
@@ -2396,7 +2400,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         if (requestedQuality?.status === "failed") pendingQualitySelectionRef.current = null;
         if (requestedAudio?.status === "failed") {
           pendingAudioSelectionRef.current = null;
-          setPlayerNotice(`${requestedAudio.label} audio could not be prepared.`);
+          setPlayerNotice(`${requestedAudio.label} audio could not be prepared.`, "error");
         }
         const stillPending = !refreshed.fullyPrepared;
         if (!stillPending) return;
@@ -2649,6 +2653,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [clearPlaybackClockAdvanceWatchdog, clearStallRecovery, markPlaybackStartupReady]);
 
   const safePlay = useCallback(() => {
+    setPlayerNotice("");
     externalAudioBlockedRef.current = false;
     playbackIntentRef.current = true;
     staleVideoPlayEventRef.current = false;
@@ -2657,7 +2662,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (hls && !hls.loadingEnabled) hls.startLoad(Math.max(0, currentTimeRef.current));
     else if (hls && !hls.bufferingEnabled) hls.resumeBuffering();
     requestVideoPlay();
-  }, [requestVideoPlay]);
+  }, [requestVideoPlay, setPlayerNotice]);
 
   const pausePlayback = useCallback(() => {
     playbackIntentRef.current = false;
@@ -2840,7 +2845,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const playerControlsContainFocus = useCallback(() => {
     const activeElement = document.activeElement;
     if (!(activeElement instanceof HTMLElement)) return false;
-    return Boolean(activeElement.closest(".player-controls, .mobile-player-chrome"));
+    return Boolean(activeElement.closest(".player-controls, .player-topbar, .mobile-player-chrome"));
   }, []);
 
   const scheduleControlsHide = useCallback(() => {
@@ -3099,7 +3104,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }
       }
       if (!document.pictureInPictureEnabled) {
-        setPlayerNotice("Picture-in-picture is not available in this browser.");
+        setPlayerNotice("Picture-in-picture is not available in this browser.", "error");
         return;
       }
       if (document.pictureInPictureElement) await document.exitPictureInPicture();
@@ -3107,7 +3112,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     };
     void open().catch((error: unknown) => {
       if (generation !== runGenerationRef.current) return;
-      setPlayerNotice(error instanceof Error ? error.message : "Picture-in-picture could not be opened.");
+      setPlayerNotice(error instanceof Error ? error.message : "Picture-in-picture could not be opened.", "error");
       setControlsVisibility(true);
     });
   }, [setControlsVisibility]);
@@ -3147,7 +3152,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         setPhase("fatal");
       } else {
         setPhase("ended");
-        setPlayerNotice("Replay could not be started. Try Replay again.");
+        setPlayerNotice("Replay could not be started. Try Replay again.", "error");
       }
     });
   }, [runResponse, safePlay, seek]);
@@ -3200,7 +3205,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         event.preventDefault();
         revealControls();
         window.requestAnimationFrame(() => {
-          const controls = containerRef.current?.querySelectorAll<HTMLButtonElement>(".player-controls button:not(:disabled), .mobile-player-chrome button:not(:disabled)");
+          const controls = containerRef.current?.querySelectorAll<HTMLButtonElement>(".player-topbar button:not(:disabled), .player-controls button:not(:disabled), .mobile-player-chrome button:not(:disabled)");
           controls?.[event.shiftKey ? controls.length - 1 : 0]?.focus();
         });
         return;
@@ -3427,11 +3432,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (selected.status === "failed" || !selected.ready) {
       setPlayerNotice(selected.status === "failed"
         ? `${selected.label} is unavailable for this source.`
-        : `${selected.label} is not present in the prepared adaptive stream.`);
+        : `${selected.label} is not present in the prepared adaptive stream.`, "error");
       return;
     }
     if (!hlsRef.current && !runResponse?.manifestUrl) {
-      setPlayerNotice("Adaptive quality switching is unavailable for the current transport.");
+      setPlayerNotice("Adaptive quality switching is unavailable for the current transport.", "error");
       return;
     }
     deferredStartupQualityRef.current = null;
@@ -3483,7 +3488,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       return;
     }
     pendingQualitySelectionRef.current = null;
-    setPlayerNotice("Adaptive quality switching is unavailable for the current transport.");
+    setPlayerNotice("Adaptive quality switching is unavailable for the current transport.", "error");
   };
 
   const changeAudio = (trackId: string) => {
@@ -3493,7 +3498,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       : selected.id === selectedAudioTrackId)) return;
     if (selected.status === "failed") {
       pendingAudioSelectionRef.current = null;
-      setPlayerNotice(`${selected.label} audio is unavailable for this source.`);
+      setPlayerNotice(`${selected.label} audio is unavailable for this source.`, "error");
       return;
     }
     pendingAudioSelectionRef.current = trackId;
@@ -3572,7 +3577,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       return;
     }
     pendingAudioSelectionRef.current = null;
-    setPlayerNotice(`${selected.label} is not available in the active playback transport.`);
+    setPlayerNotice(`${selected.label} is not available in the active playback transport.`, "error");
   };
 
   const retryPlayback = () => {
@@ -4154,7 +4159,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
               audioLanguage: normalizeLanguageTag(fallback.language, ""),
             }));
           }
-          setPlayerNotice("The selected dubbing file could not be played. Restored the original audio.");
+          setPlayerNotice("The selected dubbing file could not be played. Restored the original audio.", "error");
           if (playbackIntentRef.current) requestVideoPlay();
         }}
       />
@@ -4223,11 +4228,12 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       </span>
 
       <div className="sr-only" role="status" aria-live="polite">{phaseMessage[phase]}</div>
+      <div className="sr-only" role="status" aria-live="polite">{playerNotice?.severity === "info" ? playerNotice.message : ""}</div>
 
       <AnimatePresence>
         {fullscreenError && (
           <motion.div
-            className="absolute left-1/2 top-[max(1rem,env(safe-area-inset-top))] z-[60] w-[min(92vw,34rem)] -translate-x-1/2 rounded-lg border border-red-300/25 bg-black/90 px-4 py-3 text-center text-sm text-red-100 shadow-2xl backdrop-blur-md"
+            className="player-error-notice"
             role="alert"
             initial={reduced ? { opacity: 0 } : { opacity: 0, y: -10 }}
             animate={{ opacity: 1, y: 0 }}
@@ -4239,15 +4245,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       </AnimatePresence>
 
       <AnimatePresence>
-        {playerNotice && !fullscreenError && (
+        {playerNotice?.severity === "error" && !fullscreenError && (
           <motion.div
-            className="pointer-events-none absolute left-1/2 top-[max(1rem,env(safe-area-inset-top))] z-[55] w-[min(92vw,34rem)] -translate-x-1/2 rounded-lg border border-white/15 bg-black/85 px-4 py-3 text-center text-sm text-white/85 shadow-2xl backdrop-blur-md"
-            role="status"
+            className="player-error-notice"
+            role="alert"
             initial={reduced ? { opacity: 0 } : { opacity: 0, y: -10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={reduced ? { opacity: 0 } : { opacity: 0, y: -8 }}
           >
-            {playerNotice}
+            <p>{playerNotice.message}</p>
+            <button type="button" aria-label="Dismiss error" onClick={() => setPlayerNotice("")}>×</button>
           </motion.div>
         )}
       </AnimatePresence>
@@ -4313,7 +4320,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             <header className="mobile-player-topbar">
               <div className="mobile-player-topbar__actions">
                 <PlayerIconButton
-                  icon="exit"
+                  icon="back"
                   label="Exit player"
                   className="mobile-player-exit"
                   onClick={exitPlayer}
@@ -4322,7 +4329,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
               <div className="mobile-player-title">
                 <h1>{asset.title}</h1>
                 {asset.subtitle && <p>{asset.subtitle}</p>}
-                <small>{runResponse.sourceMetadata.sourceFormat} source</small>
               </div>
             </header>
 
@@ -4401,7 +4407,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                       icon="quality"
                       value={selectedQualityId}
                       status={qualityStatus}
-                      options={availableQualities.map((item) => ({ value: item.id, label: item.label, disabled: item.status === "failed", status: item.ready ? undefined : item.status === "failed" ? "Unavailable" : item.status === "idle" ? "Prepare on request" : "Preparing" }))}
+                      summary={qualityStatus?.startsWith("Switching") ? qualityStatus : undefined}
+                      compact
+                      options={availableQualities.map((item) => ({ value: item.id, label: item.label, shortLabel: item.label.split(" · ")[0], disabled: item.status === "failed", status: item.ready ? undefined : item.status === "failed" ? "Unavailable" : item.status === "idle" ? "Prepare on request" : "Preparing" }))}
                       onSelect={changeQuality}
                       onOpenChange={handleControlMenuOpenChange}
                     />
@@ -4429,6 +4437,29 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
       <AnimatePresence>
         {!mobilePlayer && phase !== "ended" && (
+          <motion.header
+            className="player-topbar"
+            data-visible={showControls ? "true" : "false"}
+            aria-hidden={!showControls}
+            inert={!showControls}
+            onFocusCapture={revealControls}
+            onBlurCapture={handleControlsBlur}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: showControls ? 1 : 0 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: reduced ? MOTION_TIMINGS.reduced : 0.16, ease: MOTION_EASE }}
+          >
+            <PlayerIconButton icon="back" label="Exit player" className="player-topbar__exit" onClick={exitPlayer} />
+            <div className="player-topbar__title">
+              <h1>{asset.title}</h1>
+              {asset.subtitle && <p>{asset.subtitle}</p>}
+            </div>
+          </motion.header>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {!mobilePlayer && phase !== "ended" && (
           <motion.div
             className="player-controls absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black via-black/85 to-transparent px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-24 md:px-10 md:pb-7"
             data-visible={showControls ? "true" : "false"}
@@ -4441,18 +4472,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             exit={reduced ? { opacity: 0 } : { opacity: 0, y: 12 }}
           >
             <div className="mx-auto max-w-7xl">
-              <div className="player-controls__header mb-4 flex items-start justify-between gap-5">
-                <div>
-                  <h1 className="text-lg font-semibold md:text-2xl">{asset.title}</h1>
-                  {asset.subtitle && <p className="mt-1 text-xs text-white/60 md:text-sm">{asset.subtitle}</p>}
-                  <p className="player-controls__source mt-1 text-[11px] uppercase tracking-[0.14em] text-white/35">{runResponse.sourceMetadata.sourceFormat} source · {streamMode === "progressive" ? "Compatibility delivery" : "Adaptive delivery"}</p>
-                </div>
-                <button onClick={exitPlayer} className="player-exit-button" aria-label="Exit player">
-                  <PlayerIcon name="exit" />
-                  <span>Exit</span>
-                </button>
-              </div>
-
               <div className="relative">
                 {timelinePreview && (
                   <span className="pointer-events-none absolute -top-9 -translate-x-1/2 rounded bg-black/90 px-2 py-1 text-xs" style={{ left: timelinePreview.x }}>
@@ -4523,7 +4542,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                       icon="quality"
                       value={selectedQualityId}
                       status={qualityStatus}
-                      options={availableQualities.map((item) => ({ value: item.id, label: item.label, disabled: item.status === "failed", status: item.ready ? undefined : item.status === "failed" ? "Unavailable" : item.status === "idle" ? "Prepare on request" : "Preparing" }))}
+                      summary={qualityStatus?.startsWith("Switching") ? qualityStatus : undefined}
+                      compact
+                      options={availableQualities.map((item) => ({ value: item.id, label: item.label, shortLabel: item.label.split(" · ")[0], disabled: item.status === "failed", status: item.ready ? undefined : item.status === "failed" ? "Unavailable" : item.status === "idle" ? "Prepare on request" : "Preparing" }))}
                       onSelect={changeQuality}
                       onOpenChange={handleControlMenuOpenChange}
                     />

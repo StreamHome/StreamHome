@@ -71,7 +71,7 @@ describe("dedicated mobile player presentation", () => {
     expect(playerPage).toContain("data-theme={theme}");
     expect(playerPage).toContain("data-player-theme={definition.playerVariant}");
     expect(playerStyles).toContain("var(--player-accent)");
-    expect(playerPage).toContain("sourceMetadata.sourceFormat");
+    expect(playerPage).not.toContain('className="player-controls__source');
     expect(playerPage).not.toContain("disabled={!fullscreenAvailable}");
     expect((playerPage.match(/availableAudioTracks\.length > 0/g) ?? [])).toHaveLength(2);
   });
@@ -115,7 +115,6 @@ describe("dedicated mobile player presentation", () => {
     expect(emberControls).toContain("box-shadow: none");
     expect(emberControls).toContain("rgba(0,0,0,.42)");
     expect(emberControls).not.toContain("rgba(15,6,3,.46)");
-    expect(playerStyles).toContain('.player-view[data-player-theme="terminal"] .player-control-menu__list');
     expect(playerStyles).toContain('background: linear-gradient(to top, rgba(0, 0, 0, 0.94)');
     expect(applicationStyles).toContain('@media (max-height: 420px) and (min-width: 641px)');
     expect(applicationStyles).toContain('.player-controls__transport { margin-top: .35rem; flex-wrap: nowrap; gap: .35rem; }');
