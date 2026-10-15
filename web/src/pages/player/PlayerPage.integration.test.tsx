@@ -1,6 +1,6 @@
 import React from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useProfileStore } from "../../stores/profileStore";
@@ -8,6 +8,7 @@ import { useThemeStore } from "../../stores/themeStore";
 import type { Profile } from "../../types/api";
 import * as moviesApi from "../../api/movies";
 import * as playbackApi from "../../api/playback";
+import { getPlaybackSessionRevision, subscribePlaybackSessions } from "../../api/playbackSessionEvents";
 import {
   PLAYER_CONTROLS_IDLE_MS,
   PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS,
@@ -115,6 +116,15 @@ function pointerClick(target: HTMLElement) {
   act(() => target.focus());
   fireEvent.pointerUp(target, { pointerType: "mouse", pointerId: 1 });
   fireEvent.click(target, { detail: 1 });
+}
+
+function PlayerLocation() {
+  return <output data-testid="player-location">{useLocation().search}</output>;
+}
+
+function OpenNextTitle() {
+  const navigate = useNavigate();
+  return <button type="button" onClick={() => navigate("/?profile=mounted-player-profile&view=watch&media=m_next_ack")}>Open next title</button>;
 }
 
 function pressFocusedKey(key: string, init: KeyboardEventInit = {}) {
@@ -507,7 +517,7 @@ describe("mounted player lifecycle", () => {
     }
   });
 
-  it("skips credits ranges independently and waits for native ended before presenting completion", async () => {
+  it("keeps earlier credits skippable across a scene gap and hides terminal credits until native ended", async () => {
     const view = render(<MemoryRouter><PlayerPage visualFixture={markerPlayback} /></MemoryRouter>);
     try {
       await act(async () => { await import("hls.js"); });
@@ -522,11 +532,15 @@ describe("mounted player lifecycle", () => {
       expect(screen.queryByRole("button", { name: "Replay" })).toBeNull();
       await waitFor(() => expect(screen.queryByRole("button", { name: "Skip credits" })).toBeNull());
 
+      video.currentTime = 105;
+      fireEvent.timeUpdate(video);
+      expect(screen.queryByRole("button", { name: "Skip credits" })).toBeNull();
       video.currentTime = 112;
       fireEvent.timeUpdate(video);
       writes.mockClear();
-      pointerClick(screen.getByRole("button", { name: "Skip credits" }));
-      expect(writes).toHaveBeenCalledExactlyOnceWith(120);
+      expect(screen.queryByRole("button", { name: "Skip credits" })).toBeNull();
+      expect(writes).not.toHaveBeenCalled();
+      expect(video.currentTime).toBe(112);
       expect(root.dataset.playerPhase).not.toBe("ended");
       expect(screen.queryByRole("button", { name: "Replay" })).toBeNull();
       fireEvent.ended(video);
@@ -534,6 +548,52 @@ describe("mounted player lifecycle", () => {
       expect(screen.getByRole("button", { name: "Replay" })).toBeTruthy();
     } finally {
       view.unmount();
+    }
+  });
+
+  it.each(["ember", "aurora", "cinema"] as const)("hides terminal credits without disturbing paused %s transport or leaving focus on body", async (theme) => {
+    const previousTheme = useThemeStore.getState().activeTheme;
+    useThemeStore.setState({ activeTheme: theme });
+    const Hls = (await import("hls.js")).default;
+    const attachMedia = vi.spyOn(Hls.prototype, "attachMedia");
+    const loadSource = vi.spyOn(Hls.prototype, "loadSource");
+    const view = render(<MemoryRouter><PlayerPage visualFixture={markerPlayback} /></MemoryRouter>);
+    try {
+      await act(async () => { await import("hls.js"); });
+      const root = view.container.querySelector("[data-player-root]") as HTMLElement;
+      const video = view.container.querySelector("video") as HTMLVideoElement;
+      showPlayingVideo(video, 95);
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(video, "paused", { configurable: true, value: true });
+      fireEvent.pause(video);
+      act(() => screen.getByRole("button", { name: "Skip credits" }).focus());
+      const source = video.getAttribute("src");
+      const loads = videoCallCount("load", video);
+      const plays = videoCallCount("play", video);
+
+      // A confirmed native position update replaces the focused earlier-credit
+      // action with terminal-credit presentation; it must not trigger a seek.
+      video.currentTime = 112;
+      const writes = observeVideoPosition(video);
+      fireEvent.timeUpdate(video);
+      await waitFor(() => expect(screen.queryByRole("button", { name: "Skip credits" })).toBeNull());
+      expect(document.activeElement).toBe(root);
+      expect(document.activeElement).not.toBe(document.body);
+      expect(root.dataset.playerPhase).toBe("paused");
+      expect(video.paused).toBe(true);
+      expect(video.currentTime).toBe(112);
+      expect(writes).not.toHaveBeenCalled();
+      expect(view.container.querySelector("video")).toBe(video);
+      expect(video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", video)).toBe(loads);
+      expect(videoCallCount("play", video)).toBe(plays);
+      expect(attachMedia).not.toHaveBeenCalled();
+      expect(loadSource).not.toHaveBeenCalled();
+      expect(view.container.querySelectorAll("[data-marker-kind='credits']")).toHaveLength(2);
+      expect(screen.queryByRole("button", { name: "Replay" })).toBeNull();
+    } finally {
+      view.unmount();
+      useThemeStore.setState({ activeTheme: previousTheme });
     }
   });
 
@@ -1692,6 +1752,101 @@ describe("mounted player lifecycle", () => {
     await act(async () => { resolveRun(playback.runResponse); await Promise.resolve(); });
     expect(close).toHaveBeenCalledWith(playback.runResponse.runId, expect.objectContaining({ event: "exit", totalSecondsPlayed: 0 }), true);
     expect(vi.mocked(HTMLMediaElement.prototype.load)).not.toHaveBeenCalled();
+  });
+
+  it.each(["acknowledged", "rejected"] as const)("handles an Exit close that is %s before refreshing profile sessions and sends the confirmed seek clock", async (outcome) => {
+    vi.spyOn(moviesApi, "getMovie").mockReturnValue(new Promise(() => undefined));
+    vi.spyOn(playbackApi, "createPlaybackRun").mockResolvedValue(playback.runResponse);
+    vi.spyOn(playbackApi, "updatePlaybackProgress").mockResolvedValue({ status: "ok", nextSequenceNumber: 2 });
+    let resolveClose!: (value: Awaited<ReturnType<typeof playbackApi.closePlaybackRun>>) => void;
+    let rejectClose!: (reason: Error) => void;
+    const close = vi.spyOn(playbackApi, "closePlaybackRun").mockReturnValue(new Promise((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    }));
+    const refreshProfile = vi.fn();
+    const refreshOtherProfile = vi.fn();
+    const unsubscribe = subscribePlaybackSessions(profile.id, refreshProfile);
+    const unsubscribeOther = subscribePlaybackSessions("other-profile", refreshOtherProfile);
+    const revision = getPlaybackSessionRevision(profile.id);
+    const view = render(<MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=m_exit_ack"]}>
+      <PlayerPage /><PlayerLocation />
+    </MemoryRouter>);
+    try {
+      await waitFor(() => expect(view.container.querySelector("video")?.getAttribute("src")).toBe(playback.runResponse.progressiveUrl));
+      const video = view.container.querySelector("video")!;
+      showPlayingVideo(video, 30);
+      const timeline = screen.getByRole("slider", { name: "Playback position" });
+      fireEvent.change(timeline, { target: { value: "112" } });
+      expect(video.currentTime).toBe(112);
+      // No seeked event confirms the requested credit position before Exit.
+      pointerClick(screen.getByRole("button", { name: "Exit player" }));
+      expect(screen.getByTestId("player-location").textContent).toContain("view=home");
+      expect(close).toHaveBeenCalledExactlyOnceWith(playback.runResponse.runId, expect.objectContaining({
+        timestamp: 30, event: "exit", isFinished: false,
+      }));
+      expect(refreshProfile).not.toHaveBeenCalled();
+      expect(getPlaybackSessionRevision(profile.id)).toBe(revision);
+
+      await act(async () => {
+        if (outcome === "acknowledged") resolveClose({ status: "finished", nextSequenceNumber: 3 });
+        else rejectClose(new Error("Close request failed"));
+        await Promise.resolve();
+      });
+      expect(refreshProfile).toHaveBeenCalledTimes(outcome === "acknowledged" ? 1 : 0);
+      expect(getPlaybackSessionRevision(profile.id)).toBe(revision + (outcome === "acknowledged" ? 1 : 0));
+      expect(refreshOtherProfile).not.toHaveBeenCalled();
+    } finally {
+      view.unmount();
+      unsubscribe();
+      unsubscribeOther();
+    }
+  });
+
+  it("refreshes the ended run's profile after another run replaces it without changing the new run's sequence", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    vi.spyOn(moviesApi, "getMovie").mockReturnValue(new Promise(() => undefined));
+    const nextRun = { ...playback.runResponse, runId: "next-ack-run", mediaId: "m_next_ack", movieId: "m_next_ack",
+      nextSequenceNumber: 7, progressiveUrl: "/api/playback/progressive/m_next_ack?ticket=next-ticket" };
+    const create = vi.spyOn(playbackApi, "createPlaybackRun").mockResolvedValueOnce(playback.runResponse).mockResolvedValue(nextRun);
+    let acknowledgeEnded!: (value: Awaited<ReturnType<typeof playbackApi.updatePlaybackProgress>>) => void;
+    const endedResponse = new Promise<Awaited<ReturnType<typeof playbackApi.updatePlaybackProgress>>>((resolve) => { acknowledgeEnded = resolve; });
+    const progress = vi.spyOn(playbackApi, "updatePlaybackProgress").mockImplementation((runId, request) =>
+      runId === playback.runResponse.runId && request.event === "ended" ? endedResponse
+        : Promise.resolve({ status: "ok", nextSequenceNumber: runId === nextRun.runId ? 8 : 2 }));
+    const close = vi.spyOn(playbackApi, "closePlaybackRun").mockResolvedValue({ status: "abandoned", nextSequenceNumber: 3 });
+    const refresh = vi.fn();
+    const unsubscribe = subscribePlaybackSessions(profile.id, refresh);
+    const revision = getPlaybackSessionRevision(profile.id);
+    const view = render(<MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=m_ended_ack"]}>
+      <PlayerPage /><OpenNextTitle />
+    </MemoryRouter>);
+    try {
+      await waitFor(() => expect(view.container.querySelector("video")?.getAttribute("src")).toBe(playback.runResponse.progressiveUrl));
+      const video = view.container.querySelector("video")!;
+      showPlayingVideo(video, 30);
+      video.currentTime = 120;
+      fireEvent.timeUpdate(video);
+      fireEvent.ended(video);
+      await waitFor(() => expect(progress).toHaveBeenCalledWith(playback.runResponse.runId,
+        expect.objectContaining({ event: "ended", isFinished: true }), true));
+      expect(refresh).not.toHaveBeenCalled();
+      pointerClick(screen.getByRole("button", { name: "Open next title" }));
+      await waitFor(() => expect(view.container.querySelector("video")?.getAttribute("src")).toBe(nextRun.progressiveUrl));
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(close).not.toHaveBeenCalled();
+      await act(async () => { acknowledgeEnded({ status: "finished", nextSequenceNumber: 99 }); await Promise.resolve(); });
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(getPlaybackSessionRevision(profile.id)).toBe(revision + 1);
+      const nextVideo = view.container.querySelector("video")!;
+      showPlayingVideo(nextVideo, 45);
+      fireEvent.pause(nextVideo);
+      await waitFor(() => expect(progress).toHaveBeenCalledWith(nextRun.runId,
+        expect.objectContaining({ event: "pause", timestamp: 45, sequenceNumber: 7 }), false));
+    } finally {
+      view.unmount();
+      unsubscribe();
+    }
   });
 
   it("applies the preferred native audio and keeps manual quality changes paused", async () => {

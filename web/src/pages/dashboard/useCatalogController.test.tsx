@@ -1,7 +1,8 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppQueryState } from "../../navigation/queryState";
-import type { Movie, Profile, RecommendationFeed } from "../../types/api";
+import type { Movie, PlaybackSession, Profile, RecommendationFeed } from "../../types/api";
+import { getPlaybackSessionRevision, invalidatePlaybackSessions } from "../../api/playbackSessionEvents";
 import { useCatalogController } from "./useCatalogController";
 
 const mocks = vi.hoisted(() => ({
@@ -17,6 +18,10 @@ const profile: Profile = { id: "profile one", name: "Viewer", avatarColor: "", t
 
 function movie(id: string): Movie {
   return { id, title: id, description: "", thumbnailUrl: "", bannerUrl: null, videoUrl: `/media/${id}`, genres: ["Drama"], duration: "", releaseYear: 2025, rating: null, cast: [], director: null, type: "movie", quality: "", languages: [], subtitles: [], voteAverage: 0, voteCount: 0, skipMarkers: {}, availability: "available" };
+}
+
+function playback(movieId: string, overrides: Partial<PlaybackSession> = {}): PlaybackSession {
+  return { movieId, profileId: profile.id, timestamp: 5970, durationWatched: 5970, completionRate: 0.968, updatedAt: "2026-10-15T10:00:00Z", episodeId: null, isFinished: false, ...overrides };
 }
 
 function feed(category: string, ids: string[], total = ids.length, watchAgain: string[] = []): RecommendationFeed {
@@ -159,5 +164,75 @@ describe("useCatalogController recommendations", () => {
     await waitFor(() => expect(result.current.recommendation?.items.map((entry) => entry.media.id)).toEqual(["liked"]));
     expect(result.current.recommendation?.watchAgain.map((entry) => entry.media.id)).toEqual(["hidden", "liked"]);
     expect(result.current.recommendation?.watchAgain[0].viewerPreference).toBe("dislike");
+  });
+});
+
+describe("useCatalogController playback acknowledgments", () => {
+  const query: AppQueryState = { profile: profile.id, view: "details", media: "late-movie" };
+
+  it("keeps unfinished late movies visible while retaining the series cutoff", async () => {
+    mocks.getMovies.mockResolvedValue([movie("late-movie"), { ...movie("late-series"), type: "series" }, movie("finished-movie"), movie("episode-movie")]);
+    mocks.getPlaybackSessions.mockResolvedValue([
+      playback("late-movie"), playback("late-series", { episodeId: "ep_1" }),
+      playback("finished-movie", { isFinished: true }), playback("episode-movie", { episodeId: "ep_2" }),
+    ]);
+    const { result } = renderHook(() => useCatalogController(profile, query));
+    await waitFor(() => expect(result.current.sessions).toHaveLength(4));
+    expect(result.current.continueWatching.map((item) => item.id)).toEqual(["late-movie"]);
+    expect(result.current.sessions[0]).toMatchObject({ timestamp: 5970, completionRate: 0.968 });
+  });
+
+  it("refetches on a matching ACK and prevents the older mount response from overwriting it or the cache", async () => {
+    const ackProfile = { ...profile, id: "late-close-ack-profile" };
+    let resolveOld!: (value: PlaybackSession[]) => void;
+    const old = new Promise<PlaybackSession[]>((resolve) => { resolveOld = resolve; });
+    mocks.getMovies.mockResolvedValue([movie("late-movie")]);
+    mocks.getPlaybackSessions.mockReturnValueOnce(old).mockResolvedValueOnce([playback("late-movie", { isFinished: true })]);
+    const first = renderHook(() => useCatalogController(ackProfile, query));
+    await waitFor(() => expect(mocks.getPlaybackSessions).toHaveBeenCalledTimes(1));
+    const signal = mocks.getPlaybackSessions.mock.calls[0][1] as AbortSignal;
+    const revision = getPlaybackSessionRevision(ackProfile.id);
+    act(() => invalidatePlaybackSessions(ackProfile.id));
+    expect(getPlaybackSessionRevision(ackProfile.id)).toBe(revision + 1);
+    expect(signal.aborted).toBe(true);
+    await waitFor(() => expect(first.result.current.sessions[0]?.isFinished).toBe(true));
+    await act(async () => { resolveOld([playback("late-movie")]); });
+    expect(first.result.current.sessions[0]?.isFinished).toBe(true);
+    expect(first.result.current.continueWatching).toEqual([]);
+    first.unmount();
+    mocks.getPlaybackSessions.mockImplementation(() => new Promise<PlaybackSession[]>(() => undefined));
+    const second = renderHook(() => useCatalogController(ackProfile, query));
+    expect(second.result.current.sessions[0]?.isFinished).toBe(true);
+    second.unmount();
+    const requests = mocks.getPlaybackSessions.mock.calls.length;
+    act(() => invalidatePlaybackSessions(ackProfile.id));
+    expect(mocks.getPlaybackSessions).toHaveBeenCalledTimes(requests);
+  });
+
+  it("scopes ACKs and late responses to the mounted profile", async () => {
+    const other = { ...profile, id: "other-playback-profile" };
+    const firstProfile = { ...profile, id: "first-playback-profile" };
+    let resolveOld!: (value: PlaybackSession[]) => void;
+    mocks.getPlaybackSessions.mockReturnValueOnce(new Promise<PlaybackSession[]>((resolve) => { resolveOld = resolve; })).mockResolvedValueOnce([]).mockResolvedValueOnce([playback("other-movie")]);
+    const { result, rerender } = renderHook(({ active }) => useCatalogController(active, query), { initialProps: { active: firstProfile } });
+    await waitFor(() => expect(mocks.getPlaybackSessions).toHaveBeenCalledTimes(1));
+    rerender({ active: other });
+    await waitFor(() => expect(mocks.getPlaybackSessions).toHaveBeenCalledTimes(2));
+    act(() => invalidatePlaybackSessions(firstProfile.id));
+    expect(mocks.getPlaybackSessions).toHaveBeenCalledTimes(2);
+    act(() => invalidatePlaybackSessions(other.id));
+    await waitFor(() => expect(result.current.sessions[0]?.movieId).toBe("other-movie"));
+    await act(async () => { resolveOld([playback("wrong-profile-movie")]); });
+    expect(result.current.sessions[0]?.movieId).toBe("other-movie");
+  });
+
+  it("retains server-confirmed progress after a failed ACK refresh without retry polling", async () => {
+    const failureProfile = { ...profile, id: "playback-refresh-failure" };
+    mocks.getPlaybackSessions.mockResolvedValueOnce([playback("late-movie")]).mockRejectedValueOnce(new Error("offline"));
+    const { result } = renderHook(() => useCatalogController(failureProfile, query));
+    await waitFor(() => expect(result.current.sessions).toHaveLength(1));
+    act(() => invalidatePlaybackSessions(failureProfile.id));
+    await waitFor(() => expect(mocks.getPlaybackSessions).toHaveBeenCalledTimes(2));
+    expect(result.current.sessions[0]).toMatchObject({ isFinished: false, timestamp: 5970, completionRate: 0.968 });
   });
 });

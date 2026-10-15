@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getMovie, getMovies, search as searchServer } from "../../api/movies";
 import { getPlaybackSessions } from "../../api/playback";
+import { getPlaybackSessionRevision, subscribePlaybackSessions } from "../../api/playbackSessionEvents";
 import { getMediaPreferences, getRecommendations, setMediaPreference } from "../../api/recommendations";
 import { getWatchlist } from "../../api/watchlist";
 import { isCatalogView, type AppQueryState, type CatalogView } from "../../navigation/queryState";
@@ -148,15 +149,10 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
       })
       .finally(() => { if (!abort.signal.aborted) setCatalogLoading(false); });
     void Promise.allSettled([
-      getPlaybackSessions(profile.id, abort.signal),
       getWatchlist(profile.id, abort.signal),
       getMediaPreferences(profile.id, abort.signal),
-    ]).then(([playback, saved, preferenceMap]) => {
+    ]).then(([saved, preferenceMap]) => {
       if (abort.signal.aborted) return;
-      if (playback.status === "fulfilled") {
-        setSessions(playback.value);
-        updateCatalogBootstrap(profile.id, { sessions: playback.value });
-      }
       if (saved.status === "fulfilled") {
         setWatchlist(saved.value);
         updateCatalogBootstrap(profile.id, { watchlist: saved.value });
@@ -167,6 +163,25 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
       }
     });
     return () => abort.abort();
+  }, [profile.id]);
+
+  useEffect(() => {
+    let disposed = false;
+    let request: AbortController | null = null;
+    const refresh = () => {
+      request?.abort();
+      const abort = new AbortController();
+      request = abort;
+      const revision = getPlaybackSessionRevision(profile.id);
+      void getPlaybackSessions(profile.id, abort.signal).then((playback) => {
+        if (disposed || abort.signal.aborted || revision !== getPlaybackSessionRevision(profile.id)) return;
+        setSessions(playback);
+        updateCatalogBootstrap(profile.id, { sessions: playback });
+      }).catch(() => { /* Keep the last server-confirmed sessions when refresh fails. */ });
+    };
+    const unsubscribe = subscribePlaybackSessions(profile.id, refresh);
+    refresh();
+    return () => { disposed = true; unsubscribe(); request?.abort(); };
   }, [profile.id]);
 
   useEffect(() => {
@@ -281,7 +296,7 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   const continueWatching = useMemo(() => {
     const seen = new Set<string>();
     return [...sessions]
-      .filter((session) => !session.isFinished && session.completionRate < 0.95)
+      .filter((session) => !session.isFinished && (session.completionRate < 0.95 || (mediaById.get(session.movieId)?.type === "movie" && !session.episodeId)))
       .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
       .map((session) => mediaById.get(session.movieId))
       .filter((movie): movie is Movie => Boolean(movie))

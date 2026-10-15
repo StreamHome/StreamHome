@@ -14,7 +14,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 import services.recommendation as recommendation
 import db as db_module
 from config import settings
-from models import Episode, Movie, Profile, ProfileMediaPreference, ProfileTaste, RecommendationExposure, RecommendationExposureInput, RecommendationFeedResponse, RecommendationRuntimeMetric, TelemetryRequest, ViewingAttempt
+from models import Episode, Movie, PlaybackMilestone, Profile, ProfileMediaPreference, ProfileTaste, RecommendationExposure, RecommendationExposureInput, RecommendationFeedResponse, RecommendationRuntimeMetric, TelemetryEvent, TelemetryRequest, ViewingAttempt
 from services.tmdb import tmdb_client
 
 
@@ -130,8 +130,14 @@ async def main() -> None:
 
         first_attempt = await recommendation.record_playback_progress("profile", "m_1", None, 4000, 4000, 0.80, False)
         assert first_attempt
+        completed_attempt = await recommendation.record_playback_progress("profile", "m_1", None, 4000, 0, 0.80, True)
+        assert completed_attempt == first_attempt, "credits exit must complete the same viewing attempt"
         async with AsyncSession(test_engine) as db:
             attempt = await db.get(ViewingAttempt, first_attempt)
+            assert attempt.completed_at is not None, "semantic credits completion must be recorded"
+            assert attempt.max_completion == 0.80 and attempt.duration_watched == 4000, "completion must preserve actual progress"
+            assert not (await db.exec(select(PlaybackMilestone).where(PlaybackMilestone.attempt_id == first_attempt, PlaybackMilestone.milestone == 95))).first(), "credits completion must not fabricate a 95% milestone"
+            assert not (await db.exec(select(TelemetryEvent).where(TelemetryEvent.movie_id == "m_1", TelemetryEvent.event_type == "playback_95"))).first(), "credits completion must not fabricate a taste reward"
             attempt.last_seen_at = time.time() - recommendation.ATTEMPT_GAP_SECONDS - 5
             db.add(attempt)
             await db.commit()

@@ -37,6 +37,7 @@ from services.media_probe import merge_local_external_audio, probe_cloud_externa
 from services.media_analysis import current_duration_analysis, duration_label, refreshed_analysis, stored_analysis
 from services.media_updates import atomic_json_write, metadata_payload, persist_portable_metadata
 from services.playback_prep import playback_prep_service
+from services.playback_markers import is_credits_exit_position
 from services.playback_source import LocalPlaybackSource, PlaybackSourceFailure, source_reader
 from services.ingest_preview import IngestPreviewError, ingest_preview_service
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url
@@ -775,18 +776,18 @@ def media_duration_seconds(media_obj: Any) -> float:
     return probed if probed > 0 else catalog_duration_seconds(getattr(media_obj, "duration", ""))
 
 
-def resume_position(session_rec: Optional[PlaybackSession], duration: float) -> float:
+def resume_position(session_rec: Optional[PlaybackSession], duration: float, *, is_movie: bool = False) -> float:
     if not session_rec or session_rec.is_finished or duration <= 0:
         return 0
     position = max(0.0, float(session_rec.timestamp))
-    return position if position >= 30 and position / duration < 0.95 else 0
+    return position if 30 <= position < duration and (is_movie or position / duration < 0.95) else 0
 
 
 async def run_resume_position(db: AsyncSession, run: PlaybackRun, media_obj: Any) -> float:
     filters = [PlaybackSession.profile_id == run.profile_id, PlaybackSession.movie_id == run.movie_id]
     filters.append(PlaybackSession.episode_id == run.episode_id if run.episode_id else PlaybackSession.episode_id.is_(None))
     session_rec = (await db.exec(select(PlaybackSession).where(*filters))).first()
-    return resume_position(session_rec, media_duration_seconds(media_obj))
+    return resume_position(session_rec, media_duration_seconds(media_obj), is_movie=not run.episode_id and media_obj.type == "movie")
 
 
 def source_metadata(media_obj: Any) -> PlaybackSourceMetadata:
@@ -1173,7 +1174,7 @@ async def _create_playback_run_locked(req: PlaybackRunRequest, request: Request,
     filters = [PlaybackSession.profile_id == req.profile_id, PlaybackSession.movie_id == req.movie_id]
     filters.append(PlaybackSession.episode_id == req.episode_id if req.episode_id else PlaybackSession.episode_id.is_(None))
     session_rec = (await db.exec(select(PlaybackSession).where(*filters))).first()
-    position = resume_position(session_rec, media_duration_seconds(media_obj))
+    position = resume_position(session_rec, media_duration_seconds(media_obj), is_movie=not req.episode_id and movie.type == "movie")
     now = time.time()
     run = PlaybackRun(
         id=str(uuid.uuid4()),
@@ -1370,7 +1371,19 @@ async def _update_playback_progress_locked(
         elapsed_bound = max(0.0, now - run.created_at + 2.0 - run.total_seconds_played)
     accepted_watched = min(float(requested_watched), 120.0, elapsed_bound)
     timestamp = max(0.0, min(float(req.timestamp), duration))
-    finished = bool(req.is_finished or req.event == "ended" or timestamp / duration >= 0.995)
+    analysis = stored_analysis(media_obj.analysis_metadata_str)
+    credits_exit = (
+        req.event == "exit"
+        and run.source_kind == "catalog"
+        and not run.episode_id
+        and media_obj.type == "movie"
+        and bool(run.source_fingerprint)
+        and run.source_fingerprint == media_obj.source_fingerprint
+        and current_duration_analysis(analysis)
+        and analysis.get("source_fingerprint") == run.source_fingerprint
+        and is_credits_exit_position(media_obj.skip_markers, timestamp, media_obj.probed_duration)
+    )
+    finished = bool(req.is_finished or req.event == "ended" or timestamp / duration >= 0.995 or credits_exit)
 
     run.sequence_number += 1
     run.total_seconds_played += int(accepted_watched)

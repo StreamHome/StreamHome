@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,7 +26,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from db import get_session
-from models import AuthSession, DownloadTask, Movie, PlaybackRun, PlaybackSession, Profile, User
+from models import AuthSession, DownloadTask, Episode, Movie, PlaybackRun, PlaybackSession, Profile, User
 from routes.auth import get_current_user
 from routes.playback import ensure_source_metadata, router
 from services.media_source import resolve_media_source
@@ -201,6 +202,147 @@ class PlaybackContractRegression(unittest.TestCase):
             else:
                 self.assertEqual(payload["renditions"], [])
         return payload
+
+    @contextmanager
+    def credits_run(self, markers=None, *, duration=120, source_kind="catalog", matching_source=True,
+                    duration_proof=True, matching_proof=True, episode=False):
+        """Modify only this disposable catalog fixture, restoring it on every path."""
+        run = self.create_run()
+        self.assertEqual(self.client.post(f"/api/playback/runs/{run['runId']}/start-over").status_code, 200)
+        episode_id = f"ep_credits_{uuid.uuid4().hex}" if episode else None
+
+        async def seed():
+            async with AsyncSession(self.engine, expire_on_commit=False) as db:
+                movie = await db.get(Movie, "m_playback_contract")
+                previous = (movie.skip_markers_str, movie.probed_duration, movie.type, movie.analysis_metadata_str)
+                movie.skip_markers = markers if markers is not None else {"credits": [{"start": 100, "end": 110}]}
+                movie.probed_duration = duration
+                analysis = json.loads(movie.analysis_metadata_str)
+                if not duration_proof:
+                    analysis["measurement_version"] = 1
+                if not matching_proof:
+                    analysis["source_fingerprint"] = "obsolete-proof"
+                movie.analysis_metadata_str = json.dumps(analysis)
+                playback_run = await db.get(PlaybackRun, run["runId"])
+                playback_run.source_kind = source_kind
+                playback_run.source_fingerprint = movie.source_fingerprint if matching_source else "obsolete-source"
+                playback_run.created_at = time.time() - 60
+                playback_run.last_progress_at = time.time() - 60
+                if episode_id:
+                    movie.type = "series"
+                    item = Episode(id=episode_id, movie_id=movie.id, season_number=1, episode_number=1,
+                                   title="Credits episode", description="", thumbnail_url="", video_url=movie.video_url,
+                                   duration="2m", probed_duration=duration, source_fingerprint=movie.source_fingerprint)
+                    item.skip_markers = movie.skip_markers
+                    db.add(item)
+                    playback_run.episode_id = episode_id
+                db.add(movie)
+                db.add(playback_run)
+                await db.commit()
+                return previous
+
+        previous = asyncio.run(seed())
+        try:
+            yield run
+        finally:
+            async def restore():
+                async with AsyncSession(self.engine) as db:
+                    movie = await db.get(Movie, "m_playback_contract")
+                    movie.skip_markers_str, movie.probed_duration, movie.type, movie.analysis_metadata_str = previous
+                    db.add(movie)
+                    if episode_id:
+                        for session in (await db.exec(select(PlaybackSession).where(PlaybackSession.episode_id == episode_id))).all():
+                            await db.delete(session)
+                        await db.delete(await db.get(Episode, episode_id))
+                    await db.commit()
+            asyncio.run(restore())
+
+    def test_credits_exit_boundaries_preserve_actual_position_and_sticky_completion(self) -> None:
+        for timestamp, finished in ((89.999, False), (90, True), (100, True), (109.999, True), (110, False)):
+            with self.subTest(timestamp=timestamp), self.credits_run() as run:
+                body = {"timestamp": timestamp, "duration_watched": 3, "total_seconds_played": 3,
+                        "sequence_number": 999, "event": "exit"}
+                with patch("routes.playback.record_playback_progress", new=AsyncMock(return_value="attempt")) as record:
+                    closed = self.client.post(f"/api/playback/runs/{run['runId']}/close", json=body)
+                    self.assertEqual(closed.status_code, 200, closed.text)
+                    self.assertEqual(closed.json()["status"], "finished" if finished else "abandoned")
+                    self.assertEqual(record.call_args.kwargs["is_finished"], finished)
+                    self.assertAlmostEqual(record.call_args.kwargs["completion_rate"], timestamp / 120)
+                    self.assertEqual(record.call_args.kwargs["duration_watched"], 3)
+                    repeated = self.client.post(f"/api/playback/runs/{run['runId']}/close", json=body)
+                    self.assertEqual(repeated.status_code, 200, repeated.text)
+                    self.assertEqual(record.await_count, 1)
+
+                async def read():
+                    async with AsyncSession(self.engine) as db:
+                        session = (await db.exec(select(PlaybackSession).where(
+                            PlaybackSession.profile_id == "contract-profile", PlaybackSession.movie_id == "m_playback_contract",
+                            PlaybackSession.episode_id.is_(None)))).one()
+                        return session.timestamp, session.completion_rate, session.duration_watched, session.is_finished
+                saved = asyncio.run(read())
+                self.assertEqual(saved[0], int(timestamp))
+                self.assertAlmostEqual(saved[1], timestamp / 120)
+                self.assertEqual(saved[2:], (3, finished))
+                late = self.client.post(f"/api/playback/runs/{run['runId']}/progress", json={**body, "timestamp": 20})
+                self.assertEqual(late.status_code, 200 if finished else 410)
+                if finished:
+                    self.assertEqual(late.json()["status"], "sticky_finished")
+                    replayed = self.client.post(f"/api/playback/runs/{run['runId']}/start-over")
+                    self.assertEqual(replayed.status_code, 200)
+                    self.assertFalse(asyncio.run(read())[3])
+
+    def test_credits_do_not_complete_ordinary_progress_or_unsupported_run_sources(self) -> None:
+        for event in ("heartbeat", "pause", "seek", "visibility"):
+            with self.subTest(event=event), self.credits_run() as run:
+                response = self.client.post(f"/api/playback/runs/{run['runId']}/progress", json={
+                    "timestamp": 105, "sequence_number": 1, "event": event})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["status"], "ok")
+        for options in ({"source_kind": "ingest_preview"}, {"matching_source": False}, {"duration": 0},
+                        {"duration_proof": False}, {"matching_proof": False}, {"episode": True}):
+            with self.subTest(options=options), self.credits_run(**options) as run:
+                response = self.client.post(f"/api/playback/runs/{run['runId']}/close", json={
+                    "timestamp": 105, "sequence_number": 1, "event": "exit"})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["status"], "abandoned")
+
+    def test_credits_close_discard_and_concurrent_progress_keep_one_completion_write(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        with self.credits_run() as run:
+            body = {"timestamp": 105, "sequence_number": 1, "total_seconds_played": 3, "event": "exit"}
+            with patch("routes.playback.record_playback_progress", new=AsyncMock()) as record:
+                discarded = self.client.post(f"/api/playback/runs/{run['runId']}/close", json={**body, "discard_progress": True})
+                self.assertEqual(discarded.json()["status"], "abandoned")
+                record.assert_not_awaited()
+        with self.credits_run() as run:
+            body = {"timestamp": 105, "sequence_number": 1, "total_seconds_played": 3, "event": "exit"}
+            with self.client as client, ThreadPoolExecutor(max_workers=2) as pool:
+                heartbeat = pool.submit(client.post, f"/api/playback/runs/{run['runId']}/progress", json={**body, "timestamp": 70, "event": "heartbeat"})
+                closing = pool.submit(client.post, f"/api/playback/runs/{run['runId']}/close", json=body)
+                self.assertEqual(heartbeat.result().status_code, 200)
+                self.assertEqual(closing.result().json()["status"], "finished")
+            async def total():
+                async with AsyncSession(self.engine) as db:
+                    record = await db.get(PlaybackRun, run["runId"])
+                    return record.total_seconds_played, record.lifecycle_state
+            self.assertEqual(asyncio.run(total()), (3, "finished"))
+
+    def test_unfinished_movie_beyond_95_percent_resumes_before_credits(self) -> None:
+        markers = {"credits": [{"start": 990, "end": 1000}]}
+        with self.credits_run(markers, duration=1000) as run:
+            response = self.client.post(f"/api/playback/runs/{run['runId']}/progress", json={
+                "timestamp": 960, "sequence_number": 1, "event": "pause"})
+            self.assertEqual(response.json()["status"], "ok")
+            refreshed = self.client.get(f"/api/playback/runs/{run['runId']}")
+            self.assertEqual(refreshed.status_code, 200, refreshed.text)
+            self.assertEqual(refreshed.json()["resumePosition"], 960)
+        from routes.playback import resume_position
+        session = PlaybackSession(profile_id="profile", movie_id="movie", timestamp=960, updated_at="", is_finished=False)
+        self.assertEqual(resume_position(session, 1000, is_movie=True), 960)
+        self.assertEqual(resume_position(session, 1000), 0)
+        self.assertEqual(resume_position(session, 120, is_movie=True), 0)
+        session.is_finished = True
+        self.assertEqual(resume_position(session, 1000, is_movie=True), 0)
 
     def test_ready_hls_manifest_serves_only_existing_ticket_protected_assets(self) -> None:
         run = self.create_run()

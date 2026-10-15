@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { activeMarkerRegion, deriveMarkerRegions } from "./playerMarkers";
+import { activeMarkerRegion, canSkipMarkerRegion, deriveMarkerRegions } from "./playerMarkers";
 
 describe("player marker regions", () => {
   it("places actual Snatch intro and credits on its measured timeline", () => {
@@ -12,6 +12,8 @@ describe("player marker regions", () => {
     expect(activeMarkerRegion(regions, 32)).toBeNull();
     expect(activeMarkerRegion(regions, 5964)?.kind).toBe("credits");
     expect(activeMarkerRegion(regions, 6166)).toBeNull();
+    expect(canSkipMarkerRegion(regions[0])).toBe(true);
+    expect(canSkipMarkerRegion(regions[1])).toBe(false);
   });
 
   it("clips to duration without mutating source metadata or filling gaps/postcredits", () => {
@@ -52,5 +54,35 @@ describe("player marker regions", () => {
   it("does not activate a region for invalid media positions", () => {
     const regions = deriveMarkerRegions({ intro: [{ start: 0, end: 32 }] }, 100);
     for (const time of [-1, NaN, Infinity, -Infinity]) expect(activeMarkerRegion(regions, time)).toBeNull();
+  });
+
+  it("suppresses only the connected terminal credits tail without changing timeline regions", () => {
+    const markers = { credits: [{ start: 60, end: 70 }, { start: 80, end: 90 }, { start: 90, end: 96 }, { start: 95, end: 100 }] };
+    const regions = deriveMarkerRegions(markers, 100);
+    expect(regions.map(({ start, end }) => ({ start, end }))).toEqual(markers.credits);
+    expect(regions.map(canSkipMarkerRegion)).toEqual([true, false, false, false]);
+    expect(activeMarkerRegion(regions, 75)).toBeNull();
+    expect(activeMarkerRegion(regions, 85)?.label).toBe("Credits");
+  });
+
+  it("does not bridge even a subsecond gap between credits intervals", () => {
+    const regions = deriveMarkerRegions({ credits: [{ start: 80, end: 99.6 }, { start: 99.8, end: 100 }] }, 100);
+    expect(regions.map(canSkipMarkerRegion)).toEqual([true, false]);
+    expect(activeMarkerRegion(regions, 99.7)).toBeNull();
+  });
+
+  it.each([99.5, 100, 100.5])("accepts only tiny raw EOF rounding at %s seconds", (end) => {
+    const [region] = deriveMarkerRegions({ credits: [{ start: 80, end }] }, 100);
+    expect(canSkipMarkerRegion(region)).toBe(false);
+  });
+
+  it.each([99.499, 100.501, 95, 90, 10000])("retains the action for a raw end of %s seconds", (end) => {
+    const [region] = deriveMarkerRegions({ credits: [{ start: 80, end }] }, 100);
+    expect(canSkipMarkerRegion(region)).toBe(true);
+  });
+
+  it("recognizes credits case-insensitively without granting custom labels terminal semantics", () => {
+    const regions = deriveMarkerRegions({ CrEdItS: [{ start: 80, end: 100 }], outro: [{ start: 80, end: 100 }], post_credits: [{ start: 80, end: 100 }], custom_credits: [{ start: 80, end: 100 }] }, 100);
+    expect(regions.filter((region) => !canSkipMarkerRegion(region)).map((region) => region.kind)).toEqual(["CrEdItS"]);
   });
 });

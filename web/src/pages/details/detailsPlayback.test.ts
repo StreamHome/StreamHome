@@ -34,9 +34,19 @@ describe("details playback actions", () => {
     expect(target).toMatchObject({ mediaId: "ep_4", label: "Resume S2 E3 from 1:05", context: "The Return" });
   });
 
-  it("does not offer resume for completed, nearly completed, or untouched sessions", () => {
-    expect(latestResumeSession("m_1", [session({ isFinished: true })])).toBeNull();
-    expect(latestResumeSession("m_1", [session({ completionRate: 0.96 })])).toBeNull();
-    expect(latestResumeSession("m_1", [session({ timestamp: 0 })])).toBeNull();
+  it("retains the actual late movie position until the server marks it finished", () => {
+    const late = session({ timestamp: 5970, completionRate: 0.968 });
+    expect(detailsResumeTarget(movie, [], [late])).toMatchObject({
+      session: late,
+      label: "Resume from 1:39:30",
+    });
+    expect(latestResumeSession(movie, [{ ...late, isFinished: true }])).toBeNull();
+    expect(latestResumeSession(movie, [session({ timestamp: 0 })])).toBeNull();
+  });
+
+  it("preserves the existing near-completion cutoff for series and episode sessions", () => {
+    expect(latestResumeSession(series, [session({ movieId: series.id, episodeId: "ep_4", completionRate: 0.96 })])).toBeNull();
+    expect(latestResumeSession(series, [session({ movieId: series.id, completionRate: 0.96 })])).toBeNull();
+    expect(latestResumeSession(movie, [session({ episodeId: "ep_4", completionRate: 0.96 })])).toBeNull();
   });
 });

@@ -8,6 +8,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 
 import { ApiError } from "../../api/client";
 import { getEpisodes, getMovie } from "../../api/movies";
+import { invalidatePlaybackSessions } from "../../api/playbackSessionEvents";
 import {
   closePlaybackRun,
   createPlaybackRun,
@@ -35,7 +36,7 @@ import { formatDuration } from "../../utils/format";
 import { hasSubtitleOptions, PlayerControlMenu, PlayerIcon, PlayerIconButton, PlayerMenuProvider, PlayerSettings, PlayerVolume } from "./PlayerControls";
 import { languageDisplayName, normalizeLanguageTag } from "./language";
 import { playerControlOwnsKey, restorePlayerPointerFocus } from "./playerKeyboard";
-import { activeMarkerRegion, deriveMarkerRegions } from "./playerMarkers";
+import { activeMarkerRegion, canSkipMarkerRegion, deriveMarkerRegions } from "./playerMarkers";
 import { PlayerSkipControl, PlayerTimelineShell } from "./PlayerMarkerControls";
 import {
   playerFullscreenMode,
@@ -1024,8 +1025,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       event: "exit",
     }).then((response) => {
       if (runResponseRef.current?.runId === activeRun.runId) sequenceNumberRef.current = Math.max(sequenceNumberRef.current, response.nextSequenceNumber);
+      if (profile?.id) invalidatePlaybackSessions(profile.id);
     }).catch(() => undefined);
-  }, [visualFixture]);
+  }, [profile?.id, visualFixture]);
 
   const exitPlayer = useCallback(() => {
     unlockPlayerLandscape();
@@ -2622,6 +2624,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         } as const;
         try {
           const response = await updatePlaybackProgress(activeRun.runId, request, keepalive);
+          if (profile?.id && (response.status === "finished" || event === "ended")) invalidatePlaybackSessions(profile.id);
           if (runResponseRef.current?.runId !== activeRun.runId) return;
           sequenceNumberRef.current = Math.max(sequenceNumberRef.current, response.nextSequenceNumber);
           return;
@@ -2645,6 +2648,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
               { ...request, sequenceNumber: fresh.nextSequenceNumber },
               keepalive,
             );
+            if (profile?.id && (retryResponse.status === "finished" || event === "ended")) invalidatePlaybackSessions(profile.id);
             if (runResponseRef.current?.runId !== activeRun.runId) return;
             sequenceNumberRef.current = Math.max(sequenceNumberRef.current, retryResponse.nextSequenceNumber);
           } catch (retryError: unknown) {
@@ -2657,7 +2661,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           }
         }
       });
-  }, [captureWatchedTime, visualFixture]);
+  }, [captureWatchedTime, profile?.id, visualFixture]);
 
   useEffect(() => {
     if (!runResponse || visualFixture) return;
@@ -3707,8 +3711,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   };
 
   const markerRegions = useMemo(() => deriveMarkerRegions(asset?.skipMarkers ?? {}, duration), [asset?.skipMarkers, duration]);
+  const currentMarker = activeMarkerRegion(markerRegions, confirmedTimeRef.current);
   const skipMarker = pendingSeekTargetRef.current === null && !["ended", "fatal", "unavailable"].includes(phase)
-    ? activeMarkerRegion(markerRegions, confirmedTimeRef.current) : null;
+    && currentMarker && canSkipMarkerRegion(currentMarker) ? currentMarker : null;
   const timelineRegion = activeMarkerRegion(markerRegions, currentTime);
   const captionSignature = captionLines.map((line) => line.key).join("|");
   const timelineObstacleKey = `${skipMarker?.id ?? ""}:${captionSignature}:${mobilePlayer}`;
