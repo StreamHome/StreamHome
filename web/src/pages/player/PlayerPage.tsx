@@ -33,6 +33,7 @@ import type {
 import { formatDuration } from "../../utils/format";
 import { hasSubtitleOptions, PlayerControlMenu, PlayerIcon, PlayerIconButton, PlayerMenuProvider, PlayerSettings, PlayerVolume } from "./PlayerControls";
 import { languageDisplayName, normalizeLanguageTag } from "./language";
+import { playerControlOwnsKey, restorePlayerPointerFocus } from "./playerKeyboard";
 import {
   playerFullscreenMode,
   releaseViewportPlayerFullscreen,
@@ -3059,6 +3060,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [ensureMobileLandscape, safePlay]);
 
   const handleDesktopSurfaceClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const button = event.target instanceof Element ? event.target.closest<HTMLElement>("button") : null;
+    if (event.detail > 0 && button && !button.hasAttribute("aria-haspopup")) restorePlayerPointerFocus(button);
     if (mobilePlayer || (event.target !== event.currentTarget && event.target !== videoRef.current)) return;
     revealControls();
     if (event.detail !== 1) return;
@@ -3200,7 +3203,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
       if (event.key === "Tab" && !showControlsRef.current) {
         event.preventDefault();
         revealControls();
@@ -3210,8 +3213,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         });
         return;
       }
-      const buttonTarget = event.target instanceof Element && event.target.closest("button");
-      if (buttonTarget && [" ", "Enter", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
       if (event.key === "Escape") {
         if (controlMenuOpenRef.current) return;
         if (fullscreenMode === "viewport") {
@@ -3223,7 +3224,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         revealControls();
         return;
       }
-      if (isInteractiveTarget(event.target)) return;
+      if (playerControlOwnsKey(event)) return;
       const shortcut = playerKeyboardShortcut(event);
       if (!shortcut) return;
       suppressPlayerShortcutEvent(event);
@@ -3255,9 +3256,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       revealControls();
     };
     const handleKeyUp = (event: KeyboardEvent) => {
-      if (event.ctrlKey || event.metaKey || event.altKey) return;
-      if (event.target instanceof Element && event.target.closest("button") && [" ", "Enter", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
-      if (isInteractiveTarget(event.target) || !playerKeyboardShortcut(event)) return;
+      if (playerControlOwnsKey(event) || !playerKeyboardShortcut(event)) return;
       suppressPlayerShortcutEvent(event);
     };
     document.addEventListener("keydown", handleKeyDown, true);
@@ -3416,14 +3415,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     updateTimelinePointerPreview(event, value);
     event.currentTarget.releasePointerCapture?.(event.pointerId);
     commitTimelineScrub(value);
+    restorePlayerPointerFocus(event.currentTarget);
   }, [commitTimelineScrub, timelinePointerValue, updateTimelinePointerPreview]);
 
-  const cancelTimelineScrub = useCallback(() => {
+  const cancelTimelineScrub = useCallback((event: React.PointerEvent<HTMLInputElement>) => {
     if (!scrubbingRef.current) return;
     scrubbingRef.current = false;
     setTimelineScrubbing(false);
     previewTimelineScrub(confirmedTimeRef.current);
     revealControls();
+    restorePlayerPointerFocus(event.currentTarget);
   }, [previewTimelineScrub, revealControls]);
 
   const changeQuality = (renditionId: string) => {
@@ -3697,7 +3698,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       tabIndex={-1}
       style={{ "--caption-scale": preferences.captionScale } as React.CSSProperties}
       onMouseMove={mobilePlayer ? undefined : handleDesktopPointerActivity}
-      onClick={mobilePlayer ? undefined : handleDesktopSurfaceClick}
+      onClick={handleDesktopSurfaceClick}
       onDoubleClick={mobilePlayer ? undefined : handleDesktopSurfaceDoubleClick}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}

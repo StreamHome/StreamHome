@@ -98,6 +98,40 @@ const playback: ResolvedPlayback = {
 
 const playerPreferencesKey = `streamhome_player_preferences_${profile.id}`;
 
+function pointerClick(target: HTMLElement) {
+  fireEvent.pointerDown(target, { pointerType: "mouse", pointerId: 1 });
+  act(() => target.focus());
+  fireEvent.pointerUp(target, { pointerType: "mouse", pointerId: 1 });
+  fireEvent.click(target, { detail: 1 });
+}
+
+function pressFocusedKey(key: string, init: KeyboardEventInit = {}) {
+  const down = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...init });
+  act(() => { fireEvent(document.activeElement ?? document.body, down); });
+  const up = new KeyboardEvent("keyup", { key, bubbles: true, cancelable: true, ...init });
+  act(() => { fireEvent(document.activeElement ?? document.body, up); });
+  return { down, up };
+}
+
+function videoCallCount(method: "play" | "pause" | "load", video: HTMLVideoElement) {
+  return vi.mocked(HTMLMediaElement.prototype[method]).mock.contexts.filter((element) => element === video).length;
+}
+
+function showPlayingVideo(video: HTMLVideoElement, time = 30) {
+  Object.defineProperties(video, {
+    duration: { configurable: true, value: 120 },
+    readyState: { configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA },
+    paused: { configurable: true, value: false },
+    currentTime: { configurable: true, writable: true, value: 0 },
+  });
+  fireEvent.loadedMetadata(video);
+  fireEvent.seeked(video);
+  fireEvent.play(video);
+  fireEvent.playing(video);
+  video.currentTime = time;
+  fireEvent.timeUpdate(video);
+}
+
 
 describe("mounted player lifecycle", () => {
   beforeEach(() => {
@@ -149,12 +183,39 @@ describe("mounted player lifecycle", () => {
     expect(video.currentTime).toBe(0);
 
     dispatchTimelinePointer("pointerdown", 100);
+    expect(document.activeElement).toBe(timeline);
     dispatchTimelinePointer("pointermove", 300);
     expect(video.currentTime).toBe(0);
     expect(screen.getByText("1:00")).toBeTruthy();
     dispatchTimelinePointer("pointerup", 300);
 
     expect(video.currentTime).toBe(60);
+    expect(document.activeElement).toBe(view.container.querySelector("[data-player-root='true']"));
+    pressFocusedKey("ArrowLeft");
+    expect(video.currentTime).toBe(50);
+    view.unmount();
+  });
+
+  it("restores shortcut ownership after a cancelled pointer scrub without committing its preview", () => {
+    const view = render(<MemoryRouter><PlayerPage visualFixture={playback} /></MemoryRouter>);
+    const timeline = screen.getByRole("slider", { name: "Playback position" }) as HTMLInputElement;
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    showPlayingVideo(video);
+    vi.spyOn(timeline, "getBoundingClientRect").mockReturnValue({
+      x: 0, y: 0, left: 0, right: 120, top: 0, bottom: 16, width: 120, height: 16, toJSON: () => ({}),
+    });
+    const down = new MouseEvent("pointerdown", { bubbles: true, clientX: 90 });
+    Object.defineProperty(down, "pointerId", { value: 1 });
+    fireEvent(timeline, down);
+    expect(document.activeElement).toBe(timeline);
+    expect(video.currentTime).toBe(30);
+    const cancel = new MouseEvent("pointercancel", { bubbles: true });
+    Object.defineProperty(cancel, "pointerId", { value: 1 });
+    fireEvent(timeline, cancel);
+    expect(video.currentTime).toBe(30);
+    expect(document.activeElement).toBe(view.container.querySelector("[data-player-root='true']"));
+    pressFocusedKey("ArrowRight");
+    expect(video.currentTime).toBe(40);
     view.unmount();
   });
 
@@ -287,25 +348,149 @@ describe("mounted player lifecycle", () => {
     Object.defineProperty(video, "paused", { configurable: true, value: true });
     fireEvent.pause(video);
     play.mockClear();
-    fullscreenButton.focus();
-    fireEvent.keyDown(root, { key: " " });
-    fireEvent.keyUp(root, { key: " " });
+    pointerClick(screen.getByRole("button", { name: "Rewind 10 seconds" }));
+    fireEvent.seeked(video);
+    expect(document.activeElement).toBe(root);
+    pressFocusedKey(" ");
     fireEvent.loadedMetadata(video);
     fireEvent.canPlay(video);
     await waitFor(() => expect(play).toHaveBeenCalled());
 
-    fireEvent.keyDown(document.body, { key: "ArrowDown" });
+    pressFocusedKey("ArrowDown");
     await waitFor(() => expect(video.volume).toBe(0.95));
-    fireEvent.keyDown(document.body, { key: "ArrowUp" });
+    pressFocusedKey("ArrowUp");
     await waitFor(() => expect(video.volume).toBe(1));
     expect(screen.queryByRole("slider", { name: "Volume" })).toBeNull();
 
     video.currentTime = 30;
     fireEvent.timeUpdate(video);
-    fireEvent.keyDown(document.body, { key: "ArrowRight" });
+    pressFocusedKey("ArrowRight");
     expect(video.currentTime).toBe(40);
-    fireEvent.keyDown(document.body, { key: "ArrowLeft" });
+    pressFocusedKey("ArrowLeft");
     expect(video.currentTime).toBe(30);
+    view.unmount();
+  });
+
+  it("keeps keyboard button activation native and restores shortcuts after a pointer action", async () => {
+    const view = render(<MemoryRouter><PlayerPage visualFixture={playback} /></MemoryRouter>);
+    await act(async () => { await import("hls.js"); });
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    showPlayingVideo(video);
+    const source = video.getAttribute("src");
+    const loads = videoCallCount("load", video);
+    const pauses = videoCallCount("pause", video);
+    const rewind = screen.getByRole("button", { name: "Rewind 10 seconds" });
+
+    act(() => rewind.focus());
+    const activation = pressFocusedKey(" ");
+    expect(activation.down.defaultPrevented).toBe(false);
+    expect(activation.up.defaultPrevented).toBe(false);
+    expect(videoCallCount("pause", video)).toBe(pauses);
+    fireEvent.click(rewind, { detail: 0 });
+    expect(video.currentTime).toBe(20);
+    expect(document.activeElement).toBe(rewind);
+
+    pressFocusedKey("ArrowRight");
+    expect(video.currentTime).toBe(30);
+    pointerClick(rewind);
+    expect(video.currentTime).toBe(20);
+    expect(document.activeElement).toBe(view.container.querySelector("[data-player-root='true']"));
+    pressFocusedKey(" ");
+    expect(videoCallCount("pause", video)).toBe(pauses + 1);
+    expect(video.getAttribute("src")).toBe(source);
+    expect(videoCallCount("load", video)).toBe(loads);
+    view.unmount();
+  });
+
+  it.each(["Playback position", "Volume", "Subtitle timing"])("keeps native %s navigation while routing unrelated playback shortcuts", async (label) => {
+    localStorage.setItem(playerPreferencesKey, JSON.stringify({ subtitleTrackId: "subtitle-en" }));
+    const captionPlayback: ResolvedPlayback = {
+      ...playback,
+      runResponse: { ...playback.runResponse, subtitles: [{ id: "subtitle-en", language: "en", label: "English" }] },
+    };
+    const view = render(<MemoryRouter><PlayerPage visualFixture={captionPlayback} /></MemoryRouter>);
+    await act(async () => { await import("hls.js"); });
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    showPlayingVideo(video);
+    if (label === "Volume") act(() => screen.getByRole("button", { name: "Volume" }).focus());
+    if (label === "Subtitle timing") pointerClick(screen.getByRole("button", { name: "Player settings" }));
+    const slider = screen.getByRole("slider", { name: label });
+    act(() => slider.focus());
+    const volume = video.volume;
+    const source = video.getAttribute("src");
+    const loads = videoCallCount("load", video);
+    const pauses = videoCallCount("pause", video);
+
+    for (const key of ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]) {
+      const native = pressFocusedKey(key);
+      expect(native.down.defaultPrevented).toBe(false);
+      expect(native.up.defaultPrevented).toBe(false);
+    }
+    expect(video.currentTime).toBe(30);
+    expect(video.volume).toBe(volume);
+
+    for (const init of [{ ctrlKey: true }, { metaKey: true }, { altKey: true }, { isComposing: true }]) {
+      const preserved = pressFocusedKey("k", init);
+      expect(preserved.down.defaultPrevented).toBe(false);
+      expect(preserved.up.defaultPrevented).toBe(false);
+    }
+    expect(videoCallCount("pause", video)).toBe(pauses);
+    pressFocusedKey("m");
+    expect(video.muted).toBe(true);
+    const space = pressFocusedKey(" ");
+    expect(space.down.defaultPrevented).toBe(true);
+    expect(space.up.defaultPrevented).toBe(true);
+    expect(videoCallCount("pause", video)).toBe(pauses + 1);
+    expect(document.activeElement).toBe(slider);
+    Object.defineProperty(video, "paused", { configurable: true, value: true });
+    fireEvent.pause(video);
+    const plays = videoCallCount("play", video);
+    pressFocusedKey("k");
+    await waitFor(() => expect(videoCallCount("play", video)).toBe(plays + 1));
+    expect(video.getAttribute("src")).toBe(source);
+    expect(videoCallCount("load", video)).toBe(loads);
+    view.unmount();
+  });
+
+  it.each(["Audio language", "Subtitles"])("restores live shortcut ownership after a pointer %s selection", async (label) => {
+    const captionPlayback: ResolvedPlayback = {
+      ...playback,
+      runResponse: { ...playback.runResponse, subtitles: [{ id: "subtitle-en", language: "en", label: "English" }] },
+    };
+    const view = render(<MemoryRouter><PlayerPage visualFixture={captionPlayback} /></MemoryRouter>);
+    await act(async () => { await import("hls.js"); });
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    showPlayingVideo(video);
+    const source = video.getAttribute("src");
+    const loads = videoCallCount("load", video);
+    const pauses = videoCallCount("pause", video);
+    pointerClick(screen.getByRole("button", { name: new RegExp(`^${label}:`) }));
+    pointerClick(screen.getByRole("option", { name: "English" }));
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(document.activeElement).toBe(view.container.querySelector("[data-player-root='true']"));
+    pressFocusedKey(" ");
+    expect(videoCallCount("pause", video)).toBe(pauses + 1);
+    expect(video.getAttribute("src")).toBe(source);
+    expect(videoCallCount("load", video)).toBe(loads);
+    view.unmount();
+  });
+
+  it("allows playing chrome to hide after pointer focus is released", () => {
+    vi.useFakeTimers();
+    const view = render(<MemoryRouter><PlayerPage visualFixture={playback} /></MemoryRouter>);
+    const root = view.container.querySelector("[data-player-root='true']") as HTMLElement;
+    const video = view.container.querySelector("video") as HTMLVideoElement;
+    showPlayingVideo(video);
+    pointerClick(screen.getByRole("button", { name: "Forward 10 seconds" }));
+    fireEvent.seeked(video);
+    expect(document.activeElement).toBe(root);
+    for (let update = 1; update <= 4; update += 1) {
+      video.currentTime = 40 + update;
+      fireEvent.timeUpdate(video);
+      act(() => vi.advanceTimersByTime(800));
+    }
+    expect(root.dataset.playerPhase).toBe("playing");
+    expect(root.dataset.controlsVisible).toBe("false");
     view.unmount();
   });
 
@@ -1123,15 +1308,12 @@ describe("mounted player lifecycle", () => {
     expect(document.activeElement).toBe(player);
     const play = vi.mocked(HTMLMediaElement.prototype.play);
     play.mockClear();
-    focusedFullscreenButton.focus();
-    fireEvent.keyDown(player, { key: " " });
-    fireEvent.keyUp(player, { key: " " });
-    fireEvent.keyDown(player, { key: " " });
-    fireEvent.keyUp(player, { key: " " });
+    pressFocusedKey(" ");
+    pressFocusedKey(" ");
     await waitFor(() => expect(play).toHaveBeenCalled());
     expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeTruthy();
-    fireEvent.keyDown(focusedFullscreenButton, { key: "f" });
-    fireEvent.keyUp(focusedFullscreenButton, { key: "f" });
+    act(() => focusedFullscreenButton.focus());
+    pressFocusedKey("f");
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Fullscreen" })).toBeTruthy());
     expect(player.getAttribute("data-player-viewport-fullscreen")).toBeNull();
@@ -1287,7 +1469,7 @@ describe("mounted player lifecycle", () => {
   it("lets menu triggers own ArrowDown and preserves browser shortcuts", () => {
     const view = render(<MemoryRouter><PlayerPage visualFixture={playback} /></MemoryRouter>);
     const trigger = screen.getByRole("button", { name: /Audio language/ });
-    trigger.focus();
+    act(() => trigger.focus());
     fireEvent.keyDown(trigger, { key: "ArrowDown", code: "ArrowDown" });
     expect(screen.getByRole("listbox", { name: "Audio language" })).toBeTruthy();
     fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });

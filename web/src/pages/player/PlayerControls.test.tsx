@@ -4,6 +4,13 @@ import { describe, expect, it, vi } from "vitest";
 
 import { hasSubtitleOptions, PlayerControlMenu, PlayerIconButton, PlayerMenuProvider, PlayerSettings, PlayerVolume } from "./PlayerControls";
 
+function pointerClick(target: HTMLElement) {
+  fireEvent.pointerDown(target, { pointerType: "mouse", pointerId: 1 });
+  act(() => target.focus());
+  fireEvent.pointerUp(target, { pointerType: "mouse", pointerId: 1 });
+  fireEvent.click(target, { detail: 1 });
+}
+
 describe("subtitle control availability", () => {
   it("hides the subtitle menu on every presentation when no tracks exist", () => {
     expect(hasSubtitleOptions([])).toBe(false);
@@ -19,6 +26,22 @@ describe("player icon controls", () => {
     expect(button.getAttribute("data-tooltip")).toBe("Play");
     expect(button.querySelector("svg[aria-hidden='true']")).not.toBeNull();
     expect(button.textContent).toBe("");
+  });
+
+  it("releases completed pointer focus while preserving keyboard activation focus", () => {
+    const action = vi.fn();
+    const view = render(<div data-player-root="true" tabIndex={-1}><PlayerIconButton icon="rewind" label="Rewind" onClick={action} /></div>);
+    const root = view.container.firstElementChild;
+    const button = screen.getByRole("button", { name: "Rewind" });
+
+    pointerClick(button);
+    expect(action).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(root);
+
+    act(() => button.focus());
+    fireEvent.click(button, { detail: 0 });
+    expect(action).toHaveBeenCalledTimes(2);
+    expect(document.activeElement).toBe(button);
   });
 });
 
@@ -231,6 +254,78 @@ describe("player volume control", () => {
     expect(screen.getByRole("dialog", { name: "Player settings" })).not.toBeNull();
     expect(volume.getAttribute("aria-expanded")).toBe("false");
   });
+
+  it("returns completed volume pointer actions to the player without changing keyboard focus behavior", async () => {
+    const onVolumeChange = vi.fn();
+    const onToggleMute = vi.fn();
+    const view = render(<div data-player-root="true" tabIndex={-1}><VolumeFixture onVolumeChange={onVolumeChange} onToggleMute={onToggleMute} /></div>);
+    const root = view.container.firstElementChild;
+    const trigger = screen.getByRole("button", { name: "Volume" });
+    fireEvent.pointerEnter(trigger, { pointerType: "mouse" });
+    pointerClick(trigger);
+    expect(onToggleMute).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(root);
+    expect(screen.getByRole("dialog", { name: "Volume" })).not.toBeNull();
+
+    const slider = screen.getByRole("slider", { name: "Volume" });
+    fireEvent.pointerDown(slider, { pointerType: "mouse", pointerId: 1 });
+    act(() => slider.focus());
+    fireEvent.change(slider, { target: { value: "0.25" } });
+    fireEvent.pointerUp(slider, { pointerType: "mouse", pointerId: 1 });
+    expect(onVolumeChange).toHaveBeenCalledWith(0.25);
+    expect(document.activeElement).toBe(root);
+
+    act(() => trigger.focus());
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("slider", { name: "Volume" })));
+    fireEvent.change(screen.getByRole("slider", { name: "Volume" }), { target: { value: "0.45" } });
+    expect(document.activeElement).toBe(screen.getByRole("slider", { name: "Volume" }));
+  });
+});
+
+describe("player settings pointer completion", () => {
+  it.each([
+    { label: "1.5×", kind: "rate", value: 1.5 },
+    { label: "Large", kind: "caption", value: 1.25 },
+    { label: "Reset timing", kind: "timing", value: 0 },
+  ])("closes after pointer selection of $label and restores player focus", ({ label, kind, value }) => {
+    const callbacks = { rate: vi.fn(), caption: vi.fn(), timing: vi.fn() };
+    const view = render(<div data-player-root="true" tabIndex={-1}>
+      <PlayerSettings playbackRate={1} onRateChange={callbacks.rate} captions captionScale={1} onCaptionScaleChange={callbacks.caption} subtitleOffset={0} onSubtitleOffsetChange={callbacks.timing} />
+    </div>);
+    pointerClick(screen.getByRole("button", { name: "Player settings" }));
+    pointerClick(screen.getByRole("button", { name: label }));
+    expect(callbacks[kind as keyof typeof callbacks]).toHaveBeenCalledWith(value);
+    expect(screen.queryByRole("dialog", { name: "Player settings" })).toBeNull();
+    expect(document.activeElement).toBe(view.container.firstElementChild);
+  });
+
+  it("keeps keyboard choices focused and restores focus only after timing pointer completion", () => {
+    const onTimingChange = vi.fn();
+    const view = render(<div data-player-root="true" tabIndex={-1}>
+      <PlayerSettings playbackRate={1} onRateChange={() => undefined} captions captionScale={1} onCaptionScaleChange={() => undefined} subtitleOffset={0} onSubtitleOffsetChange={onTimingChange} />
+    </div>);
+    const trigger = screen.getByRole("button", { name: "Player settings" });
+    act(() => trigger.focus());
+    fireEvent.click(trigger, { detail: 0 });
+    const rate = screen.getByRole("button", { name: "1.5×" });
+    act(() => rate.focus());
+    fireEvent.click(rate, { detail: 0 });
+    expect(screen.getByRole("dialog", { name: "Player settings" })).not.toBeNull();
+    expect(document.activeElement).toBe(rate);
+
+    const timing = screen.getByRole("slider", { name: "Subtitle timing" });
+    act(() => timing.focus());
+    fireEvent.change(timing, { target: { value: "0.25" } });
+    expect(document.activeElement).toBe(timing);
+    expect(screen.getByRole("dialog", { name: "Player settings" })).not.toBeNull();
+    fireEvent.pointerDown(timing, { pointerType: "mouse", pointerId: 1 });
+    fireEvent.change(timing, { target: { value: "0.5" } });
+    fireEvent.pointerUp(timing, { pointerType: "mouse", pointerId: 1 });
+    expect(onTimingChange).toHaveBeenLastCalledWith(0.5);
+    expect(screen.queryByRole("dialog", { name: "Player settings" })).toBeNull();
+    expect(document.activeElement).toBe(view.container.firstElementChild);
+  });
 });
 
 describe("player control menu", () => {
@@ -298,6 +393,22 @@ describe("player control menu", () => {
     expect(screen.queryByRole("status")).toBeNull();
     expect(onOpenChange).toHaveBeenCalledWith(true);
     expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("restores player focus after a pointer choice and trigger focus after a keyboard choice", async () => {
+    const view = render(<div data-player-root="true" tabIndex={-1}><QualityFixture /></div>);
+    pointerClick(screen.getByRole("button", { name: "Quality: Auto" }));
+    pointerClick(screen.getByRole("option", { name: "480p" }));
+    expect(document.activeElement).toBe(view.container.firstElementChild);
+
+    const trigger = screen.getByRole("button", { name: "Quality: 480p" });
+    act(() => trigger.focus());
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("option", { name: "480p" })));
+    fireEvent.click(screen.getByRole("option", { name: "720p" }), { detail: 0 });
+    expect(screen.queryByRole("listbox", { name: "Quality" })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    expect(screen.getByRole("button", { name: "Quality: 720p" })).toBe(trigger);
   });
 
   it("keeps the selected quality compact without losing its accessible name or status", () => {

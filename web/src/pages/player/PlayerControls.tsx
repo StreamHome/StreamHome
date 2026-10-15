@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { restorePlayerPointerClickFocus, restorePlayerPointerFocus } from "./playerKeyboard";
 
 export type PlayerIconName =
   | "audio"
@@ -67,7 +68,7 @@ interface PlayerIconButtonProps extends React.ButtonHTMLAttributes<HTMLButtonEle
   label: string;
 }
 
-export function PlayerIconButton({ icon, label, className = "", ...props }: PlayerIconButtonProps) {
+export function PlayerIconButton({ icon, label, className = "", onClick, ...props }: PlayerIconButtonProps) {
   return (
     <button
       type="button"
@@ -75,6 +76,10 @@ export function PlayerIconButton({ icon, label, className = "", ...props }: Play
       data-tooltip={label}
       className={`player-control-button ${className}`.trim()}
       {...props}
+      onClick={(event) => {
+        onClick?.(event);
+        if (!event.defaultPrevented && !event.currentTarget.hasAttribute("aria-haspopup")) restorePlayerPointerClickFocus(event);
+      }}
     >
       <PlayerIcon name={icon} />
     </button>
@@ -198,11 +203,20 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
   const keyboardFocusRef = useRef(false);
   const pointerFocusRef = useRef(false);
   const dismissingRef = useRef(false);
+  const restoringPointerFocusRef = useRef(false);
   const level = muted ? 0 : volume;
   const percentage = `${Math.round(level * 100)}%`;
   const clearClose = useCallback(() => {
     if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
     closeTimerRef.current = null;
+  }, []);
+  const restorePointerFocus = useCallback((target: HTMLElement | null) => {
+    restoringPointerFocusRef.current = true;
+    try {
+      restorePlayerPointerFocus(target);
+    } finally {
+      restoringPointerFocusRef.current = false;
+    }
   }, []);
   useEffect(() => clearClose, [clearClose]);
   useEffect(() => {
@@ -243,6 +257,7 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
         return bounds && event.clientX >= bounds.left && event.clientX < bounds.right
           && event.clientY >= bounds.top && event.clientY < bounds.bottom;
       });
+      restorePointerFocus(sliderRef.current);
       if (!hoveringRef.current && !keyboardFocusRef.current) popup.updateOpen(false);
     };
     document.addEventListener("pointerup", release);
@@ -251,7 +266,7 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
       document.removeEventListener("pointerup", release);
       document.removeEventListener("pointercancel", release);
     };
-  }, [popup.open, popup.popupRef, popup.rootRef, popup.updateOpen]);
+  }, [popup.open, popup.popupRef, popup.rootRef, popup.updateOpen, restorePointerFocus]);
   const dismiss = useCallback(() => {
     clearClose();
     keyboardFocusRef.current = false;
@@ -278,6 +293,12 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
     popup.updateOpen(true);
     window.requestAnimationFrame(() => sliderRef.current?.focus());
   };
+  const handleBlur = (event: React.FocusEvent) => {
+    if (!contains(event.relatedTarget)) keyboardFocusRef.current = false;
+    if (restoringPointerFocusRef.current && hoveringRef.current
+      && event.relatedTarget === popup.rootRef.current?.closest("[data-player-root='true']")) return;
+    popup.onBlur(event);
+  };
 
   return <div className="player-control-menu" ref={popup.rootRef} data-open={popup.open}
     onPointerEnter={enter} onPointerLeave={leave}
@@ -292,10 +313,7 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
       keyboardFocusRef.current = true;
       popup.updateOpen(true);
     }}
-    onBlur={(event) => {
-      if (!contains(event.relatedTarget)) keyboardFocusRef.current = false;
-      popup.onBlur(event);
-    }}>
+    onBlur={handleBlur}>
     <button
       ref={popup.triggerRef}
       type="button"
@@ -305,7 +323,10 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
       aria-haspopup="dialog"
       aria-expanded={popup.open}
       aria-controls={popup.id}
-      onClick={onToggleMute}
+      onClick={(event) => {
+        onToggleMute();
+        if (event.detail > 0) restorePointerFocus(event.currentTarget);
+      }}
       onKeyDown={(event) => {
         if (event.key === "ArrowDown" || event.key === "ArrowUp") {
           event.preventDefault();
@@ -327,7 +348,7 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
       style={popup.style}
       onPointerEnter={enter}
       onPointerLeave={leave}
-      onBlur={popup.onBlur}
+      onBlur={handleBlur}
       onKeyDown={(event) => {
         if (event.key === "Escape") {
           event.preventDefault();
@@ -350,18 +371,27 @@ export function PlayerSettings({ playbackRate, onRateChange, captions, captionSc
   onOpenChange?: (open: boolean) => void;
 }) {
   const popup = usePlayerPopup(onOpenChange);
+  const completePointerChoice = (event: React.MouseEvent<HTMLButtonElement>) => {
+    if (event.detail === 0) return;
+    restorePlayerPointerClickFocus(event);
+    popup.updateOpen(false);
+  };
+  const completePointerRange = (event: React.PointerEvent<HTMLInputElement>) => {
+    restorePlayerPointerFocus(event.currentTarget);
+    popup.updateOpen(false);
+  };
   return <div className="player-control-menu" ref={popup.rootRef} data-open={popup.open}>
     <button ref={popup.triggerRef} type="button" className="player-control-menu__trigger" aria-label="Player settings" aria-haspopup="dialog" aria-expanded={popup.open} aria-controls={popup.id}
-      onClick={() => popup.updateOpen(!popup.open)}
+      onClick={(event) => { popup.updateOpen(!popup.open); if (popup.open) restorePlayerPointerClickFocus(event); }}
       onKeyDown={(event) => { if (event.key === "ArrowDown") { event.preventDefault(); popup.updateOpen(true); window.requestAnimationFrame(() => popup.popupRef.current?.querySelector<HTMLButtonElement>("button")?.focus()); } else if (event.key === "Escape" && popup.open) { event.preventDefault(); popup.dismiss(); } }}>
       <PlayerIcon name="settings" /><span>Settings</span>
     </button>
     {popup.open && popup.render(<div ref={popup.popupRef} id={popup.id} role="dialog" aria-label="Player settings" className="player-control-menu__list player-settings-panel" style={popup.style} onBlur={popup.onBlur}
       onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); popup.dismiss(); } }}>
       <span className="player-control-menu__label">Settings</span>
-      <fieldset><legend>Playback speed</legend><div className="player-settings-options">{[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) => <button key={rate} type="button" aria-pressed={rate === playbackRate} onClick={() => onRateChange(rate)}>{rate}×</button>)}</div></fieldset>
-      {captions && <><fieldset><legend>Caption size</legend><div className="player-settings-options">{[[0.8, "Small"], [1, "Medium"], [1.25, "Large"], [1.5, "Extra large"]].map(([scale, label]) => <button key={scale} type="button" aria-pressed={Number(scale) === captionScale} onClick={() => onCaptionScaleChange(Number(scale))}>{label}</button>)}</div></fieldset>
-      <label className="player-settings-timing">Subtitle timing<input aria-label="Subtitle timing" type="range" min={-5} max={5} step={0.25} value={subtitleOffset} onChange={(event) => onSubtitleOffsetChange(Number(event.target.value))} /><span>{subtitleOffset === 0 ? "Synced" : `${Math.abs(subtitleOffset)}s ${subtitleOffset < 0 ? "earlier" : "later"}`}</span></label><button type="button" className="player-settings-reset" onClick={() => onSubtitleOffsetChange(0)}>Reset timing</button></>}
+      <fieldset><legend>Playback speed</legend><div className="player-settings-options">{[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) => <button key={rate} type="button" aria-pressed={rate === playbackRate} onClick={(event) => { onRateChange(rate); completePointerChoice(event); }}>{rate}×</button>)}</div></fieldset>
+      {captions && <><fieldset><legend>Caption size</legend><div className="player-settings-options">{[[0.8, "Small"], [1, "Medium"], [1.25, "Large"], [1.5, "Extra large"]].map(([scale, label]) => <button key={scale} type="button" aria-pressed={Number(scale) === captionScale} onClick={(event) => { onCaptionScaleChange(Number(scale)); completePointerChoice(event); }}>{label}</button>)}</div></fieldset>
+      <label className="player-settings-timing">Subtitle timing<input aria-label="Subtitle timing" type="range" min={-5} max={5} step={0.25} value={subtitleOffset} onChange={(event) => onSubtitleOffsetChange(Number(event.target.value))} onPointerUp={completePointerRange} onPointerCancel={completePointerRange} /><span>{subtitleOffset === 0 ? "Synced" : `${Math.abs(subtitleOffset)}s ${subtitleOffset < 0 ? "earlier" : "later"}`}</span></label><button type="button" className="player-settings-reset" onClick={(event) => { onSubtitleOffsetChange(0); completePointerChoice(event); }}>Reset timing</button></>}
     </div>)}
   </div>;
 }
@@ -430,7 +460,10 @@ export function PlayerControlMenu<T extends string | number>({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={listboxId}
-        onClick={() => open ? updateOpen(false) : openAndFocus(selectedIndex)}
+        onClick={(event) => {
+          if (open) { updateOpen(false); restorePlayerPointerClickFocus(event); }
+          else openAndFocus(selectedIndex);
+        }}
         onKeyDown={(event) => {
           if (event.key === "ArrowDown") {
             event.preventDefault();
@@ -492,11 +525,12 @@ export function PlayerControlMenu<T extends string | number>({
                 aria-disabled={option.disabled || undefined}
                 disabled={option.disabled}
                 tabIndex={!option.disabled && index === selectedIndex ? 0 : -1}
-                onClick={() => {
+                onClick={(event) => {
                   if (option.disabled) return;
                   onSelect(option.value);
                   updateOpen(false);
-                  triggerRef.current?.focus();
+                  if (event.detail > 0) restorePlayerPointerClickFocus(event);
+                  else triggerRef.current?.focus();
                 }}
               >
                 <span>{option.label}{option.status && <small>{option.status}</small>}</span>

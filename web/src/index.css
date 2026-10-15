@@ -611,6 +611,14 @@ body[data-player-viewport-fullscreen="true"] {
   border-radius: 0;
 }
 
+/* Player chrome should not select text during pointer control gestures. */
+.player-controls,
+.player-topbar,
+.player-control-menu__list {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 /* Phones use a purpose-built landscape player instead of the compressed desktop control bar. */
 .player-view[data-mobile-player="true"] {
   --mobile-safe-area: max(1rem, env(safe-area-inset-top), env(safe-area-inset-right), env(safe-area-inset-bottom), env(safe-area-inset-left));
