@@ -217,6 +217,7 @@ interface PlayerControlMenuProps<T extends string | number> {
   options: PlayerMenuOption<T>[];
   onSelect: (value: T) => void;
   onOpenChange?: (open: boolean) => void;
+  status?: string;
 }
 
 export function PlayerControlMenu<T extends string | number>({
@@ -226,6 +227,7 @@ export function PlayerControlMenu<T extends string | number>({
   options,
   onSelect,
   onOpenChange,
+  status,
 }: PlayerControlMenuProps<T>) {
   const popup = usePlayerPopup(onOpenChange);
   const { open, rootRef, triggerRef, updateOpen } = popup;
@@ -256,6 +258,7 @@ export function PlayerControlMenu<T extends string | number>({
         type="button"
         className="player-control-menu__trigger"
         aria-label={`${label}: ${selected?.label ?? "Unavailable"}`}
+        aria-description={status}
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={listboxId}
@@ -273,7 +276,7 @@ export function PlayerControlMenu<T extends string | number>({
         }}
       >
         <PlayerIcon name={icon} />
-        <span>{selected?.label ?? label}</span>
+        <span>{selected?.label ?? label}{status && <small className="player-control-menu__status" aria-hidden="true">{status}</small>}</span>
         <PlayerIcon name="chevron" className="player-control-menu__chevron" />
       </button>
 
@@ -308,6 +311,7 @@ export function PlayerControlMenu<T extends string | number>({
           }}
         >
           <span className="player-control-menu__label">{label}</span>
+          {status && <div className="player-control-menu__summary" role="status">{status}</div>}
           {options.map((option, index) => {
             const isSelected = Object.is(option.value, value);
             return (

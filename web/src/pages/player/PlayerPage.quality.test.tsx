@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useProfileStore } from "../../stores/profileStore";
 import * as moviesApi from "../../api/movies";
 import * as playbackApi from "../../api/playback";
-import { PlayerPage, type ResolvedPlayback } from "./PlayerPage";
+import { PlayerPage, STARTUP_QUALITY_MAX_WAIT_MS, type ResolvedPlayback } from "./PlayerPage";
 
 const engine = vi.hoisted(() => {
   const Events = Object.fromEntries([
@@ -26,10 +26,14 @@ const engine = vi.hoisted(() => {
     current = 1;
     manualLevel = -1;
     bandwidthEstimate = 10_000_000;
+    loadingEnabled = true;
+    bufferingEnabled = true;
+    audioTrack = 0;
     listeners = new Map<string, Array<(event: string, data: Record<string, unknown>) => void>>();
     immediateSwitch = vi.fn();
     nextSwitch = vi.fn();
     startLoad = vi.fn();
+    resumeBuffering = vi.fn();
     destroy = vi.fn(() => this.listeners.clear());
     constructor() { Hls.instances.push(this); }
     get currentLevel() { return this.current; }
@@ -46,7 +50,10 @@ const engine = vi.hoisted(() => {
       video.src = "blob:quality-regression";
       queueMicrotask(() => this.emit(Events.MEDIA_ATTACHED));
     }
-    loadSource() { this.emit(Events.MANIFEST_PARSED, { levels: this.levels }); }
+    loadSource() {
+      this.emit(Events.MANIFEST_PARSED, { levels: this.levels });
+      this.emit(Events.AUDIO_TRACKS_UPDATED, { audioTracks: [{ name: "English", lang: "en" }, { name: "Turkish", lang: "tr" }] });
+    }
   }
   return { Hls, Events };
 });
@@ -62,7 +69,10 @@ const playback: ResolvedPlayback = {
     runId: "quality-run", mediaId: "quality-media", movieId: "quality-media", episodeId: null,
     sourceFingerprint: "quality-source", resumePosition: 0,
     sourceMetadata: { duration: 120, container: "mp4", codec: "hevc", width: 1920, height: 1040, frameRate: 24, sourceFormat: "MP4", progressiveCompatible: false },
-    tracks: [], subtitles: [],
+    tracks: [
+      { id: "audio_en", label: "English", language: "en", channels: 2, default: true, source: "embedded", streamIndex: 0, ready: true, status: "ready" },
+      { id: "audio_tr", label: "Turkish", language: "tr", channels: 2, default: false, source: "embedded", streamIndex: 1, ready: true, status: "ready" },
+    ], subtitles: [],
     renditions: [
       { id: "video_original", label: "1080p", height: 1040, width: 1920, original: true, ready: true, status: "ready" },
       { id: "video_720p", label: "720p", height: 720, width: 1328, original: false, ready: true, status: "ready" },
@@ -97,9 +107,12 @@ describe("mounted HLS quality policy", () => {
     vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
     vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
     vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    vi.spyOn(HTMLVideoElement.prototype, "videoHeight", "get").mockReturnValue(1040);
+    vi.spyOn(HTMLVideoElement.prototype, "videoWidth", "get").mockReturnValue(1920);
   });
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     localStorage.removeItem(preferencesKey);
     useProfileStore.setState({ profiles: [], activeProfile: null, isAdmin: false });
     vi.restoreAllMocks();
@@ -173,6 +186,7 @@ describe("mounted HLS quality policy", () => {
     expect(savedQuality()).toBe(1040);
     expect(screen.getByRole("button", { name: "Quality: 1080p · Original" })).toBeTruthy();
     Object.defineProperty(video, "buffered", { configurable: true, value: { length: 1, start: () => 0, end: () => 30 } });
+    Object.defineProperty(video, "readyState", { configurable: true, value: 2 });
     act(() => hls.emit(engine.Events.FRAG_BUFFERED));
     expect(hls.manualLevel).toBe(1);
     expect(hls.immediateSwitch).not.toHaveBeenCalled();
@@ -207,5 +221,101 @@ describe("mounted HLS quality policy", () => {
     expect(savedQuality()).toBe(1040);
     expect(screen.getByRole("button", { name: "Quality: 1080p · Original" })).toBeTruthy();
     expect(view.container.querySelector("[data-player-root]")?.getAttribute("data-player-phase")).toBe("paused");
+  });
+
+  it("resumes a healthy loader without restarting it and restarts only a stopped loader", async () => {
+    const { hls } = await mountPlayer();
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    expect(hls.startLoad).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    hls.loadingEnabled = false;
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    expect(hls.startLoad).toHaveBeenCalledTimes(1);
+  });
+
+  it("honors saved quality after a bounded warmup even below the bandwidth threshold", async () => {
+    localStorage.setItem(preferencesKey, JSON.stringify({ qualityHeight: 1040 }));
+    const { hls, video } = await mountPlayer();
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    vi.useFakeTimers();
+    hls.bandwidthEstimate = 1_000_000;
+    Object.defineProperty(video, "readyState", { configurable: true, value: 2 });
+    fireEvent.loadedData(video);
+    expect(hls.manualLevel).toBe(-1);
+    act(() => vi.advanceTimersByTime(STARTUP_QUALITY_MAX_WAIT_MS));
+    expect(hls.manualLevel).toBe(1);
+    expect(hls.immediateSwitch).not.toHaveBeenCalled();
+    expect(video.paused).toBe(true);
+    expect(savedQuality()).toBe(1040);
+  });
+
+  it("restores quality with the short buffer available near the end of a title", async () => {
+    localStorage.setItem(preferencesKey, JSON.stringify({ qualityHeight: 1040 }));
+    const { hls, video } = await mountPlayer();
+    hls.current = 0;
+    video.currentTime = 114;
+    Object.defineProperty(video, "readyState", { configurable: true, value: 2 });
+    Object.defineProperty(video, "buffered", { configurable: true, value: { length: 1, start: () => 112, end: () => 120 } });
+    fireEvent.loadedData(video);
+    expect(hls.manualLevel).toBe(1);
+    expect(hls.nextSwitch).toHaveBeenCalledExactlyOnceWith(1);
+    expect(hls.immediateSwitch).not.toHaveBeenCalled();
+  });
+
+  it("cancels deferred quality on Auto and retains switching feedback until acknowledgement", async () => {
+    localStorage.setItem(preferencesKey, JSON.stringify({ qualityHeight: 1040 }));
+    const { hls, video } = await mountPlayer();
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    vi.useFakeTimers();
+    hls.bandwidthEstimate = 1_000_000;
+    Object.defineProperty(video, "readyState", { configurable: true, value: 2 });
+    fireEvent.loadedData(video);
+    selectQuality("Auto");
+    act(() => vi.advanceTimersByTime(STARTUP_QUALITY_MAX_WAIT_MS));
+    expect(hls.manualLevel).toBe(-1);
+    hls.current = 0;
+    Object.defineProperty(video, "videoHeight", { configurable: true, value: 720 });
+    Object.defineProperty(video, "videoWidth", { configurable: true, value: 1328 });
+    act(() => hls.emit(engine.Events.LEVEL_SWITCHED, { level: 0 }));
+    selectQuality("1080p · Original");
+    act(() => vi.advanceTimersByTime(5000));
+    expect(screen.getByRole("button", { name: "Quality: 1080p · Original" }).getAttribute("aria-description")).toBe("Switching · Playing 720p");
+    hls.current = 1;
+    act(() => hls.emit(engine.Events.LEVEL_SWITCHED, { level: 1 }));
+    expect(screen.getByRole("button", { name: "Quality: 1080p · Original" }).getAttribute("aria-description")).toBe("Switching · Playing 720p");
+    Object.defineProperty(video, "videoHeight", { configurable: true, value: 1040 });
+    Object.defineProperty(video, "videoWidth", { configurable: true, value: 1920 });
+    fireEvent(video, new Event("resize"));
+    expect(screen.getByRole("button", { name: "Quality: 1080p · Original" }).getAttribute("aria-description")).toBe("Playing 1080p · Original");
+  });
+
+  it("honors English -> Turkish -> English while the first audio switch is pending", async () => {
+    const { hls } = await mountPlayer();
+    const choose = (name: string) => {
+      fireEvent.click(screen.getByRole("button", { name: /^Audio language:/ }));
+      fireEvent.click(screen.getByRole("option", { name }));
+    };
+    choose("Turkish");
+    expect(hls.audioTrack).toBe(1);
+    choose("English");
+    expect(hls.audioTrack).toBe(0);
+    act(() => hls.emit(engine.Events.AUDIO_TRACK_SWITCHED, { id: 1 }));
+    expect(JSON.parse(localStorage.getItem(preferencesKey)!).audioLanguage).toBe("en");
+    act(() => hls.emit(engine.Events.AUDIO_TRACK_SWITCHED, { id: 0 }));
+    act(() => hls.emit(engine.Events.AUDIO_TRACK_SWITCHED, { id: 1 }));
+    expect(screen.getByRole("button", { name: "Audio language: English" })).toBeTruthy();
+    expect(JSON.parse(localStorage.getItem(preferencesKey)!).audioLanguage).toBe("en");
+  });
+
+  it("keeps the latest audio preference when HLS publishes its tracks again", async () => {
+    localStorage.setItem(preferencesKey, JSON.stringify({ audioTrackId: "audio_en", audioLanguage: "en" }));
+    const { hls } = await mountPlayer();
+    fireEvent.click(screen.getByRole("button", { name: /^Audio language:/ }));
+    fireEvent.click(screen.getByRole("option", { name: "Turkish" }));
+    act(() => hls.emit(engine.Events.AUDIO_TRACK_SWITCHED, { id: 1 }));
+    act(() => hls.emit(engine.Events.AUDIO_TRACKS_UPDATED, { audioTracks: [{ name: "English", lang: "en" }, { name: "Turkish", lang: "tr" }] }));
+    expect(hls.audioTrack).toBe(1);
+    expect(JSON.parse(localStorage.getItem(preferencesKey)!).audioLanguage).toBe("tr");
   });
 });

@@ -242,6 +242,22 @@
   backdrop-filter: none;
 }
 
+.player-control-menu__status {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.55rem;
+  line-height: 1.2;
+  opacity: 0.75;
+}
+
+.player-control-menu__summary {
+  padding: 0 0.55rem 0.55rem;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.75);
+}
+
 .player-control-menu__label {
   display: block;
   padding: 0.45rem 0.55rem 0.55rem;

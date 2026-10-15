@@ -162,6 +162,7 @@ export const FORWARD_BUFFER_TARGET_SECONDS = 30;
 export const FORWARD_BUFFER_MAX_SECONDS = 60;
 export const STARTUP_QUALITY_MIN_BUFFER_SECONDS = 8;
 export const STARTUP_QUALITY_HEADROOM_RATIO = 1.35;
+export const STARTUP_QUALITY_MAX_WAIT_MS = 1_500;
 
 type PlaybackStartupStage =
   | "transport-initializing"
@@ -198,10 +199,11 @@ export function shouldApplyDeferredStartupQuality(
   levelBitrate: number,
   estimatedBandwidth: number,
   bufferedAhead: number,
+  remainingSeconds = Number.POSITIVE_INFINITY,
 ): boolean {
   return levelBitrate > 0
     && estimatedBandwidth >= levelBitrate * STARTUP_QUALITY_HEADROOM_RATIO
-    && bufferedAhead >= STARTUP_QUALITY_MIN_BUFFER_SECONDS;
+    && bufferedAhead + 0.05 >= Math.min(STARTUP_QUALITY_MIN_BUFFER_SECONDS, Math.max(0, remainingSeconds));
 }
 
 
@@ -901,6 +903,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [timelineScrubbing, setTimelineScrubbing] = useState(false);
   const [availableQualities, setAvailableQualities] = useState<ReturnType<typeof playbackQualityOptions>>([{ id: "auto", label: "Auto", height: "auto", index: -1, ready: true, status: "ready" }]);
   const [selectedQualityId, setSelectedQualityId] = useState("auto");
+  const [activeQualityId, setActiveQualityId] = useState<string | null>(null);
+  const [qualitySwitching, setQualitySwitching] = useState(false);
   const [availableAudioTracks, setAvailableAudioTracks] = useState<PlayerAudioOption[]>([]);
   const [selectedAudioTrackId, setSelectedAudioTrackId] = useState("");
   const [nextCountdown, setNextCountdown] = useState<number | null>(null);
@@ -926,6 +930,20 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   useEffect(() => {
     runResponseRef.current = runResponse;
   }, [runResponse]);
+
+  const syncRenderedQuality = useCallback(() => {
+    const video = videoRef.current;
+    const actual = runResponseRef.current?.renditions.find((item) => item.ready && item.height === video?.videoHeight);
+    setActiveQualityId(actual?.id ?? null);
+    const pending = pendingQualitySelectionRef.current;
+    const option = hlsQualityOptionsRef.current.find((item) => item.id === pending);
+    if (actual && actual.id === pending && !deferredStartupQualityRef.current
+      && (!hlsRef.current || hlsRef.current.manualLevel === option?.index)) {
+      pendingQualitySelectionRef.current = null;
+      setQualitySwitching(false);
+      setPlayerNotice(`${option?.label ?? actual.label} quality active`);
+    }
+  }, []);
 
   useEffect(() => {
     volumeRef.current = volume;
@@ -1131,6 +1149,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     setBufferedEnd(0);
     setAvailableQualities([{ id: "auto", label: "Auto", height: "auto", index: -1, ready: true, status: "ready" }]);
     setSelectedQualityId("auto");
+    setActiveQualityId(null);
+    setQualitySwitching(false);
     nativeQualityRef.current = "auto";
     userQualityRef.current = preferencesRef.current.qualityHeight;
     setAvailableAudioTracks([]);
@@ -1863,20 +1883,30 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         maxLoadingDelay: 4,
       });
       hlsRef.current = hls;
-      const applyDeferredStartupQuality = () => {
+      let startupQualityTimer: number | null = null;
+      const applyDeferredStartupQuality = (deadlineReached = false) => {
         const deferred = deferredStartupQualityRef.current;
-        if (!deferred) return;
+        if (!deferred || hlsRef.current !== hls || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
         const level = hls.levels[deferred.index];
         const levelBitrate = Math.max(0, Number(level?.bitrate || level?.averageBitrate || 0));
         const bufferedAhead = Math.max(0, bufferedEndForTime(video.buffered, video.currentTime) - video.currentTime);
-        if (!shouldApplyDeferredStartupQuality(levelBitrate, hls.bandwidthEstimate, bufferedAhead)) return;
+        const remaining = Math.max(0, runResponse.sourceMetadata.duration - video.currentTime);
+        if (!deadlineReached && !shouldApplyDeferredStartupQuality(levelBitrate, hls.bandwidthEstimate, bufferedAhead, remaining)) {
+          if (startupQualityTimer === null) startupQualityTimer = window.setTimeout(() => {
+            startupQualityTimer = null;
+            applyDeferredStartupQuality(true);
+          }, STARTUP_QUALITY_MAX_WAIT_MS);
+          return;
+        }
+        if (startupQualityTimer !== null) window.clearTimeout(startupQualityTimer);
+        startupQualityTimer = null;
         deferredStartupQualityRef.current = null;
         pendingQualitySelectionRef.current = deferred.id;
         applyHlsQuality(hls, deferred.index);
-        if (hls.currentLevel === deferred.index) {
-          pendingQualitySelectionRef.current = null;
-        }
+        syncRenderedQuality();
       };
+      const onStartupQualityReady = () => applyDeferredStartupQuality();
+      video.addEventListener("loadeddata", onStartupQualityReady);
       hls.attachMedia(video);
       hls.on(HlsRuntime.Events.MEDIA_ATTACHED, () => {
         markPlaybackStartupProgress("media-attached");
@@ -1896,10 +1926,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           ? options[0]
           : readyOptions.reduce((best, item) => Math.abs(Number(item.height) - Number(qualityPreference)) < Math.abs(Number(best.height) - Number(qualityPreference)) ? item : best));
         setSelectedQualityId(preferred.id);
+        setQualitySwitching(preferred.index >= 0);
         if (requestedQuality && requestedQuality.index >= 0) {
           deferredStartupQualityRef.current = null;
           applyHlsQuality(hls, requestedQuality.index);
-          if (hls.currentLevel === requestedQuality.index) pendingQualitySelectionRef.current = null;
+          syncRenderedQuality();
         } else {
           hls.loadLevel = -1;
           deferredStartupQualityRef.current = preferred && preferred.index >= 0
@@ -1911,14 +1942,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       hls.on(HlsRuntime.Events.LEVEL_SWITCHING, () => {
         if (pendingQualitySelectionRef.current) setPlayerNotice("Switching video quality…");
       });
-      hls.on(HlsRuntime.Events.LEVEL_SWITCHED, (_, data) => {
+      hls.on(HlsRuntime.Events.LEVEL_SWITCHED, () => {
         if (hlsRef.current !== hls) return;
-        const selected = hlsQualityOptionsRef.current.find((item) => item.index === data.level);
-        const requestedQuality = pendingQualitySelectionRef.current;
-        // Decoded levels acknowledge a switch; they never own the saved policy.
-        if (!requestedQuality || selected?.id !== requestedQuality) return;
-        pendingQualitySelectionRef.current = null;
-        setPlayerNotice(`${selected.label} quality active`);
+        // Fragment switches may precede the next displayed frame while paused.
+        syncRenderedQuality();
       });
       hls.on(HlsRuntime.Events.LEVEL_UPDATED, () => {
         markPlaybackStartupProgress("level-playlist");
@@ -1932,6 +1959,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       });
       hls.on(HlsRuntime.Events.AUDIO_TRACKS_UPDATED, (_, data) => {
         markPlaybackStartupProgress("audio-playlist");
+        const audioPreferences = preferencesRef.current;
         const matchedIndexes = matchAudioTrackIndexes(runResponse.tracks, data.audioTracks);
         const tracks = runResponse.tracks
           .map((serverTrack, serverIndex) => {
@@ -1953,8 +1981,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         setAvailableAudioTracks(tracks);
         const transportTrack = pendingAudioSelectionRef.current
           ? tracks.find((track) => track.id === pendingAudioSelectionRef.current && track.index >= 0)
-          : tracks.find((track) => track.id === transportPreferences.audioTrackId && track.index >= 0)
-            ?? tracks.find((track) => track.language === transportPreferences.audioLanguage && track.index >= 0);
+          : tracks.find((track) => track.id === audioPreferences.audioTrackId && track.index >= 0)
+            ?? tracks.find((track) => track.language === audioPreferences.audioLanguage && track.index >= 0);
         if (transportTrack) {
           releaseExternalAudio();
           hls.audioTrack = transportTrack.index;
@@ -1965,8 +1993,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         }
         const directTrack = pendingAudioSelectionRef.current
           ? tracks.find((track) => track.id === pendingAudioSelectionRef.current && Boolean(track.directUrl))
-          : tracks.find((track) => track.id === transportPreferences.audioTrackId && Boolean(track.directUrl))
-            ?? tracks.find((track) => track.language === transportPreferences.audioLanguage && Boolean(track.directUrl));
+          : tracks.find((track) => track.id === audioPreferences.audioTrackId && Boolean(track.directUrl))
+            ?? tracks.find((track) => track.language === audioPreferences.audioLanguage && Boolean(track.directUrl));
         if (directTrack?.directUrl && activateExternalAudio(directTrack)) {
           const explicitlyRequested = pendingAudioSelectionRef.current !== null;
           selectedAudioTrackIdRef.current = directTrack.id;
@@ -1984,8 +2012,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           ? tracks.find((track) => track.id === pendingAudioSelectionRef.current && track.index >= 0)
           : undefined;
         const preferredTrack = requestedTrack
-          || tracks.find((track) => track.id === transportPreferences.audioTrackId && track.index >= 0)
-          || tracks.find((track) => track.language === transportPreferences.audioLanguage && track.index >= 0)
+          || tracks.find((track) => track.id === audioPreferences.audioTrackId && track.index >= 0)
+          || tracks.find((track) => track.language === audioPreferences.audioLanguage && track.index >= 0)
           || tracks.find((track) => track.index >= 0);
         if (preferredTrack) {
           hls.audioTrack = preferredTrack.index;
@@ -1997,9 +2025,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         if (selected && pendingAudioSelectionRef.current) setPlayerNotice(`Switching audio to ${selected.label}…`);
       });
       hls.on(HlsRuntime.Events.AUDIO_TRACK_SWITCHED, (_, data) => {
+        if (hlsRef.current !== hls) return;
         markPlaybackStartupProgress("audio-playlist");
         const selected = hlsAudioOptionsRef.current.find((track) => track.index === data.id);
         if (!selected || (pendingAudioSelectionRef.current && selected.id !== pendingAudioSelectionRef.current)) return;
+        if (!pendingAudioSelectionRef.current && selected.id !== selectedAudioTrackIdRef.current) return;
         if (activeExternalAudioTrackIdRef.current && !pendingAudioSelectionRef.current) return;
         releaseExternalAudio();
         selectedAudioTrackIdRef.current = selected.id;
@@ -2087,6 +2117,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         setPhase("fatal");
       });
       return () => {
+        if (startupQualityTimer !== null) window.clearTimeout(startupQualityTimer);
+        video.removeEventListener("loadeddata", onStartupQualityReady);
         clearPlaybackStartupWatchdog();
         clearPlaybackClockAdvanceWatchdog();
         if (hlsRetryTimerRef.current !== null) window.clearTimeout(hlsRetryTimerRef.current);
@@ -2173,7 +2205,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
           list.addEventListener("change", onNativeAudioChange);
         }
         setSelectedQualityId(requestedNativeQuality);
-        pendingQualitySelectionRef.current = null;
+        syncRenderedQuality();
         beginPlayback();
       };
       video.addEventListener("loadedmetadata", onLoadedMetadata, { once: true });
@@ -2220,6 +2252,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     requestVideoPlay,
     streamMode,
     submitPlaybackStartupDiagnostic,
+    syncRenderedQuality,
     transportRevision,
   ]);
 
@@ -2620,7 +2653,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     playbackIntentRef.current = true;
     staleVideoPlayEventRef.current = false;
     setPhase("loading");
-    hlsRef.current?.startLoad(Math.max(0, currentTimeRef.current));
+    const hls = hlsRef.current;
+    if (hls && !hls.loadingEnabled) hls.startLoad(Math.max(0, currentTimeRef.current));
+    else if (hls && !hls.bufferingEnabled) hls.resumeBuffering();
     requestVideoPlay();
   }, [requestVideoPlay]);
 
@@ -3403,9 +3438,14 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     userQualityRef.current = selected.height;
     pendingQualitySelectionRef.current = renditionId;
     setSelectedQualityId(renditionId);
+    setQualitySwitching(renditionId !== "auto");
     setPreferences((current) => ({ ...current, qualityHeight: selected.height }));
     if (streamMode === "native-hls" && selected.ready && runResponse?.manifestUrl) {
-      if (nativeQualityRef.current === renditionId) { pendingQualitySelectionRef.current = null; return; }
+      if (nativeQualityRef.current === renditionId) {
+        pendingQualitySelectionRef.current = null;
+        setQualitySwitching(false);
+        return;
+      }
       nativeQualityRef.current = renditionId;
       captureLastFrame(true);
       preservePlaybackPosition();
@@ -3426,10 +3466,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (hlsRef.current && selected.index >= 0) {
       const hls = hlsRef.current;
       applyHlsQuality(hls, selected.index);
-      if (hls.currentLevel === selected.index) {
-        pendingQualitySelectionRef.current = null;
-        setPlayerNotice(`${selected.label} quality active`);
-      }
+      syncRenderedQuality();
       return;
     }
     if (hlsRef.current) {
@@ -3451,7 +3488,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
   const changeAudio = (trackId: string) => {
     const selected = availableAudioTracks.find((item) => item.id === trackId);
-    if (!selected || selected.id === selectedAudioTrackId) return;
+    if (!selected || (pendingAudioSelectionRef.current
+      ? selected.id === pendingAudioSelectionRef.current
+      : selected.id === selectedAudioTrackId)) return;
     if (selected.status === "failed") {
       pendingAudioSelectionRef.current = null;
       setPlayerNotice(`${selected.label} audio is unavailable for this source.`);
@@ -3460,6 +3499,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     pendingAudioSelectionRef.current = trackId;
     setPlayerNotice(`Switching audio to ${selected.label}…`);
     if (hlsRef.current && selected.index >= 0) {
+      setPreferences((current) => ({ ...current, audioTrackId: selected.id, audioLanguage: selected.language }));
       hlsRef.current.audioTrack = selected.index;
       return;
     }
@@ -3559,6 +3599,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   };
 
   const skipMarker = asset ? activeSkipMarker(asset.skipMarkers, currentTime) : null;
+  const activeQuality = availableQualities.find((item) => item.id === activeQualityId);
+  const qualityStatus = qualitySwitching || (selectedQualityId !== "auto" && activeQualityId !== selectedQualityId)
+    ? activeQuality ? `Switching · Playing ${activeQuality.label}` : "Switching"
+    : activeQuality ? `Playing ${activeQuality.label}` : undefined;
   const hasSubtitles = hasSubtitleOptions(runResponse?.subtitles ?? []);
   const playbackControlShowsPause = playbackIntentRef.current
     && ["loading", "recovering", "buffering", "playing"].includes(phase);
@@ -3666,6 +3710,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         crossOrigin="anonymous"
         preload="auto"
         playsInline
+        onLoadedData={syncRenderedQuality}
+        onResize={syncRenderedQuality}
         onLoadedMetadata={() => {
           const video = videoRef.current;
           if (!video) return;
@@ -4354,6 +4400,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                       label="Quality"
                       icon="quality"
                       value={selectedQualityId}
+                      status={qualityStatus}
                       options={availableQualities.map((item) => ({ value: item.id, label: item.label, disabled: item.status === "failed", status: item.ready ? undefined : item.status === "failed" ? "Unavailable" : item.status === "idle" ? "Prepare on request" : "Preparing" }))}
                       onSelect={changeQuality}
                       onOpenChange={handleControlMenuOpenChange}
@@ -4475,6 +4522,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                       label="Quality"
                       icon="quality"
                       value={selectedQualityId}
+                      status={qualityStatus}
                       options={availableQualities.map((item) => ({ value: item.id, label: item.label, disabled: item.status === "failed", status: item.ready ? undefined : item.status === "failed" ? "Unavailable" : item.status === "idle" ? "Prepare on request" : "Preparing" }))}
                       onSelect={changeQuality}
                       onOpenChange={handleControlMenuOpenChange}
