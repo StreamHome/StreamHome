@@ -26,7 +26,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from db import get_session
-from models import AuthSession, DownloadTask, Episode, Movie, PlaybackRun, PlaybackSession, Profile, User
+from models import AuthSession, DownloadTask, Episode, Movie, PlaybackRun, PlaybackSession, Profile, User, ViewingAttempt
 from routes.auth import get_current_user
 from routes.playback import ensure_source_metadata, router
 from services.media_source import resolve_media_source
@@ -164,6 +164,15 @@ class PlaybackContractRegression(unittest.TestCase):
         shutil.rmtree(cls.cache_root.parent, ignore_errors=True)
 
     def setUp(self) -> None:
+        async def reset_playback():
+            async with AsyncSession(self.engine) as db:
+                for model in (PlaybackSession, PlaybackRun):
+                    rows = (await db.exec(select(model).where(
+                        model.profile_id == "contract-profile", model.movie_id == "m_playback_contract"))).all()
+                    for row in rows:
+                        await db.delete(row)
+                await db.commit()
+        asyncio.run(reset_playback())
         self.patchers = [
             patch("routes.playback.record_playback_progress", new=AsyncMock(return_value="viewing-attempt-contract")),
         ]
@@ -290,6 +299,270 @@ class PlaybackContractRegression(unittest.TestCase):
                     replayed = self.client.post(f"/api/playback/runs/{run['runId']}/start-over")
                     self.assertEqual(replayed.status_code, 200)
                     self.assertFalse(asyncio.run(read())[3])
+
+    def test_completed_movie_normal_reopen_records_new_unfinished_viewing_without_replay(self) -> None:
+        with self.credits_run() as first, patch("routes.playback.record_playback_progress", new=AsyncMock(return_value="attempt")) as recorder:
+            completed = self.client.post(f"/api/playback/runs/{first['runId']}/close", json={
+                "timestamp": 105, "duration_watched": 1, "total_seconds_played": 1,
+                "sequence_number": 1, "event": "exit"})
+            self.assertEqual(completed.status_code, 200, completed.text)
+            self.assertEqual(completed.json()["status"], "finished")
+
+            # This is the Details Play-now path: normal creation, no start-over.
+            reopened = self.create_run()
+            self.assertEqual(reopened["resumePosition"], 0)
+            progress = self.client.post(f"/api/playback/runs/{reopened['runId']}/progress", json={
+                "timestamp": 37, "duration_watched": 1, "total_seconds_played": 1,
+                "sequence_number": 1, "event": "heartbeat"})
+            self.assertEqual(progress.status_code, 200, progress.text)
+            self.assertEqual(progress.json()["status"], "ok")
+            closed = self.client.post(f"/api/playback/runs/{reopened['runId']}/close", json={
+                "timestamp": 37, "duration_watched": 0, "total_seconds_played": 1,
+                "sequence_number": 2, "event": "exit"})
+            self.assertEqual(closed.status_code, 200, closed.text)
+            self.assertEqual(closed.json()["status"], "abandoned")
+
+            async def read():
+                async with AsyncSession(self.engine) as db:
+                    return (await db.exec(select(PlaybackSession).where(
+                        PlaybackSession.profile_id == "contract-profile", PlaybackSession.movie_id == "m_playback_contract",
+                        PlaybackSession.episode_id.is_(None)))).one()
+            saved = asyncio.run(read())
+            self.assertFalse(saved.is_finished)
+            self.assertEqual(saved.timestamp, 37)
+            self.assertAlmostEqual(saved.completion_rate, 37 / 120)
+            self.assertEqual(saved.duration_watched, 1)
+            self.assertTrue(recorder.await_args_list[1].kwargs["start_new_attempt"])
+            self.assertNotIn("start_new_attempt", recorder.await_args_list[2].kwargs)
+            restored = self.create_run()
+            self.assertEqual(restored["resumePosition"], 37)
+
+    def saved_playback_state(self):
+        async def read():
+            async with AsyncSession(self.engine) as db:
+                saved = (await db.exec(select(PlaybackSession).where(
+                    PlaybackSession.profile_id == "contract-profile", PlaybackSession.movie_id == "m_playback_contract",
+                    PlaybackSession.episode_id.is_(None)))).one()
+                return (saved.timestamp, saved.duration_watched, saved.completion_rate,
+                        saved.is_finished, saved.progress_run_id, saved.updated_at)
+        return asyncio.run(read())
+
+    def test_finished_title_zero_watch_and_discarded_reopens_preserve_state_and_history(self) -> None:
+        with self.credits_run() as first:
+            self.assertEqual(self.client.post(f"/api/playback/runs/{first['runId']}/close", json={
+                "timestamp": 105, "total_seconds_played": 1, "sequence_number": 1}).json()["status"], "finished")
+            before = self.saved_playback_state()
+            for event in ("heartbeat", "pause", "seek", "visibility"):
+                with self.subTest(event=event), patch("routes.playback.record_playback_progress", new=AsyncMock()) as recorder:
+                    reopened = self.create_run()
+                    body = {"timestamp": 37, "total_seconds_played": 0, "sequence_number": 1, "event": event}
+                    self.assertEqual(self.client.post(f"/api/playback/runs/{reopened['runId']}/progress", json=body).status_code, 200)
+                    self.assertEqual(self.client.post(f"/api/playback/runs/{reopened['runId']}/close", json={**body, "sequence_number": 2}).status_code, 200)
+                    self.assertEqual(self.saved_playback_state(), before)
+                    recorder.assert_not_awaited()
+            discarded = self.create_run()
+            self.assertEqual(self.client.post(f"/api/playback/runs/{discarded['runId']}/close", json={
+                "timestamp": 37, "total_seconds_played": 1, "sequence_number": 1, "discard_progress": True}).status_code, 200)
+            self.assertEqual(self.saved_playback_state(), before)
+
+    def test_newest_confirmed_run_fences_late_completion_and_older_replay(self) -> None:
+        with self.credits_run() as initial:
+            older, owner = self.create_run(), self.create_run()
+            progress = self.client.post(f"/api/playback/runs/{owner['runId']}/progress", json={
+                "timestamp": 37, "total_seconds_played": 1, "sequence_number": 1})
+            self.assertEqual(progress.status_code, 200, progress.text)
+            before = self.saved_playback_state()
+            self.assertEqual(before[4], owner["runId"])
+            with patch("routes.playback.record_playback_progress", new=AsyncMock()) as recorder:
+                late = self.client.post(f"/api/playback/runs/{older['runId']}/progress", json={
+                    "timestamp": 120, "total_seconds_played": 1, "sequence_number": 1, "event": "ended"})
+                self.assertEqual(late.status_code, 200, late.text)
+                self.assertEqual(late.json()["status"], "finished")
+                self.assertEqual(self.saved_playback_state(), before)
+                recorder.assert_not_awaited()
+                replayed = self.client.post(f"/api/playback/runs/{older['runId']}/start-over")
+                self.assertEqual(replayed.status_code, 409, replayed.text)
+                self.assertEqual(replayed.json()["detail"]["code"], "PLAYBACK_RUN_SUPERSEDED")
+                self.assertEqual(self.saved_playback_state(), before)
+                # Superseded progress ownership does not revoke media delivery.
+                self.assertEqual(self.client.get(f"{initial['streamBaseUrl']}/manifest").status_code, 200)
+            newest = self.create_run()
+            advanced = self.client.post(f"/api/playback/runs/{newest['runId']}/progress", json={
+                "timestamp": 70, "total_seconds_played": 1, "sequence_number": 1})
+            self.assertEqual(advanced.status_code, 200, advanced.text)
+            after = self.saved_playback_state()
+            self.assertEqual(after[:2], (70, 2))
+            self.assertEqual(after[4], newest["runId"])
+            with patch("routes.playback.record_playback_progress", new=AsyncMock()) as recorder:
+                late_close = self.client.post(f"/api/playback/runs/{owner['runId']}/close", json={
+                    "timestamp": 105, "total_seconds_played": 2, "sequence_number": 2})
+                self.assertEqual(late_close.status_code, 200, late_close.text)
+                self.assertEqual(self.saved_playback_state(), after)
+                recorder.assert_not_awaited()
+
+    def test_unfinished_transfer_preserves_cycle_totals_without_forcing_history(self) -> None:
+        with self.credits_run() as first:
+            self.assertEqual(self.client.post(f"/api/playback/runs/{first['runId']}/progress", json={
+                "timestamp": 40, "total_seconds_played": 2, "sequence_number": 1}).status_code, 200)
+            second = self.create_run()
+            self.assertEqual(second["resumePosition"], 40)
+            with patch("routes.playback.record_playback_progress", new=AsyncMock()) as recorder:
+                response = self.client.post(f"/api/playback/runs/{second['runId']}/progress", json={
+                    "timestamp": 50, "total_seconds_played": 2, "sequence_number": 1})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(self.saved_playback_state()[:2], (50, 4))
+                self.assertNotIn("start_new_attempt", recorder.await_args.kwargs)
+
+    def test_unfinished_newer_confirmed_seek_saves_position_without_viewing_or_history_split(self) -> None:
+        with self.credits_run() as first:
+            self.assertEqual(self.client.post(f"/api/playback/runs/{first['runId']}/progress", json={
+                "timestamp": 40, "total_seconds_played": 2, "sequence_number": 1}).status_code, 200)
+            second = self.create_run()
+            with patch("routes.playback.record_playback_progress", new=AsyncMock()) as recorder:
+                seek = self.client.post(f"/api/playback/runs/{second['runId']}/progress", json={
+                    "timestamp": 48, "total_seconds_played": 0, "sequence_number": 1, "event": "seek"})
+                self.assertEqual(seek.status_code, 200, seek.text)
+                self.assertEqual(self.saved_playback_state()[:2], (48, 2))
+                self.assertEqual(self.saved_playback_state()[4], second["runId"])
+                recorder.assert_not_awaited()
+                refreshed = self.client.get(f"/api/playback/runs/{second['runId']}")
+                self.assertEqual(refreshed.status_code, 200, refreshed.text)
+                self.assertEqual(refreshed.json()["resumePosition"], 48)
+                before = self.saved_playback_state()
+                self.assertEqual(self.client.post(f"/api/playback/runs/{first['runId']}/progress", json={
+                    "timestamp": 45, "total_seconds_played": 3, "sequence_number": 2}).status_code, 200)
+                self.assertEqual(self.saved_playback_state(), before)
+                recorder.assert_not_awaited()
+                resumed = self.client.post(f"/api/playback/runs/{second['runId']}/progress", json={
+                    "timestamp": 70, "total_seconds_played": 1, "sequence_number": 2})
+                self.assertEqual(resumed.status_code, 200, resumed.text)
+                self.assertEqual(self.saved_playback_state()[:2], (70, 3))
+                self.assertNotIn("start_new_attempt", recorder.await_args.kwargs)
+
+    def test_replay_keeps_new_attempt_signal_across_zero_watch_seek(self) -> None:
+        with self.credits_run() as first:
+            self.assertEqual(self.client.post(f"/api/playback/runs/{first['runId']}/close", json={
+                "timestamp": 105, "total_seconds_played": 1, "sequence_number": 1}).json()["status"], "finished")
+            self.assertEqual(self.client.post(f"/api/playback/runs/{first['runId']}/start-over").status_code, 200)
+            with patch("routes.playback.record_playback_progress", new=AsyncMock(return_value="new-attempt")) as recorder:
+                seek = self.client.post(f"/api/playback/runs/{first['runId']}/progress", json={
+                    "timestamp": 70, "total_seconds_played": 0, "sequence_number": 2, "event": "seek"})
+                self.assertEqual(seek.status_code, 200, seek.text)
+                recorder.assert_not_awaited()
+                positive = self.client.post(f"/api/playback/runs/{first['runId']}/progress", json={
+                    "timestamp": 70, "total_seconds_played": 1, "sequence_number": 3})
+                self.assertEqual(positive.status_code, 200, positive.text)
+                self.assertTrue(recorder.await_args.kwargs["start_new_attempt"])
+                self.assertEqual(self.saved_playback_state()[4], first["runId"])
+                self.assertEqual(self.client.post(f"/api/playback/runs/{first['runId']}/progress", json={
+                    "timestamp": 71, "total_seconds_played": 2, "sequence_number": 4}).status_code, 200)
+                self.assertNotIn("start_new_attempt", recorder.await_args.kwargs)
+
+    def test_legacy_finished_rows_reject_old_automatic_writes_but_allow_explicit_replay(self) -> None:
+        with self.credits_run() as old:
+            async def legacy(updated_at):
+                async with AsyncSession(self.engine) as db:
+                    saved = (await db.exec(select(PlaybackSession).where(
+                        PlaybackSession.profile_id == "contract-profile", PlaybackSession.movie_id == "m_playback_contract",
+                        PlaybackSession.episode_id.is_(None)))).one()
+                    saved.progress_run_id = None
+                    saved.timestamp = 105
+                    saved.is_finished = True
+                    saved.updated_at = updated_at
+                    db.add(saved)
+                    await db.commit()
+            asyncio.run(legacy(datetime.now(timezone.utc).isoformat()))
+            before = self.saved_playback_state()
+            with patch("routes.playback.record_playback_progress", new=AsyncMock()) as recorder:
+                response = self.client.post(f"/api/playback/runs/{old['runId']}/progress", json={
+                    "timestamp": 37, "total_seconds_played": 1, "sequence_number": 1})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(self.saved_playback_state(), before)
+                recorder.assert_not_awaited()
+            fresh = self.create_run()
+            self.assertEqual(self.client.post(f"/api/playback/runs/{fresh['runId']}/progress", json={
+                "timestamp": 70, "total_seconds_played": 1, "sequence_number": 1}).status_code, 200)
+            self.assertFalse(self.saved_playback_state()[3])
+            self.assertEqual(self.saved_playback_state()[4], fresh["runId"])
+            asyncio.run(legacy("malformed legacy timestamp"))
+            self.assertEqual(self.client.post(f"/api/playback/runs/{old['runId']}/start-over").status_code, 200)
+            self.assertEqual(self.saved_playback_state()[:5], (0, 0, 0, False, old["runId"]))
+
+    def test_title_writer_holds_ownership_until_recommendation_commit(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+        with self.credits_run() as first:
+            second = self.create_run()
+            entered, release, second_recorded = Event(), Event(), Event()
+
+            async def record(**values):
+                if values["position"] == 40:
+                    entered.set()
+                    await asyncio.to_thread(release.wait, 3)
+                else:
+                    second_recorded.set()
+                return "attempt"
+
+            with patch("routes.playback.record_playback_progress", side_effect=record), self.client as client, ThreadPoolExecutor(max_workers=2) as pool:
+                initial = pool.submit(client.post, f"/api/playback/runs/{first['runId']}/progress", json={
+                    "timestamp": 40, "total_seconds_played": 1, "sequence_number": 1})
+                try:
+                    self.assertTrue(entered.wait(3))
+                    later = pool.submit(client.post, f"/api/playback/runs/{second['runId']}/progress", json={
+                        "timestamp": 50, "total_seconds_played": 1, "sequence_number": 1})
+                    self.assertFalse(second_recorded.wait(0.05))
+                finally:
+                    release.set()
+                self.assertEqual(initial.result(timeout=5).status_code, 200)
+                self.assertEqual(later.result(timeout=5).status_code, 200)
+            self.assertTrue(second_recorded.is_set())
+            self.assertEqual(self.saved_playback_state()[4], second["runId"])
+
+    def test_rewatch_history_failure_rolls_back_owner_sequence_and_attempt_before_retry(self) -> None:
+        from services.recommendation import record_playback_progress as real_record
+        with self.credits_run() as first, patch("routes.playback.record_playback_progress", side_effect=real_record):
+            completed = self.client.post(f"/api/playback/runs/{first['runId']}/close", json={
+                "timestamp": 105, "total_seconds_played": 1, "sequence_number": 1})
+            self.assertEqual(completed.status_code, 200, completed.text)
+            completed_attempt = completed.json()["viewingSessionId"]
+            before = self.saved_playback_state()
+            reopened = self.create_run()
+
+            async def history_state():
+                async with AsyncSession(self.engine) as db:
+                    run = await db.get(PlaybackRun, reopened["runId"])
+                    attempts = (await db.exec(select(ViewingAttempt).where(
+                        ViewingAttempt.profile_id == "contract-profile", ViewingAttempt.movie_id == "m_playback_contract"))).all()
+                    return (run.sequence_number, run.total_seconds_played, run.lifecycle_state), {
+                        row.id: (row.max_completion, row.completed_at, row.duration_watched) for row in attempts}
+            baseline_run, baseline_attempts = asyncio.run(history_state())
+            self.assertIsNotNone(baseline_attempts[completed_attempt][1])
+            failed_once = False
+
+            async def fail_after_history(**values):
+                nonlocal failed_once
+                result = await real_record(**values)
+                if not failed_once:
+                    failed_once = True
+                    raise RuntimeError("staged history failure")
+                return result
+
+            body = {"timestamp": 70, "total_seconds_played": 1, "sequence_number": 1}
+            with patch("routes.playback.record_playback_progress", side_effect=fail_after_history):
+                with self.assertRaisesRegex(RuntimeError, "staged history failure"):
+                    self.client.post(f"/api/playback/runs/{reopened['runId']}/progress", json=body)
+                self.assertEqual(self.saved_playback_state(), before)
+                self.assertEqual(asyncio.run(history_state()), (baseline_run, baseline_attempts))
+                retried = self.client.post(f"/api/playback/runs/{reopened['runId']}/progress", json=body)
+                self.assertEqual(retried.status_code, 200, retried.text)
+            new_attempt = retried.json()["viewingSessionId"]
+            self.assertNotEqual(new_attempt, completed_attempt)
+            saved_run, attempts = asyncio.run(history_state())
+            self.assertEqual(saved_run, (2, 1, "active"))
+            self.assertEqual(attempts[completed_attempt], baseline_attempts[completed_attempt])
+            self.assertEqual(len(attempts), len(baseline_attempts) + 1)
+            self.assertEqual(attempts[new_attempt], (70 / 120, None, 1))
+            self.assertEqual(self.saved_playback_state()[4], reopened["runId"])
 
     def test_credits_do_not_complete_ordinary_progress_or_unsupported_run_sources(self) -> None:
         for event in ("heartbeat", "pause", "seek", "visibility"):

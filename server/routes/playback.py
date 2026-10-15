@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import weakref
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 import re
 import time
@@ -59,10 +60,52 @@ ACTIVE_REPAIR_STATUSES = {"PENDING", "DOWNLOADING", "MERGING", "MOVING_CLOUD"}
 CLOUD_AUDIO_PROBE_TTL_SECONDS = 300
 _cloud_audio_probe_times: dict[str, float] = {}
 _run_write_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+_session_write_locks: weakref.WeakValueDictionary[tuple[str, str, Optional[str]], asyncio.Lock] = weakref.WeakValueDictionary()
 
 
 def run_write_lock(run_id: str) -> asyncio.Lock:
     return _run_write_locks.setdefault(run_id, asyncio.Lock())
+
+
+@asynccontextmanager
+async def playback_progress_writer(db: AsyncSession, run_id: str) -> AsyncIterator[None]:
+    """Serialize each title's fresh authorization, progress and history writes."""
+    async with run_write_lock(run_id):
+        anchor = await db.get(PlaybackRun, run_id)
+        key = (anchor.profile_id, anchor.movie_id, anchor.episode_id) if anchor else None
+        await db.rollback()
+        if key is None:
+            yield
+            return
+        lock = _session_write_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            try:
+                yield
+            except BaseException:
+                await settle(db.rollback())
+                raise
+
+
+async def can_own_session_progress(db: AsyncSession, run: PlaybackRun, session_rec: PlaybackSession) -> bool:
+    """An older run cannot replace the most recent confirmed viewing owner."""
+    if session_rec.progress_run_id:
+        if session_rec.progress_run_id == run.id:
+            return True
+        owner = await db.get(PlaybackRun, session_rec.progress_run_id)
+        if not owner or (owner.profile_id, owner.movie_id, owner.episode_id) != (run.profile_id, run.movie_id, run.episode_id):
+            return False
+        return (run.created_at, run.id) > (owner.created_at, owner.id)
+    if session_rec.is_finished:
+        # Legacy finished rows have no run identity. A pre-completion run must
+        # not reopen them merely because its delayed progress finally arrives.
+        try:
+            completed_at = datetime.fromisoformat(session_rec.updated_at)
+            if completed_at.tzinfo is None:
+                completed_at = completed_at.replace(tzinfo=timezone.utc)
+            return run.created_at > completed_at.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return False
+    return True
 
 
 _browser_stream_run: ContextVar[Optional[str]] = ContextVar("browser_stream_run", default=None)
@@ -1335,7 +1378,7 @@ async def update_playback_progress(
     await db.rollback()
     # Retain only the lookup anchor; authorization is read again under the writer.
     request.state.auth_session = AuthSession(id=identity, user_id=0)
-    async with run_write_lock(run_id):
+    async with playback_progress_writer(db, run_id):
         return await _update_playback_progress_locked(run_id, req, request, db, user)
 
 
@@ -1385,8 +1428,10 @@ async def _update_playback_progress_locked(
     )
     finished = bool(req.is_finished or req.event == "ended" or timestamp / duration >= 0.995 or credits_exit)
 
+    previous_seconds_played = run.total_seconds_played
+    whole_seconds_played = int(accepted_watched)
     run.sequence_number += 1
-    run.total_seconds_played += int(accepted_watched)
+    run.total_seconds_played += whole_seconds_played
     run.last_seen_at = now
     run.last_progress_at = now
     run.updated_at = now
@@ -1399,36 +1444,60 @@ async def _update_playback_progress_locked(
     session_rec = (await db.exec(select(PlaybackSession).where(*filters))).first()
     updated_at = datetime.now(timezone.utc).isoformat()
     completion_rate = min(timestamp / duration, 1.0)
+    is_owner = bool(session_rec and session_rec.progress_run_id == run.id)
+    intentional_seek = bool(
+        session_rec and not session_rec.is_finished and req.event == "seek"
+        and int(timestamp) != session_rec.timestamp
+    )
+    claims_progress = (
+        (whole_seconds_played > 0 and timestamp > 0 or intentional_seek)
+        and (session_rec is None or await can_own_session_progress(db, run, session_rec))
+    )
+    reopens_finished = bool(session_rec and session_rec.is_finished and claims_progress and not is_owner)
+    # Replay retains its owner but resets its run counter. Zero-watch seeks may
+    # update the resume point; defer history until its first real viewing batch.
+    unplayed_owner = is_owner and previous_seconds_played == 0
+    replay_cycle = unplayed_owner and int(session_rec.duration_watched or 0) == 0
+    writes_session = session_rec is None or is_owner or claims_progress or (
+        not session_rec.progress_run_id and not session_rec.is_finished
+    )
     if session_rec is None:
         session_rec = PlaybackSession(
             profile_id=run.profile_id,
             movie_id=run.movie_id,
             episode_id=run.episode_id,
             timestamp=int(timestamp),
-            duration_watched=int(accepted_watched),
+            duration_watched=whole_seconds_played,
             completion_rate=completion_rate,
             updated_at=updated_at,
             is_finished=finished,
+            progress_run_id=run.id if claims_progress else None,
         )
         db.add(session_rec)
-    elif not session_rec.is_finished:
+    elif writes_session:
         session_rec.timestamp = int(timestamp)
-        session_rec.duration_watched = int(session_rec.duration_watched or 0) + int(accepted_watched)
+        session_rec.duration_watched = (0 if reopens_finished else int(session_rec.duration_watched or 0)) + whole_seconds_played
         session_rec.completion_rate = completion_rate
         session_rec.updated_at = updated_at
         session_rec.is_finished = finished
+        if claims_progress:
+            session_rec.progress_run_id = run.id
         db.add(session_rec)
+    viewing_attempt_id = None
+    if writes_session and (previous_seconds_played > 0 or whole_seconds_played > 0 or finished):
+        attempt_options = {"start_new_attempt": True} if reopens_finished or replay_cycle else {}
+        viewing_attempt_id = await record_playback_progress(
+            profile_id=run.profile_id,
+            movie_id=run.movie_id,
+            episode_id=run.episode_id,
+            position=int(timestamp),
+            duration_watched=whole_seconds_played,
+            completion_rate=completion_rate,
+            is_finished=finished,
+            session=db,
+            **attempt_options,
+        )
     await db.commit()
-
-    viewing_attempt_id = await record_playback_progress(
-        profile_id=run.profile_id,
-        movie_id=run.movie_id,
-        episode_id=run.episode_id,
-        position=int(timestamp),
-        duration_watched=int(accepted_watched),
-        completion_rate=completion_rate,
-        is_finished=finished,
-    )
     return {
         "status": "finished" if finished else "ok",
         "viewingSessionId": viewing_attempt_id,
@@ -1449,7 +1518,7 @@ async def close_playback_run(
     await db.rollback()
     # Retain only the lookup anchor; authorization is read again under the writer.
     request.state.auth_session = AuthSession(id=identity, user_id=0)
-    async with run_write_lock(run_id):
+    async with playback_progress_writer(db, run_id):
         return await _close_playback_run_locked(run_id, req, request, db, user)
 
 
@@ -1496,7 +1565,7 @@ async def start_over_playback_run(
     await db.rollback()
     # Retain only the lookup anchor; authorization is read again under the writer.
     request.state.auth_session = AuthSession(id=identity, user_id=0)
-    async with run_write_lock(run_id):
+    async with playback_progress_writer(db, run_id):
         return await _start_over_playback_run_locked(run_id, request, db, user)
 
 
@@ -1511,12 +1580,18 @@ async def _start_over_playback_run_locked(
     filters = [PlaybackSession.profile_id == run.profile_id, PlaybackSession.movie_id == run.movie_id]
     filters.append(PlaybackSession.episode_id == run.episode_id if run.episode_id else PlaybackSession.episode_id.is_(None))
     session_rec = (await db.exec(select(PlaybackSession).where(*filters))).first()
+    if session_rec and session_rec.progress_run_id and session_rec.progress_run_id != run.id and not await can_own_session_progress(db, run, session_rec):
+        raise playback_error(status.HTTP_409_CONFLICT, "PLAYBACK_RUN_SUPERSEDED", "A newer viewing owns this title. Open the title again to start over.")
+    if session_rec is None:
+        session_rec = PlaybackSession(profile_id=run.profile_id, movie_id=run.movie_id, episode_id=run.episode_id,
+                                      timestamp=0, updated_at=datetime.now(timezone.utc).isoformat())
     if session_rec:
         session_rec.timestamp = 0
         session_rec.duration_watched = 0
         session_rec.is_finished = False
         session_rec.completion_rate = 0.0
         session_rec.updated_at = datetime.now(timezone.utc).isoformat()
+        session_rec.progress_run_id = run.id
         db.add(session_rec)
     run.lifecycle_state = "active"
     run.total_seconds_played = 0

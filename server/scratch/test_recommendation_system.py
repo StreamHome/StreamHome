@@ -42,6 +42,108 @@ def movie(movie_id: str, title: str, genres, *, available: bool, media_type: str
     return item
 
 
+async def check_confirmed_rewatch_history(test_engine) -> None:
+    """An authorized rewatch keeps completed history even outside restart heuristics."""
+    async with AsyncSession(test_engine) as db:
+        db.add(Profile(id="rewatch-history", name="Rewatch History"))
+        db.add(movie("m_201", "Late First Rewatch Report", ["Action"], available=True))
+        db.add(movie("m_202", "Early Credits Completion", ["Drama"], available=True))
+        await db.commit()
+
+    for movie_id, previous_position, previous_watched, previous_completion in (
+        ("m_201", 4000, 4000, 0.80),
+        ("m_202", 80, 80, 0.08),
+    ):
+        completed_id = await recommendation.record_playback_progress(
+            "rewatch-history", movie_id, None, previous_position,
+            previous_watched, previous_completion, True,
+        )
+        assert completed_id
+        async with AsyncSession(test_engine) as db:
+            completed = await db.get(ViewingAttempt, completed_id)
+            assert completed and completed.completed_at is not None
+            completed.rewatch_reward = 0.60
+            db.add(completed)
+            await db.commit()
+            await db.refresh(completed)
+            historical = completed.model_dump()
+            milestones = [item.model_dump() for item in (await db.exec(
+                select(PlaybackMilestone).where(PlaybackMilestone.attempt_id == completed_id).order_by(PlaybackMilestone.id)
+            )).all()]
+            rewards = [item.model_dump() for item in (await db.exec(
+                select(TelemetryEvent).where(TelemetryEvent.profile_id == "rewatch-history", TelemetryEvent.movie_id == movie_id).order_by(TelemetryEvent.id)
+            )).all()]
+
+        new_id = await recommendation.record_playback_progress(
+            "rewatch-history", movie_id, None, 75, 12, 75 / 7200, False,
+            start_new_attempt=True,
+        )
+        assert new_id and new_id != completed_id, "confirmed rewatch must start separate history even after 60 seconds or low credits completion"
+        continued_id = await recommendation.record_playback_progress(
+            "rewatch-history", movie_id, None, 85, 20, 85 / 7200, False,
+        )
+        assert continued_id == new_id, "ordinary follow-up progress must retain the newly opened attempt"
+        async with AsyncSession(test_engine) as db:
+            completed = await db.get(ViewingAttempt, completed_id)
+            current = await db.get(ViewingAttempt, new_id)
+            assert completed and completed.model_dump() == historical, "rewatch must not rewrite completed history or its reward"
+            assert current and current.completed_at is None and not current.early_exit_recorded
+            assert current.max_completion == 85 / 7200 and current.duration_watched == 20
+            assert current.rewatch_reward == 0.0, "opening a rewatch must not fabricate a rewatch reward"
+            assert [item.model_dump() for item in (await db.exec(
+                select(PlaybackMilestone).where(PlaybackMilestone.attempt_id == completed_id).order_by(PlaybackMilestone.id)
+            )).all()] == milestones, "historical milestones must stay unchanged"
+            assert [item.model_dump() for item in (await db.exec(
+                select(TelemetryEvent).where(TelemetryEvent.profile_id == "rewatch-history", TelemetryEvent.movie_id == movie_id).order_by(TelemetryEvent.id)
+            )).all()] == rewards, "a low-progress rewatch must not add completion or early-exit signals"
+
+
+async def check_caller_owned_rewatch_transaction(test_engine) -> None:
+    async with AsyncSession(test_engine) as db:
+        db.add(Profile(id="rewatch-transaction", name="Rewatch Transaction"))
+        db.add(movie("m_203", "Atomic Rewatch History", ["Action"], available=True))
+        await db.commit()
+    completed_id = await recommendation.record_playback_progress(
+        "rewatch-transaction", "m_203", None, 5760, 5760, 0.80, True,
+    )
+    assert completed_id
+
+    async def history_snapshot():
+        async with AsyncSession(test_engine) as db:
+            return {
+                "attempts": [item.model_dump() for item in (await db.exec(select(ViewingAttempt).where(ViewingAttempt.profile_id == "rewatch-transaction").order_by(ViewingAttempt.id))).all()],
+                "milestones": [item.model_dump() for item in (await db.exec(select(PlaybackMilestone).order_by(PlaybackMilestone.id))).all()],
+                "signals": [item.model_dump() for item in (await db.exec(select(TelemetryEvent).where(TelemetryEvent.profile_id == "rewatch-transaction").order_by(TelemetryEvent.id))).all()],
+                "tastes": [item.model_dump() for item in (await db.exec(select(ProfileTaste).where(ProfileTaste.profile_id == "rewatch-transaction").order_by(ProfileTaste.id))).all()],
+            }
+
+    before = await history_snapshot()
+    async with AsyncSession(test_engine) as db:
+        rolled_back_id = await recommendation.record_playback_progress(
+            "rewatch-transaction", "m_203", None, 4320, 50, 0.60, False,
+            start_new_attempt=True, session=db,
+        )
+        await db.flush()
+        assert rolled_back_id and rolled_back_id != completed_id
+        assert await db.get(ViewingAttempt, rolled_back_id)
+        await db.rollback()
+    assert await history_snapshot() == before, "caller rollback must discard the new attempt, milestones, signals and taste changes together"
+
+    async with AsyncSession(test_engine) as db:
+        committed_id = await recommendation.record_playback_progress(
+            "rewatch-transaction", "m_203", None, 4320, 50, 0.60, False,
+            start_new_attempt=True, session=db,
+        )
+        await db.commit()
+    after = await history_snapshot()
+    assert committed_id and committed_id != rolled_back_id
+    assert len(after["attempts"]) == 2, "retry must commit exactly one new attempt"
+    assert next(item for item in after["attempts"] if item["id"] == completed_id) == before["attempts"][0], "atomic retry must preserve completed history"
+    current = next(item for item in after["attempts"] if item["id"] == committed_id)
+    assert current["completed_at"] is None and current["max_completion"] == 0.60
+    assert all(item["id"] != rolled_back_id for item in after["attempts"])
+
+
 async def main() -> None:
     handle, path = tempfile.mkstemp(suffix=".db")
     os.close(handle)
@@ -154,6 +256,8 @@ async def main() -> None:
 
         half_life_taste = ProfileTaste(profile_id="profile", tag_type="genre", tag_value="action", score=10.0, last_updated=time.time() - 90 * 86400)
         assert 4.95 <= recommendation.decayed_score(half_life_taste) <= 5.05
+        await check_confirmed_rewatch_history(test_engine)
+        await check_caller_owned_rewatch_transaction(test_engine)
         print("Recommendation regression checks passed.")
     finally:
         recommendation.engine = original_engine

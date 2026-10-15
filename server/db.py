@@ -41,10 +41,12 @@ async def init_db(
             existing_tables = {row[0] for row in check.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             movie_columns = {row[1] for row in check.execute("PRAGMA table_info(movie)").fetchall()}
             playback_run_columns = {row[1] for row in check.execute("PRAGMA table_info(playbackrun)").fetchall()} if "playbackrun" in existing_tables else set()
+            playback_session_columns = {row[1] for row in check.execute("PRAGMA table_info(playbacksession)").fetchall()} if "playbacksession" in existing_tables else set()
             playback_upgrade_needed = (
                 "playbackrun" not in existing_tables
                 or bool(playback_run_columns and "last_progress_at" not in playback_run_columns)
                 or bool(movie_columns and "source_fingerprint" not in movie_columns)
+                or bool(playback_session_columns and "progress_run_id" not in playback_session_columns)
             )
             if playback_upgrade_needed and allow_migration_backups:
                 backup_dir = os.path.join(os.path.dirname(settings.db_path), "backup")
@@ -158,6 +160,9 @@ async def init_db(
                     sync_conn.exec_driver_sql("ALTER TABLE user ADD COLUMN last_login_device TEXT")
 
             if "playbacksession" in inspector.get_table_names():
+                playback_session_cols = {column["name"] for column in inspector.get_columns("playbacksession")}
+                if "progress_run_id" not in playback_session_cols:
+                    sync_conn.exec_driver_sql("ALTER TABLE playbacksession ADD COLUMN progress_run_id TEXT")
                 logger.info("[Database] Deduplicating playbacksession rows...")
                 sync_conn.exec_driver_sql(
                     "DELETE FROM playbacksession WHERE id NOT IN ("

@@ -8,8 +8,9 @@ import math
 import time
 import uuid
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy import delete
@@ -425,6 +426,16 @@ def _parse_iso_timestamp(value: Optional[str]) -> float:
         return 0.0
 
 
+@asynccontextmanager
+async def _playback_history_session(session: Optional[AsyncSession]) -> AsyncIterator[AsyncSession]:
+    if session is not None:
+        yield session
+        return
+    async with AsyncSession(engine) as db:
+        yield db
+        await db.commit()
+
+
 async def record_playback_progress(
     profile_id: str,
     movie_id: str,
@@ -433,11 +444,14 @@ async def record_playback_progress(
     duration_watched: int,
     completion_rate: float,
     is_finished: bool,
+    *,
+    start_new_attempt: bool = False,
+    session: Optional[AsyncSession] = None,
 ) -> Optional[str]:
-    """Create idempotent milestones and bounded rewatch/early-exit signals."""
+    """Record history; a supplied session keeps commit/rollback with its caller."""
     now = time.time()
     completion_rate = max(0.0, min(1.0, float(completion_rate or 0.0)))
-    async with AsyncSession(engine) as db:
+    async with _playback_history_session(session) as db:
         movie = await db.get(Movie, movie_id)
         if not movie or not await db.get(Profile, profile_id):
             return None
@@ -453,11 +467,11 @@ async def record_playback_progress(
         attempts_result = await db.exec(stmt.order_by(ViewingAttempt.last_seen_at.desc()))
         attempts = list(attempts_result.all())
         current = attempts[0] if attempts else None
-        starts_new = not current or (now - current.last_seen_at > ATTEMPT_GAP_SECONDS) or (
+        starts_new = start_new_attempt or not current or (now - current.last_seen_at > ATTEMPT_GAP_SECONDS) or (
             position < 60 and current.max_completion >= 0.25
         )
 
-        if starts_new and current and current.max_completion < 0.10 and current.duration_watched >= 60 and not current.early_exit_recorded:
+        if starts_new and current and current.completed_at is None and current.max_completion < 0.10 and current.duration_watched >= 60 and not current.early_exit_recorded:
             current.early_exit_recorded = True
             db.add(current)
             earlier_exits = sum(1 for attempt in attempts[1:] if attempt.early_exit_recorded and now - attempt.last_seen_at <= 30 * 86400)
@@ -527,7 +541,6 @@ async def record_playback_progress(
                 )
 
         attempt_id = current.id
-        await db.commit()
         return attempt_id
 
 

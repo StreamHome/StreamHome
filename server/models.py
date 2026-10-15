@@ -547,6 +547,7 @@ class PlaybackSession(SQLModel, table=True):
     completion_rate: Optional[float] = Field(default=0.0)  # Ratio of watched to total duration
     updated_at: str
     is_finished: Optional[bool] = Field(default=False)
+    progress_run_id: Optional[str] = Field(default=None)  # Private owner of this viewing cycle
 
 class PlaybackRun(SQLModel, table=True):
     id: str = Field(primary_key=True)
