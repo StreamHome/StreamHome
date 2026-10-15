@@ -555,6 +555,7 @@ export interface PlaybackPreparationProgress {
 export type PlaybackProgressEvent = "heartbeat" | "pause" | "seek" | "visibility" | "exit" | "ended";
 
 export interface PlaybackProgressRequest {
+  totalSecondsPlayed?: number;
   timestamp: number;
   durationWatched: number;
   isFinished: boolean;
@@ -570,6 +571,7 @@ export interface PlaybackProgressResponse {
 }
 
 export interface PlaybackRunResponse {
+  streamBaseUrl?: string | null;
   runId: string;
   mediaId: string;
   movieId: string;

@@ -24,9 +24,12 @@ export function normalizeLanguageTag(value: string | null | undefined, fallback 
 export function languageDisplayName(language: string, suppliedLabel = ""): string {
   const normalized = normalizeLanguageTag(language);
   try {
-    const locale = typeof navigator === "undefined" ? "en" : navigator.language || "en";
-    const displayName = new Intl.DisplayNames([locale], { type: "language" }).of(normalized);
-    if (displayName) return displayName;
+    const displayName = new Intl.DisplayNames(["en"], { type: "language" }).of(normalized);
+    if (displayName) {
+      const label = suppliedLabel.trim();
+      if (!label || normalizeLanguageTag(label, "") === normalized || label.toLowerCase() === displayName.toLowerCase()) return displayName;
+      return label.toLowerCase().includes(displayName.toLowerCase()) ? label : `${displayName} · ${label}`;
+    }
   } catch {
     // Older browsers retain the supplied server label or neutral language tag.
   }

@@ -1,3 +1,4 @@
+import { useThemeStore } from "../../stores/themeStore";
 import { MemoryRouter } from "react-router-dom";
 
 import { useProfileStore } from "../../stores/profileStore";
@@ -66,9 +67,13 @@ const fixturePlayback: ResolvedPlayback = {
 
 
 export function PlayerVisualFixture() {
+  const serverFixture = new URLSearchParams(window.location.search).get("fixture") === "server";
+  const query = new URLSearchParams(window.location.search);
+  const selectedProfile = { ...fixtureProfile, id: serverFixture ? query.get("profile") || "isolated-player-profile" : fixtureProfile.id, theme: query.get("theme") || "ember" };
+  useThemeStore.getState().setTheme(selectedProfile.theme);
   const profile = useProfileStore.getState().activeProfile;
-  if (profile?.id !== fixtureProfile.id) {
-    useProfileStore.setState({ profiles: [fixtureProfile], activeProfile: fixtureProfile, isAdmin: false });
+  if (profile?.id !== selectedProfile.id || profile.theme !== selectedProfile.theme) {
+    useProfileStore.setState({ profiles: [selectedProfile], activeProfile: selectedProfile, isAdmin: false });
   }
   const fixtureState = new URLSearchParams(window.location.search).get("fixtureState");
   const playback = fixtureState === "preparing"
@@ -84,10 +89,19 @@ export function PlayerVisualFixture() {
           fullyPrepared: false,
         },
       }
-    : fixturePlayback;
+    : query.get("fixture") === "semantic" ? {
+        ...fixturePlayback,
+        runResponse: { ...fixturePlayback.runResponse, manifestUrl: "/__player-semantic-fixture/master.m3u8", progressiveUrl: "", sourceMetadata: { ...fixturePlayback.runResponse.sourceMetadata, width: 320, height: 180, frameRate: 25 },
+          tracks: [
+            { id: "audio_embedded_1_2e7314e345_en", label: "English", language: "en", channels: 2, default: true, source: "embedded" as const, streamIndex: 1, ready: true, status: "ready" as const },
+            { id: "audio_embedded_2_bfc7290ec7_tr", label: "Turkish", language: "tr", channels: 2, default: false, source: "embedded" as const, streamIndex: 2, ready: true, status: "ready" as const },
+          ], renditions: [{ id: "video_original", label: "180p", height: 180, width: 320, original: true, ready: true, status: "ready" as const }, { id: "video_144p", label: "144p", height: 144, width: 256, original: false, ready: true, status: "ready" as const }],
+          subtitles: [{ id: "semantic-en", label: "English", language: "en" },{ id: "semantic-tr", label: "Turkish", language: "tr" }],
+        },
+      } : fixturePlayback;
   return (
-    <MemoryRouter initialEntries={["/?profile=player-visual-fixture&view=watch&media=m_player_visual_fixture"]}>
-      <PlayerPage visualFixture={playback} />
+    <MemoryRouter initialEntries={[serverFixture ? `/?profile=${encodeURIComponent(selectedProfile.id)}&view=watch&media=${encodeURIComponent(query.get("media") || "m_player_visual_fixture")}` : "/?profile=player-visual-fixture&view=watch&media=m_player_visual_fixture"]}>
+      <PlayerPage visualFixture={serverFixture ? undefined : playback} />
     </MemoryRouter>
   );
 }

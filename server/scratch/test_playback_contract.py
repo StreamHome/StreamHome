@@ -221,6 +221,121 @@ class PlaybackContractRegression(unittest.TestCase):
         obsolete_jit = self.client.get(f"/api/playback/jit/m_playback_contract/master.m3u8?ticket={run['ticket']}")
         self.assertEqual(obsolete_jit.status_code, 404)
 
+    def test_browser_urls_survive_ticket_expiry_and_keep_assets_run_scoped(self) -> None:
+        run = self.create_run()
+        base = run["streamBaseUrl"]
+        self.assertEqual(base, f"/api/playback/streams/{run['runId']}")
+        class FutureClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.fromtimestamp(run["ticketExpiresAt"] + 1, tz=tz)
+        with patch("routes.playback.time.time", return_value=run["ticketExpiresAt"] + 1), patch("jwt.api_jwt.datetime", FutureClock):
+            master = self.client.get(f"{base}/manifest")
+            self.assertEqual(master.status_code, 200, master.text)
+            self.assertNotIn("ticket=", master.text)
+            child_url = next(line for line in master.text.splitlines() if "video_original/playlist" in line)
+            self.assertTrue(child_url.startswith(f"{base}/hls/"))
+            child = self.client.get(child_url)
+            segment_url = next(line for line in child.text.splitlines() if "segment_00000" in line)
+            self.assertEqual(self.client.get(segment_url).content, b"video-segment")
+            head = self.client.head(f"{base}/progressive")
+            self.assertEqual(head.status_code, 200, head.text)
+            ranged = self.client.get(f"{base}/progressive", headers={"Range": "bytes=32-159"})
+            self.assertEqual(ranged.status_code, 206, ranged.text)
+            self.assertEqual(ranged.content, self.media_file.read_bytes()[32:160])
+        closed = self.client.post(f"/api/playback/runs/{run['runId']}/close", json={"timestamp": 5, "duration_watched": 0, "sequence_number": 1, "event": "exit"})
+        self.assertEqual(closed.status_code, 200, closed.text)
+        self.assertEqual(self.client.get(f"{base}/manifest").status_code, 410)
+
+    def test_browser_assets_recheck_revocation_and_reject_missing_paths(self) -> None:
+        run = self.create_run()
+        base = run["streamBaseUrl"]
+        async def revoke(value):
+            async with AsyncSession(self.engine) as db:
+                session = await db.get(AuthSession, self.auth_session.id)
+                session.revoked_at = value
+                db.add(session)
+                await db.commit()
+        asyncio.run(revoke(time.time()))
+        try:
+            self.assertEqual(self.client.get(f"{base}/manifest").status_code, 401)
+        finally:
+            asyncio.run(revoke(None))
+        self.assertEqual(self.client.get(f"{base}/not-an-asset").status_code, 404)
+        self.assertEqual(self.client.get(f"{base}/manifest?rendition_id=unprepared").status_code, 404)
+        selected = self.client.get(f"{base}/manifest?rendition_id=video_original")
+        self.assertEqual(selected.status_code, 200, selected.text)
+        self.assertEqual(selected.text.count("#EXT-X-STREAM-INF:"), 1)
+        self.assertIn("#EXT-X-MEDIA:TYPE=AUDIO", selected.text)
+
+    def test_cumulative_close_retains_a_delayed_progress_snapshot_without_double_counting(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        run = self.create_run()
+        async def age():
+            async with AsyncSession(self.engine) as db:
+                record = await db.get(PlaybackRun, run["runId"])
+                record.created_at = time.time() - 35
+                record.last_progress_at = time.time() - 35
+                db.add(record)
+                await db.commit()
+        asyncio.run(age())
+        body = {"timestamp": 30, "duration_watched": 10, "total_seconds_played": 10, "sequence_number": 1, "event": "heartbeat"}
+        closing = {**body, "total_seconds_played": 30, "event": "exit"}
+        with self.client as client, ThreadPoolExecutor(max_workers=2) as pool:
+            progress = pool.submit(client.post, f"/api/playback/runs/{run['runId']}/progress", json=body)
+            close = pool.submit(client.post, f"/api/playback/runs/{run['runId']}/close", json=closing)
+            self.assertIn(progress.result().status_code, (200, 410))
+            self.assertEqual(close.result().status_code, 200)
+            repeated = client.post(f"/api/playback/runs/{run['runId']}/close", json=closing)
+            self.assertEqual(repeated.status_code, 200)
+        async def total():
+            async with AsyncSession(self.engine) as db:
+                record = await db.get(PlaybackRun, run["runId"])
+                return record.total_seconds_played, record.lifecycle_state
+        self.assertEqual(asyncio.run(total()), (30, "abandoned"))
+
+    def test_discarding_an_obsolete_run_preserves_newer_profile_progress(self) -> None:
+        old = self.create_run()
+        new = self.create_run()
+        progress = self.client.post(f"/api/playback/runs/{new['runId']}/progress", json={"timestamp": 48, "duration_watched": 0, "sequence_number": 1, "event": "seek"})
+        self.assertEqual(progress.status_code, 200, progress.text)
+        closed = self.client.post(f"/api/playback/runs/{old['runId']}/close", json={"timestamp": 0, "duration_watched": 0, "sequence_number": 1, "event": "exit", "discard_progress": True})
+        self.assertEqual(closed.status_code, 200, closed.text)
+        restored = self.client.get(f"/api/playback/runs/{new['runId']}")
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertEqual(restored.json()["resumePosition"], 48)
+        self.assertEqual(self.client.get(f"{old['streamBaseUrl']}/manifest").status_code, 410)
+
+    def test_stable_assets_reject_another_session_and_an_accepted_source_change(self) -> None:
+        run = self.create_run()
+        base = run["streamBaseUrl"]
+        previous = type(self).auth_session
+        other = AuthSession(id="other-playback-session", user_id=previous.user_id, created_at=time.time(), last_seen_at=time.time(), expires_at=time.time()+3600)
+        async def seed():
+            async with AsyncSession(self.engine) as db:
+                await db.merge(other)
+                await db.commit()
+        asyncio.run(seed())
+        type(self).auth_session = other
+        try:
+            response = self.client.get(f"{base}/manifest")
+            self.assertEqual(response.status_code, 403, response.text)
+        finally:
+            type(self).auth_session = previous
+        async def identity(value):
+            async with AsyncSession(self.engine) as db:
+                movie = await db.get(Movie, "m_playback_contract")
+                movie.source_fingerprint = value
+                db.add(movie)
+                await db.commit()
+        asyncio.run(identity("changed-source"))
+        try:
+            response = self.client.get(f"{base}/manifest")
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertEqual(response.json()["detail"]["code"], "PLAYBACK_SOURCE_CHANGED")
+        finally:
+            asyncio.run(identity(self.fingerprint))
+
     def test_direct_and_ffmpeg_bridge_sources_are_true_byte_range_streams(self) -> None:
         run = self.create_run()
         expected = self.media_file.read_bytes()[32:160]

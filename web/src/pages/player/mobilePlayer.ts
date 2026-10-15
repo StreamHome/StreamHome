@@ -67,7 +67,7 @@ export function isMobileTapCandidate(
 }
 
 export function shouldShowMobileChrome(phase: string, requested: boolean): boolean {
-  return requested || phase === "paused" || phase === "loading";
+  return requested || ["paused", "loading", "buffering", "recovering", "preparing"].includes(phase);
 }
 
 export function nextMobileTap(

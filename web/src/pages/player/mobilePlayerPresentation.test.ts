@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const playerPage = readFileSync(resolve("src/pages/player/PlayerPage.tsx"), "utf8");
+const playerControls = readFileSync(resolve("src/pages/player/PlayerControls.tsx"), "utf8");
 const playerStyles = readFileSync(resolve("src/index.css"), "utf8");
 const applicationStyles = readFileSync(resolve("src/themes/application/application.css"), "utf8");
 
@@ -23,7 +24,7 @@ describe("dedicated mobile player presentation", () => {
     expect(mobilePresentation).not.toContain('className="player-volume"');
     expect(mobilePresentation).not.toContain('icon={muted ? "mute" : "volume"}');
     expect((playerPage.match(/\{hasSubtitles && \(/g) ?? [])).toHaveLength(2);
-    expect((playerPage.match(/\{hasSubtitles && preferences\.subtitleTrackId !== "off" && \(/g) ?? [])).toHaveLength(4);
+    expect((playerPage.match(/captions=\{hasSubtitles && preferences\.subtitleTrackId !== "off"\}/g) ?? [])).toHaveLength(2);
   });
 
   it("defines automatic locked-portrait landscape fallback, safe areas, gesture feedback, and touch tooltip suppression", () => {
@@ -34,7 +35,7 @@ describe("dedicated mobile player presentation", () => {
     expect(playerPage).not.toContain('icon="rotate"');
     expect(playerPage).not.toContain('label="Start over"');
     expect(playerPage).toContain("const startOver = useCallback");
-    expect(playerPage).toContain("startOverPlaybackRun(runResponse.runId)");
+    expect(playerPage).toContain("startOverPlaybackRun(runId)");
     expect(playerPage).toContain('className="mobile-player-topbar__actions"');
     expect(playerPage).toContain('className="mobile-player-exit"');
     expect(playerStyles).toContain('.mobile-player-seek-feedback');
@@ -122,7 +123,7 @@ describe("dedicated mobile player presentation", () => {
 
   it("renders captions above visible controls and keeps exit actions opaque", () => {
     expect(playerPage).toContain('className="player-caption-layer"');
-    expect(playerPage).toContain('label="Subtitle timing"');
+    expect(playerControls).toContain('aria-label="Subtitle timing"');
     expect(playerStyles).toContain('bottom: max(clamp(9.5rem, 20vh, 13rem), calc(env(safe-area-inset-bottom) + 1.5rem))');
     expect(playerStyles).toContain('.player-view[data-mobile-player="true"] .player-caption-layer');
     expect(playerStyles).not.toContain('[data-controls-visible="true"]:not([data-mobile-player="true"]) .player-caption-layer');

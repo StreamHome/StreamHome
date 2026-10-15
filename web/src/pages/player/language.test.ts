@@ -3,6 +3,11 @@ import { describe, expect, it } from "vitest";
 import { languageDisplayName, normalizeLanguageTag } from "./language";
 
 describe("player language tags", () => {
+  it("retains server-provided commentary and accessibility labels", () => {
+    expect(languageDisplayName("en", "English · Commentary")).toBe("English · Commentary");
+    expect(languageDisplayName("en", "Audio description")).toContain("Audio description");
+    expect(languageDisplayName("en", "English")).toBe("English");
+  });
   it("canonicalizes reported legacy values without restricting arbitrary valid tags", () => {
     expect(normalizeLanguageTag("eng")).toBe("en");
     expect(normalizeLanguageTag("SPA")).toBe("es");

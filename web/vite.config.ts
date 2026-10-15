@@ -63,6 +63,15 @@ export default defineConfig(({ mode }) => {
             response.setHeader('Cache-Control', 'no-store');
             createReadStream(asset).pipe(response);
           });
+          server.middlewares.use('/__player-semantic-fixture', (request, response, next) => {
+            const relative = decodeURIComponent((request.url || '').split('?')[0]).replace(/^\/+/, '');
+            const root = path.resolve(__dirname, 'test-assets/player-semantic-hls');
+            const asset = path.resolve(root, relative);
+            if (!asset.startsWith(`${root}${path.sep}`) || !existsSync(asset) || !statSync(asset).isFile()) { next(); return; }
+            response.setHeader('Content-Type', asset.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp4');
+            response.setHeader('Cache-Control', 'no-store');
+            createReadStream(asset).pipe(response);
+          });
           server.middlewares.use('/__player-visual-fixture.mp4', (request, response) => {
             const asset = path.resolve(__dirname, 'test-assets/player-visual-fixture.mp4');
             const size = statSync(asset).size;

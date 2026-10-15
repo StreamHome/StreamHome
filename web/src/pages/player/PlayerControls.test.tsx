@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import { hasSubtitleOptions, PlayerControlMenu, PlayerIconButton } from "./PlayerControls";
+import { hasSubtitleOptions, PlayerControlMenu, PlayerIconButton, PlayerMenuProvider, PlayerSettings } from "./PlayerControls";
 
 describe("subtitle control availability", () => {
   it("hides the subtitle menu on every presentation when no tracks exist", () => {
@@ -23,6 +23,21 @@ describe("player icon controls", () => {
 });
 
 describe("player control menu", () => {
+  it("keeps one menu owner and releases an open control when it unmounts", () => {
+    const owner=vi.fn();
+    const fixture=(quality:boolean) => <PlayerMenuProvider onOpenChange={owner}>
+      {quality && <PlayerControlMenu label="Quality" icon="quality" value="auto" options={[{value:"auto",label:"Auto"}]} onSelect={() => undefined} />}
+      <PlayerSettings playbackRate={1} onRateChange={() => undefined} captions={false} captionScale={1} onCaptionScaleChange={() => undefined} subtitleOffset={0} onSubtitleOffsetChange={() => undefined} />
+    </PlayerMenuProvider>;
+    const view=render(fixture(true));
+    fireEvent.click(screen.getByRole("button",{name:"Quality: Auto"}));
+    fireEvent.click(screen.getByRole("button",{name:"Player settings"}));
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.getByRole("dialog",{name:"Player settings"})).toBeTruthy();
+    fireEvent.click(screen.getByRole("button",{name:"Quality: Auto"}));
+    view.rerender(fixture(false));
+    expect(owner).toHaveBeenLastCalledWith(false);
+  });
   function QualityFixture({ onOpenChange = () => undefined }: { onOpenChange?: (open: boolean) => void }) {
     const [quality, setQuality] = useState(-1);
     return (

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import mimetypes
 import os
+import weakref
+from contextvars import ContextVar
 import re
 import time
 import tempfile
@@ -53,6 +56,14 @@ SAFE_SUBTITLE_FILE_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,180}\.vtt$", re.IGNORECAS
 ACTIVE_REPAIR_STATUSES = {"PENDING", "DOWNLOADING", "MERGING", "MOVING_CLOUD"}
 CLOUD_AUDIO_PROBE_TTL_SECONDS = 300
 _cloud_audio_probe_times: dict[str, float] = {}
+_run_write_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def run_write_lock(run_id: str) -> asyncio.Lock:
+    return _run_write_locks.setdefault(run_id, asyncio.Lock())
+
+
+_browser_stream_run: ContextVar[Optional[str]] = ContextVar("browser_stream_run", default=None)
 
 
 class LeaseBoundPlaybackResponse(Response):
@@ -122,11 +133,16 @@ class PlaybackQualityRequest(APIModel):
 
 
 class PlaybackProgressRequest(APIModel):
+    total_seconds_played: Optional[int] = Field(default=None, ge=0, le=1_000_000_000)
     timestamp: float = Field(ge=0)
     duration_watched: float = Field(default=0, ge=0, le=120)
     is_finished: bool = False
     sequence_number: int = Field(ge=1)
     event: Literal["heartbeat", "pause", "seek", "visibility", "exit", "ended"] = "heartbeat"
+
+
+class PlaybackCloseRequest(PlaybackProgressRequest):
+    discard_progress: bool = False
 
 
 class PlaybackStartupDiagnosticRequest(APIModel):
@@ -192,6 +208,7 @@ class PlaybackPreparationProgress(APIModel):
 
 
 class PlaybackRunResponse(APIModel):
+    stream_base_url: Optional[str] = None
     run_id: str
     media_id: str
     movie_id: str
@@ -950,6 +967,7 @@ async def build_run_response(
         encoded_ticket = quote(ticket, safe="")
         duration = max(float(getattr(media_obj, "probed_duration", 0) or 0), float(preview_status["duration_seconds"] or 0))
         return PlaybackRunResponse(
+        stream_base_url=f"/api/playback/streams/{quote(run.id, safe='')}",
             run_id=run.id,
             media_id=media_obj.id,
             movie_id=run.movie_id,
@@ -1042,6 +1060,7 @@ async def build_run_response(
         baseline.name,
     )
     return PlaybackRunResponse(
+        stream_base_url=f"/api/playback/streams/{quote(run.id, safe='')}",
         run_id=run.id,
         media_id=media_obj.id,
         movie_id=run.movie_id,
@@ -1298,6 +1317,21 @@ async def update_playback_progress(
     db: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
+    identity = current_auth_session(request).id
+    await db.rollback()
+    # Retain only the lookup anchor; authorization is read again under the writer.
+    request.state.auth_session = AuthSession(id=identity, user_id=0)
+    async with run_write_lock(run_id):
+        return await _update_playback_progress_locked(run_id, req, request, db, user)
+
+
+async def _update_playback_progress_locked(
+    run_id: str,
+    req: PlaybackProgressRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
     del user
     run = await authorized_run(db, request, run_id)
     if run.lifecycle_state == "finished":
@@ -1313,7 +1347,15 @@ async def update_playback_progress(
     duration = max(1.0, media_duration_seconds(media_obj) or 3600.0)
     now = time.time()
     elapsed_bound = max(0.0, min(120.0, now - run.last_progress_at + 2.0))
-    accepted_watched = min(float(req.duration_watched), elapsed_bound)
+    requested_watched = (
+        max(0, req.total_seconds_played - run.total_seconds_played)
+        if req.total_seconds_played is not None else float(req.duration_watched)
+    )
+    if req.total_seconds_played is not None:
+        # Delayed snapshots may arrive together. Bound the cumulative lifetime,
+        # rather than dropping the older snapshot's remaining watch time.
+        elapsed_bound = max(0.0, now - run.created_at + 2.0 - run.total_seconds_played)
+    accepted_watched = min(float(requested_watched), 120.0, elapsed_bound)
     timestamp = max(0.0, min(float(req.timestamp), duration))
     finished = bool(req.is_finished or req.event == "ended" or timestamp / duration >= 0.995)
 
@@ -1372,7 +1414,22 @@ async def update_playback_progress(
 @router.post("/runs/{run_id}/close")
 async def close_playback_run(
     run_id: str,
-    req: PlaybackProgressRequest,
+    req: PlaybackCloseRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    identity = current_auth_session(request).id
+    await db.rollback()
+    # Retain only the lookup anchor; authorization is read again under the writer.
+    request.state.auth_session = AuthSession(id=identity, user_id=0)
+    async with run_write_lock(run_id):
+        return await _close_playback_run_locked(run_id, req, request, db, user)
+
+
+async def _close_playback_run_locked(
+    run_id: str,
+    req: PlaybackCloseRequest,
     request: Request,
     db: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
@@ -1382,8 +1439,15 @@ async def close_playback_run(
         return {"status": "abandoned", "nextSequenceNumber": run.sequence_number}
     if run.lifecycle_state == "finished":
         return {"status": "sticky_finished", "nextSequenceNumber": run.sequence_number}
+    if req.discard_progress:
+        run.lifecycle_state = "abandoned"
+        run.last_seen_at = time.time()
+        run.updated_at = run.last_seen_at
+        db.add(run)
+        await db.commit()
+        return {"status": "abandoned", "nextSequenceNumber": run.sequence_number}
     close_request = req.model_copy(update={"sequence_number": run.sequence_number, "event": "exit"})
-    response = await update_playback_progress(run_id, close_request, request, db, user)
+    response = await _update_playback_progress_locked(run_id, close_request, request, db, user)
     refreshed_run = await db.get(PlaybackRun, run_id)
     if refreshed_run and refreshed_run.lifecycle_state != "finished":
         refreshed_run.lifecycle_state = "abandoned"
@@ -1397,6 +1461,20 @@ async def close_playback_run(
 
 @router.post("/runs/{run_id}/start-over")
 async def start_over_playback_run(
+    run_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    identity = current_auth_session(request).id
+    await db.rollback()
+    # Retain only the lookup anchor; authorization is read again under the writer.
+    request.state.auth_session = AuthSession(id=identity, user_id=0)
+    async with run_write_lock(run_id):
+        return await _start_over_playback_run_locked(run_id, request, db, user)
+
+
+async def _start_over_playback_run_locked(
     run_id: str,
     request: Request,
     db: AsyncSession = Depends(get_session),
@@ -1424,10 +1502,16 @@ async def start_over_playback_run(
 
 
 def protected_hls_url(media_id: str, relative_path: str, ticket: str) -> str:
+    run_id = _browser_stream_run.get()
+    if run_id is not None:
+        return f"/api/playback/streams/{quote(run_id, safe='')}/hls/{quote(relative_path, safe='/')}"
     return f"/api/playback/hls/{quote(media_id, safe='')}/{quote(relative_path, safe='/')}?ticket={quote(ticket, safe='')}"
 
 
 def protected_preview_url(media_id: str, relative_path: str, ticket: str) -> str:
+    run_id = _browser_stream_run.get()
+    if run_id is not None:
+        return f"/api/playback/streams/{quote(run_id, safe='')}/preview/{quote(relative_path, safe='/')}"
     return f"/api/playback/preview/{quote(media_id, safe='')}/{quote(relative_path, safe='/')}?ticket={quote(ticket, safe='')}"
 
 
@@ -1576,6 +1660,7 @@ async def serve_master_manifest(
     media_id: str,
     ticket: str = Query(...),
     db: AsyncSession = Depends(get_session),
+    rendition_id: Optional[str] = Query(None, max_length=96, pattern=r"^[a-zA-Z0-9_-]+$"),
 ) -> Response:
     payload, _, media_obj = await validate_playback_ticket(ticket, media_id, db)
     cache_root = playback_prep_service.cache_path(media_id, str(payload["fingerprint"]))
@@ -1588,7 +1673,26 @@ async def serve_master_manifest(
     lease = playback_response_lease("playback.hls-manifest", disposable_cache=True)
     try:
         playback_prep_service.touch(media_id, str(payload["fingerprint"]))
-        content = rewrite_hls_playlist(master_path.read_text(encoding="utf-8"), media_id, ticket, PurePosixPath())
+        raw_content = master_path.read_text(encoding="utf-8")
+        if isinstance(rendition_id, str):
+            allowed = {item.id for item in rendition_contract(media_obj, media_id, str(payload["fingerprint"]))}
+            if rendition_id not in allowed:
+                raise playback_error(404, "RENDITION_NOT_READY", "The selected quality is not available.")
+            lines = raw_content.splitlines()
+            selected_lines = []
+            index = 0
+            while index < len(lines):
+                line = lines[index]
+                if line.startswith("#EXT-X-STREAM-INF:"):
+                    uri = lines[index + 1] if index + 1 < len(lines) else ""
+                    if uri == f"{rendition_id}/playlist.m3u8":
+                        selected_lines.extend([line, uri])
+                    index += 2
+                else:
+                    selected_lines.append(line)
+                    index += 1
+            raw_content = "\n".join(selected_lines) + "\n"
+        content = rewrite_hls_playlist(raw_content, media_id, ticket, PurePosixPath())
         return LeaseBoundPlaybackResponse(
             PlainTextResponse(content, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"}),
             lease,
@@ -1878,3 +1982,58 @@ async def _serve_playback_subtitles_locked(media_id: str, track_id: str, ticket:
             await reader.close()
         lease.release()
         raise
+
+
+async def browser_stream_access(run_id: str, request: Request, db: AsyncSession, user: User) -> tuple[str, str, str]:
+    """Resolve a cookie/session-owned run without retaining a snapshot across source admission.
+
+    URLs contain an opaque run identity, never a reusable authentication credential.
+    The existing protected delivery validates a short-lived server-internal ticket
+    again after source admission. No ticket expiry or revocation rule is relaxed.
+    """
+    async with AsyncSession(db.bind, expire_on_commit=False) as lookup:
+        run = await authorized_run(lookup, request, run_id)
+        session = await active_auth_session(lookup, request)
+        fingerprint = str(run.source_fingerprint or "")
+        if not fingerprint:
+            raise playback_error(409, "PLAYBACK_SOURCE_CHANGED", "Start playback again to authorize the current source.")
+        media_id = run.episode_id or run.movie_id
+        ticket, _ = issue_playback_ticket(user, session, run.profile_id, run.id, media_id, fingerprint)
+        kind = run.source_kind
+    # Authentication dependencies may have read using the route's session. Do not
+    # carry that read transaction into a bounded or blocked media ownership wait.
+    await db.rollback()
+    return media_id, ticket, kind
+
+
+@router.api_route("/streams/{run_id}/{asset:path}", methods=["GET", "HEAD"])
+async def serve_browser_stream(
+    run_id: str,
+    asset: str,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    media_id, ticket, kind = await browser_stream_access(run_id, request, db, user)
+    token = _browser_stream_run.set(run_id)
+    try:
+        if asset == "progressive" and kind == "catalog":
+            return await protected_source_response(media_id, request, ticket, db, require_progressive=True)
+        if asset.startswith("source/") and kind == "catalog":
+            return await protected_source_response(media_id, request, ticket, db, source_id=asset.removeprefix("source/"))
+        if asset == "manifest":
+            if kind == "ingest_preview":
+                return await serve_ingest_preview_manifest(media_id, ticket, db)
+            return await serve_master_manifest(media_id, ticket, db, request.query_params.get("rendition_id"))
+        if asset.startswith("hls/") and kind == "catalog":
+            return await serve_hls_asset(media_id, asset.removeprefix("hls/"), ticket, db)
+        if asset.startswith("preview/") and kind == "ingest_preview":
+            path = asset.removeprefix("preview/")
+            if path == "playlist.m3u8":
+                return await serve_ingest_preview_manifest(media_id, ticket, db)
+            return await serve_ingest_preview_asset(media_id, path, ticket, db)
+        if asset.startswith("subtitles/") and kind == "catalog":
+            return await serve_playback_subtitles(media_id, asset.removeprefix("subtitles/"), ticket, db)
+        raise playback_error(404, "PLAYBACK_ASSET_NOT_FOUND", "The requested playback asset does not exist.")
+    finally:
+        _browser_stream_run.reset(token)

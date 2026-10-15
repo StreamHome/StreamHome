@@ -11,7 +11,7 @@ Important route families:
 - `/api/add-movie`: scoped ingestion;
 - `/api/playback/*`: authenticated playback runs, preparation, and ticket-protected delivery;
 - `/api/system/*`: authenticated administration;
-- `/media/*`: range-capable physical media delivery.
+- `/media/*`: allowlisted safe presentation assets; protected media uses playback routes.
 
 API-key management is available only to an authenticated administrator with recent reauthentication:
 
@@ -65,3 +65,19 @@ Use the generated FastAPI OpenAPI document from a development server for the exa
 TOTP setup begins with a server-owned enrollment. The client receives an opaque enrollment identifier, a one-time manual key, and a same-origin SVG QR URL. Verification sends the enrollment identifier and current six-digit code; it never posts the TOTP secret back to the server. Setup enrollments are bound to the setup-session hash, while administrator enrollments are bound to both the user and current authenticated session.
 
 Movie ingestion JSON must omit `season` and `episode`; sending either key with `null` is not equivalent.
+
+### Browser playback delivery
+
+Playback-run responses include an optional `streamBaseUrl`. Browser clients use its
+same-origin `manifest`, `progressive`, `source/{trackId}`, `subtitles/{trackId}`,
+`hls/{path}` and `preview/{path}` assets with the current human session cookie.
+Each request revalidates the session/profile/run/source; the run ID is not a bearer
+credential. Ticket URLs remain supported and retain their expiry/revocation rules.
+`rendition_id` on a master selects one verified video variant without dropping its
+alternate audio group. No viewer request starts completed-media preparation.
+
+Progress and Close optionally accept `total_seconds_played` for cumulative,
+idempotent watch-time snapshots. Legacy `duration_watched` remains accepted.
+Close additionally accepts `discard_progress: true` to abandon cancelled work
+without modifying saved profile progress. Default Close still records the final
+confirmed position and watch time.

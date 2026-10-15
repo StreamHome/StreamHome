@@ -380,10 +380,10 @@ class PlaybackPipelineRegression(unittest.TestCase):
             playback_prep_service.active_jobs.pop(key, None)
             playback_prep_service.job_priorities.pop(key, None)
             (rendition_dir / ".complete").write_text("done", encoding="utf-8")
-            (rendition_dir / ".verified-v1").write_text("1", encoding="utf-8")
+            (rendition_dir / VIDEO_VERIFIED_MARKER).write_text("1", encoding="utf-8")
             self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "ready")
             (rendition_dir / ".complete").unlink()
-            (rendition_dir / ".verified-v1").unlink()
+            (rendition_dir / VIDEO_VERIFIED_MARKER).unlink()
             shutil.rmtree(rendition_dir)
             playback_prep_service._write_rendition_error(media_id, fingerprint, rendition_name, "TEST_FAILURE", "failed")
             self.assertEqual(playback_prep_service.rendition_status(media_id, fingerprint, rendition_name), "failed")
@@ -419,7 +419,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             self.assertFalse(playback_prep_service.fully_prepared(media_id, fingerprint, media))
             for rendition_name in rendition_names:
                 (cache_path / rendition_name / ".complete").write_text("done", encoding="utf-8")
-                (cache_path / rendition_name / ".verified-v1").write_text("1", encoding="utf-8")
+                (cache_path / rendition_name / VIDEO_VERIFIED_MARKER).write_text("1", encoding="utf-8")
             self.assertTrue(playback_prep_service.fully_prepared(media_id, fingerprint, media))
         finally:
             shutil.rmtree(cache_path.parent, ignore_errors=True)
@@ -542,7 +542,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 (rendition_dir / "init.mp4").write_bytes(b"init")
                 (rendition_dir / "segment_00000.m4s").write_bytes(b"segment")
             (cache_path / "video_original" / ".complete").write_text("done", encoding="utf-8")
-            (cache_path / "video_original" / ".verified-v1").write_text("1", encoding="utf-8")
+            (cache_path / "video_original" / VIDEO_VERIFIED_MARKER).write_text("1", encoding="utf-8")
             key = f"{media_id}:{fingerprint}:video_480p"
             service.active_jobs[key] = SimpleNamespace()  # type: ignore[assignment]
             service.job_priorities[key] = 100
@@ -667,7 +667,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             (original / "init.mp4").write_bytes(b"init")
             (original / "segment_00000.m4s").write_bytes(b"unchanged-video")
             (original / ".complete").write_text("done", encoding="utf-8")
-            (original / ".verified-v1").write_text("1", encoding="utf-8")
+            (original / VIDEO_VERIFIED_MARKER).write_text("1", encoding="utf-8")
 
             reused = service.reuse_video_renditions(
                 "m_sidecar_reuse",
@@ -682,7 +682,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
             self.assertEqual(reused, ["video_original"])
             self.assertEqual((target / "segment_00000.m4s").read_bytes(), b"unchanged-video")
             self.assertTrue((target / ".complete").is_file())
-            self.assertTrue((target / ".verified-v1").is_file())
+            self.assertTrue((target / VIDEO_VERIFIED_MARKER).is_file())
 
     def test_embedded_and_external_audio_with_the_same_index_and_language_have_distinct_identities(self) -> None:
         service = PlaybackPrepService()
@@ -1277,6 +1277,64 @@ class PlaybackPipelineRegression(unittest.TestCase):
         finally:
             if os.getenv("KEEP_PLAYBACK_TEST_CACHE") != "1":
                 shutil.rmtree(cache_path.parent, ignore_errors=True)
+
+    def test_encoded_hls_preserves_flash_impulse_alignment_after_aac_priming(self) -> None:
+        import array
+        import json
+        fixture = self.media_directory / "semantic.mp4"
+        subprocess.run([
+            str(shutil.which("ffmpeg")), "-hide_banner", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=black:size=320x180:rate=25:duration=12,drawbox=color=white:t=fill:enable='between(t,2,2.12)+between(t,5,5.12)+between(t,8,8.12)'",
+            "-f", "lavfi", "-i", "aevalsrc=if(between(t\\,2.04\\,2.16)+between(t\\,5.04\\,5.16)+between(t\\,8.04\\,8.16)\\,0.9*sin(2*PI*440*t)\\,0):s=44100:d=12",
+            "-f", "lavfi", "-i", "aevalsrc=if(between(t\\,2.04\\,2.16)+between(t\\,5.04\\,5.16)+between(t\\,8.04\\,8.16)\\,0.9*sin(2*PI*880*t)\\,0):s=44100:d=12",
+            "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0", "-vf", "setpts=PTS+0.04/TB", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-metadata:s:a:0", "language=eng", "-metadata:s:a:1", "language=tur", str(fixture),
+        ], check=True, capture_output=True, timeout=30)
+        async def prepare():
+            measured = await probe_completed_media(str(fixture))
+            catalog_path = "/media/" + fixture.relative_to(Path(settings.MEDIA_DIR)).as_posix()
+            source = await resolve_media_source(catalog_path, check_cloud=False)
+            media = SimpleNamespace(id="m_semantic_alignment", video_url=catalog_path, source_fingerprint=source.fingerprint, probed_duration=measured["probed_duration"], container=measured["container"], codec=measured["codec"], width=measured["width"], height=measured["height"], frame_rate=measured["frame_rate"], audio_metadata=measured["audio_metadata"], languages=["en", "tr"])
+            async with self.catalog_fixture(media):
+                await playback_prep_service.prepare(media.id, media, source, include_remaining=False)
+                await asyncio.gather(*[task for key, task in playback_prep_service.active_jobs.items() if key.startswith(f"{media.id}:")])
+                lower = playback_prep_service.video_renditions(media)[1]
+                await playback_prep_service._transcode_video(media.id, source.fingerprint, source, lower, media)
+                second = playback_prep_service.audio_renditions(media)[1]
+                await playback_prep_service._transcode_audio(media.id, source.fingerprint, source, second, media)
+            await playback_prep_service.rebuild_master(media.id, source.fingerprint, media)
+            return playback_prep_service.cache_path(media.id, source.fingerprint), media
+        cache, media = asyncio.run(prepare())
+        def first_decoded_pts(playlist):
+            result = subprocess.run([str(shutil.which("ffprobe")), "-v", "error", "-read_intervals", "%+#4", "-show_frames", "-show_entries", "frame=best_effort_timestamp_time", "-of", "json", str(playlist)], check=True, capture_output=True, timeout=10)
+            return float(json.loads(result.stdout)["frames"][0]["best_effort_timestamp_time"])
+        try:
+            video = cache / "video_original/playlist.m3u8"
+            pixels = subprocess.run([str(shutil.which("ffmpeg")), "-v", "error", "-copyts", "-i", str(video), "-vf", "scale=16:16,format=gray", "-vsync", "0", "-f", "rawvideo", "-"], check=True, capture_output=True, timeout=30).stdout
+            frames = [sum(pixels[index:index + 256]) / 256 for index in range(0, len(pixels), 256)]
+            flashes = [index / 25 + first_decoded_pts(video) for index, value in enumerate(frames) if value > 200 and (index == 0 or frames[index - 1] <= 200)]
+            measurements = []
+            for audio in playback_prep_service.audio_renditions(media):
+                playlist = cache / audio.name / "playlist.m3u8"
+                samples = array.array("f")
+                samples.frombytes(subprocess.run([str(shutil.which("ffmpeg")), "-v", "error", "-copyts", "-i", str(playlist), "-ac", "1", "-ar", "48000", "-f", "f32le", "-"], check=True, capture_output=True, timeout=30).stdout)
+                origin = first_decoded_pts(playlist)
+                impulses = []
+                for index, sample in enumerate(samples):
+                    if abs(sample) > 0.2 and (not impulses or index / 48000 + origin > impulses[-1] + 0.5): impulses.append(index / 48000 + origin)
+                self.assertEqual(len(flashes), 3)
+                self.assertEqual(len(impulses), 3)
+                errors = [abs(a - v) for a, v in zip(impulses, flashes)]
+                self.assertLessEqual(max(errors), 0.08, {"audio": audio.name, "flashes": flashes, "impulses": impulses})
+                measurements.append({"language": audio.language, "maxSemanticErrorMs": round(max(errors) * 1000, 3)})
+            print("HLS semantic alignment:", json.dumps(measurements))
+            export = os.environ.get("STREAMHOME_PLAYER_FIXTURE_EXPORT")
+            if export:
+                target = Path(export).resolve()
+                instance = Path(os.environ["STREAMHOME_INSTANCE_ROOT"]).resolve()
+                self.assertTrue(target.is_relative_to(instance / "web/test-assets"))
+                shutil.copytree(cache, target, dirs_exist_ok=True)
+        finally:
+            shutil.rmtree(cache.parent, ignore_errors=True)
 
     def test_hevc_source_is_converted_to_browser_compatible_h264(self) -> None:
         ffmpeg = shutil.which("ffmpeg")

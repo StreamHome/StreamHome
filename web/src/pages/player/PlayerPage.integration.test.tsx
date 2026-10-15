@@ -181,7 +181,7 @@ describe("mounted player lifecycle", () => {
     const cue = { startTime: 10, endTime: 12, text: "<i>Early caption</i>" };
     Object.defineProperty(track, "track", {
       configurable: true,
-      value: { mode: "disabled", cues: { 0: cue, length: 1 } },
+      value: Object.assign(new EventTarget(), { mode: "disabled", cues: { 0: cue, length: 1 } }),
     });
 
     fireEvent.load(track);
@@ -214,7 +214,7 @@ describe("mounted player lifecycle", () => {
     const track = view.container.querySelector("track[data-subtitle-id='subtitle-en']") as HTMLTrackElement;
     Object.defineProperty(track, "track", {
       configurable: true,
-      value: { mode: "disabled", cues: { 0: { startTime: 0, endTime: 120, text: "Persistent caption" }, length: 1 } },
+      value: Object.assign(new EventTarget(), { mode: "disabled", cues: { 0: { startTime: 0, endTime: 120, text: "Persistent caption" }, length: 1 } }),
     });
     Object.defineProperty(video, "duration", { configurable: true, value: 120 });
     Object.defineProperty(video, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA });
@@ -230,7 +230,11 @@ describe("mounted player lifecycle", () => {
 
     fireEvent.mouseMove(root, { clientX: 20, clientY: 20 });
     fireEvent.mouseMove(root, { clientX: 21, clientY: 20 });
-    act(() => vi.advanceTimersByTime(PLAYER_CONTROLS_IDLE_MS + 1));
+    for (let i = 0; i < 4; i += 1) {
+      video.currentTime = 2 + i;
+      fireEvent.timeUpdate(video);
+      act(() => vi.advanceTimersByTime(800));
+    }
 
     expect(root.dataset.controlsVisible).toBe("false");
     expect(screen.getByRole("region", { name: "Subtitles" }).textContent).toBe("Persistent caption");
@@ -284,8 +288,8 @@ describe("mounted player lifecycle", () => {
     fireEvent.pause(video);
     play.mockClear();
     fullscreenButton.focus();
-    fireEvent.keyDown(fullscreenButton, { key: " " });
-    fireEvent.keyUp(fullscreenButton, { key: " " });
+    fireEvent.keyDown(root, { key: " " });
+    fireEvent.keyUp(root, { key: " " });
     fireEvent.loadedMetadata(video);
     fireEvent.canPlay(video);
     await waitFor(() => expect(play).toHaveBeenCalled());
@@ -1085,8 +1089,10 @@ describe("mounted player lifecycle", () => {
     const play = vi.mocked(HTMLMediaElement.prototype.play);
     play.mockClear();
     focusedFullscreenButton.focus();
-    fireEvent.keyDown(focusedFullscreenButton, { key: " " });
-    fireEvent.keyUp(focusedFullscreenButton, { key: " " });
+    fireEvent.keyDown(player, { key: " " });
+    fireEvent.keyUp(player, { key: " " });
+    fireEvent.keyDown(player, { key: " " });
+    fireEvent.keyUp(player, { key: " " });
     await waitFor(() => expect(play).toHaveBeenCalled());
     expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeTruthy();
     fireEvent.keyDown(focusedFullscreenButton, { key: "f" });
@@ -1098,4 +1104,201 @@ describe("mounted player lifecycle", () => {
     expect(document.body.getAttribute("data-player-viewport-fullscreen")).toBeNull();
     view.unmount();
   });
+  it("renews a paused run without loading or replacing its stable transport", async () => {
+    const run = { ...playback.runResponse, resumePosition: 0, streamBaseUrl: "/api/playback/streams/renew-run", runId: "renew-run", ticketExpiresAt: Math.ceil(Date.now() / 1000) + 182, progressiveUrl: "/api/playback/streams/renew-run/progressive" };
+    vi.spyOn(moviesApi, "getMovie").mockReturnValue(new Promise(() => undefined));
+    vi.spyOn(playbackApi, "createPlaybackRun").mockResolvedValue(run);
+    const refreshed = vi.spyOn(playbackApi, "getPlaybackRun").mockResolvedValue({ ...run, ticket: "new-ticket", ticketExpiresAt: run.ticketExpiresAt + 900 });
+    vi.spyOn(playbackApi, "closePlaybackRun").mockResolvedValue({ status: "abandoned", nextSequenceNumber: 2 });
+    const timers = vi.spyOn(window, "setTimeout");
+    const view = render(<MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=m_renew"]}><PlayerPage /></MemoryRouter>);
+    await waitFor(() => expect(view.container.querySelector("video")?.getAttribute("src")).toBe(run.progressiveUrl));
+    const video = view.container.querySelector("video")!;
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: 4 });
+    fireEvent.loadedMetadata(video);
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    const loads = vi.mocked(HTMLMediaElement.prototype.load);
+    const before = loads.mock.contexts.filter((element) => element === video).length;
+    const renewal = timers.mock.calls.find(([,delay]) => Number(delay) === 30_000);
+    expect(renewal).toBeDefined();
+    await act(async () => { (renewal![0] as () => void)(); await Promise.resolve(); });
+    expect(refreshed).toHaveBeenCalledWith("renew-run");
+    expect(video.getAttribute("src")).toBe(run.progressiveUrl);
+    expect(loads.mock.contexts.filter((element) => element === video)).toHaveLength(before);
+    expect(view.container.querySelector("[data-player-root]")?.getAttribute("data-player-phase")).toBe("paused");
+    const play = vi.mocked(HTMLMediaElement.prototype.play); play.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    await waitFor(() => expect(play).toHaveBeenCalled());
+    view.unmount();
+  });
+
+  it("closes an obsolete resolve without mounting its transport", async () => {
+    let resolveRun!: (value: typeof playback.runResponse) => void;
+    vi.spyOn(moviesApi, "getMovie").mockReturnValue(new Promise(() => undefined));
+    vi.spyOn(playbackApi, "createPlaybackRun").mockReturnValue(new Promise((resolve) => { resolveRun = resolve; }));
+    const close = vi.spyOn(playbackApi, "closePlaybackRun").mockResolvedValue({ status: "abandoned", nextSequenceNumber: 2 });
+    const view = render(<MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=m_stale"]}><PlayerPage /></MemoryRouter>);
+    view.unmount();
+    await act(async () => { resolveRun(playback.runResponse); await Promise.resolve(); });
+    expect(close).toHaveBeenCalledWith(playback.runResponse.runId, expect.objectContaining({ event: "exit", totalSecondsPlayed: 0 }), true);
+    expect(vi.mocked(HTMLMediaElement.prototype.load)).not.toHaveBeenCalled();
+  });
+
+  it("applies the preferred native audio and keeps manual quality changes paused", async () => {
+    localStorage.setItem(playerPreferencesKey, JSON.stringify({ audioTrackId: "audio_0_en", audioLanguage: "en" }));
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((type) => type.includes("mpegurl") ? "probably" : "");
+    const tracks = [{ language: "tr", label: "Turkish", enabled: true }, { language: "en", label: "English", enabled: false }];
+    Object.defineProperty(HTMLMediaElement.prototype, "audioTracks", { configurable: true, get: () => tracks });
+    const native: ResolvedPlayback = { ...playback, runResponse: { ...playback.runResponse, progressiveUrl: "", manifestUrl: "/api/playback/streams/native-run/manifest", sourceMetadata: { ...playback.runResponse.sourceMetadata, progressiveCompatible: false }, tracks: [...playback.runResponse.tracks, { id: "audio_1_tr", label: "Turkish", language: "tr", channels: 2, default: false, source: "embedded", streamIndex: 1, ready: true, status: "ready" }] } };
+    const view = render(<MemoryRouter><PlayerPage visualFixture={native} /></MemoryRouter>);
+    try {
+      const video = view.container.querySelector("video")!;
+      Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+      Object.defineProperty(video, "readyState", { configurable: true, value: 4 });
+      fireEvent.loadedMetadata(video);
+      await act(async () => undefined);
+      expect(tracks.map((track) => track.enabled)).toEqual([false, true]);
+      fireEvent.seeked(video);
+      fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+      fireEvent.click(screen.getByRole("button", { name: "Quality: Auto" }));
+      fireEvent.click(screen.getByRole("option", { name: /360p/ }));
+      expect(video.src).toContain("rendition_id=video_original");
+      fireEvent.loadedMetadata(video); fireEvent.seeked(video);
+      expect(view.container.querySelector("[data-player-root]")?.getAttribute("data-player-phase")).toBe("paused");
+      expect(JSON.parse(localStorage.getItem(playerPreferencesKey)!).qualityHeight).toBe(360);
+    } finally { view.unmount(); Reflect.deleteProperty(HTMLMediaElement.prototype, "audioTracks"); }
+  });
+
+  it("serializes Replay, blocks old heartbeats, and respects Pause during the request", async () => {
+    vi.spyOn(moviesApi, "getMovie").mockReturnValue(new Promise(() => undefined));
+    vi.spyOn(playbackApi, "createPlaybackRun").mockResolvedValue({ ...playback.runResponse, resumePosition: 0 });
+    const progress = vi.spyOn(playbackApi, "updatePlaybackProgress").mockResolvedValue({ status: "ok", nextSequenceNumber: 2 });
+    vi.spyOn(playbackApi, "closePlaybackRun").mockResolvedValue({ status: "abandoned", nextSequenceNumber: 3 });
+    let finishReplay!: (value: { status: string }) => void;
+    const replay = vi.spyOn(playbackApi, "startOverPlaybackRun").mockReturnValue(new Promise((resolve) => { finishReplay = resolve; }));
+    const timers = vi.spyOn(window, "setInterval");
+    const view = render(<MemoryRouter initialEntries={["/?profile=mounted-player-profile&view=watch&media=m_replay"]}><PlayerPage /></MemoryRouter>);
+    await waitFor(() => expect(view.container.querySelector("video")?.getAttribute("src")).toBe(playback.runResponse.progressiveUrl));
+    const video = view.container.querySelector("video")!;
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: 4 });
+    fireEvent.loadedMetadata(video); video.currentTime = 120; fireEvent.timeUpdate(video); fireEvent.ended(video);
+    await act(async () => undefined); progress.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Replay" }));
+    await waitFor(() => expect(replay).toHaveBeenCalled());
+    const heartbeat = timers.mock.calls.find(([,delay]) => delay === 10_000)![0] as () => void;
+    await act(async () => { heartbeat(); await Promise.resolve(); });
+    expect(progress).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    const play = vi.mocked(HTMLMediaElement.prototype.play); play.mockClear();
+    await act(async () => { finishReplay({ status: "ok" }); await Promise.resolve(); });
+    fireEvent.seeked(video);
+    expect(video.currentTime).toBe(0);
+    expect(view.container.querySelector("[data-player-root]")?.getAttribute("data-player-phase")).toBe("paused");
+    expect(play).not.toHaveBeenCalled();
+    await act(async () => { heartbeat(); await Promise.resolve(); });
+    for (const [,request] of progress.mock.calls) expect(request.timestamp).toBe(0);
+    view.unmount();
+  });
+
+  it("detects a stopped frame callback while the media clock keeps advancing", () => {
+    vi.useFakeTimers(); vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+    let frame!: (now: number, metadata: VideoFrameCallbackMetadata) => void;
+    Object.defineProperty(HTMLVideoElement.prototype, "requestVideoFrameCallback", { configurable: true, value: vi.fn((callback) => { frame = callback; return 1; }) });
+    Object.defineProperty(HTMLVideoElement.prototype, "cancelVideoFrameCallback", { configurable: true, value: vi.fn() });
+    const view = render(<MemoryRouter><PlayerPage visualFixture={playback} /></MemoryRouter>);
+    try {
+      const video = view.container.querySelector("video")!;
+      Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+      Object.defineProperty(video, "readyState", { configurable: true, value: 4 });
+      Object.defineProperty(video, "paused", { configurable: true, value: false });
+      fireEvent.loadedMetadata(video); fireEvent.seeked(video); fireEvent.playing(video); video.currentTime = 13; fireEvent.timeUpdate(video);
+      act(() => frame(performance.now(), { mediaTime: 13 } as VideoFrameCallbackMetadata));
+      for (let index=0;index<4;index++) { act(() => vi.advanceTimersByTime(800)); video.currentTime += 1; fireEvent.timeUpdate(video); }
+      act(() => vi.advanceTimersByTime(1000));
+      expect(view.container.querySelector("[data-player-root]")?.getAttribute("data-player-phase")).toBe("buffering");
+      const observedTime = video.currentTime;
+      video.currentTime = 1; fireEvent.seeked(video);
+      video.currentTime = observedTime + 1; fireEvent.timeUpdate(video);
+      expect(view.container.querySelector("[data-player-root]")?.getAttribute("data-player-phase")).toBe("buffering");
+      const loads = vi.mocked(HTMLMediaElement.prototype.load).mock.calls.length;
+      for (let index=0;index<4;index++) { act(() => vi.advanceTimersByTime(800)); video.currentTime += 1; fireEvent.timeUpdate(video); }
+      expect(vi.mocked(HTMLMediaElement.prototype.load).mock.calls.length).toBeGreaterThan(loads);
+      for (let index=0;index<45;index++) { act(() => vi.advanceTimersByTime(400)); video.currentTime += .4; fireEvent.timeUpdate(video); }
+      expect(view.container.querySelector(".player-state-view")?.textContent).toContain("Playback connection stalled");
+    } finally {
+      view.unmount(); Reflect.deleteProperty(HTMLVideoElement.prototype, "requestVideoFrameCallback"); Reflect.deleteProperty(HTMLVideoElement.prototype, "cancelVideoFrameCallback");
+    }
+  });
+
+  it("accepts a native backward seek and keeps the displayed clock confirmed", () => {
+    const view = render(<MemoryRouter><PlayerPage visualFixture={playback} /></MemoryRouter>);
+    const video = view.container.querySelector("video")!;
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: 4 });
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.loadedMetadata(video);
+    fireEvent.seeked(video);
+    video.currentTime = 90;
+    fireEvent.timeUpdate(video);
+    video.currentTime = 40;
+    fireEvent.seeking(video);
+    fireEvent.seeked(video);
+    expect((screen.getByRole("slider", { name: "Playback position" }) as HTMLInputElement).value).toBe("40");
+    view.unmount();
+  });
+
+  it("lets menu triggers own ArrowDown and preserves browser shortcuts", () => {
+    const view = render(<MemoryRouter><PlayerPage visualFixture={playback} /></MemoryRouter>);
+    const trigger = screen.getByRole("button", { name: /Audio language/ });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "ArrowDown", code: "ArrowDown" });
+    expect(screen.getByRole("listbox", { name: "Audio language" })).toBeTruthy();
+    fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+    const event = new KeyboardEvent("keydown", { key: "f", code: "KeyF", ctrlKey: true, bubbles: true, cancelable: true });
+    act(() => { document.dispatchEvent(event); });
+    expect(event.defaultPrevented).toBe(false);
+    view.unmount();
+  });
+
+  it("detects a frozen clock after playback has already advanced", () => {
+    vi.useFakeTimers();
+    const view = render(<MemoryRouter><PlayerPage visualFixture={playback} /></MemoryRouter>);
+    const video = view.container.querySelector("video")!;
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: 4 });
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.loadedMetadata(video);
+    fireEvent.seeked(video);
+    fireEvent.playing(video);
+    video.currentTime = 13;
+    fireEvent.timeUpdate(video);
+    act(() => vi.advanceTimersByTime(PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS + 20));
+    expect((view.container.querySelector("[data-player-root]") as HTMLElement).dataset.playerPhase).toBe("buffering");
+    view.unmount();
+  });
+
+  it("reveals idle chrome when the master video begins buffering", () => {
+    vi.useFakeTimers();
+    const view = render(<MemoryRouter><PlayerPage visualFixture={playback} /></MemoryRouter>);
+    const video = view.container.querySelector("video")!;
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "readyState", { configurable: true, value: 4 });
+    Object.defineProperty(video, "paused", { configurable: true, value: false });
+    fireEvent.loadedMetadata(video);
+    fireEvent.seeked(video);
+    fireEvent.playing(video);
+    for (let i = 0; i < 4; i++) {
+      video.currentTime = 13 + i;
+      fireEvent.timeUpdate(video);
+      act(() => vi.advanceTimersByTime(800));
+    }
+    const root = view.container.querySelector("[data-player-root]") as HTMLElement;
+    expect(root.dataset.controlsVisible).toBe("false");
+    fireEvent.waiting(video);
+    expect(root.dataset.controlsVisible).toBe("true");
+    view.unmount();
+  });
+
 });

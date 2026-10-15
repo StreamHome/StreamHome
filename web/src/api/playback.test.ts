@@ -1,9 +1,21 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { closePlaybackRun, createPlaybackRun, updatePlaybackProgress } from "./playback";
+import { closePlaybackRun, createPlaybackRun, updatePlaybackProgress, normalizePlaybackRun } from "./playback";
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe("playback tracking", () => {
+  it("normalizes only exact same-origin run URLs and keeps legacy contracts", () => {
+    const wire = { runId: "run-1", streamBaseUrl: "/api/playback/streams/run-1", manifestUrl: "/ticket-manifest", progressiveUrl: "/ticket-video", tracks: [{ id: "external_tr", directUrl: "/ticket-audio" }] } as unknown as import("../types/api").PlaybackRunResponse;
+    const normalized = normalizePlaybackRun(wire);
+    expect(normalized.manifestUrl).toBe("/api/playback/streams/run-1/manifest");
+    expect(normalized.progressiveUrl).toBe("/api/playback/streams/run-1/progressive");
+    expect(normalized.tracks[0].directUrl).toBe("/api/playback/streams/run-1/source/external_tr");
+    const untrusted = { ...wire, streamBaseUrl: "https://other.invalid/streams/run-1" };
+    expect(normalizePlaybackRun(untrusted).streamBaseUrl).toBeNull();
+    expect(normalizePlaybackRun(untrusted).manifestUrl).toBe(wire.manifestUrl);
+    const legacy = { ...wire, streamBaseUrl: null };
+    expect(normalizePlaybackRun(legacy)).toBe(legacy);
+  });
   it("creates authenticated playback runs with canonical movie, profile, and episode fields", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ runId: "run-1" }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);

@@ -30,7 +30,7 @@ from lifecycle.coordination import (
     run_cancellation_safe_thread,
     runtime_work,
 )
-from lifecycle.media_work import MediaRecoveryRequired, media_ownership, require_resolved_media
+from lifecycle.media_work import MediaRecoveryRequired, media_ownership, require_resolved_media, supervised_output
 
 
 STANDARD_HEIGHTS = (1080, 720, 480, 360, 240, 144)
@@ -38,8 +38,8 @@ BOOTSTRAP_HLS_HEIGHT = 480
 PLAYLIST_NAME = "playlist.m3u8"
 MASTER_NAME = "master.m3u8"
 COMPLETE_MARKER = ".complete"
-VIDEO_VERIFIED_MARKER = ".verified-v1"
-AUDIO_VERIFIED_MARKER = ".verified-audio-v4"
+VIDEO_VERIFIED_MARKER = ".verified-v2"
+AUDIO_VERIFIED_MARKER = ".verified-audio-v5"
 FOREGROUND_PRIORITY = 0
 BACKGROUND_PRIORITY = 100
 FAST_HLS_VIDEO_CODECS = {"avc", "avc1", "h264"}
@@ -1149,6 +1149,7 @@ class PlaybackPrepService:
             "-hls_playlist_type", "event",
             "-hls_flags", "independent_segments+temp_file",
             "-hls_segment_type", "fmp4",
+            "-avoid_negative_ts", "disabled",
             "-hls_fmp4_init_filename", "init.mp4",
             "-hls_segment_filename", "segment_%05d.m4s",
             PLAYLIST_NAME,
@@ -1234,6 +1235,52 @@ class PlaybackPrepService:
             # Cache preparation is disposable and may be scheduled again later.
             return
 
+    async def _decoded_audio_offset(self, actual_input: str, rendition: AudioRendition, pass_fds: tuple[int, ...]) -> float:
+        """Measure decoded content origins, after codec priming/edit-list trimming.
+
+        A negative AAC packet is encoder preroll, not necessarily audible content.
+        This bounded probe reads the same immutable input inherited by the encoder.
+        Standalone inputs retain their independent zero-relative-offset contract.
+        """
+        if rendition.source == "external":
+            return 0.0
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            raise PlaybackPreparationError("FFPROBE_UNAVAILABLE", "FFprobe is required to align adaptive audio.")
+        process = await asyncio.create_subprocess_exec(
+            ffprobe, "-v", "error", *local_media_input_options(),
+            "-read_intervals", "%+#256", "-show_frames",
+            "-show_entries", "frame=media_type,stream_index,best_effort_timestamp_time",
+            "-of", "json", actual_input,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=native_media_environment(),
+            **({"pass_fds": pass_fds} if pass_fds else {}),
+        )
+        key = f"playback-decoded-timing:{id(process)}"
+        register_process(key, process)
+        try:
+            stdout, _ = await supervised_output(process, timeout=10, stdout_limit=4 * 1024 * 1024)
+        finally:
+            unregister_process(key)
+        try:
+            if process.returncode != 0:
+                raise ValueError("probe failed")
+            frames = json.loads(stdout).get("frames", [])
+            starts: dict[tuple[str, int], float] = {}
+            for frame in frames:
+                timestamp = float(frame["best_effort_timestamp_time"])
+                if not (-1e12 < timestamp < 1e12):
+                    continue
+                identity = (str(frame["media_type"]), int(frame["stream_index"]))
+                starts[identity] = min(starts.get(identity, timestamp), timestamp)
+            video = next(value for (kind, _), value in sorted(starts.items()) if kind == "video")
+            audios = sorted((index, value) for (kind, index), value in starts.items() if kind == "audio")
+            audio = (next(value for index, value in audios if index == rendition.stream_index)
+                     if rendition.absolute_stream_index else audios[rendition.stream_index][1])
+            return audio - video
+        except (ValueError, TypeError, KeyError, IndexError, StopIteration) as exc:
+            raise PlaybackPreparationError("AUDIO_TIMELINE_UNVERIFIED", "Decoded audio and video origins could not be verified.") from exc
+
     async def _run_admitted_ffmpeg_job(
         self,
         media_id: str,
@@ -1268,6 +1315,12 @@ class PlaybackPrepService:
                 actual_input, cloud_process, input_descriptors = await capacity.enter_async_context(
                     self._owned_job_input(media_id, fingerprint, rendition_name, source)
                 )
+                audio = next((item for item in self.audio_renditions(media_obj) if item.name == rendition_name), None)
+                if audio is not None and "-af" in arguments:
+                    offset = await self._decoded_audio_offset(actual_input, audio, input_descriptors)
+                    arguments = list(arguments)
+                    arguments[arguments.index("-af") + 1] = ",".join(canonical_audio_filter_chain(
+                        offset, max(0.0, float(getattr(media_obj, "probed_duration", 0.0) or 0.0))))
                 command = [self._ffmpeg_executable(), "-hide_banner", "-nostdin", "-y", *local_media_input_options(), "-i", actual_input, *arguments, *self._hls_output_args(target_dir)]
                 logger.info(f"[Playback Prep] Preparing {media_id} rendition {rendition_name}.")
                 ffmpeg_process = await asyncio.create_subprocess_exec(

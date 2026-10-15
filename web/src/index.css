@@ -983,3 +983,18 @@ button:disabled {
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.2);
 }
+
+/* Popovers are mounted in the player root, outside scrolling control rows. */
+.player-control-menu__list { max-height: min(70vh, 32rem); overflow-y: auto; overscroll-behavior: contain; }
+.player-settings-panel fieldset { border: 0; margin: .4rem .5rem 1rem; padding: 0; }
+.player-settings-panel legend, .player-settings-timing { display: block; color: rgba(255,255,255,.8); font-size: .75rem; margin-bottom: .5rem; }
+.player-settings-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .35rem; }
+.player-settings-options button { min-height: 2.75rem; min-width: 2.75rem; padding: .4rem .55rem; border: 1px solid var(--player-border); border-radius: .3rem; color: white; background: transparent; font-size: .75rem; }
+.player-settings-options button[aria-pressed="true"] { border-color: var(--player-accent); background: var(--player-accent-soft); }
+.player-settings-options button:focus-visible { outline: 2px solid var(--player-accent); outline-offset: 2px; }
+.player-settings-timing { margin: .5rem; }
+.player-settings-timing input { display: block; width: 100%; min-height: 2.75rem; accent-color: var(--player-accent); }
+.player-settings-timing span { display: block; text-align: center; }
+
+.player-settings-reset { min-height: 2.75rem; width: calc(100% - 1rem); margin: .25rem .5rem .5rem; border: 1px solid var(--player-border); color: white; border-radius: .3rem; }
+.player-settings-reset:focus-visible { outline: 2px solid var(--player-accent); outline-offset: 2px; }
