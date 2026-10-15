@@ -386,7 +386,7 @@ describe("mounted player lifecycle", () => {
     const playCalls = vi.mocked(HTMLMediaElement.prototype.play).mock.calls.length;
     const pauseCalls = vi.mocked(HTMLMediaElement.prototype.pause).mock.calls.length;
     expect(screen.queryByRole("slider", { name: "Volume" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Volume" }));
+    act(() => screen.getByRole("button", { name: "Volume" }).focus());
     const firstVolume = screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement;
     await waitFor(() => expect(firstVolume.value).toBe("0.36"));
     expect(firstVideo.volume).toBe(0.36);
@@ -397,9 +397,9 @@ describe("mounted player lifecycle", () => {
       muted: false,
     }));
     expect(firstVideo.volume).toBe(0.24);
-    fireEvent.click(screen.getByRole("button", { name: "Mute" }));
+    fireEvent.click(screen.getByRole("button", { name: "Volume" }));
     expect(firstVideo.muted).toBe(true);
-    fireEvent.click(screen.getByRole("button", { name: "Unmute" }));
+    fireEvent.click(screen.getByRole("button", { name: "Volume" }));
     expect(firstVideo.muted).toBe(false);
     expect(firstVideo.volume).toBe(0.24);
     fireEvent.keyDown(firstVolume, { key: "Escape" });
@@ -427,7 +427,7 @@ describe("mounted player lifecycle", () => {
 
     const secondVideo = secondView.container.querySelector("video") as HTMLVideoElement;
     expect(screen.queryByRole("slider", { name: "Volume" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Volume" }));
+    act(() => screen.getByRole("button", { name: "Volume" }).focus());
     await waitFor(() => expect((screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement).value).toBe("0.24"));
     expect(secondVideo.volume).toBe(0.24);
     secondView.unmount();

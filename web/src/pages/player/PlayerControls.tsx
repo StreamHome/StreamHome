@@ -110,7 +110,7 @@ export function PlayerMenuProvider({ children, onOpenChange }: { children: React
   return <MenuContext.Provider value={value}>{children}</MenuContext.Provider>;
 }
 
-function usePlayerPopup(onOpenChange?: (open: boolean) => void, preferredWidth?: number) {
+function usePlayerPopup(onOpenChange?: (open: boolean) => void, preferredWidth?: number, alignment: "end" | "center" = "end") {
   const id = useId();
   const owner = useContext(MenuContext);
   const [localOpen, setLocalOpen] = useState(false);
@@ -152,7 +152,7 @@ function usePlayerPopup(onOpenChange?: (open: boolean) => void, preferredWidth?:
       const maxHeight = Math.max(1, Math.min(height - 24, above ? roomAbove : roomBelow));
       const menuHeight = Math.min(popup.scrollHeight, maxHeight);
       setStyle({ position: player ? "absolute" : "fixed", width: menuWidth,
-        left: Math.max(12, Math.min(x + anchorWidth - menuWidth, width - menuWidth - 12)),
+        left: Math.max(12, Math.min(alignment === "center" ? x + (anchorWidth - menuWidth) / 2 : x + anchorWidth - menuWidth, width - menuWidth - 12)),
         top: above ? Math.max(12, y - menuHeight - 8) : Math.min(height - menuHeight - 12, y + anchorHeight + 8),
         right: "auto", bottom: "auto", maxHeight, overflowY: "auto" });
     };
@@ -163,7 +163,7 @@ function usePlayerPopup(onOpenChange?: (open: boolean) => void, preferredWidth?:
     observer?.observe(anchor!);
     if (popupRef.current) observer?.observe(popupRef.current);
     return () => { window.removeEventListener("resize", position); observer?.disconnect(); };
-  }, [host, open, preferredWidth]);
+  }, [alignment, host, open, preferredWidth]);
 
   useEffect(() => {
     if (!open) return;
@@ -190,16 +190,100 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
   onToggleMute: () => void;
   onOpenChange?: (open: boolean) => void;
 }) {
-  const popup = usePlayerPopup(onOpenChange, 224);
+  const popup = usePlayerPopup(onOpenChange, 64, "center");
   const sliderRef = useRef<HTMLInputElement>(null);
+  const closeTimerRef = useRef<number | null>(null);
+  const hoveringRef = useRef(false);
+  const draggingRef = useRef(false);
+  const keyboardFocusRef = useRef(false);
+  const pointerFocusRef = useRef(false);
+  const dismissingRef = useRef(false);
   const level = muted ? 0 : volume;
   const percentage = `${Math.round(level * 100)}%`;
+  const clearClose = useCallback(() => {
+    if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = null;
+  }, []);
+  useEffect(() => clearClose, [clearClose]);
+  useEffect(() => {
+    if (popup.open) return;
+    draggingRef.current = false;
+    keyboardFocusRef.current = false;
+    pointerFocusRef.current = false;
+    clearClose();
+  }, [clearClose, popup.open]);
+  const contains = (target: EventTarget | null) => target instanceof Node
+    && (popup.rootRef.current?.contains(target) || popup.popupRef.current?.contains(target));
+  const scheduleClose = () => {
+    clearClose();
+    closeTimerRef.current = window.setTimeout(() => {
+      closeTimerRef.current = null;
+      if (!hoveringRef.current && !draggingRef.current && !keyboardFocusRef.current) popup.updateOpen(false);
+    }, 140);
+  };
+  const enter = (event: React.PointerEvent) => {
+    if (event.pointerType === "touch") return;
+    hoveringRef.current = true;
+    clearClose();
+    popup.updateOpen(true);
+  };
+  const leave = (event: React.PointerEvent) => {
+    if (contains(event.relatedTarget)) return;
+    hoveringRef.current = false;
+    scheduleClose();
+  };
+  useEffect(() => {
+    if (!popup.open) return;
+    const release = (event: PointerEvent) => {
+      pointerFocusRef.current = false;
+      if (!draggingRef.current) return;
+      draggingRef.current = false;
+      hoveringRef.current = [popup.rootRef.current, popup.popupRef.current].some((element) => {
+        const bounds = element?.getBoundingClientRect();
+        return bounds && event.clientX >= bounds.left && event.clientX < bounds.right
+          && event.clientY >= bounds.top && event.clientY < bounds.bottom;
+      });
+      if (!hoveringRef.current && !keyboardFocusRef.current) popup.updateOpen(false);
+    };
+    document.addEventListener("pointerup", release);
+    document.addEventListener("pointercancel", release);
+    return () => {
+      document.removeEventListener("pointerup", release);
+      document.removeEventListener("pointercancel", release);
+    };
+  }, [popup.open, popup.popupRef, popup.rootRef, popup.updateOpen]);
+  const dismiss = () => {
+    clearClose();
+    keyboardFocusRef.current = false;
+    dismissingRef.current = true;
+    popup.dismiss();
+    dismissingRef.current = false;
+  };
   const openAndFocus = () => {
+    clearClose();
+    pointerFocusRef.current = false;
+    keyboardFocusRef.current = true;
     popup.updateOpen(true);
     window.requestAnimationFrame(() => sliderRef.current?.focus());
   };
 
-  return <div className="player-control-menu" ref={popup.rootRef} onBlur={popup.onBlur} data-open={popup.open}>
+  return <div className="player-control-menu" ref={popup.rootRef} data-open={popup.open}
+    onPointerEnter={enter} onPointerLeave={leave}
+    onPointerDownCapture={(event) => {
+      pointerFocusRef.current = true;
+      keyboardFocusRef.current = false;
+      if (event.pointerType === "touch") popup.updateOpen(true);
+    }}
+    onFocusCapture={() => {
+      if (pointerFocusRef.current || dismissingRef.current) return;
+      clearClose();
+      keyboardFocusRef.current = true;
+      popup.updateOpen(true);
+    }}
+    onBlur={(event) => {
+      if (!contains(event.relatedTarget)) keyboardFocusRef.current = false;
+      popup.onBlur(event);
+    }}>
     <button
       ref={popup.triggerRef}
       type="button"
@@ -209,14 +293,14 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
       aria-haspopup="dialog"
       aria-expanded={popup.open}
       aria-controls={popup.id}
-      onClick={() => popup.open ? popup.updateOpen(false) : openAndFocus()}
+      onClick={onToggleMute}
       onKeyDown={(event) => {
-        if (event.key === "ArrowDown") {
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
           event.preventDefault();
           openAndFocus();
         } else if (event.key === "Escape" && popup.open) {
           event.preventDefault();
-          popup.dismiss();
+          dismiss();
         }
       }}
     >
@@ -229,21 +313,20 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
       aria-label="Volume"
       className="player-control-menu__list player-volume-panel"
       style={popup.style}
+      onPointerEnter={enter}
+      onPointerLeave={leave}
       onBlur={popup.onBlur}
       onKeyDown={(event) => {
         if (event.key === "Escape") {
           event.preventDefault();
           event.stopPropagation();
-          popup.dismiss();
+          dismiss();
         }
       }}
     >
-      <span className="player-control-menu__label">Volume</span>
-      <div className="player-volume-panel__row">
-        <PlayerIconButton icon={muted ? "mute" : "volume"} label={muted ? "Unmute" : "Mute"} onClick={onToggleMute} />
-        <input ref={sliderRef} aria-label="Volume" aria-valuetext={percentage} type="range" min={0} max={1} step={0.01} value={level} onChange={(event) => onVolumeChange(Number(event.currentTarget.value))} className="player-volume" />
-        <span className="player-volume-panel__value" aria-hidden="true">{percentage}</span>
-      </div>
+      <input ref={sliderRef} aria-label="Volume" aria-orientation="vertical" aria-valuetext={percentage} type="range" min={0} max={1} step={0.01} value={level}
+        onPointerDown={() => { draggingRef.current = true; }}
+        onChange={(event) => onVolumeChange(Number(event.currentTarget.value))} className="player-volume" />
     </div>)}
   </div>;
 }

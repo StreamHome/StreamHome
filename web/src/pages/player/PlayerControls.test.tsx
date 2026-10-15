@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { hasSubtitleOptions, PlayerControlMenu, PlayerIconButton, PlayerMenuProvider, PlayerSettings, PlayerVolume } from "./PlayerControls";
@@ -43,72 +43,151 @@ describe("player volume control", () => {
     />;
   }
 
-  it("keeps the slider hidden until requested without changing volume or mute", () => {
+  it("reveals a textless vertical slider on hover without stealing focus or changing audio", () => {
     const onVolumeChange = vi.fn();
     const onToggleMute = vi.fn();
-    render(<VolumeFixture onVolumeChange={onVolumeChange} onToggleMute={onToggleMute} />);
+    render(<><VolumeFixture onVolumeChange={onVolumeChange} onToggleMute={onToggleMute} /><button type="button">Outside</button></>);
 
     const trigger = screen.getByRole("button", { name: "Volume" });
+    const outside = screen.getByRole("button", { name: "Outside" });
+    act(() => outside.focus());
     expect(trigger.getAttribute("aria-haspopup")).toBe("dialog");
     expect(trigger.getAttribute("aria-expanded")).toBe("false");
     expect(screen.queryByRole("slider", { name: "Volume" })).toBeNull();
     expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
 
-    fireEvent.click(trigger);
+    fireEvent.pointerEnter(trigger, { pointerType: "mouse" });
     expect(trigger.getAttribute("aria-expanded")).toBe("true");
-    expect(screen.getByRole("dialog", { name: "Volume" })).not.toBeNull();
-    expect((screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement).value).toBe("0.65");
-    expect(onVolumeChange).not.toHaveBeenCalled();
-    expect(onToggleMute).not.toHaveBeenCalled();
-
-    fireEvent.click(trigger);
-    expect(screen.queryByRole("slider", { name: "Volume" })).toBeNull();
+    const dialog = screen.getByRole("dialog", { name: "Volume" });
+    const slider = screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement;
+    expect(dialog.textContent).toBe("");
+    expect(dialog.querySelector("button")).toBeNull();
+    expect(slider.getAttribute("aria-orientation")).toBe("vertical");
+    expect(slider.value).toBe("0.65");
+    expect(document.activeElement).toBe(outside);
     expect(onVolumeChange).not.toHaveBeenCalled();
     expect(onToggleMute).not.toHaveBeenCalled();
   });
 
-  it("changes volume and toggles mute through the open dialog", () => {
+  it("changes the range level and toggles mute from the main speaker button", () => {
     const onVolumeChange = vi.fn();
     const onToggleMute = vi.fn();
     render(<VolumeFixture onVolumeChange={onVolumeChange} onToggleMute={onToggleMute} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Volume" }));
+    const trigger = screen.getByRole("button", { name: "Volume" });
+    fireEvent.pointerEnter(trigger, { pointerType: "mouse" });
     const slider = screen.getByRole("slider", { name: "Volume" }) as HTMLInputElement;
     fireEvent.change(slider, { target: { value: "0.37" } });
     expect(onVolumeChange).toHaveBeenCalledWith(0.37);
     expect(slider.value).toBe("0.37");
 
-    fireEvent.click(screen.getByRole("button", { name: "Mute" }));
+    fireEvent.click(trigger);
     expect(onToggleMute).toHaveBeenCalledTimes(1);
+    expect(trigger.getAttribute("aria-description")).toBe("Muted");
     expect(screen.getByRole("dialog", { name: "Volume" })).not.toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Unmute" }));
+    fireEvent.click(trigger);
     expect(onToggleMute).toHaveBeenCalledTimes(2);
     expect(slider.value).toBe("0.37");
     expect(onVolumeChange).toHaveBeenCalledTimes(1);
   });
 
-  it("supports keyboard focus, Escape, outside dismissal, and focus dismissal", async () => {
+  it("opens on keyboard focus and restores focus after Escape without reopening", async () => {
     const onOpenChange = vi.fn();
     render(<><VolumeFixture onOpenChange={onOpenChange} /><button type="button">Outside</button></>);
 
     const trigger = screen.getByRole("button", { name: "Volume" });
-    trigger.focus();
+    act(() => trigger.focus());
+    expect(screen.getByRole("dialog", { name: "Volume" })).not.toBeNull();
+    expect(document.activeElement).toBe(trigger);
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("slider", { name: "Volume" })));
+    for (const key of ["ArrowUp", "ArrowDown"]) {
+      const nativeStep = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      fireEvent(screen.getByRole("slider", { name: "Volume" }), nativeStep);
+      expect(nativeStep.defaultPrevented).toBe(false);
+    }
     fireEvent.keyDown(screen.getByRole("dialog", { name: "Volume" }), { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
     expect(document.activeElement).toBe(trigger);
     expect(onOpenChange).toHaveBeenLastCalledWith(false);
 
-    fireEvent.click(trigger);
+    fireEvent.keyDown(trigger, { key: "ArrowUp" });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("slider", { name: "Volume" })));
     fireEvent.pointerDown(screen.getByRole("button", { name: "Outside" }));
-    expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull());
 
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("slider", { name: "Volume" })));
-    fireEvent.blur(screen.getByRole("slider", { name: "Volume" }), { relatedTarget: screen.getByRole("button", { name: "Outside" }) });
-    expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
+    act(() => screen.getByRole("button", { name: "Outside" }).focus());
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull());
     expect(onOpenChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("allows the pointer to cross the portal gap and closes after leaving both controls", () => {
+    vi.useFakeTimers();
+    try {
+      render(<VolumeFixture />);
+      const trigger = screen.getByRole("button", { name: "Volume" });
+      fireEvent.pointerEnter(trigger, { pointerType: "mouse" });
+      const dialog = screen.getByRole("dialog", { name: "Volume" });
+
+      fireEvent.pointerLeave(trigger, { pointerType: "mouse", relatedTarget: document.body });
+      act(() => vi.advanceTimersByTime(50));
+      expect(screen.getByRole("dialog", { name: "Volume" })).toBe(dialog);
+      fireEvent.pointerEnter(dialog, { pointerType: "mouse" });
+      act(() => vi.advanceTimersByTime(200));
+      expect(screen.getByRole("dialog", { name: "Volume" })).toBe(dialog);
+
+      fireEvent.pointerLeave(dialog, { pointerType: "mouse", relatedTarget: document.body });
+      act(() => vi.advanceTimersByTime(200));
+      expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains the popup while keyboard focus is on the speaker or range", () => {
+    vi.useFakeTimers();
+    try {
+      render(<><VolumeFixture /><button type="button">Outside</button></>);
+      const trigger = screen.getByRole("button", { name: "Volume" });
+      act(() => trigger.focus());
+      fireEvent.pointerLeave(trigger, { pointerType: "mouse", relatedTarget: document.body });
+      act(() => vi.advanceTimersByTime(200));
+      const dialog = screen.getByRole("dialog", { name: "Volume" });
+
+      act(() => screen.getByRole("slider", { name: "Volume" }).focus());
+      fireEvent.pointerLeave(dialog, { pointerType: "mouse", relatedTarget: document.body });
+      act(() => vi.advanceTimersByTime(200));
+      expect(screen.getByRole("dialog", { name: "Volume" })).toBe(dialog);
+
+      act(() => screen.getByRole("button", { name: "Outside" }).focus());
+      act(() => vi.advanceTimersByTime(200));
+      expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a drag active outside the popup until the pointer is released", () => {
+    vi.useFakeTimers();
+    try {
+      render(<VolumeFixture />);
+      const trigger = screen.getByRole("button", { name: "Volume" });
+      fireEvent.pointerEnter(trigger, { pointerType: "mouse" });
+      const dialog = screen.getByRole("dialog", { name: "Volume" });
+      fireEvent.pointerDown(screen.getByRole("slider", { name: "Volume" }), { pointerId: 1, pointerType: "mouse", buttons: 1 });
+      fireEvent.pointerLeave(trigger, { pointerType: "mouse", relatedTarget: document.body });
+      fireEvent.pointerLeave(dialog, { pointerType: "mouse", relatedTarget: document.body });
+      act(() => vi.advanceTimersByTime(200));
+      expect(screen.getByRole("dialog", { name: "Volume" })).toBe(dialog);
+
+      fireEvent.pointerUp(document.body, { pointerId: 1, pointerType: "mouse" });
+      act(() => vi.advanceTimersByTime(200));
+      expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("shares the menu owner with quality and settings", () => {
@@ -120,12 +199,12 @@ describe("player volume control", () => {
 
     const volume = screen.getByRole("button", { name: "Volume" });
     const quality = screen.getByRole("button", { name: "Quality: Auto" });
-    fireEvent.click(volume);
+    fireEvent.pointerEnter(volume, { pointerType: "mouse" });
     fireEvent.click(quality);
     expect(screen.queryByRole("dialog", { name: "Volume" })).toBeNull();
     expect(screen.getByRole("listbox", { name: "Quality" })).not.toBeNull();
 
-    fireEvent.click(volume);
+    fireEvent.pointerEnter(volume, { pointerType: "mouse" });
     expect(screen.queryByRole("listbox", { name: "Quality" })).toBeNull();
     expect(screen.getByRole("dialog", { name: "Volume" })).not.toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Player settings" }));
