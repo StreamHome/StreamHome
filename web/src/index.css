@@ -1126,6 +1126,14 @@ button:disabled {
   pointer-events: auto;
 }
 
+.player-view :is(.player-topbar__exit, .mobile-player-exit),
+.player-view :is(.player-topbar__exit, .mobile-player-exit):hover {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
 .player-topbar__title {
   min-width: 0;
   max-width: min(65vw, 52rem);

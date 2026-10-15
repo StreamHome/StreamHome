@@ -4326,6 +4326,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                 <PlayerIconButton
                   icon="back"
                   label="Exit player"
+                  data-tooltip={undefined}
                   className="mobile-player-exit"
                   onClick={exitPlayer}
                 />
@@ -4453,7 +4454,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             exit={{ opacity: 0 }}
             transition={{ duration: reduced ? MOTION_TIMINGS.reduced : 0.16, ease: MOTION_EASE }}
           >
-            <PlayerIconButton icon="back" label="Exit player" className="player-topbar__exit" onClick={exitPlayer} />
+            <PlayerIconButton icon="back" label="Exit player" data-tooltip={undefined} className="player-topbar__exit" onClick={exitPlayer} />
             <div className="player-topbar__title">
               <h1>{asset.title}</h1>
               {asset.subtitle && <p>{asset.subtitle}</p>}
