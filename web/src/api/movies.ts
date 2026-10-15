@@ -1,5 +1,12 @@
 import { apiGet } from "./client";
 import type { DiscoverMovie, Episode, MediaAnalysis, Movie } from "../types/api";
+import { normalizeSkipMarkers } from "./skipMarkers";
+
+type EpisodeResponse = Omit<Partial<Episode>, "skipMarkers"> & { skipMarkers?: unknown };
+type MovieResponse = Omit<Partial<Movie>, "skipMarkers" | "episodes"> & {
+  skipMarkers?: unknown;
+  episodes?: EpisodeResponse[] | null;
+};
 
 export function normalizeAnalysis(raw: unknown): MediaAnalysis | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
@@ -22,7 +29,7 @@ export function normalizeAnalysis(raw: unknown): MediaAnalysis | null {
   };
 }
 
-function normalizeEpisode(raw: Partial<Episode>): Episode {
+function normalizeEpisode(raw: EpisodeResponse): Episode {
   return {
     id: raw.id ?? "",
     movieId: raw.movieId,
@@ -37,13 +44,13 @@ function normalizeEpisode(raw: Partial<Episode>): Episode {
     analysis: normalizeAnalysis(raw.analysis),
     languages: Array.isArray(raw.languages) ? raw.languages : [],
     subtitles: Array.isArray(raw.subtitles) ? raw.subtitles : [],
-    skipMarkers: raw.skipMarkers && typeof raw.skipMarkers === "object" ? raw.skipMarkers : {},
+    skipMarkers: normalizeSkipMarkers(raw.skipMarkers),
     dialogueWpm: raw.dialogueWpm ?? null,
     dialogueConfidence: raw.dialogueConfidence ?? 0,
   };
 }
 
-export function normalizeMovie(raw: Partial<Movie>): Movie {
+export function normalizeMovie(raw: MovieResponse): Movie {
   return {
     id: raw.id ?? "",
     title: raw.title ?? "",
@@ -64,7 +71,7 @@ export function normalizeMovie(raw: Partial<Movie>): Movie {
     subtitles: Array.isArray(raw.subtitles) ? raw.subtitles : [],
     voteAverage: raw.voteAverage ?? 0,
     voteCount: raw.voteCount ?? 0,
-    skipMarkers: raw.skipMarkers && typeof raw.skipMarkers === "object" ? raw.skipMarkers : {},
+    skipMarkers: normalizeSkipMarkers(raw.skipMarkers),
     episodes: Array.isArray(raw.episodes) ? raw.episodes.map(normalizeEpisode) : null,
     source: raw.source,
     availability: raw.availability,
@@ -86,24 +93,24 @@ export function normalizeMovie(raw: Partial<Movie>): Movie {
 
 export async function getMovies(profileId?: string, signal?: AbortSignal): Promise<Movie[]> {
   const path = profileId ? `/api/movies?profile_id=${encodeURIComponent(profileId)}` : "/api/movies";
-  const response = await apiGet<Partial<Movie>[]>(path, { signal });
+  const response = await apiGet<MovieResponse[]>(path, { signal });
   return response.map(normalizeMovie);
 }
 
 export async function getFeatured(): Promise<Movie | null> {
-  const response = await apiGet<Partial<Movie> | null>("/api/movies/featured");
+  const response = await apiGet<MovieResponse | null>("/api/movies/featured");
   return response ? normalizeMovie(response) : null;
 }
 
 export async function getMovie(mediaId: string, signal?: AbortSignal): Promise<Movie> {
-  return normalizeMovie(await apiGet<Partial<Movie>>(`/api/movies/${encodeURIComponent(mediaId)}`, { signal }));
+  return normalizeMovie(await apiGet<MovieResponse>(`/api/movies/${encodeURIComponent(mediaId)}`, { signal }));
 }
 
 export const search = (query: string, signal?: AbortSignal) => apiGet<DiscoverMovie[]>(`/api/search?query=${encodeURIComponent(query)}`, { signal });
 export const discover = (category: string, type: string) => apiGet<DiscoverMovie[]>(`/api/discover?category=${encodeURIComponent(category)}&type=${encodeURIComponent(type)}`);
 
 export async function getEpisodes(tmdbId: number | string, signal?: AbortSignal): Promise<Episode[]> {
-  const response = await apiGet<Partial<Episode>[]>(`/api/series/${tmdbId}/episodes`, { signal });
+  const response = await apiGet<EpisodeResponse[]>(`/api/series/${tmdbId}/episodes`, { signal });
   return response.map(normalizeEpisode);
 }
 

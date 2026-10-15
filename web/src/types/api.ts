@@ -105,6 +105,13 @@ export interface MediaAnalysis {
   durationProvenance: string;
 }
 
+export interface SkipMarkerRange {
+  start: number;
+  end: number;
+}
+
+export type SkipMarkers = Record<string, SkipMarkerRange[]>;
+
 export interface Episode {
   id: string;
   movieId?: string;
@@ -119,7 +126,7 @@ export interface Episode {
   analysis?: MediaAnalysis | null;
   languages: string[];
   subtitles: SubtitleInfo[];
-  skipMarkers: Record<string, unknown>;
+  skipMarkers: SkipMarkers;
   dialogueWpm?: number | null;
   dialogueConfidence?: number;
   previewTaskId?: string | null;
@@ -149,7 +156,7 @@ export interface Movie {
   subtitles: SubtitleInfo[];
   voteAverage: number;
   voteCount: number;
-  skipMarkers: Record<string, unknown>;
+  skipMarkers: SkipMarkers;
   episodes?: Episode[] | null;
   source?: MediaSource;
   availability?: MediaAvailability;

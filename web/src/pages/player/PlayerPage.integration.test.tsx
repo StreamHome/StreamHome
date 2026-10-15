@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useProfileStore } from "../../stores/profileStore";
+import { useThemeStore } from "../../stores/themeStore";
 import type { Profile } from "../../types/api";
 import * as moviesApi from "../../api/movies";
 import * as playbackApi from "../../api/playback";
@@ -98,6 +99,17 @@ const playback: ResolvedPlayback = {
 
 const playerPreferencesKey = `streamhome_player_preferences_${profile.id}`;
 
+const markerPlayback: ResolvedPlayback = {
+  ...playback,
+  asset: {
+    ...playback.asset,
+    skipMarkers: {
+      intro: [{ start: 10, end: 20 }],
+      credits: [{ start: 90, end: 100 }, { start: 110, end: 120 }],
+    },
+  },
+};
+
 function pointerClick(target: HTMLElement) {
   fireEvent.pointerDown(target, { pointerType: "mouse", pointerId: 1 });
   act(() => target.focus());
@@ -115,6 +127,19 @@ function pressFocusedKey(key: string, init: KeyboardEventInit = {}) {
 
 function videoCallCount(method: "play" | "pause" | "load", video: HTMLVideoElement) {
   return vi.mocked(HTMLMediaElement.prototype[method]).mock.contexts.filter((element) => element === video).length;
+}
+
+function observeVideoPosition(video: HTMLVideoElement) {
+  let position = video.currentTime;
+  const writes = vi.fn((value: number) => { position = value; });
+  Object.defineProperty(video, "currentTime", { configurable: true, get: () => position, set: writes });
+  return writes;
+}
+
+function timelinePointer(timeline: HTMLInputElement, type: string, clientX: number) {
+  const event = new MouseEvent(type, { bubbles: true, clientX });
+  Object.defineProperty(event, "pointerId", { value: 1 });
+  fireEvent(timeline, event);
 }
 
 function showPlayingVideo(video: HTMLVideoElement, time = 30) {
@@ -348,6 +373,168 @@ describe("mounted player lifecycle", () => {
     pressFocusedKey("ArrowRight");
     expect(video.currentTime).toBe(40);
     view.unmount();
+  });
+
+  it.each(["ember", "aurora", "cinema"] as const)("skips an active intro once while preserving paused %s playback", async (theme) => {
+    const previousTheme = useThemeStore.getState().activeTheme;
+    useThemeStore.setState({ activeTheme: theme });
+    localStorage.setItem(playerPreferencesKey, JSON.stringify({ playbackRate: 1.5 }));
+    const view = render(<MemoryRouter><PlayerPage visualFixture={markerPlayback} /></MemoryRouter>);
+    try {
+      await act(async () => { await import("hls.js"); });
+      const root = view.container.querySelector("[data-player-root]") as HTMLElement;
+      const video = view.container.querySelector("video") as HTMLVideoElement;
+      showPlayingVideo(video, 15);
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(video, "paused", { configurable: true, value: true });
+      fireEvent.pause(video);
+      const source = video.getAttribute("src");
+      const loads = videoCallCount("load", video);
+      const plays = videoCallCount("play", video);
+      const writes = observeVideoPosition(video);
+      pointerClick(screen.getByRole("button", { name: "Skip intro" }));
+      expect(writes).toHaveBeenCalledExactlyOnceWith(20);
+      expect(video.currentTime).toBe(20);
+      expect(video.paused).toBe(true);
+      expect(root.dataset.playerPhase).toBe("paused");
+      expect(document.activeElement).toBe(root);
+      expect(view.container.querySelector("video")).toBe(video);
+      expect(video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", video)).toBe(loads);
+      expect(videoCallCount("play", video)).toBe(plays);
+      expect(video.playbackRate).toBe(1.5);
+      fireEvent.seeked(video);
+      expect(root.dataset.playerPhase).toBe("paused");
+      await waitFor(() => expect(screen.queryByRole("button", { name: "Skip intro" })).toBeNull());
+    } finally {
+      view.unmount();
+      useThemeStore.setState({ activeTheme: previousTheme });
+    }
+  });
+
+  it("uses confirmed playback markers while the scrub preview visits a different region", async () => {
+    const view = render(<MemoryRouter><PlayerPage visualFixture={markerPlayback} /></MemoryRouter>);
+    try {
+      await act(async () => { await import("hls.js"); });
+      const video = view.container.querySelector("video") as HTMLVideoElement;
+      const timeline = screen.getByRole("slider", { name: "Playback position" }) as HTMLInputElement;
+      showPlayingVideo(video, 15);
+      vi.spyOn(timeline, "getBoundingClientRect").mockReturnValue({
+        x: 0, y: 0, left: 0, right: 120, top: 0, bottom: 16, width: 120, height: 16, toJSON: () => ({}),
+      });
+      expect(screen.getByRole("button", { name: "Skip intro" })).toBeTruthy();
+      timelinePointer(timeline, "pointerdown", 95);
+      expect(video.currentTime).toBe(15);
+      expect(timeline.getAttribute("aria-valuetext")).toContain("Credits");
+      expect(view.container.querySelector(".player-timeline-preview")?.textContent).toContain("Credits");
+      expect(screen.getByRole("button", { name: "Skip intro" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Skip credits" })).toBeNull();
+      timelinePointer(timeline, "pointercancel", 95);
+
+      video.currentTime = 20;
+      fireEvent.timeUpdate(video);
+      await waitFor(() => expect(screen.queryByRole("button", { name: "Skip intro" })).toBeNull());
+      timelinePointer(timeline, "pointerdown", 15);
+      expect(video.currentTime).toBe(20);
+      expect(view.container.querySelector(".player-timeline-preview")?.textContent).toContain("Intro");
+      expect(screen.queryByRole("button", { name: "Skip intro" })).toBeNull();
+      timelinePointer(timeline, "pointercancel", 15);
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it("keeps marker regions decorative while the native timeline owns navigation and labeled previews", async () => {
+    const view = render(<MemoryRouter><PlayerPage visualFixture={markerPlayback} /></MemoryRouter>);
+    try {
+      await act(async () => { await import("hls.js"); });
+      const root = view.container.querySelector("[data-player-root]") as HTMLElement;
+      const video = view.container.querySelector("video") as HTMLVideoElement;
+      const timeline = screen.getByRole("slider", { name: "Playback position" }) as HTMLInputElement;
+      showPlayingVideo(video);
+      const markers = view.container.querySelector(".player-timeline-markers");
+      expect(markers?.getAttribute("aria-hidden")).toBe("true");
+      expect(markers?.querySelectorAll("[data-marker-id]")).toHaveLength(3);
+      expect(markers?.querySelectorAll("[data-marker-kind='intro']")).toHaveLength(1);
+      expect(markers?.querySelectorAll("[data-marker-kind='credits']")).toHaveLength(2);
+      expect(markers?.querySelector("button, input, a, [tabindex], [role='button']")).toBeNull();
+      expect(timeline.type).toBe("range");
+      act(() => timeline.focus());
+      const native = pressFocusedKey("ArrowRight");
+      expect(native.down.defaultPrevented).toBe(false);
+      expect(native.up.defaultPrevented).toBe(false);
+      expect(video.currentTime).toBe(30);
+      vi.spyOn(timeline, "getBoundingClientRect").mockReturnValue({
+        x: 0, y: 0, left: 0, right: 120, top: 0, bottom: 16, width: 120, height: 16, toJSON: () => ({}),
+      });
+      timelinePointer(timeline, "pointermove", 15);
+      expect(view.container.querySelector(".player-timeline-preview")?.textContent).toContain("Intro");
+      expect(video.currentTime).toBe(30);
+      timelinePointer(timeline, "pointerdown", 15);
+      expect(timeline.getAttribute("aria-valuetext")).toContain("Intro");
+      expect(screen.queryByRole("button", { name: "Skip intro" })).toBeNull();
+      timelinePointer(timeline, "pointercancel", 15);
+      expect(document.activeElement).toBe(root);
+      pressFocusedKey("ArrowRight");
+      expect(video.currentTime).toBe(40);
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it("preserves native keyboard Skip activation and releases focus when its marker disappears", async () => {
+    const view = render(<MemoryRouter><PlayerPage visualFixture={markerPlayback} /></MemoryRouter>);
+    try {
+      await act(async () => { await import("hls.js"); });
+      const root = view.container.querySelector("[data-player-root]") as HTMLElement;
+      const video = view.container.querySelector("video") as HTMLVideoElement;
+      showPlayingVideo(video, 15);
+      const button = screen.getByRole("button", { name: "Skip intro" });
+      const writes = observeVideoPosition(video);
+      act(() => button.focus());
+      const activation = pressFocusedKey("Enter");
+      expect(activation.down.defaultPrevented).toBe(false);
+      expect(activation.up.defaultPrevented).toBe(false);
+      expect(writes).not.toHaveBeenCalled();
+      fireEvent.click(button, { detail: 0 });
+      expect(writes).toHaveBeenCalledExactlyOnceWith(20);
+      fireEvent.seeked(video);
+      await waitFor(() => expect(document.activeElement).toBe(root));
+      pressFocusedKey("ArrowRight");
+      expect(video.currentTime).toBe(30);
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it("skips credits ranges independently and waits for native ended before presenting completion", async () => {
+    const view = render(<MemoryRouter><PlayerPage visualFixture={markerPlayback} /></MemoryRouter>);
+    try {
+      await act(async () => { await import("hls.js"); });
+      const root = view.container.querySelector("[data-player-root]") as HTMLElement;
+      const video = view.container.querySelector("video") as HTMLVideoElement;
+      showPlayingVideo(video, 95);
+      const writes = observeVideoPosition(video);
+      pointerClick(screen.getByRole("button", { name: "Skip credits" }));
+      expect(writes).toHaveBeenCalledExactlyOnceWith(100);
+      fireEvent.seeked(video);
+      expect(root.dataset.playerPhase).not.toBe("ended");
+      expect(screen.queryByRole("button", { name: "Replay" })).toBeNull();
+      await waitFor(() => expect(screen.queryByRole("button", { name: "Skip credits" })).toBeNull());
+
+      video.currentTime = 112;
+      fireEvent.timeUpdate(video);
+      writes.mockClear();
+      pointerClick(screen.getByRole("button", { name: "Skip credits" }));
+      expect(writes).toHaveBeenCalledExactlyOnceWith(120);
+      expect(root.dataset.playerPhase).not.toBe("ended");
+      expect(screen.queryByRole("button", { name: "Replay" })).toBeNull();
+      fireEvent.ended(video);
+      expect(root.dataset.playerPhase).toBe("ended");
+      expect(screen.getByRole("button", { name: "Replay" })).toBeTruthy();
+    } finally {
+      view.unmount();
+    }
   });
 
   it("renders selected captions through the player overlay with profile timing", () => {

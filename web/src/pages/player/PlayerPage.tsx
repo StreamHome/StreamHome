@@ -29,11 +29,14 @@ import type {
   PlaybackProgressEvent,
   PlaybackRendition,
   PlaybackRunResponse,
+  SkipMarkers,
 } from "../../types/api";
 import { formatDuration } from "../../utils/format";
 import { hasSubtitleOptions, PlayerControlMenu, PlayerIcon, PlayerIconButton, PlayerMenuProvider, PlayerSettings, PlayerVolume } from "./PlayerControls";
 import { languageDisplayName, normalizeLanguageTag } from "./language";
 import { playerControlOwnsKey, restorePlayerPointerFocus } from "./playerKeyboard";
+import { activeMarkerRegion, deriveMarkerRegions } from "./playerMarkers";
+import { PlayerSkipControl, PlayerTimelineShell } from "./PlayerMarkerControls";
 import {
   playerFullscreenMode,
   releaseViewportPlayerFullscreen,
@@ -76,7 +79,7 @@ interface PlayableAsset {
   title: string;
   subtitle: string;
   durationLabel: string;
-  skipMarkers: Record<string, unknown>;
+  skipMarkers: SkipMarkers;
 }
 
 export interface ResolvedPlayback {
@@ -433,21 +436,6 @@ function assetFromEpisode(movie: Movie, episode: Episode): PlayableAsset {
     durationLabel: episode.duration,
     skipMarkers: episode.skipMarkers || {},
   };
-}
-
-function activeSkipMarker(markers: Record<string, unknown>, time: number): { label: string; end: number } | null {
-  for (const [name, value] of Object.entries(markers)) {
-    if (!Array.isArray(value)) continue;
-    for (const marker of value) {
-      if (!marker || typeof marker !== "object") continue;
-      const start = Number((marker as { start?: unknown }).start);
-      const end = Number((marker as { end?: unknown }).end);
-      if (Number.isFinite(start) && Number.isFinite(end) && time >= start && time < end) {
-        return { label: `Skip ${name}`, end };
-      }
-    }
-  }
-  return null;
 }
 
 function loadPreferences(profileId: string): PlayerPreferences {
@@ -2960,7 +2948,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const playerControlsContainFocus = useCallback(() => {
     const activeElement = document.activeElement;
     if (!(activeElement instanceof HTMLElement)) return false;
-    return Boolean(activeElement.closest(".player-controls, .player-topbar, .mobile-player-chrome"));
+    return Boolean(activeElement.closest(".player-controls, .player-topbar, .mobile-player-chrome, .player-skip-control"));
   }, []);
 
   const scheduleControlsHide = useCallback(() => {
@@ -3718,7 +3706,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     setRetryVersion((value) => value + 1);
   };
 
-  const skipMarker = asset ? activeSkipMarker(asset.skipMarkers, currentTime) : null;
+  const markerRegions = useMemo(() => deriveMarkerRegions(asset?.skipMarkers ?? {}, duration), [asset?.skipMarkers, duration]);
+  const skipMarker = pendingSeekTargetRef.current === null && !["ended", "fatal", "unavailable"].includes(phase)
+    ? activeMarkerRegion(markerRegions, confirmedTimeRef.current) : null;
+  const timelineRegion = activeMarkerRegion(markerRegions, currentTime);
+  const captionSignature = captionLines.map((line) => line.key).join("|");
+  const timelineObstacleKey = `${skipMarker?.id ?? ""}:${captionSignature}:${mobilePlayer}`;
+  const timelineValueText = `${formatDuration(currentTime)}${timelineRegion ? ` · ${timelineRegion.label}` : ""}`;
   const activeQuality = availableQualities.find((item) => item.id === activeQualityId);
   const qualityStatus = qualitySwitching || (selectedQualityId !== "auto" && activeQualityId !== selectedQualityId)
     ? activeQuality ? `Switching · Playing ${activeQuality.label}` : "Switching"
@@ -4398,13 +4392,15 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         )}
       </AnimatePresence>
 
-      <AnimatePresence>
-        {skipMarker && (
-          <motion.div className="player-skip-control absolute bottom-36 right-6 z-40 md:right-10" initial={reduced ? { opacity: 0 } : { opacity: 0, x: 18 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 12 }}>
-            <Button onClick={() => seek(skipMarker.end)}>{skipMarker.label}</Button>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {skipMarker && <PlayerSkipControl
+        region={skipMarker}
+        captionSignature={captionSignature}
+        mobile={mobilePlayer}
+        reduced={reduced}
+        onSkip={() => seek(skipMarker.end)}
+        onFocus={revealControls}
+        onBlur={handleControlsBlur}
+      />}
 
       <AnimatePresence>
         {phase === "ended" && (
@@ -4483,9 +4479,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             </div>
 
             <div className="mobile-player-bottom">
+              <PlayerTimelineShell regions={markerRegions} duration={duration} time={currentTime} preview={timelinePreview} obstacleKey={timelineObstacleKey}>
               <input
                 ref={timelineRef}
                 aria-label="Playback position"
+                aria-valuetext={timelineValueText}
                 type="range"
                 min={0}
                 max={duration > 0 ? duration : Math.max(runResponse.sourceMetadata.duration, currentTime, 1)}
@@ -4493,6 +4491,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                 value={Math.min(currentTime, duration || currentTime)}
                 onPointerDown={beginTimelineScrub}
                 onPointerMove={moveTimelinePointer}
+                onPointerLeave={() => { if (!scrubbingRef.current) setTimelinePreview(null); }}
                 onInput={(event) => previewTimelineScrub(Number(event.currentTarget.value))}
                 onPointerUp={endTimelineScrub}
                 onPointerCancel={cancelTimelineScrub}
@@ -4505,6 +4504,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                   "--player-buffered": `${duration > 0 ? Math.min(100, (bufferedEnd / duration) * 100) : 0}%`,
                 } as React.CSSProperties}
               />
+              </PlayerTimelineShell>
               <div className="mobile-player-bottom__row">
                 <span className="mobile-player-time">
                   {formatDuration(currentTime)} <i>/</i> {duration ? formatDuration(duration) : asset.durationLabel}
@@ -4601,15 +4601,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             exit={reduced ? { opacity: 0 } : { opacity: 0, y: 12 }}
           >
             <div className="mx-auto max-w-7xl">
-              <div className="relative">
-                {timelinePreview && (
-                  <span className="pointer-events-none absolute -top-9 -translate-x-1/2 rounded bg-black/90 px-2 py-1 text-xs" style={{ left: timelinePreview.x }}>
-                    {formatDuration(timelinePreview.time)}
-                  </span>
-                )}
+              <PlayerTimelineShell regions={markerRegions} duration={duration} time={currentTime} preview={timelinePreview} obstacleKey={timelineObstacleKey}>
                 <input
                   ref={timelineRef}
                   aria-label="Playback position"
+                  aria-valuetext={timelineValueText}
                   type="range"
                   min={0}
                   max={duration || 0}
@@ -4634,7 +4630,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                     "--player-buffered": `${duration > 0 ? Math.min(100, (bufferedEnd / duration) * 100) : 0}%`,
                   } as React.CSSProperties}
                 />
-              </div>
+              </PlayerTimelineShell>
 
               <div className="player-controls__transport mt-3 flex flex-wrap items-center gap-2 md:gap-3">
                 <PlayerIconButton icon={playbackControlShowsPause ? "pause" : "play"} label={playbackControlShowsPause ? "Pause" : "Play"} onClick={() => playbackControlShowsPause ? pausePlayback() : safePlay()} />
