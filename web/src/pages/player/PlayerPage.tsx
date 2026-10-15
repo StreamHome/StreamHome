@@ -4644,6 +4644,12 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
               <h1>{asset.title}</h1>
               {asset.subtitle && <p>{asset.subtitle}</p>}
             </div>
+            <PlayerSettings compact className="player-topbar__settings"
+              playbackRate={preferences.playbackRate} onRateChange={(value) => setPreferences((current) => ({ ...current, playbackRate: value }))}
+              captions={hasSubtitles && preferences.subtitleTrackId !== "off"} captionScale={preferences.captionScale}
+              onCaptionScaleChange={(value) => setPreferences((current) => ({ ...current, captionScale: value }))}
+              subtitleOffset={preferences.subtitleOffset} onSubtitleOffsetChange={(value) => setPreferences((current) => ({ ...current, subtitleOffset: value }))}
+              onOpenChange={handleControlMenuOpenChange} />
           </motion.header>
         )}
       </AnimatePresence>
@@ -4734,11 +4740,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                       onOpenChange={handleControlMenuOpenChange}
                     />
                   )}
-                  <PlayerSettings playbackRate={preferences.playbackRate} onRateChange={(value) => setPreferences((current) => ({ ...current, playbackRate: value }))}
-                    captions={hasSubtitles && preferences.subtitleTrackId !== "off"} captionScale={preferences.captionScale}
-                    onCaptionScaleChange={(value) => setPreferences((current) => ({ ...current, captionScale: value }))}
-                    subtitleOffset={preferences.subtitleOffset} onSubtitleOffsetChange={(value) => setPreferences((current) => ({ ...current, subtitleOffset: value }))}
-                    onOpenChange={handleControlMenuOpenChange} />
                   {document.pictureInPictureEnabled && <PlayerIconButton icon="pip" label="Picture in picture" onClick={togglePictureInPicture} />}
                   <PlayerIconButton
                     icon={fullscreenActive ? "fullscreen-exit" : "fullscreen"}

@@ -1182,6 +1182,138 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
+  it.each(["ember", "aurora", "cinema"] as const)("uses one topbar Settings control without disturbing paused %s playback", async (theme) => {
+    const previousTheme = useThemeStore.getState().activeTheme;
+    useThemeStore.setState({ activeTheme: theme });
+    const settingsPlayback = {
+      ...playback,
+      runResponse: { ...playback.runResponse, ticketExpiresAt: Math.floor(Date.now() / 1_000) + 3_600 },
+    };
+    const view = render(<MemoryRouter><PlayerPage visualFixture={settingsPlayback} /></MemoryRouter>);
+    try {
+      await act(async () => { await import("hls.js"); });
+      const root = view.container.querySelector<HTMLElement>("[data-player-root='true']")!;
+      const video = view.container.querySelector("video") as HTMLVideoElement;
+      showPlayingVideo(video);
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(video, "paused", { configurable: true, value: true });
+      fireEvent.pause(video);
+      const source = video.getAttribute("src");
+      const loads = videoCallCount("load", video);
+      const plays = videoCallCount("play", video);
+      const pauses = videoCallCount("pause", video);
+      const settings = screen.getByRole("button", { name: "Player settings" });
+      expect(screen.getAllByRole("button", { name: "Player settings" })).toHaveLength(1);
+      expect(settings.closest(".player-topbar")).not.toBeNull();
+      expect(view.container.querySelector(".player-controls button[aria-label='Player settings']")).toBeNull();
+      expect(settings.querySelector("svg[aria-hidden='true']")).not.toBeNull();
+      expect(settings.textContent).toBe("");
+
+      pointerClick(settings);
+      pointerClick(screen.getByRole("button", { name: "1.5×" }));
+      expect(screen.queryByRole("dialog", { name: "Player settings" })).toBeNull();
+      expect(document.activeElement).toBe(root);
+      expect(root.dataset.playerPhase).toBe("paused");
+      expect(video.paused).toBe(true);
+      expect(video.currentTime).toBe(30);
+      expect(video.playbackRate).toBe(1.5);
+      expect(view.container.querySelector("video")).toBe(video);
+      expect(video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", video)).toBe(loads);
+      expect(videoCallCount("play", video)).toBe(plays);
+      expect(videoCallCount("pause", video)).toBe(pauses);
+    } finally {
+      view.unmount();
+      useThemeStore.setState({ activeTheme: previousTheme });
+    }
+  });
+
+  it("retains the labeled Settings control in the dedicated phone bottom row", () => {
+    const width = Object.getOwnPropertyDescriptor(window, "innerWidth")!;
+    const height = Object.getOwnPropertyDescriptor(window, "innerHeight")!;
+    const touchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 844 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 390 });
+    Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+    let view: ReturnType<typeof render> | undefined;
+    try {
+      const settingsPlayback = {
+        ...playback,
+        runResponse: { ...playback.runResponse, ticketExpiresAt: Math.floor(Date.now() / 1_000) + 3_600 },
+      };
+      view = render(<MemoryRouter><PlayerPage visualFixture={settingsPlayback} /></MemoryRouter>);
+      const settings = screen.getByRole("button", { name: "Player settings" });
+      expect(screen.getAllByRole("button", { name: "Player settings" })).toHaveLength(1);
+      expect(view.container.querySelector<HTMLElement>("[data-player-root]")?.dataset.mobilePlayer).toBe("true");
+      expect(settings.closest(".mobile-player-bottom")).not.toBeNull();
+      expect(settings.closest(".player-topbar")).toBeNull();
+      expect(settings.textContent).toBe("Settings");
+      pointerClick(settings);
+      expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
+    } finally {
+      view?.unmount();
+      Object.defineProperty(window, "innerWidth", width);
+      Object.defineProperty(window, "innerHeight", height);
+      if (touchPoints) Object.defineProperty(navigator, "maxTouchPoints", touchPoints);
+      else Reflect.deleteProperty(navigator, "maxTouchPoints");
+    }
+  });
+
+  it("retains playing chrome for focused or open topbar Settings and releases it after pointer completion", async () => {
+    const settingsPlayback = {
+      ...playback,
+      runResponse: { ...playback.runResponse, ticketExpiresAt: Math.floor(Date.now() / 1_000) + 3_600 },
+    };
+    const view = render(<MemoryRouter><PlayerPage visualFixture={settingsPlayback} /></MemoryRouter>);
+    try {
+      await act(async () => { await import("hls.js"); });
+      vi.useFakeTimers();
+      const root = view.container.querySelector<HTMLElement>("[data-player-root='true']")!;
+      const video = view.container.querySelector("video") as HTMLVideoElement;
+      showPlayingVideo(video);
+      const source = video.getAttribute("src");
+      const loads = videoCallCount("load", video);
+      const settings = screen.getByRole("button", { name: "Player settings" });
+      const advancePlaying = () => {
+        for (let update = 0; update < 4; update += 1) {
+          video.currentTime += 1;
+          fireEvent.timeUpdate(video);
+          act(() => vi.advanceTimersByTime(800));
+        }
+      };
+
+      pointerClick(screen.getByRole("button", { name: /Audio language/ }));
+      expect(screen.getByRole("listbox", { name: "Audio language" })).toBeTruthy();
+      pointerClick(settings);
+      expect(screen.queryByRole("listbox", { name: "Audio language" })).toBeNull();
+      const dialog = screen.getByRole("dialog", { name: "Player settings" });
+      fireEvent.keyDown(dialog, { key: "Escape" });
+      expect(document.activeElement).toBe(settings);
+      advancePlaying();
+      expect(root.dataset.controlsVisible).toBe("true");
+      expect(document.activeElement).toBe(settings);
+
+      pressFocusedKey("ArrowDown");
+      act(() => vi.advanceTimersByTime(20));
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "0.5×" }));
+      advancePlaying();
+      expect(root.dataset.controlsVisible).toBe("true");
+      expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
+
+      pointerClick(screen.getByRole("button", { name: "1.5×" }));
+      expect(screen.queryByRole("dialog", { name: "Player settings" })).toBeNull();
+      expect(document.activeElement).toBe(root);
+      advancePlaying();
+      expect(root.dataset.playerPhase).toBe("playing");
+      expect(root.dataset.controlsVisible).toBe("false");
+      expect(view.container.querySelector("video")).toBe(video);
+      expect(video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", video)).toBe(loads);
+    } finally {
+      view.unmount();
+    }
+  });
+
   it("keeps paused and keyboard-focused controls visible", () => {
     vi.useFakeTimers();
     const view = render(

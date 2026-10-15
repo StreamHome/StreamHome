@@ -284,6 +284,56 @@ describe("player volume control", () => {
 });
 
 describe("player settings pointer completion", () => {
+  it.each([700, 180])("opens compact topbar Settings below its anchor within a %ipx player", async (height) => {
+    const bounds = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.dataset.playerRoot === "true") return new DOMRect(100, 50, 1200, height);
+      if (this.classList.contains("player-topbar__settings")) return new DOMRect(1220, 70, 44, 44);
+      return new DOMRect();
+    });
+    const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.dataset.playerRoot === "true" ? 1200 : 0;
+    });
+    const frameHeight = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.dataset.playerRoot === "true" ? height : 0;
+    });
+    const contentHeight = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("player-settings-panel") ? 420 : 0;
+    });
+    const view = render(<div data-player-root="true" tabIndex={-1}>
+      <PlayerSettings compact className="player-topbar__settings" playbackRate={1} onRateChange={() => undefined}
+        captions captionScale={1} onCaptionScaleChange={() => undefined} subtitleOffset={0} onSubtitleOffsetChange={() => undefined} />
+    </div>);
+    try {
+      const trigger = screen.getByRole("button", { name: "Player settings" });
+      expect(trigger.getAttribute("aria-haspopup")).toBe("dialog");
+      expect(trigger.getAttribute("aria-expanded")).toBe("false");
+      act(() => trigger.focus());
+      fireEvent.keyDown(trigger, { key: "ArrowDown" });
+      const dialog = screen.getByRole("dialog", { name: "Player settings" });
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "0.5×" })));
+
+      expect(trigger.getAttribute("aria-controls")).toBe(dialog.id);
+      expect(trigger.getAttribute("aria-expanded")).toBe("true");
+      expect(dialog.parentElement).toBe(view.container.firstElementChild);
+      expect(Number.parseFloat(dialog.style.left) + Number.parseFloat(dialog.style.width)).toBe(1164);
+      expect(Number.parseFloat(dialog.style.top)).toBe(72);
+      expect(Number.parseFloat(dialog.style.maxHeight)).toBe(height - 84);
+      expect(Number.parseFloat(dialog.style.top) + Math.min(420, Number.parseFloat(dialog.style.maxHeight))).toBeLessThanOrEqual(height - 12);
+      expect(dialog.style.overflowY).toBe("auto");
+
+      fireEvent.keyDown(dialog, { key: "Escape" });
+      expect(screen.queryByRole("dialog", { name: "Player settings" })).toBeNull();
+      expect(document.activeElement).toBe(trigger);
+      expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    } finally {
+      view.unmount();
+      contentHeight.mockRestore();
+      frameHeight.mockRestore();
+      width.mockRestore();
+      bounds.mockRestore();
+    }
+  });
+
   it.each([
     { label: "1.5×", kind: "rate", value: 1.5 },
     { label: "Large", kind: "caption", value: 1.25 },

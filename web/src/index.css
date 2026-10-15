@@ -1264,6 +1264,33 @@ button:disabled {
   pointer-events: auto;
 }
 
+.player-topbar__settings {
+  justify-self: end;
+  pointer-events: auto;
+}
+
+.player-topbar__settings .player-control-menu__trigger {
+  display: grid;
+  place-items: center;
+  width: 2.75rem;
+  min-height: 2.75rem;
+  padding: 0;
+}
+
+.player-view .player-topbar__settings .player-control-menu__trigger {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  transform: none;
+}
+
+.player-view .player-topbar__settings .player-control-menu__trigger:hover,
+.player-view .player-topbar__settings[data-open="true"] .player-control-menu__trigger {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
 .player-view :is(.player-topbar__exit, .mobile-player-exit, .player-skip-button) {
   background: transparent;
   border-color: transparent;
@@ -1318,7 +1345,7 @@ button:disabled {
   pointer-events: none;
 }
 
-.player-topbar[data-visible="false"] .player-topbar__exit {
+.player-topbar[data-visible="false"] :is(.player-topbar__exit, .player-topbar__settings) {
   pointer-events: none;
 }
 

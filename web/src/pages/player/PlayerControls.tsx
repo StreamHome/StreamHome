@@ -365,11 +365,13 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
   </div>;
 }
 
-export function PlayerSettings({ playbackRate, onRateChange, captions, captionScale, onCaptionScaleChange, subtitleOffset, onSubtitleOffsetChange, onOpenChange }: {
+export function PlayerSettings({ playbackRate, onRateChange, captions, captionScale, onCaptionScaleChange, subtitleOffset, onSubtitleOffsetChange, onOpenChange, compact = false, className = "" }: {
   playbackRate: number; onRateChange: (value: number) => void; captions: boolean;
   captionScale: number; onCaptionScaleChange: (value: number) => void;
   subtitleOffset: number; onSubtitleOffsetChange: (value: number) => void;
   onOpenChange?: (open: boolean) => void;
+  compact?: boolean;
+  className?: string;
 }) {
   const popup = usePlayerPopup(onOpenChange);
   const completePointerChoice = (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -381,11 +383,11 @@ export function PlayerSettings({ playbackRate, onRateChange, captions, captionSc
     restorePlayerPointerFocus(event.currentTarget);
     popup.updateOpen(false);
   };
-  return <div className="player-control-menu" ref={popup.rootRef} data-open={popup.open}>
-    <button ref={popup.triggerRef} type="button" className="player-control-menu__trigger" aria-label="Player settings" aria-haspopup="dialog" aria-expanded={popup.open} aria-controls={popup.id}
+  return <div className={`player-control-menu ${className}`.trim()} ref={popup.rootRef} data-open={popup.open}>
+    <button ref={popup.triggerRef} type="button" className={compact ? "player-control-button player-control-menu__trigger" : "player-control-menu__trigger"} aria-label="Player settings" aria-haspopup="dialog" aria-expanded={popup.open} aria-controls={popup.id}
       onClick={(event) => { popup.updateOpen(!popup.open); if (popup.open) restorePlayerPointerClickFocus(event); }}
       onKeyDown={(event) => { if (event.key === "ArrowDown") { event.preventDefault(); popup.updateOpen(true); window.requestAnimationFrame(() => popup.popupRef.current?.querySelector<HTMLButtonElement>("button")?.focus()); } else if (event.key === "Escape" && popup.open) { event.preventDefault(); popup.dismiss(); } }}>
-      <PlayerIcon name="settings" /><span>Settings</span>
+      <PlayerIcon name="settings" />{!compact && <span>Settings</span>}
     </button>
     {popup.open && popup.render(<div ref={popup.popupRef} id={popup.id} role="dialog" aria-label="Player settings" className="player-control-menu__list player-settings-panel" style={popup.style} onBlur={popup.onBlur}
       onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); popup.dismiss(); } }}>
