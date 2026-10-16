@@ -982,6 +982,9 @@ body[data-player-viewport-fullscreen="true"] {
 
 .mobile-player-chrome .player-icon--mobile { width: 1rem; height: 1rem; }
 
+.mobile-player-transport__seek .player-icon--mobile { width: 2.25rem; height: 2.25rem; }
+.mobile-player-transport__play .player-icon--mobile { width: 3rem; height: 3rem; }
+
 .mobile-player-bottom {
   position: absolute;
   inset: auto 0 0;
