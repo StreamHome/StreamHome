@@ -1198,6 +1198,8 @@ body:has([aria-modal="true"]) .mobile-navigation-layer { visibility: hidden; }
 }
 
 @media (max-width: 760px) {
+  /* Preserve native root scrollbars; forced widths misplace fixed chrome in Firefox Android. */
+  :is(html,body):has(.mobile-navigation-layer:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema))::-webkit-scrollbar { width: auto; height: auto; }
   .brand-logo--login { gap: 12px; }
   .brand-logo--login .brand-logo__image { width: 64px; height: 64px; flex-basis: 64px; }
   .brand-logo--profiles .brand-logo__image { width: 58px; height: 58px; flex-basis: 58px; }
