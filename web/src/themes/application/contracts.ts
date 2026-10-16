@@ -5,6 +5,8 @@ import type { Profile } from "../../types/api";
 import type { ThemeId } from "../../types/theme";
 import type { ThemeMotionDefinition } from "../../motion/motionSystem";
 
+export type MobileNavigationView = "home" | "movies" | "series" | "watchlist" | "downloads" | "search" | "admin";
+
 export interface ThemeNavigationProps {
   profile: Profile;
   activeView: AppView;
@@ -18,14 +20,14 @@ export interface ThemeNavigationProps {
   onLogout: () => void;
 }
 
-export type ThemeInteractionId = "terminal" | "editorial" | "cinematic" | "workspace";
+export type ThemeInteractionId = "terminal" | "editorial" | "cinematic";
 
 export interface ThemeInteractionProfile {
   id: ThemeInteractionId;
-  action: "edge-grow" | "soft-bloom" | "theatrical-grow" | "modular-lift";
-  navigation: "signal-line" | "glass-pill" | "spotlight-underline" | "directional-rail";
-  card: "technical-tilt" | "floating-glass" | "poster-depth" | "module-elevation";
-  rail: "square" | "orb" | "cinema-disc" | "rounded-module";
+  action: "edge-grow" | "soft-bloom" | "theatrical-grow";
+  navigation: "signal-line" | "glass-pill" | "spotlight-underline";
+  card: "technical-tilt" | "floating-glass" | "poster-depth";
+  rail: "square" | "orb" | "cinema-disc";
   timing: { enterMs: number; exitMs: number; pressMs: number };
   easing: string;
 }
@@ -36,11 +38,11 @@ export interface ThemePresentation {
   Background: React.ComponentType;
   Navigation: React.ComponentType<ThemeNavigationProps>;
   shellClass: string;
-  heroVariant: "terminal" | "editorial" | "cinematic" | "workspace";
-  browseVariant: "technical" | "masonry" | "rails" | "modules";
-  cardVariant: "sharp" | "glass" | "poster" | "module";
-  detailsVariant: "terminal" | "editorial" | "cinematic" | "workspace";
-  playerVariant: "terminal" | "minimal" | "cinematic" | "workspace";
+  heroVariant: "terminal" | "editorial" | "cinematic";
+  browseVariant: "technical" | "masonry" | "rails";
+  cardVariant: "sharp" | "glass" | "poster";
+  detailsVariant: "terminal" | "editorial" | "cinematic";
+  playerVariant: "terminal" | "minimal" | "cinematic";
   interaction: ThemeInteractionProfile;
   motion: ThemeMotionDefinition;
 }

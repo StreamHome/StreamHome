@@ -89,11 +89,6 @@ export const THEME_MOTION: Record<ThemeId, ThemeMotionDefinition> = {
     billboardTiming: { enter: .42, exit: .26 },
     billboard: billboardVariants({ opacity: 0, x: 18, scale: 1.008 }, { opacity: 0, x: -14 }, { enter: .42, exit: .26 }),
   },
-  gemini: {
-    view: viewVariants({ opacity: 0, x: 10, y: 4 }, { opacity: 0, x: -8 }),
-    billboardTiming: { enter: .36, exit: .18 },
-    billboard: billboardVariants({ opacity: 0, x: 12, y: 4 }, { opacity: 0, x: -10 }, { enter: .36, exit: .18 }),
-  },
 };
 
 interface MotionContextValue {

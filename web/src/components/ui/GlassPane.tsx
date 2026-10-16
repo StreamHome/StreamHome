@@ -61,7 +61,7 @@ export function GlassPane({
       onMouseLeave={handleMouseLeave}
       {...props}
     >
-      {/* Gemini Gradient Border (Pseudo-element equivalent handled via absolute inset div) */}
+      {/* Hover border drawn inside the shared pane */}
       <div className="interaction-pane-border absolute inset-0 rounded-[var(--radius)] pointer-events-none opacity-0" style={{
          boxShadow: 'inset 0 0 0 1px var(--glass-border-hover)'
       }} />

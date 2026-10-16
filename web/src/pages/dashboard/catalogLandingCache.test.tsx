@@ -51,7 +51,7 @@ describe("landing feed display cache", () => {
     expect(second.result.current.recommendation?.items[0].media.id).toBe("Cached feature");
     expect(second.result.current.categoriesReady).toBe(false);
     second.unmount();
-    // Default/Gemini ownership does not opt into landing feed reuse.
+    // A controller without automatic landing does not opt into feed reuse.
     const legacy = renderHook(() => useCatalogController(profile, query));
     expect(legacy.result.current.recommendation).toBeNull();
     await waitFor(() => expect(legacy.result.current.recommendationError).toBeTruthy());

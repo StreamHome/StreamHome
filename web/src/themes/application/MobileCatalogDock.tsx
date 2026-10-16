@@ -1,6 +1,5 @@
 import React from "react";
-import type { MobileNavigationView } from "../../components/navigation/MobileNavigationIcon";
-import type { ThemeNavigationProps } from "./contracts";
+import type { MobileNavigationView, ThemeNavigationProps } from "./contracts";
 
 const ITEMS: Array<{ view: MobileNavigationView; label: string }> = [
   { view: "home", label: "Home" },

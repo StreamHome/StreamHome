@@ -1,1 +1,1 @@
-export type ThemeId = "ember" | "aurora" | "cinema" | "gemini";
+export type ThemeId = "ember" | "aurora" | "cinema";

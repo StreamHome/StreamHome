@@ -1,5 +1,5 @@
 import React from "react";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { deleteProfile, getProfiles, saveProfile } from "../api/profiles";
@@ -52,20 +52,20 @@ describe("ProfileEditPage", () => {
     renderEditor({ pathname: "/profiles/2/edit", state: { returnTo: "/?profile=2&view=movies#featured" } });
 
     fireEvent.change(screen.getByLabelText("Profile name"), { target: { value: "Movie Fan" } });
-    fireEvent.click(screen.getByRole("button", { name: "Gemini" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cinema" }));
     fireEvent.click(screen.getByRole("button", { name: "Ocean signal" }));
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() => expect(saveProfile).toHaveBeenCalledWith(expect.objectContaining({
       id: "2",
       name: "Movie Fan",
-      theme: "gemini",
+      theme: "cinema",
       avatarColor: PROFILE_AVATAR_PRESETS[1].background,
       pinEnabled: true,
     })));
     expect(vi.mocked(saveProfile).mock.calls[0][0]).not.toHaveProperty("pin");
     expect(await screen.findByText("Catalog return")).toBeTruthy();
-    expect(useThemeStore.getState().activeTheme).toBe("gemini");
+    expect(useThemeStore.getState().activeTheme).toBe("cinema");
     expect(useProfileStore.getState().activeProfile?.name).toBe("Movie Fan");
   });
 
@@ -77,6 +77,24 @@ describe("ProfileEditPage", () => {
     expect(confirm).toHaveBeenCalledWith("Discard your unsaved profile changes?");
     expect(screen.getByRole("heading", { name: "Edit profile" })).toBeTruthy();
     confirm.mockRestore();
+  });
+
+  it("opens a retired Gemini profile cleanly as Ember and saves only after an explicit edit", async () => {
+    const legacy = { ...profile, theme: "gemini" };
+    useProfileStore.setState({ profiles: [legacy], activeProfile: legacy });
+    vi.mocked(saveProfile).mockImplementation(async (payload) => ({ ...legacy, ...payload }));
+    renderEditor();
+    const choices = screen.getByRole("group", { name: "Interface theme" });
+    expect(within(choices).getAllByRole("button").map((button) => button.textContent)).toEqual(["Ember", "Aurora", "Cinema"]);
+    expect(within(choices).getByRole("button", { name: "Ember" }).getAttribute("aria-pressed")).toBe("true");
+    const save = screen.getByRole("button", { name: "Save changes" });
+    expect((save as HTMLButtonElement).disabled).toBe(true);
+    expect(saveProfile).not.toHaveBeenCalled();
+    expect(useProfileStore.getState().activeProfile?.theme).toBe("gemini");
+    fireEvent.change(screen.getByLabelText("Profile name"), { target: { value: "Updated viewer" } });
+    fireEvent.click(save);
+    await waitFor(() => expect(saveProfile).toHaveBeenCalledWith(expect.objectContaining({ id: legacy.id, name: "Updated viewer", theme: "ember" })));
+    expect(useThemeStore.getState().activeTheme).toBe("ember");
   });
 
   it("loads a missing store profile from the server and supports typed-name deletion", async () => {

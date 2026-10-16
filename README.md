@@ -78,14 +78,13 @@ Built-in Google Drive storage powered by Rclone and native Google OAuth.
 
 StreamHome manages its own Rclone configuration and integrates cloud storage without disrupting the established local media directory structure.
 
-### 🎨 Four Distinct Interface Themes
+### 🎨 Three Distinct Interface Themes
 
-StreamHome includes four complete presentation systems:
+StreamHome includes three complete presentation systems:
 
 * **Ember**
 * **Aurora**
 * **Cinema**
-* **Gemini**
 
 Each theme provides its own navigation, hero presentation, cards, details pages, visual language, and player styling rather than functioning as a simple color preset.
 

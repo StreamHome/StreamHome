@@ -12,12 +12,10 @@
 :where(.theme-app,.player-view)[data-interaction="terminal"] { --interaction-enter: 125ms; --interaction-exit: 155ms; --interaction-fill: rgba(255,95,31,.09); --interaction-border: rgba(255,126,78,.68); }
 :where(.theme-app,.player-view)[data-interaction="editorial"] { --interaction-enter: 155ms; --interaction-exit: 185ms; --interaction-fill: rgba(255,255,255,.075); --interaction-border: rgba(255,255,255,.32); }
 :where(.theme-app,.player-view)[data-interaction="cinematic"] { --interaction-enter: 145ms; --interaction-exit: 175ms; --interaction-fill: rgba(229,9,20,.12); --interaction-border: rgba(229,9,20,.72); }
-:where(.theme-app,.player-view)[data-interaction="workspace"] { --interaction-enter: 135ms; --interaction-exit: 165ms; --interaction-fill: rgba(66,133,244,.1); --interaction-border: rgba(138,180,248,.5); }
 
 [data-interaction="terminal"] .category-filter button { border-radius: 0; }
 [data-interaction="editorial"] .category-filter button { border-radius: 999px; }
 [data-interaction="cinematic"] .category-filter button { border-radius: 3px; text-transform: uppercase; }
-[data-interaction="workspace"] .category-filter button { border-radius: 10px; }
 
 :where(.theme-app,.profile-gallery,.login-page,.player-view,.app-guard-state) button { -webkit-tap-highlight-color: transparent; }
 
@@ -28,20 +26,7 @@
 }
 
 /* Small controls share one immediate response contract. */
-:where(
-  .interaction-button,.interaction-chip,.login-primary-action,.login-secondary-action,
-  .app-guard-state button,.feature-action,.ember-action,.details-close,
-  .season-tabs button,.genre-filter button,.ember-filters button,.category-filter button,
-  .search-page-form button,.ember-search__form button,.admin-nav button,
-  .profile-editor__header > button,.profile-editor__themes button,
-  .profile-editor__avatars button,.profile-editor__danger > button,
-  .profile-editor__actions button,.profile-editor__state button,
-  .profile-gallery__state button,.profile-dialog__actions button,
-  .profile-theme-picker button,.profile-delete-zone button,
-  .player-complete-panel button,.player-controls button,
-  .catalog-load-more,.catalog-retry,.catalog-feed-status button,
-  .ember-load-more,.ember-retry,.ember-feed-status button
-) {
+:where(.interaction-button,.interaction-chip,.login-primary-action,.login-secondary-action,.app-guard-state button,.feature-action,.ember-action,.details-close,.season-tabs button,.genre-filter button,.ember-filters button,.category-filter button,.search-page-form button,.ember-search__form button,.admin-nav button,.profile-editor__header > button,.profile-editor__themes button,.profile-editor__avatars button,.profile-editor__danger > button,.profile-editor__actions button,.profile-editor__state button,.profile-gallery__state button,.profile-dialog__actions button,.profile-theme-picker button,.profile-delete-zone button,.player-complete-panel button,.player-controls button,.catalog-load-more,.catalog-retry,.ember-load-more,.ember-retry,.ember-feed-status button) {
   transform: translate3d(0,0,0);
   transition: transform var(--interaction-exit) var(--interaction-ease),border-color var(--interaction-exit) var(--interaction-ease),background-color var(--interaction-exit) var(--interaction-ease),color var(--interaction-exit) var(--interaction-ease),opacity var(--interaction-exit) var(--interaction-ease);
 }
@@ -55,10 +40,10 @@
 .interaction-option { position: relative; transition: color var(--interaction-exit) var(--interaction-ease),background-color var(--interaction-exit) var(--interaction-ease),border-color var(--interaction-exit) var(--interaction-ease),transform var(--interaction-exit) var(--interaction-ease); }
 
 /* Navigation */
-.theme-brand,.theme-nav nav button,.theme-nav__tools > button,.nav-admin,.theme-profile-control,.theme-search button,.gemini-collapse,.mobile-app-nav button {
+.theme-brand,.theme-nav nav button,.theme-nav__tools > button,.nav-admin,.theme-profile-control,.theme-search button {
   transition: transform var(--interaction-exit) var(--interaction-ease),color var(--interaction-exit) var(--interaction-ease),background-color var(--interaction-exit) var(--interaction-ease),border-color var(--interaction-exit) var(--interaction-ease),opacity var(--interaction-exit) linear;
 }
-.brand-logo__image,.theme-profile-control > span,.theme-profile-control b,.theme-nav--gemini nav button i { transition: transform var(--interaction-exit) var(--interaction-ease),background-color var(--interaction-exit) var(--interaction-ease); }
+.brand-logo__image,.theme-profile-control > span,.theme-profile-control b { transition: transform var(--interaction-exit) var(--interaction-ease),background-color var(--interaction-exit) var(--interaction-ease); }
 .theme-profile-menu__panel button { position: relative; overflow: hidden; transition: color var(--interaction-exit) var(--interaction-ease),background-color var(--interaction-exit) var(--interaction-ease),transform var(--interaction-exit) var(--interaction-ease); }
 .theme-profile-menu__panel button::before { content: ""; position: absolute; inset: 7px auto 7px 0; width: 2px; background: var(--accent-primary); opacity: 0; transform: scaleY(.25); transition: opacity 100ms linear,transform var(--interaction-enter) var(--interaction-ease); }
 
@@ -95,21 +80,9 @@
 .player-controls select { transition: border-color var(--interaction-exit) var(--interaction-ease),background-color var(--interaction-exit) var(--interaction-ease); }
 
 @media (hover: hover) and (pointer: fine) {
-  :where(
-    .interaction-button,.interaction-chip,.login-primary-action,
-    .app-guard-state button,.feature-action,.ember-action,.details-close,
-    .season-tabs button,.genre-filter button,.ember-filters button,.category-filter button,
-    .search-page-form button,.ember-search__form button,.admin-nav button,
-    .profile-editor__header > button,.profile-editor__themes button,
-    .profile-editor__avatars button,.profile-editor__danger > button,
-    .profile-editor__actions button,.profile-editor__state button,
-    .profile-gallery__state button,.profile-dialog__actions button,
-    .profile-theme-picker button,.profile-delete-zone button,
-    .player-complete-panel button,.catalog-load-more,.catalog-retry,.catalog-feed-status button,
-    .ember-load-more,.ember-retry,.ember-feed-status button
-  ):not(:disabled):hover { transform: translate3d(0,-2px,0); border-color: var(--interaction-border); background-color: var(--interaction-fill); transition-duration: var(--interaction-enter); }
+  :where(.interaction-button,.interaction-chip,.login-primary-action,.app-guard-state button,.feature-action,.ember-action,.details-close,.season-tabs button,.genre-filter button,.ember-filters button,.category-filter button,.search-page-form button,.ember-search__form button,.admin-nav button,.profile-editor__header > button,.profile-editor__themes button,.profile-editor__avatars button,.profile-editor__danger > button,.profile-editor__actions button,.profile-editor__state button,.profile-gallery__state button,.profile-dialog__actions button,.profile-theme-picker button,.profile-delete-zone button,.player-complete-panel button,.catalog-load-more,.catalog-retry,.ember-load-more,.ember-retry,.ember-feed-status button):not(:disabled):hover { transform: translate3d(0,-2px,0); border-color: var(--interaction-border); background-color: var(--interaction-fill); transition-duration: var(--interaction-enter); }
 
-  :where(.interaction-button,.interaction-chip,.login-primary-action,.feature-action,.ember-action,.details-close,.season-tabs button,.genre-filter button,.ember-filters button,.category-filter button,.search-page-form button,.ember-search__form button,.admin-nav button,.profile-editor__actions button,.profile-dialog__actions button,.player-complete-panel button,.catalog-load-more,.catalog-retry,.catalog-feed-status button,.ember-load-more,.ember-retry,.ember-feed-status button):not(:disabled):active { transform: translate3d(0,1px,0) scale(.985); transition-duration: var(--interaction-press); }
+  :where(.interaction-button,.interaction-chip,.login-primary-action,.feature-action,.ember-action,.details-close,.season-tabs button,.genre-filter button,.ember-filters button,.category-filter button,.search-page-form button,.ember-search__form button,.admin-nav button,.profile-editor__actions button,.profile-dialog__actions button,.player-complete-panel button,.catalog-load-more,.catalog-retry,.ember-load-more,.ember-retry,.ember-feed-status button):not(:disabled):active { transform: translate3d(0,1px,0) scale(.985); transition-duration: var(--interaction-press); }
   .interaction-button:hover::after,.login-primary-action:hover::after { opacity: 1; transform: translate3d(105%,0,0); }
   .interaction-option:hover { transform: translate3d(3px,0,0); border-left-color: var(--accent-primary); background: var(--interaction-fill); color: var(--text-accent); }
 
@@ -120,19 +93,16 @@
   .theme-nav--ember nav button:hover::after { opacity: .72; transform: scaleX(.78); }
   .theme-nav--aurora nav button:hover { background: rgba(255,255,255,.07); transform: translate3d(0,-2px,0); }
   .theme-nav--cinema nav button:hover { color: #fff; transform: translate3d(0,-1px,0); }
-  .theme-nav--gemini nav button:hover { background: linear-gradient(90deg,rgba(66,133,244,.12),rgba(155,114,203,.04)); transform: translate3d(3px,0,0); }
-  .theme-nav--gemini nav button:hover i { transform: scale(1.12); background: #8ab4f8; }
   .theme-profile-control:hover > span { transform: scale(1.04); }
   .theme-profile-control:hover b { transform: translate3d(2px,0,0); }
   .theme-profile-menu__panel button:hover { color: var(--text-primary); background: var(--interaction-fill); transform: translate3d(3px,0,0); }
   .theme-profile-menu__panel button:hover::before { opacity: 1; transform: scaleY(1); }
-  .theme-search button:hover,.theme-nav__tools > button:hover,.nav-admin:hover,.gemini-collapse:hover,.mobile-app-nav button:hover { color: var(--text-primary); background: var(--interaction-fill); }
+  .theme-search button:hover,.theme-nav__tools > button:hover,.nav-admin:hover { color: var(--text-primary); background: var(--interaction-fill); }
 
   /* Theme-specific action grammar stays subtle and cheap. */
   .theme-app[data-interaction="terminal"] :where(.interaction-button,.feature-action,.ember-action,.details-close,.season-tabs button,.genre-filter button,.ember-filters button,.search-page-form button,.ember-search__form button,.admin-nav button,.profile-editor__actions button):not(:disabled):hover { transform: translate3d(2px,-1px,0); }
   .theme-app[data-interaction="editorial"] :where(.interaction-button,.feature-action,.details-close,.season-tabs button,.genre-filter button,.search-page-form button,.admin-nav button,.profile-editor__actions button):not(:disabled):hover { transform: translate3d(0,-3px,0) scale(1.012); }
   .theme-app[data-interaction="cinematic"] :where(.interaction-button,.feature-action,.details-close,.season-tabs button,.genre-filter button,.search-page-form button,.admin-nav button,.profile-editor__actions button):not(:disabled):hover { transform: translate3d(0,-2px,0) scale(1.016); }
-  .theme-app[data-interaction="workspace"] :where(.interaction-button,.feature-action,.details-close,.season-tabs button,.genre-filter button,.search-page-form button,.admin-nav button,.profile-editor__actions button):not(:disabled):hover { transform: translate3d(3px,-1px,0); }
 
   .catalog-card:hover,.ember-media-card:hover { border-color: var(--interaction-border); background-color: color-mix(in srgb,var(--glass-fill) 94%,var(--interaction-fill)); }
   .catalog-card:hover::before,.ember-media-card:hover::before,.catalog-card:hover::after,.ember-media-card:hover::after { opacity: 1; }
@@ -142,13 +112,11 @@
   .catalog-card[data-card-theme="sharp"]:hover,.ember-media-card:hover { transform: translate3d(2px,-2px,0); }
   .catalog-card[data-card-theme="glass"]:hover { transform: translate3d(0,-3px,0) scale(1.008); }
   .catalog-card[data-card-theme="poster"]:hover { transform: scale(1.008); }
-  .catalog-card[data-card-theme="module"]:hover { transform: translate3d(2px,-1px,0); }
 
   .genre-category-gallery__grid > button:hover .genre-category-gallery__art > img { transform: scale(1.025); }
   .theme-app[data-interaction="terminal"] .genre-category-gallery__grid > button:hover { transform: translate3d(3px,-2px,0); border-color: rgba(255,126,78,.68); }
   .theme-app[data-interaction="editorial"] .genre-category-gallery__grid > button:hover { transform: translate3d(0,-3px,0) scale(1.008); border-color: rgba(255,255,255,.42); }
   .theme-app[data-interaction="cinematic"] .genre-category-gallery__grid > button:hover { transform: scale(1.01); border-color: rgba(229,9,20,.82); }
-  .theme-app[data-interaction="workspace"] .genre-category-gallery__grid > button:hover { transform: translate3d(3px,-2px,0); border-color: rgba(138,180,248,.58); }
 
   .search-result:not(:disabled):hover,.ember-search__results > button:not(:disabled):hover,.episode-card:not(:disabled):hover { transform: translate3d(0,-2px,0); border-color: var(--interaction-border); background: color-mix(in srgb,var(--glass-fill) 90%,var(--interaction-fill)); }
   .search-result:not(:disabled):hover .search-result__art,.ember-search__results > button:not(:disabled):hover .ember-search__art,.episode-card:not(:disabled):hover .episode-card__art { transform: scale(1.018); }
@@ -177,9 +145,8 @@
 .theme-app[data-interaction="terminal"] :where(.catalog-rail-blade,.ember-rail__blade) { border-radius: 0; }
 .theme-app[data-interaction="editorial"] .catalog-rail-blade { border-radius: 50%; background: rgba(20,20,24,.62); border-color: rgba(255,255,255,.2); }
 .theme-app[data-interaction="cinematic"] .catalog-rail-blade { border-radius: 50%; background: rgba(8,8,8,.82); border-color: rgba(229,9,20,.44); }
-.theme-app[data-interaction="workspace"] .catalog-rail-blade { border-radius: 12px; background: rgba(24,26,31,.86); border-color: rgba(138,180,248,.32); }
 
-:where(.interaction-button,.interaction-chip,.feature-action,.ember-action,.details-close,.season-tabs button,.genre-filter button,.ember-filters button,.category-filter button,.admin-nav button,.genre-category-gallery__grid > button,.profile-editor button,.profile-gallery button,.player-controls button,.player-complete-panel button,.catalog-load-more,.catalog-retry,.catalog-feed-status button,.ember-load-more,.ember-retry,.ember-feed-status button):focus-visible { border-color: var(--interaction-border); box-shadow: var(--interaction-shadow); }
+:where(.interaction-button,.interaction-chip,.feature-action,.ember-action,.details-close,.season-tabs button,.genre-filter button,.ember-filters button,.category-filter button,.admin-nav button,.genre-category-gallery__grid > button,.profile-editor button,.profile-gallery button,.player-controls button,.player-complete-panel button,.catalog-load-more,.catalog-retry,.ember-load-more,.ember-retry,.ember-feed-status button):focus-visible { border-color: var(--interaction-border); box-shadow: var(--interaction-shadow); }
 .theme-profile-menu__panel button:focus-visible { color: var(--text-primary); background: var(--interaction-fill); }
 .theme-profile-menu__panel button:focus-visible::before { opacity: 1; transform: scaleY(1); }
 .catalog-rail-blade:focus-visible,.ember-rail__blade:focus-visible { opacity: 1; color: var(--accent-primary); }

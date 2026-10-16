@@ -17,7 +17,7 @@ describe("profile theme hover intent", () => {
     act(() => result.current.schedule("cinema"));
     act(() => vi.advanceTimersByTime(180));
     expect(result.current.value).toBe("cinema");
-    act(() => result.current.setImmediate("gemini"));
-    expect(result.current.value).toBe("gemini");
+    act(() => result.current.setImmediate("cinema"));
+    expect(result.current.value).toBe("cinema");
   });
 });

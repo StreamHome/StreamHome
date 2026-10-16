@@ -46,10 +46,10 @@ describe("fluid motion system", () => {
   it("defines distinct view and billboard choreography for every theme", () => {
     const definitions = Object.values(THEME_MOTION);
     const resolve = (variant: unknown) => typeof variant === "function" ? variant(1) : variant;
-    expect(definitions).toHaveLength(4);
-    expect(new Set(definitions.map((definition) => JSON.stringify(resolve(definition.view.initial)))).size).toBe(4);
+    expect(definitions).toHaveLength(3);
+    expect(new Set(definitions.map((definition) => JSON.stringify(resolve(definition.view.initial)))).size).toBe(3);
     expect(definitions.every((definition) => resolve(definition.billboard.initial))).toBe(true);
-    expect(new Set(definitions.map((definition) => JSON.stringify(definition.billboardTiming))).size).toBe(4);
+    expect(new Set(definitions.map((definition) => JSON.stringify(definition.billboardTiming))).size).toBe(3);
     expect(definitions.every((definition) => !JSON.stringify(definition).includes("filter"))).toBe(true);
     expect(definitions.every((definition) => definition.billboardTiming.enter <= .42)).toBe(true);
   });

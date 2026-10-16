@@ -18,7 +18,7 @@ describe("themed server downloads", () => {
   afterEach(cleanup);
 
   it("renders the live queue under every compatibility theme", () => {
-    for (const theme of ["aurora", "cinema", "gemini"] as const) {
+    for (const theme of ["aurora", "cinema"] as const) {
       useThemeStore.setState({ activeTheme: theme });
       const { container, unmount } = render(<ServerDownloads />);
       expect(container.querySelector(".server-downloads")?.getAttribute("data-download-theme")).toBe(theme);
@@ -43,11 +43,10 @@ describe("themed server downloads", () => {
     expect(screen.queryByText("— · ETA —")).toBeNull();
   });
 
-  it("defines dedicated layout contracts for Aurora, Cinema, and Gemini", () => {
+  it("defines dedicated layout contracts for Aurora and Cinema", () => {
     const css = readFileSync(resolve("src/themes/application/application.css"), "utf8");
-    for (const theme of ["aurora", "cinema", "gemini"]) expect(css).toContain(`data-download-theme="${theme}"`);
+    for (const theme of ["aurora", "cinema"]) expect(css).toContain(`data-download-theme="${theme}"`);
     expect(css).toContain('.server-downloads[data-download-theme="cinema"] { width: 100%; padding: 118px');
-    expect(css).toContain('.server-downloads[data-download-theme="gemini"] .server-downloads__list { grid-template-columns: repeat(auto-fit');
     expect(css).toContain(".admin-content .server-downloads");
   });
 });

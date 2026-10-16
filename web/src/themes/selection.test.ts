@@ -16,7 +16,6 @@ describe("theme text selection", () => {
       ["src/themes/ember/ember.css", "#ff7a3d", "#1e100b"],
       ["src/themes/aurora/aurora.css", "#d8c7ff", "#050505"],
       ["src/themes/cinema/cinema.css", "#e50914", "#ffffff"],
-      ["src/themes/gemini/gemini.css", "#4285f4", "#ffffff"],
     ] as const;
 
     for (const [path, background, foreground] of palettes) {
@@ -24,6 +23,6 @@ describe("theme text selection", () => {
       expect(css).toContain(`--selection-background: ${background}`);
       expect(css).toContain(`--selection-foreground: ${foreground}`);
     }
-    expect(new Set(palettes.map(([, background]) => background)).size).toBe(4);
+    expect(new Set(palettes.map(([, background]) => background)).size).toBe(3);
   });
 });

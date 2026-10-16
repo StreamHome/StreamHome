@@ -40,12 +40,25 @@ describe("persisted client state", () => {
     const child = { ...profile, id: "2", name: "Viewer", theme: "aurora" };
     useProfileStore.setState({ profiles: [profile, child], activeProfile: child, isAdmin: false });
     localStorage.setItem("streamhome_profile", "2");
-    const updated = { ...child, name: "Renamed", theme: "gemini" };
+    const updated = { ...child, name: "Renamed", theme: "cinema" };
     useProfileStore.getState().updateProfile(updated);
     expect(useProfileStore.getState().profiles[1]).toEqual(updated);
     expect(useProfileStore.getState().activeProfile).toEqual(updated);
     useProfileStore.getState().removeProfile("2");
     expect(useProfileStore.getState()).toMatchObject({ profiles: [profile], activeProfile: null, isAdmin: false });
     expect(localStorage.getItem("streamhome_profile")).toBeNull();
+  });
+
+  it("restores a retired Gemini profile as Ember without rewriting its server data", () => {
+    const legacy = { ...profile, id: "2", theme: "gemini" };
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    localStorage.setItem("streamhome_profile", legacy.id);
+    const restored = useProfileStore.getState().restoreProfile([legacy]);
+    useThemeStore.getState().syncFromProfile(restored);
+    expect(useThemeStore.getState().activeTheme).toBe("ember");
+    expect(useProfileStore.getState().activeProfile).toEqual(legacy);
+    expect(localStorage.getItem("streamhome_profile")).toBe(legacy.id);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

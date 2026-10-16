@@ -18,7 +18,6 @@ import type { DiscoverMovie, Movie, PlaybackSession } from "../../types/api";
 import { formatDuration } from "../../utils/format";
 import { completionFraction, isAvailableMedia, isPlayableMovie, mediaAvailability } from "../../utils/media";
 import { DetailsRouter } from "../details/DetailsRouter";
-import { buildCatalogPresentation } from "./catalogPresentation";
 import { ENABLE_VISUAL_GENRE_CATEGORIES } from "./catalogFeatures";
 import { CategoryFilterRail } from "./CategoryFilterRail";
 import { GenreCategoryGallery } from "./GenreCategoryGallery";
@@ -28,7 +27,6 @@ import { ServerDownloads } from "./ServerDownloads";
 import type { CatalogController } from "./useCatalogController";
 import { useRecommendationExposure } from "./useRecommendationExposure";
 import { BillboardStack } from "./BillboardStack";
-import { useCatalogDiscovery } from "./useCatalogDiscovery";
 import { useCatalogLanding } from "./useCatalogLanding";
 import { CatalogLandingNotice, CatalogLandingState } from "./CatalogLandingState";
 
@@ -60,8 +58,7 @@ function FeaturedStage({ movie, variant, context, onDetails, onPlay, measurement
   const meta = personalized ? <RecommendationReason movie={movie} /> : null;
   if (variant === "terminal") return <section className="feature-stage feature-stage--terminal"><div className="terminal-intro"><span><i />CATALOG ONLINE</span><p>{contextLabel} / PROFILE FEED</p></div><div className="terminal-feature"><div className="terminal-feature__copy"><small>{contextLabel} / {movie.type.toUpperCase()}</small>{meta}<h1>{movie.title}</h1><p>{movie.description || "No server description is available for this title."}</p><div className="feature-meta"><span>{movie.releaseYear || "YEAR N/A"}</span><span>{movie.quality || "SOURCE"}</span><span>{movie.genres[0] || "UNCATEGORIZED"}</span></div><FeatureActions measurement={measurement} movie={movie} onDetails={onDetails} onPlay={onPlay} /></div><div className="terminal-feature__art">{art}<AvailabilityBadge movie={movie} /></div></div></section>;
   if (variant === "editorial") return <section className="feature-stage feature-stage--editorial"><div className="editorial-art">{art}<AvailabilityBadge movie={movie} /></div><div className="editorial-copy"><small>{contextLabel}</small>{meta}<h1>{movie.title}</h1><p>{movie.description || "No server description is available for this title."}</p><FeatureActions measurement={measurement} movie={movie} onDetails={onDetails} onPlay={onPlay} /></div></section>;
-  if (variant === "cinematic") return <section className="feature-stage feature-stage--cinematic"><div className="cinema-art">{art}</div><div className="cinema-shade" /><AvailabilityBadge movie={movie} /><div className="cinema-copy"><small>{contextLabel} / {movie.releaseYear || "catalog"}</small>{meta}<h1>{movie.title}</h1><p>{movie.description || "No server description is available for this title."}</p><FeatureActions measurement={measurement} movie={movie} onDetails={onDetails} onPlay={onPlay} /></div></section>;
-  return <section className="feature-stage feature-stage--workspace"><div className="workspace-heading"><p>{contextLabel}</p>{meta}<h1>{movie.title}</h1><span>{movie.description || "No server description is available for this title."}</span><FeatureActions measurement={measurement} movie={movie} onDetails={onDetails} onPlay={onPlay} /></div><div className="workspace-art">{art}<AvailabilityBadge movie={movie} /></div><div className="workspace-stat"><small>CATALOG STATE</small><strong>{mediaAvailability(movie).toUpperCase()}</strong><span>{movie.languages.length} audio track{movie.languages.length === 1 ? "" : "s"}</span></div></section>;
+  return <section className="feature-stage feature-stage--cinematic"><div className="cinema-art">{art}</div><div className="cinema-shade" /><AvailabilityBadge movie={movie} /><div className="cinema-copy"><small>{contextLabel} / {movie.releaseYear || "catalog"}</small>{meta}<h1>{movie.title}</h1><p>{movie.description || "No server description is available for this title."}</p><FeatureActions measurement={measurement} movie={movie} onDetails={onDetails} onPlay={onPlay} /></div></section>;
 }
 
 function RotatingBillboard({ items, variant, context, onDetails, onPlay, personalized = true }: { personalized?: boolean; items: Movie[]; variant: string; context: "home" | "movies" | "series"; onDetails: (movie: Movie) => void; onPlay: (movie: Movie) => void }) {
@@ -74,20 +71,9 @@ function CatalogGrid({ title, label, items, total, sessions, theme, showReasons,
   return <motion.section variants={CONTENT_REVEAL} className="category-catalog-grid"><header><div><p>{label}</p><h2>{title}</h2></div><span>{items.length} of {total} titles</span></header><motion.div variants={CONTENT_STAGGER} initial="hidden" animate="shown" className="browse-grid">{items.map((movie, position) => <MediaCard key={movie.id} movie={movie} session={sessions.find((session) => session.movieId === movie.id)} theme={theme} showReason={showReasons} position={position} onOpen={onOpen} />)}</motion.div></motion.section>;
 }
 
-function FeedStatus({ controller }: { controller: CatalogController }) {
-  if (!controller.recommendationError && !controller.recommendationRefreshing && !controller.recommendation?.stale) return null;
-  if (controller.recommendationError) return <div className="catalog-feed-status" data-state="error" role="alert"><span>{controller.recommendationError}</span><button onClick={controller.retryRecommendations}>Retry recommendations</button></div>;
-  return <div className="catalog-feed-status" data-state={controller.recommendationRefreshing ? "refreshing" : "stale"} role="status"><i aria-hidden="true" /><span>{controller.recommendationRefreshing ? "Refreshing your recommendations…" : "Showing saved recommendations while the server refreshes them."}</span></div>;
-}
-
 type CatalogDiscoveryProps = { query: AppQueryState; controller: CatalogController; theme: string; variant: string; onOpen: (movie: Movie) => void; onPlay: (movie: Movie) => void; onResume: (movie: Movie, session: PlaybackSession) => void; onCategory: (category: string) => void };
 
-function CatalogDiscoveryView(props: CatalogDiscoveryProps) {
-  // Gemini retains its existing manual handoff and presentation until its separate removal.
-  return props.variant === "workspace" ? <LegacyCatalogDiscoveryView {...props} /> : <AutomaticCatalogDiscoveryView {...props} />;
-}
-
-function AutomaticCatalogDiscoveryView({ query, controller, theme, variant, onOpen, onPlay, onResume, onCategory }: CatalogDiscoveryProps) {
+function CatalogDiscoveryView({ query, controller, theme, variant, onOpen, onPlay, onResume, onCategory }: CatalogDiscoveryProps) {
   const view = query.view as CatalogView;
   const feedback = useRecommendationFeedback();
   const { region, model, hasContent, pending, error } = useCatalogLanding(query, controller);
@@ -103,39 +89,6 @@ function AutomaticCatalogDiscoveryView({ query, controller, theme, variant, onOp
     </AnimatedState>
     {model.source === "recommendations" && controller.recommendationHasMore && <div className="catalog-pagination"><button className="catalog-load-more" disabled={controller.recommendationLoadingMore} onClick={() => void controller.loadMoreRecommendations()}>{controller.recommendationLoadingMore ? "Loading titles…" : "Load more"}</button></div>}
   </div></RecommendationFeedbackProvider>;
-}
-
-function LegacyCatalogDiscoveryView({ query, controller, theme, variant, onOpen, onPlay, onResume, onCategory }: { query: AppQueryState; controller: CatalogController; theme: string; variant: string; onOpen: (movie: Movie) => void; onPlay: (movie: Movie) => void; onResume: (movie: Movie, session: PlaybackSession) => void; onCategory: (category: string) => void }) {
-  const view = query.view as CatalogView;
-  const discovery = useCatalogDiscovery(query, controller);
-  const model = useMemo(() => discovery.discovery && controller.recommendation ? buildCatalogPresentation({ feed: controller.recommendation, fallbackMovies: controller.catalogItems, continueWatching: controller.continueWatching, view }) : null, [controller.continueWatching, controller.catalogItems, controller.recommendation, discovery.discovery, view]);
-  const regionProps = { ref: discovery.region, tabIndex: -1, "data-catalog-region": true, role: "region", "aria-label": model ? "Recommendations" : "Server catalog" };
-  if (!model) {
-    const fallbackItems = discovery.fallbackItems.filter((movie) => view === "home" || movie.type === (view === "movies" ? "movie" : "series"));
-    const requestedGenre = query.genre && !["all", "recommended"].includes(query.genre.toLocaleLowerCase()) ? query.genre : null;
-    return <div {...regionProps} className={`${view === "home" ? "home-view" : "browse-discovery"} category-discovery`} data-category-mode="catalog-fallback">
-      <div className="catalog-feature-reservation"><p>SERVER CATALOG</p><h1>{requestedGenre ? `${requestedGenre} recommendations` : "Your server library"}</h1><span>{requestedGenre ? `The catalog below is unfiltered. ${requestedGenre} recommendations are requested separately.` : "Browse the server catalog while personalized recommendations are prepared."}</span></div>
-      <div className="catalog-feed-status catalog-handoff-status" data-state={controller.recommendationError ? "error" : "pending"}>
-        <span role={controller.recommendationError ? "alert" : "status"}>{controller.recommendationError ? `Recommendations unavailable. ${controller.recommendationError}` : discovery.hasFeed ? "Recommendations ready" : controller.recommendationLoading || !controller.recommendation ? "Loading recommendations" : "No recommendations are available. The server catalog remains available."}</span>
-        {controller.recommendationError ? <button onClick={controller.retryRecommendations}>Retry recommendations</button> : discovery.hasFeed ? <button onClick={discovery.showRecommendations}>Show recommendations</button> : null}
-      </div>
-      {controller.loading ? <LoadingState label="Loading server catalog" /> : fallbackItems.length ? <CatalogGrid title={view === "home" ? "Server Catalog" : view === "movies" ? "Movies" : "Series"} label="SERVER CATALOG" items={fallbackItems} total={fallbackItems.length} sessions={controller.sessions} theme={theme} showReasons={false} onOpen={onOpen} /> : <EmptyState title={controller.error ? "Catalog unavailable" : "No catalog records"} body={controller.error || "The server catalog has no records for this view."} />}
-    </div>;
-  }
-  const context = view as "home" | "movies" | "series";
-  const collectionsClass = view === "home" ? "home-collections" : "browse-genre-collections";
-  const hasResults = model.gridItems.length > 0 || model.sections.length > 0;
-  const emptyTitle = !model.sourceItems.length ? `No ${view === "home" ? "recommendations" : view} found` : `No ${model.activeLabel} titles`;
-  return <div {...regionProps} className={`${view === "home" ? "home-view" : "browse-discovery"} category-discovery`} data-category-mode={model.mode}>
-    <RotatingBillboard items={model.billboardItems} variant={variant} context={context} onDetails={onOpen} onPlay={onPlay} />
-    <FeedStatus controller={controller} />
-    <CategoryFilterRail options={model.categories} active={model.activeCategory} variant="shared" onSelect={onCategory} />
-    {ENABLE_VISUAL_GENRE_CATEGORIES && <GenreCategoryGallery cards={model.genreCards} active={model.activeCategory} variant="shared" onSelect={onCategory} />}
-    <AnimatedState stateKey={`${model.mode}:${model.activeCategory}`}>
-      {model.gridItems.length > 0 ? <CatalogGrid title={model.mode === "all" ? "All Releases" : model.activeLabel} label={model.mode === "all" ? "COMPLETE SERVER CATALOG" : "CATEGORY CATALOG"} items={model.gridItems} total={model.total} sessions={controller.sessions} theme={theme} showReasons={model.mode !== "all"} onOpen={onOpen} /> : hasResults ? <motion.div variants={CONTENT_STAGGER} initial="hidden" animate="shown" className={collectionsClass}>{model.sections.map((collection) => <MediaCollection key={collection.id} label={collection.label} title={collection.title} items={collection.items} sessions={controller.sessions} theme={theme} kind={collection.kind} showReasons={collection.showReasons} onOpen={onOpen} onResume={collection.id === "continue-watching" ? onResume : undefined} />)}</motion.div> : <div className="category-discovery__empty"><EmptyState title={emptyTitle} body={`No titles match the ${model.activeLabel} category.`} /></div>}
-    </AnimatedState>
-    {controller.recommendationHasMore && <div className="catalog-pagination"><button className="catalog-load-more" disabled={controller.recommendationLoadingMore} onClick={() => void controller.loadMoreRecommendations()}>{controller.recommendationLoadingMore ? "Loading more…" : `Load more (${model.sourceItems.length} of ${model.total})`}</button></div>}
-  </div>;
 }
 
 function WatchlistView({ controller, theme, onOpen }: { controller: CatalogController; theme: string; onOpen: (movie: Movie) => void }) {
@@ -175,8 +128,6 @@ export function LegacyThemeAdapter({ query, controller, presentation: definition
   const clearProfile = useProfileStore((state) => state.clearProfile);
   const logout = useAuthStore((state) => state.logout);
   const { trackEvent } = useTelemetry();
-  const Background = definition.Background;
-  const Navigation = definition.Navigation;
   const appNavigate = (view: AppView, options: Parameters<typeof appUrl>[2] = {}) => navigate(appUrl(profile.id, view, options), { state: { fromApp: true, previous: location.search } });
   const navigateView = (view: AppView) => appNavigate(view, preservedCatalogCategory(query, view));
   const navigateDetails = (movie: Movie) => appNavigate("details", { media: movie.id });
@@ -188,6 +139,5 @@ export function LegacyThemeAdapter({ query, controller, presentation: definition
   const navigationProps = { profile, activeView: query.view, query: query.q, isAdmin: profile.id === "1", onView: navigateView, onSearch: (q: string) => appNavigate("search", q ? { q } : {}), onEditProfile: () => navigate(profileEditUrl(profile.id), { state: { returnTo: `${location.pathname}${location.search}${location.hash}` } }), onProfiles: () => { clearProfile(); navigate("/profiles"); }, onAdmin: () => appNavigate("admin", { section: "account" }), onLogout: logout };
   const content = controller.loading && !isCatalogView(query.view) ? <LoadingState /> : isCatalogView(query.view) ? <CatalogDiscoveryView query={query} controller={controller} theme={definition.cardVariant} variant={definition.heroVariant} onOpen={openDetails} onPlay={openWatch} onResume={resumeWatch} onCategory={(category) => appNavigate(query.view, { genre: category })} /> : query.view === "watchlist" ? <WatchlistView controller={controller} theme={definition.cardVariant} onOpen={openDetails} /> : query.view === "search" ? <SearchView query={query} controller={controller} theme={definition.cardVariant} onOpen={navigateDetails} onSearch={(q) => appNavigate("search", q ? { q } : {})} /> : query.view === "downloads" ? <ServerDownloads /> : query.view === "details" ? selected ? <DetailsRouter movie={selected} onClose={closeDetails} isWatchlisted={controller.watchlist.includes(selected.id)} sessions={controller.sessions} onWatchlistChange={controller.setWatchlist} onRecommendationInvalidated={controller.refreshRecommendations} /> : controller.detailsLoading ? <LoadingState label="Loading media details" /> : controller.detailsError ? <EmptyState title="Details unavailable" body={controller.detailsError} action={<button className="catalog-retry" onClick={controller.retryDetails}>Retry details</button>} /> : <EmptyState title="Title not found" body="That media identifier is not present in the server catalog." /> : null;
   const feedback = { profileId: profile.id, preferences: controller.preferences, preferencesKnown: controller.preferencesKnown, preferenceKnownIds: controller.preferenceKnownIds, preferenceOperations: controller.preferenceOperations, onCheck: controller.checkPreference, onChange: controller.updatePreference, feedGeneration: controller.recommendation ? String(controller.recommendation.generatedAt) : "", scope: isCatalogView(query.view) ? query.view : "details", category: query.genre ?? "recommended" };
-  if (definition.id !== "gemini") return <RecommendationFeedbackProvider value={feedback}><CatalogLayout presentation={definition} navigationProps={navigationProps}>{controller.error && controller.error !== controller.catalogError && <div className="catalog-error" role="alert">{controller.error}</div>}<AnimatedView theme={theme} viewKey={appViewMotionKey(query)}>{content}</AnimatedView></CatalogLayout></RecommendationFeedbackProvider>;
-  return <RecommendationFeedbackProvider value={feedback}><div className={`theme-app ${definition.shellClass}`} data-theme={theme} data-interaction={definition.interaction.id} data-view={query.view}><Background /><Navigation {...navigationProps} /><main className="theme-main" data-catalog-focus-anchor tabIndex={-1} aria-label="Catalog content">{controller.error && (definition.id === "gemini" || controller.error !== controller.catalogError) && <div className="catalog-error" role="alert">{controller.error}</div>}<AnimatedView theme={theme} viewKey={appViewMotionKey(query)}>{content}</AnimatedView></main></div></RecommendationFeedbackProvider>;
+  return <RecommendationFeedbackProvider value={feedback}><CatalogLayout presentation={definition} navigationProps={navigationProps}>{controller.error && controller.error !== controller.catalogError && <div className="catalog-error" role="alert">{controller.error}</div>}<AnimatedView theme={theme} viewKey={appViewMotionKey(query)}>{content}</AnimatedView></CatalogLayout></RecommendationFeedbackProvider>;
 }

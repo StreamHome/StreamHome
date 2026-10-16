@@ -40,23 +40,22 @@ describe("category renderer parity", () => {
     const application = read("src/themes/application/application.css");
     const ember = read("src/themes/ember/ember-application.css");
     const interactions = read("src/themes/application/interactions.css");
-    for (const theme of ["aurora", "cinema", "gemini"]) expect(application).toContain(`.theme-app--${theme} .category-filter button`);
-    for (const theme of ["aurora", "cinema", "gemini"]) expect(application).toContain(`.theme-app--${theme} .genre-category-gallery`);
+    for (const theme of ["aurora", "cinema"]) expect(application).toContain(`.theme-app--${theme} .category-filter button`);
+    for (const theme of ["aurora", "cinema"]) expect(application).toContain(`.theme-app--${theme} .genre-category-gallery`);
     expect(ember).toContain(".ember-category-discovery .category-filter button[data-active=\"true\"]");
     expect(ember).toContain(".ember-category-discovery .genre-category-gallery__grid > button");
     expect(application).toContain("scroll-snap-type: x proximity");
     expect(application).toContain(".category-filter::before,.category-filter::after");
     expect(application).toContain(".category-catalog-grid");
     expect(ember).toContain(".ember-category-grid");
-    expect(application).toContain(".catalog-feed-status");
+    expect(application).toContain(".catalog-landing-notice");
     expect(application).toContain(".catalog-load-more");
     expect(application).toContain("data-card-theme=\"glass\"");
     expect(application).toContain("data-card-theme=\"poster\"");
-    expect(application).toContain("data-card-theme=\"module\"");
     expect(ember).toContain(".ember-feed-status");
     expect(ember).toContain(".ember-load-more");
-    for (const profile of ["terminal", "editorial", "cinematic", "workspace"]) expect(interactions).toContain(`data-interaction=\"${profile}\"] .category-filter button`);
-    for (const profile of ["terminal", "editorial", "cinematic", "workspace"]) expect(interactions).toContain(`data-interaction=\"${profile}\"] .genre-category-gallery__grid > button:hover`);
+    for (const profile of ["terminal", "editorial", "cinematic"]) expect(interactions).toContain(`data-interaction=\"${profile}\"] .category-filter button`);
+    for (const profile of ["terminal", "editorial", "cinematic"]) expect(interactions).toContain(`data-interaction=\"${profile}\"] .genre-category-gallery__grid > button:hover`);
   });
 
   it("keeps availability signals icon-only and on artwork surfaces", () => {
@@ -69,7 +68,7 @@ describe("category renderer parity", () => {
     expect(meta).toContain("Stored on StreamHome server");
     expect(meta).toContain("Metadata cached — media unavailable");
     expect(shared).toContain('<div className="terminal-feature__art">{art}<AvailabilityBadge');
-    expect(shared).toContain('<div className="workspace-art">{art}<AvailabilityBadge');
+    expect(shared).toContain('<div className="editorial-art">{art}<AvailabilityBadge');
     expect(emberDashboard).not.toContain("PROFILE FEED ONLINE");
     expect(emberDashboard).toContain('<div className="ember-hero__shade" /><AvailabilityBadge');
     expect(application).toContain(".feature-stage--cinematic > .media-availability");

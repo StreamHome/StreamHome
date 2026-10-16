@@ -16,7 +16,7 @@ async function ready(page: import('@playwright/test').Page, query = '') {
   return video;
 }
 
-for (const theme of ['ember','aurora','cinema','gemini']) {
+for (const theme of ['ember','aurora','cinema']) {
   test(`keeps ${theme} popovers inside a short desktop viewport`, async ({page}) => {
     await page.setViewportSize({width:960,height:320});
     await ready(page,`?theme=${theme}`);

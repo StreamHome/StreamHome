@@ -1,7 +1,7 @@
 import type { Episode, Movie } from "../types/api";
 import type { ThemeId } from "../types/theme";
 
-export const SUPPORTED_THEMES: ThemeId[] = ["ember", "aurora", "cinema", "gemini"];
+export const SUPPORTED_THEMES: ThemeId[] = ["ember", "aurora", "cinema"];
 
 export function normalizeTheme(theme: string | null | undefined): ThemeId {
   return SUPPORTED_THEMES.includes(theme as ThemeId) ? (theme as ThemeId) : "ember";

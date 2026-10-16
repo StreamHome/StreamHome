@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as profiles from "../api/profiles";
 import { ApiError } from "../api/client";
 import { useProfileStore } from "../stores/profileStore";
+import { useThemeStore } from "../stores/themeStore";
 import { ProfileSelectPage } from "./ProfileSelectPage";
 import type { Profile } from "../types/api";
 vi.mock("../api/profiles", () => ({ getProfiles: vi.fn(), createProfile: vi.fn(), selectProfileAccess: vi.fn(), unlockProfile: vi.fn() }));
@@ -31,6 +32,7 @@ describe("profile dialogs on included surfaces", () => {
     vi.mocked(profiles.createProfile).mockResolvedValue(created); mount(); await openCreate();
     const dialog = screen.getByRole("dialog"); fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "New viewer" } });
     const cinema = within(dialog).getByRole("button", { name: "Cinema" }); cinema.focus(); fireEvent.click(cinema);
+    expect(Array.from(dialog.querySelectorAll("[aria-pressed]")).map((button) => button.textContent)).toEqual(["Ember", "Aurora", "Cinema"]);
     expect(cinema.getAttribute("aria-pressed")).toBe("true"); expect(within(dialog).getByRole("button", { name: "Ember" }).getAttribute("aria-pressed")).toBe("false");
     expect(dialog.querySelectorAll('[aria-pressed="true"]').length).toBe(1); fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
     await waitFor(() => expect(profiles.createProfile).toHaveBeenCalledWith(expect.objectContaining({ name: "New viewer", theme: "cinema", pinEnabled: false })));
@@ -66,5 +68,36 @@ describe("profile dialogs on included surfaces", () => {
     fireEvent.change(pin, { target: { value: "1234" } }); fireEvent.submit(pin.closest("form")!); fireEvent.submit(pin.closest("form")!);
     expect(profiles.unlockProfile).toHaveBeenCalledTimes(1); expect(useProfileStore.getState().activeProfile).toBeNull(); fireEvent.keyDown(window, { key: "Escape" }); expect(screen.getByRole("dialog")).toBeTruthy();
     view.unmount(); await act(async () => request.resolve({ verified: true })); expect(useProfileStore.getState().activeProfile).toBeNull(); expect(document.body.style.overflow).toBe("");
+  });
+
+  it.each([false, true])("shows a retired Gemini profile as Ember while preserving server access (PIN: %s)", async (pinEnabled) => {
+    const legacy = { ...profile, theme: "gemini", pinEnabled };
+    vi.mocked(profiles.getProfiles).mockResolvedValue([legacy]);
+    const grant = deferred<{ selected: true }>();
+    const unlock = deferred<{ verified: true }>();
+    vi.mocked(profiles.selectProfileAccess).mockReturnValue(grant.promise);
+    vi.mocked(profiles.unlockProfile).mockReturnValue(unlock.promise);
+    useThemeStore.setState({ activeTheme: "cinema" });
+    const view = mount();
+    const select = await screen.findByRole("button", { name: /Viewer/ });
+    expect(select.querySelector(".profile-preview--ember")).not.toBeNull();
+    expect(select.textContent).toContain("Ember / profile");
+    fireEvent.click(select);
+    if (pinEnabled) {
+      const pin = screen.getByLabelText("Profile PIN");
+      fireEvent.change(pin, { target: { value: "1234" } });
+      fireEvent.submit(pin.closest("form")!);
+      expect(profiles.selectProfileAccess).not.toHaveBeenCalled();
+      expect(useProfileStore.getState().activeProfile).toBeNull();
+      await act(async () => unlock.resolve({ verified: true }));
+    } else {
+      expect(profiles.selectProfileAccess).toHaveBeenCalledWith(legacy.id);
+      expect(useProfileStore.getState().activeProfile).toBeNull();
+      await act(async () => grant.resolve({ selected: true }));
+    }
+    expect(useThemeStore.getState().activeTheme).toBe("ember");
+    expect(useProfileStore.getState().activeProfile).toEqual(legacy);
+    expect(profiles.createProfile).not.toHaveBeenCalled();
+    view.unmount();
   });
 });

@@ -176,15 +176,3 @@ describe.each(themes)("%s truthful catalog presentation", (theme) => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "No results" })).toBeTruthy());
   });
 });
-
-it("preserves Gemini's existing catalog and manual recommendation handoff", async () => {
-  const query: AppQueryState = { profile: catalogProfile.id, view: "movies" };
-  const controller = catalogController({ catalogItems: [catalogMovie("Gemini base")] });
-  const { rerender } = render(<App theme="gemini" query={query} controller={controller} />);
-  expect(screen.getByRole("heading", { name: "Your server library" })).toBeTruthy();
-  rerender(<App theme="gemini" query={query} controller={{ ...controller, recommendation: catalogFeed(["Gemini recommended"]), recommendationLoading: false }} />);
-  expect(screen.getByRole("button", { name: "Show recommendations" })).toBeTruthy();
-  expect(screen.queryByRole("heading", { name: "Gemini recommended" })).toBeNull();
-  fireEvent.click(screen.getByRole("button", { name: "Show recommendations" }));
-  await waitFor(() => expect(screen.getByRole("heading", { name: "Gemini recommended" })).toBeTruthy());
-});

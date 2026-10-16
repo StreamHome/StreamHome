@@ -13,15 +13,14 @@ import type { ThemeId } from "../types/theme";
 import { normalizeTheme } from "../utils/media";
 import { AuroraBackground } from "../themes/aurora/AuroraBackground";
 import { CinemaBackground } from "../themes/cinema/CinemaBackground";
-import { GeminiBackground } from "../themes/gemini/GeminiBackground";
 import { MOTION_EASE, MOTION_TIMINGS, useAppMotion } from "../motion/motionSystem";
 import { ScanLines } from "../themes/ember/ScanLines";
 import { useHoverIntent } from "../motion/useHoverIntent";
 import { BrandLogo } from "../components/brand/BrandLogo";
 import { PROFILE_AVATAR_PRESETS } from "../profile/profileAppearance";
 
-const THEMES: ThemeId[] = ["ember", "aurora", "cinema", "gemini"];
-const THEME_LABELS: Record<ThemeId, string> = { ember: "Ember", aurora: "Aurora", cinema: "Cinema", gemini: "Gemini" };
+const THEMES: ThemeId[] = ["ember", "aurora", "cinema"];
+const THEME_LABELS: Record<ThemeId, string> = { ember: "Ember", aurora: "Aurora", cinema: "Cinema" };
 export const PROFILE_INTENT_DELAY = 180;
 
 interface ProfileLocationState {
@@ -57,9 +56,9 @@ function ProfileDialogLayer(props: HTMLMotionProps<"div">) {
 }
 
 function ProfileAmbient({ theme }: { theme: ThemeId }) {
-  const Background = theme === "aurora" ? AuroraBackground : theme === "cinema" ? CinemaBackground : GeminiBackground;
+  const background = theme === "ember" ? <ScanLines /> : theme === "aurora" ? <AuroraBackground /> : <CinemaBackground />;
   const { reduced } = useAppMotion();
-  return <AnimatePresence initial={false} mode="sync"><motion.div className="profile-gallery__ambient" data-ambient-theme={theme} key={theme} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileMorph, ease: MOTION_EASE }}>{theme === "ember" ? <ScanLines /> : <Background />}</motion.div></AnimatePresence>;
+  return <AnimatePresence initial={false} mode="sync"><motion.div className="profile-gallery__ambient" data-ambient-theme={theme} key={theme} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.profileMorph, ease: MOTION_EASE }}>{background}</motion.div></AnimatePresence>;
 }
 
 export function ProfileSelectPage() {

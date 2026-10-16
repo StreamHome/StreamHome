@@ -5,7 +5,7 @@ import { THEME_DEFINITIONS } from "./themeRegistry";
 import { MotionProvider } from "../../motion/motionSystem";
 
 const navigationProps = {
-  profile: { id: "1", name: "Admin", avatarColor: "#ff5f1f", theme: "gemini", pinEnabled: false },
+  profile: { id: "1", name: "Admin", avatarColor: "#ff5f1f", theme: "ember", pinEnabled: false },
   activeView: "home" as const,
   isAdmin: true,
   onView: () => undefined,
@@ -19,17 +19,17 @@ const navigationProps = {
 describe("theme definition registry", () => {
   it("keeps every theme on a distinct presentation contract", () => {
     const definitions = Object.values(THEME_DEFINITIONS);
-    expect(new Set(definitions.map((theme) => theme.Navigation)).size).toBe(4);
-    expect(new Set(definitions.map((theme) => theme.heroVariant)).size).toBe(4);
-    expect(new Set(definitions.map((theme) => theme.cardVariant)).size).toBe(4);
-    expect(new Set(definitions.map((theme) => theme.detailsVariant)).size).toBe(4);
-    expect(new Set(definitions.map((theme) => theme.playerVariant)).size).toBe(4);
-    expect(new Set(definitions.map((theme) => theme.interaction.id)).size).toBe(4);
-    expect(new Set(definitions.map((theme) => theme.interaction.action)).size).toBe(4);
-    expect(new Set(definitions.map((theme) => theme.interaction.easing)).size).toBe(4);
+    expect(definitions.map((theme) => theme.id)).toEqual(["ember", "aurora", "cinema"]);
+    expect(new Set(definitions.map((theme) => theme.Navigation)).size).toBe(3);
+    expect(new Set(definitions.map((theme) => theme.heroVariant)).size).toBe(3);
+    expect(new Set(definitions.map((theme) => theme.cardVariant)).size).toBe(3);
+    expect(new Set(definitions.map((theme) => theme.detailsVariant)).size).toBe(3);
+    expect(new Set(definitions.map((theme) => theme.playerVariant)).size).toBe(3);
+    expect(new Set(definitions.map((theme) => theme.interaction.id)).size).toBe(3);
+    expect(new Set(definitions.map((theme) => theme.interaction.action)).size).toBe(3);
+    expect(new Set(definitions.map((theme) => theme.interaction.easing)).size).toBe(3);
     expect(THEME_DEFINITIONS.ember.Application).not.toBe(THEME_DEFINITIONS.cinema.Application);
     expect(THEME_DEFINITIONS.aurora.Application).toBe(THEME_DEFINITIONS.cinema.Application);
-    expect(THEME_DEFINITIONS.cinema.Application).toBe(THEME_DEFINITIONS.gemini.Application);
     expect(definitions.every((theme) => theme.motion.view && theme.motion.billboard && theme.motion.billboardTiming)).toBe(true);
   });
 
@@ -38,17 +38,7 @@ describe("theme definition registry", () => {
     expect(container.querySelector("canvas")).toBeNull();
   });
 
-  it("opens the desktop Gemini profile menu upward from the bottom sidebar", () => {
-    render(React.createElement(THEME_DEFINITIONS.gemini.Navigation, navigationProps));
-    fireEvent.click(screen.getAllByLabelText("Open settings for Admin")[0]);
-    expect(screen.getByRole("menu").getAttribute("data-placement")).toBe("top-start");
-  });
 
-  it("opens the Gemini mobile profile menu downward from the top header", () => {
-    render(React.createElement(THEME_DEFINITIONS.gemini.Navigation, navigationProps));
-    fireEvent.click(screen.getAllByLabelText("Open settings for Admin")[1]);
-    expect(screen.getByRole("menu").getAttribute("data-placement")).toBe("bottom-end");
-  });
 
   it("omits the profile-menu caret decoration from every theme", () => {
     for (const definition of Object.values(THEME_DEFINITIONS)) {
@@ -89,23 +79,6 @@ describe("theme definition registry", () => {
     Object.defineProperty(window, "scrollY", { configurable: true, value: 0 });
   });
 
-  it("preserves Gemini phone navigation as accessible icon-only controls", () => {
-    const onView = vi.fn();
-    render(React.createElement(THEME_DEFINITIONS.gemini.Navigation, { ...navigationProps, onView }));
-    const navigation = screen.getByRole("navigation", { name: "Catalog mobile" });
-    const home = navigation.querySelector<HTMLButtonElement>('button[aria-label="Home"]')!;
-    const movies = navigation.querySelector<HTMLButtonElement>('button[aria-label="Movies"]')!;
-    expect(home.getAttribute("aria-current")).toBe("page");
-    expect(home.querySelector(".mobile-navigation-icon")).not.toBeNull();
-    expect(home.textContent).toBe("");
-    fireEvent.click(movies);
-    expect(onView).toHaveBeenCalledWith("movies");
-  });
 
-  it("keeps Gemini phone navigation in its original presentation tree", () => {
-    const { container } = render(React.createElement(THEME_DEFINITIONS.gemini.Navigation, navigationProps));
-    expect(container.contains(screen.getByRole("navigation", { name: "Catalog mobile" }))).toBe(true);
-    expect(document.querySelector(".mobile-navigation-layer")).toBeNull();
-  });
 
 });

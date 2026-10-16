@@ -13,7 +13,7 @@ export function DashboardRouter() {
   const activeTheme = useThemeStore((state) => state.activeTheme);
   const syncFromProfile = useThemeStore((state) => state.syncFromProfile);
   const query = useMemo(() => parseAppQuery(location.search), [location.search]);
-  const controller = useCatalogController(activeProfile, query, activeTheme !== "gemini");
+  const controller = useCatalogController(activeProfile, query, true);
 
   useEffect(() => syncFromProfile(activeProfile), [activeProfile, syncFromProfile]);
   useEffect(() => {

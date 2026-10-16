@@ -22,7 +22,7 @@ It combines:
 * local and Google Drive storage;
 * automatic backup and recovery;
 * multiple user profiles;
-* four distinct interface themes;
+* three distinct interface themes;
 * a responsive desktop and mobile browser client.
 
 StreamHome is designed to provide a premium streaming experience while keeping the server, media, profiles, and catalog data under the user's control.
@@ -592,12 +592,11 @@ It is intentionally separated from the main recommendation-ranking system.
 
 ### How many themes does StreamHome include?
 
-StreamHome includes four interface themes:
+StreamHome includes three interface themes:
 
 * Ember
 * Aurora
 * Cinema
-* Gemini
 
 ### Are the themes only different colors?
 

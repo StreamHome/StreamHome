@@ -21,18 +21,16 @@ describe("semantic hover interaction system", () => {
     expect(interactions).toContain("transform: none !important");
   });
 
-  it("defines distinct navigation and card behavior for all four themes", () => {
+  it("defines distinct navigation and card behavior for all three themes", () => {
     for (const selector of [
       ".theme-nav--ember nav button:hover",
       ".theme-nav--aurora nav button:hover",
       ".theme-nav--cinema nav button:hover",
-      ".theme-nav--gemini nav button:hover",
       '.catalog-card[data-card-theme="sharp"]:hover',
       '.catalog-card[data-card-theme="glass"]:hover',
       '.catalog-card[data-card-theme="poster"]:hover',
-      '.catalog-card[data-card-theme="module"]:hover',
     ]) expect(interactions).toContain(selector);
-    for (const profile of ["terminal", "editorial", "cinematic", "workspace"]) {
+    for (const profile of ["terminal", "editorial", "cinematic"]) {
       expect(interactions).toContain(`data-interaction="${profile}"`);
     }
   });
@@ -40,8 +38,6 @@ describe("semantic hover interaction system", () => {
   it("uses fluid search sizing and compact centered rail controls", () => {
     expect(application).toContain("width: clamp(150px,18vw,260px)");
     expect(application).toContain("font-size: clamp(10px,.76vw,13px)");
-    expect(application).toContain(".theme-nav--gemini .theme-search { width: calc(100% - 28px); min-width: 0; max-width: none; height: 42px; min-height: 42px; flex: 0 0 42px");
-    expect(application).toContain(".theme-nav--gemini .theme-search button { min-width: 64px");
     expect(application).toContain("top: 50%; bottom: auto; width: 42px; height: 42px");
     expect(ember).toContain("top: 50%; bottom: auto; width: 40px; height: 40px");
   });
@@ -68,7 +64,6 @@ describe("semantic hover interaction system", () => {
       "linear-gradient(90deg,#ffb59c,#ff5f1f)",
       "linear-gradient(90deg,#fff,#d8c7ff)",
       "linear-gradient(90deg,#e50914,#ff4d57)",
-      "linear-gradient(90deg,#4285f4,#9b72cb,#d96570,#f4b400)",
     ]) expect(application).toContain(`--billboard-progress-fill: ${gradient}`);
     expect(application).toContain("background: var(--billboard-marker");
     expect(application).toContain("background: var(--billboard-progress-fill");

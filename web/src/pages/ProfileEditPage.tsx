@@ -13,8 +13,8 @@ import type { Profile } from "../types/api";
 import type { ThemeId } from "../types/theme";
 import { normalizeTheme } from "../utils/media";
 
-const THEMES: ThemeId[] = ["ember", "aurora", "cinema", "gemini"];
-const THEME_LABELS: Record<ThemeId, string> = { ember: "Ember", aurora: "Aurora", cinema: "Cinema", gemini: "Gemini" };
+const THEMES: ThemeId[] = ["ember", "aurora", "cinema"];
+const THEME_LABELS: Record<ThemeId, string> = { ember: "Ember", aurora: "Aurora", cinema: "Cinema" };
 
 function ThemePreview({ theme }: { theme: ThemeId }) {
   return <span className={`profile-preview profile-preview--${theme}`} aria-hidden="true"><i /><i /><i /></span>;

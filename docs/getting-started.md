@@ -225,12 +225,11 @@ Do not use separate administrator accounts merely to separate viewing preference
 
 ## 11. Explore the Interface
 
-StreamHome includes four distinct interface themes:
+StreamHome includes three distinct interface themes:
 
 * Ember;
 * Aurora;
-* Cinema;
-* Gemini.
+* Cinema.
 
 These themes may differ in:
 

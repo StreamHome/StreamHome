@@ -28,6 +28,7 @@ describe("server media rules", () => {
 
   it("normalizes legacy and unknown themes", () => {
     expect(normalizeTheme("netflix")).toBe("ember");
+    expect(normalizeTheme("gemini")).toBe("ember");
     expect(normalizeTheme("aurora")).toBe("aurora");
     expect(normalizeTheme("cinema")).toBe("cinema");
     expect(normalizeTheme(null)).toBe("ember");
