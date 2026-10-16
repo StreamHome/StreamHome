@@ -18,6 +18,8 @@ export type PlayerIconName =
   | "play"
   | "quality"
   | "rewind"
+  | "seek-backward"
+  | "seek-forward"
   | "speed"
   | "settings"
   | "volume";
@@ -25,13 +27,14 @@ export type PlayerIconName =
 interface PlayerIconProps {
   name: PlayerIconName;
   className?: string;
+  prominent?: boolean;
 }
 
 export function hasSubtitleOptions(options: readonly unknown[]): boolean {
   return options.length > 0;
 }
 
-export function PlayerIcon({ name, className = "" }: PlayerIconProps) {
+export function PlayerIcon({ name, className = "", prominent = false }: PlayerIconProps) {
   const common = {
     className: `player-icon ${className}`.trim(),
     viewBox: "0 0 24 24",
@@ -43,8 +46,12 @@ export function PlayerIcon({ name, className = "" }: PlayerIconProps) {
     "aria-hidden": true,
   };
 
-  if (name === "play") return <svg {...common}><path d="m8 5 11 7-11 7V5Z" fill="currentColor" stroke="none" /></svg>;
-  if (name === "pause") return <svg {...common}><path d="M8 5v14M16 5v14" strokeWidth="2.4" /></svg>;
+  if (name === "play") return <svg {...common}><path d={prominent ? "M6 3.75 20.5 12 6 20.25V3.75Z" : "m8 5 11 7-11 7V5Z"} fill="currentColor" stroke="none" /></svg>;
+  if (name === "pause") return prominent
+    ? <svg {...common} fill="currentColor" stroke="none"><rect x="5.5" y="4" width="4.5" height="16" rx=".7" /><rect x="14" y="4" width="4.5" height="16" rx=".7" /></svg>
+    : <svg {...common}><path d="M8 5v14M16 5v14" strokeWidth="2.4" /></svg>;
+  if (name === "seek-backward") return <svg {...common}><path d="m11 6-6 6 6 6m8-12-6 6 6 6" /></svg>;
+  if (name === "seek-forward") return <svg {...common}><path d="m5 6 6 6-6 6m8-12 6 6-6 6" /></svg>;
   if (name === "rewind") return <svg {...common}><path d="M8.5 8H4V3.5" /><path d="M4.3 8a8 8 0 1 1-.1 7.8" /><text x="8" y="15.2" fill="currentColor" stroke="none" fontSize="7" fontWeight="700">10</text></svg>;
   if (name === "forward") return <svg {...common}><path d="M15.5 8H20V3.5" /><path d="M19.7 8a8 8 0 1 0 .1 7.8" /><text x="8" y="15.2" fill="currentColor" stroke="none" fontSize="7" fontWeight="700">10</text></svg>;
   if (name === "volume") return <svg {...common}><path d="M4 10v4h4l5 4V6l-5 4H4Z" /><path d="M16 9a4 4 0 0 1 0 6M18.5 6.5a8 8 0 0 1 0 11" /></svg>;
@@ -66,9 +73,10 @@ export function PlayerIcon({ name, className = "" }: PlayerIconProps) {
 interface PlayerIconButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   icon: PlayerIconName;
   label: string;
+  prominentIcon?: boolean;
 }
 
-export function PlayerIconButton({ icon, label, className = "", onClick, ...props }: PlayerIconButtonProps) {
+export function PlayerIconButton({ icon, label, className = "", onClick, prominentIcon = false, ...props }: PlayerIconButtonProps) {
   return (
     <button
       type="button"
@@ -81,7 +89,7 @@ export function PlayerIconButton({ icon, label, className = "", onClick, ...prop
         if (!event.defaultPrevented && !event.currentTarget.hasAttribute("aria-haspopup")) restorePlayerPointerClickFocus(event);
       }}
     >
-      <PlayerIcon name={icon} />
+      <PlayerIcon name={icon} prominent={prominentIcon} />
     </button>
   );
 }

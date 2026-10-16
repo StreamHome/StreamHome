@@ -49,6 +49,7 @@ import {
   isMobileTapCandidate,
   isPhonePlayerViewport,
   lockPlayerLandscape,
+  MOBILE_SEEK_FEEDBACK_MS,
   MOBILE_TAP_CHAIN_WINDOW,
   nextMobileTap,
   readMobileViewport,
@@ -873,6 +874,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const mobileTapChainRef = useRef<MobileTapChain | null>(null);
   const mobileSingleTapTimerRef = useRef<number | null>(null);
   const mobileTapResetTimerRef = useRef<number | null>(null);
+  const mobileSeekFeedbackTimerRef = useRef<number | null>(null);
   const mobileFullscreenAttemptedAtRef = useRef(0);
   const mobilePointerGestureRef = useRef<MobilePointerGesture | null>(null);
   const desktopPointerPositionRef = useRef<{ x: number; y: number } | null>(null);
@@ -3422,19 +3424,27 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [exitPlayer, fullscreenActive, fullscreenMode, pausePlayback, revealControls, safePlay, seek, setOutputVolume, toggleFullscreen, toggleOutputMute, togglePictureInPicture]);
 
   const toggleMobileControls = useCallback(() => {
+    if (!["playing", "paused"].includes(phaseRef.current) || controlMenuOpenRef.current || scrubbingRef.current) {
+      revealControls();
+      return;
+    }
     if (showControlsRef.current) {
-      if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
+      if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
+      controlsTimerRef.current = null;
+      if (playerControlsContainFocus()) containerRef.current?.focus({ preventScroll: true });
       setControlsVisibility(false);
       return;
     }
     revealControls();
-  }, [revealControls, setControlsVisibility]);
+  }, [playerControlsContainFocus, revealControls, setControlsVisibility]);
 
   const resetMobileTapTimers = useCallback(() => {
     if (mobileSingleTapTimerRef.current !== null) window.clearTimeout(mobileSingleTapTimerRef.current);
     if (mobileTapResetTimerRef.current !== null) window.clearTimeout(mobileTapResetTimerRef.current);
+    if (mobileSeekFeedbackTimerRef.current !== null) window.clearTimeout(mobileSeekFeedbackTimerRef.current);
     mobileSingleTapTimerRef.current = null;
     mobileTapResetTimerRef.current = null;
+    mobileSeekFeedbackTimerRef.current = null;
   }, []);
 
   const handleMobileSurfaceTap = useCallback((side: MobileTapSide) => {
@@ -3453,7 +3463,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     mobileTapResetTimerRef.current = window.setTimeout(() => {
       if ((mobileTapChainRef.current?.seekSteps ?? 0) > 0) reportConfirmedSeek();
       mobileTapChainRef.current = null;
-      setMobileSeekFeedback(null);
       mobileTapResetTimerRef.current = null;
     }, MOBILE_TAP_CHAIN_WINDOW + 60);
 
@@ -3462,6 +3471,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       mobileSingleTapTimerRef.current = null;
       seek(currentTimeRef.current + result.seekDelta, false);
       setMobileSeekFeedback({ side, seconds: result.accumulatedSeconds });
+      if (mobileSeekFeedbackTimerRef.current !== null) window.clearTimeout(mobileSeekFeedbackTimerRef.current);
+      mobileSeekFeedbackTimerRef.current = window.setTimeout(() => {
+        mobileSeekFeedbackTimerRef.current = null;
+        setMobileSeekFeedback(null);
+      }, MOBILE_SEEK_FEEDBACK_MS);
       return;
     }
 
@@ -3488,6 +3502,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
   const handleMobilePointerDown = useCallback((side: MobileTapSide | "center", event: React.PointerEvent<HTMLDivElement>) => {
     if (event.pointerType === "mouse" && event.button !== 0) return;
+    if (controlMenuOpenRef.current || scrubbingRef.current) {
+      mobilePointerGestureRef.current = null;
+      return;
+    }
     mobilePointerGestureRef.current = { id: event.pointerId, side, x: event.clientX, y: event.clientY, at: performance.now() };
     event.currentTarget.setPointerCapture?.(event.pointerId);
   }, []);
@@ -3773,6 +3791,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const hasSubtitles = hasSubtitleOptions(runResponse?.subtitles ?? []);
   const playbackControlShowsPause = playbackIntentRef.current
     && ["loading", "recovering", "buffering", "playing"].includes(phase);
+  const controlsVisible = mobilePlayer
+    ? shouldShowMobileChrome(phase, showControls, controlMenuOpen, timelineScrubbing)
+    : showControls;
   const phaseMessage: Record<PlayerPhase, string> = {
     resolving: "Resolving secure playback",
     preparing: "Preparing adaptive stream",
@@ -3855,7 +3876,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       data-player-transport={streamMode}
       data-player-root="true"
       data-frame-hold={holdLastFrame ? "true" : "false"}
-      data-controls-visible={showControls ? "true" : "false"}
+      data-controls-visible={controlsVisible ? "true" : "false"}
       data-mobile-player={mobilePlayer ? "true" : "false"}
       data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
       data-player-viewport-fullscreen={fullscreenMode === "viewport" ? "true" : undefined}
@@ -4389,17 +4410,16 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         {mobilePlayer && mobileSeekFeedback && (
           <motion.div
             className={`mobile-player-seek-feedback mobile-player-seek-feedback--${mobileSeekFeedback.side}`}
-            initial={reduced ? { opacity: 0 } : { opacity: 0, y: 4 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={reduced ? { opacity: 0 } : { opacity: 0, y: 2 }}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
             transition={{ duration: reduced ? MOTION_TIMINGS.reduced : 0.13, ease: MOTION_EASE }}
             aria-hidden="true"
           >
             <i>
-              <PlayerIcon name={mobileSeekFeedback.side === "left" ? "rewind" : "forward"} />
+              <PlayerIcon name={mobileSeekFeedback.side === "left" ? "seek-backward" : "seek-forward"} />
             </i>
-            <strong>{mobileSeekFeedback.side === "left" ? "−" : "+"}{mobileSeekFeedback.seconds}</strong>
-            <span>seconds</span>
+            <strong>{mobileSeekFeedback.side === "left" ? "−" : "+"}{mobileSeekFeedback.seconds} s</strong>
           </motion.div>
         )}
       </AnimatePresence>
@@ -4455,7 +4475,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         captionSignature={captionSignature}
         mobile={mobilePlayer}
         reduced={reduced}
-        controlsVisible={showControls}
+        controlsVisible={controlsVisible}
         countdownEnabled={phase === "playing" && !controlMenuOpen && !timelineScrubbing}
         onVisibilityChange={setSkipControlVisible}
         onSkip={() => seek(skipMarker.end)}
@@ -4492,13 +4512,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         {mobilePlayer && phase !== "ended" && (
           <motion.div
             className="mobile-player-chrome"
-            data-visible={shouldShowMobileChrome(phase, showControls) ? "true" : "false"}
-            aria-hidden={!shouldShowMobileChrome(phase, showControls)}
-            inert={!shouldShowMobileChrome(phase, showControls)}
+            data-visible={controlsVisible ? "true" : "false"}
+            aria-hidden={!controlsVisible}
+            inert={!controlsVisible}
             onFocusCapture={revealControls}
             onBlurCapture={handleControlsBlur}
             initial={{ opacity: 0 }}
-            animate={{ opacity: shouldShowMobileChrome(phase, showControls) ? 1 : 0 }}
+            animate={{ opacity: controlsVisible ? 1 : 0 }}
             exit={{ opacity: 0 }}
             transition={{ duration: reduced ? MOTION_TIMINGS.reduced : 0.16, ease: MOTION_EASE }}
           >
@@ -4516,6 +4536,11 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                 <h1>{asset.title}</h1>
                 {asset.subtitle && <p>{asset.subtitle}</p>}
               </div>
+              <PlayerSettings playbackRate={preferences.playbackRate} onRateChange={(value) => setPreferences((current) => ({ ...current, playbackRate: value }))}
+                captions={hasSubtitles && preferences.subtitleTrackId !== "off"} captionScale={preferences.captionScale}
+                onCaptionScaleChange={(value) => setPreferences((current) => ({ ...current, captionScale: value }))}
+                subtitleOffset={preferences.subtitleOffset} onSubtitleOffsetChange={(value) => setPreferences((current) => ({ ...current, subtitleOffset: value }))}
+                onOpenChange={handleControlMenuOpenChange} compact className="mobile-player-topbar__settings" />
             </header>
 
             <div className="mobile-player-transport">
@@ -4529,6 +4554,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                 icon={playbackControlShowsPause ? "pause" : "play"}
                 label={playbackControlShowsPause ? "Pause" : "Play"}
                 className="mobile-player-transport__play"
+                prominentIcon
                 onClick={() => playbackControlShowsPause ? pausePlayback() : startMobilePlayback()}
               />
               <PlayerIconButton
@@ -4604,11 +4630,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                       onOpenChange={handleControlMenuOpenChange}
                     />
                   )}
-                  <PlayerSettings playbackRate={preferences.playbackRate} onRateChange={(value) => setPreferences((current) => ({ ...current, playbackRate: value }))}
-                    captions={hasSubtitles && preferences.subtitleTrackId !== "off"} captionScale={preferences.captionScale}
-                    onCaptionScaleChange={(value) => setPreferences((current) => ({ ...current, captionScale: value }))}
-                    subtitleOffset={preferences.subtitleOffset} onSubtitleOffsetChange={(value) => setPreferences((current) => ({ ...current, subtitleOffset: value }))}
-                    onOpenChange={handleControlMenuOpenChange} />
                   {document.pictureInPictureEnabled && (
                     <PlayerIconButton icon="pip" label="Picture in picture" onClick={togglePictureInPicture} />
                   )}

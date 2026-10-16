@@ -59,7 +59,11 @@ describe("mobile tap recognition", () => {
   it("keeps transport controls available during buffering and recovery", () => {
     expect(shouldShowMobileChrome("buffering", false)).toBe(true);
     expect(shouldShowMobileChrome("recovering", false)).toBe(true);
-    expect(shouldShowMobileChrome("paused", false)).toBe(true);
+    expect(shouldShowMobileChrome("paused", false)).toBe(false);
+    expect(shouldShowMobileChrome("paused", true)).toBe(true);
+    expect(shouldShowMobileChrome("playing", false)).toBe(false);
+    expect(shouldShowMobileChrome("paused", false, true)).toBe(true);
+    expect(shouldShowMobileChrome("paused", false, false, true)).toBe(true);
     expect(shouldShowMobileChrome("playing", true)).toBe(true);
   });
 });

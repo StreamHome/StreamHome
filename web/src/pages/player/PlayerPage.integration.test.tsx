@@ -10,6 +10,7 @@ import * as moviesApi from "../../api/movies";
 import * as playbackApi from "../../api/playback";
 import { getPlaybackSessionRevision, subscribePlaybackSessions } from "../../api/playbackSessionEvents";
 import { PLAYER_SKIP_COUNTDOWN_DELAY_MS, PLAYER_SKIP_COUNTDOWN_DURATION_MS } from "./PlayerMarkerControls";
+import { MOBILE_SEEK_FEEDBACK_MS } from "./mobilePlayer";
 import {
   PLAYER_CONTROLS_IDLE_MS,
   PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS,
@@ -151,6 +152,29 @@ function timelinePointer(timeline: HTMLInputElement, type: string, clientX: numb
   const event = new MouseEvent(type, { bubbles: true, clientX });
   Object.defineProperty(event, "pointerId", { value: 1 });
   fireEvent(timeline, event);
+}
+
+function phoneViewport() {
+  const width = Object.getOwnPropertyDescriptor(window, "innerWidth")!;
+  const height = Object.getOwnPropertyDescriptor(window, "innerHeight")!;
+  const touchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+  Object.defineProperty(window, "innerWidth", { configurable: true, value: 844 });
+  Object.defineProperty(window, "innerHeight", { configurable: true, value: 390 });
+  Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+  return () => {
+    Object.defineProperty(window, "innerWidth", width);
+    Object.defineProperty(window, "innerHeight", height);
+    if (touchPoints) Object.defineProperty(navigator, "maxTouchPoints", touchPoints);
+    else Reflect.deleteProperty(navigator, "maxTouchPoints");
+  };
+}
+
+function mobileTap(zone: HTMLElement, cancelled = false, distance = 0) {
+  for (const type of ["pointerdown", cancelled ? "pointercancel" : "pointerup"]) {
+    const event = new MouseEvent(type, { bubbles: true, clientX: 100 + (type === "pointerup" ? distance : 0), clientY: 80 });
+    Object.defineProperties(event, { pointerId: { value: 1 }, pointerType: { value: "touch" } });
+    fireEvent(zone, event);
+  }
 }
 
 function showPlayingVideo(video: HTMLVideoElement, time = 30) {
@@ -302,6 +326,20 @@ async function mountFramePlayer(fixture: ResolvedPlayback = playback, frameCallb
       else Reflect.deleteProperty(document, "visibilityState");
     },
   };
+}
+
+async function mountPhonePlayer() {
+  const restore = phoneViewport();
+  try {
+    const player = await mountFramePlayer({
+      ...playback,
+      runResponse: { ...playback.runResponse, ticketExpiresAt: Math.floor(Date.now() / 1_000) + 3_600 },
+    });
+    return { ...player, close: () => { player.close(); restore(); } };
+  } catch (error) {
+    restore();
+    throw error;
+  }
 }
 
 
@@ -1228,7 +1266,114 @@ describe("mounted player lifecycle", () => {
     }
   });
 
-  it("retains the labeled Settings control in the dedicated phone bottom row", () => {
+  it("dismisses and reveals paused phone chrome without touching the mounted transport", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      const source = player.video.getAttribute("src");
+      const time = player.video.currentTime;
+      const calls = ["play", "pause", "load"].map((method) => videoCallCount(method as "play" | "pause" | "load", player.video));
+      const play = screen.getByRole("button", { name: "Play" });
+      act(() => play.focus());
+      const center = player.view.container.querySelector<HTMLElement>(".mobile-player-gesture-zone--center")!;
+      mobileTap(center);
+      await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+      const chrome = player.view.container.querySelector(".mobile-player-chrome")!;
+      expect(player.root.dataset.controlsVisible).toBe("false");
+      expect(chrome.getAttribute("data-visible")).toBe("false");
+      expect(chrome.getAttribute("aria-hidden")).toBe("true");
+      expect(chrome.hasAttribute("inert")).toBe(true);
+      expect(document.activeElement).toBe(player.root);
+      mobileTap(center);
+      await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+      expect(chrome.getAttribute("data-visible")).toBe("true");
+      expect(chrome.hasAttribute("inert")).toBe(false);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(player.video.currentTime).toBe(time);
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(player.view.container.querySelector("video")).toBe(player.video);
+      expect(["play", "pause", "load"].map((method) => videoCallCount(method as "play" | "pause" | "load", player.video))).toEqual(calls);
+    } finally { player.close(); }
+  });
+
+  it("restores phone auto-hide after manual hide/reveal and retains buffering controls", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      const center = player.view.container.querySelector<HTMLElement>(".mobile-player-gesture-zone--center")!;
+      mobileTap(center);
+      expect(player.root.dataset.controlsVisible).toBe("false");
+      mobileTap(center);
+      expect(player.root.dataset.controlsVisible).toBe("true");
+      player.advance(PLAYER_CONTROLS_IDLE_MS + 200, true);
+      expect(player.root.dataset.controlsVisible).toBe("false");
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.playerPhase).toBe("buffering");
+      expect(player.root.dataset.controlsVisible).toBe("true");
+      mobileTap(center);
+      expect(player.root.dataset.controlsVisible).toBe("true");
+    } finally { player.close(); }
+  });
+
+  it("keeps accumulated phone seek feedback beyond the tap-chain window while preserving Pause", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      const right = player.view.container.querySelector<HTMLElement>(".mobile-player-gesture-zone--right")!;
+      const source = player.video.getAttribute("src");
+      const plays = videoCallCount("play", player.video);
+      const loads = videoCallCount("load", player.video);
+      const origin = player.video.currentTime;
+      mobileTap(right);
+      act(() => vi.advanceTimersByTime(80));
+      mobileTap(right);
+      const feedback = player.view.container.querySelector(".mobile-player-seek-feedback")!;
+      expect(feedback.textContent).toBe("+10 s");
+      expect(player.video.currentTime).toBeCloseTo(origin + 10);
+      act(() => vi.advanceTimersByTime(80));
+      mobileTap(right);
+      expect(player.view.container.querySelector(".mobile-player-seek-feedback")).toBe(feedback);
+      expect(feedback.textContent).toBe("+20 s");
+      expect(player.video.currentTime).toBeCloseTo(origin + 20);
+      expect(player.root.dataset.controlsVisible).toBe("true");
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+      expect(player.view.container.querySelector(".mobile-player-seek-feedback")).toBe(feedback);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      await act(async () => { await vi.advanceTimersByTimeAsync(MOBILE_SEEK_FEEDBACK_MS); });
+      const fadingFeedback = player.view.container.querySelector<HTMLElement>(".mobile-player-seek-feedback");
+      expect(fadingFeedback === null || fadingFeedback.style.opacity === "0").toBe(true);
+      expect(screen.queryByText("Forward 20 seconds")).toBeNull();
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+    } finally { player.close(); }
+  });
+
+  it("dismisses phone menus without also hiding/seeking and rejects cancelled or dragged taps", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      const center = player.view.container.querySelector<HTMLElement>(".mobile-player-gesture-zone--center")!;
+      const right = player.view.container.querySelector<HTMLElement>(".mobile-player-gesture-zone--right")!;
+      const time = player.video.currentTime;
+      pointerClick(screen.getByRole("button", { name: "Player settings" }));
+      expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
+      mobileTap(right);
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+      expect(screen.queryByRole("dialog", { name: "Player settings" })).toBeNull();
+      expect(player.root.dataset.controlsVisible).toBe("true");
+      mobileTap(center, true);
+      mobileTap(right, false, 40);
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+      expect(player.root.dataset.controlsVisible).toBe("true");
+      expect(player.video.currentTime).toBe(time);
+      expect(player.view.container.querySelector(".mobile-player-seek-feedback")).toBeNull();
+    } finally { player.close(); }
+  });
+
+  it("places one icon-only phone Settings control in the topbar", () => {
     const width = Object.getOwnPropertyDescriptor(window, "innerWidth")!;
     const height = Object.getOwnPropertyDescriptor(window, "innerHeight")!;
     const touchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
@@ -1245,9 +1390,10 @@ describe("mounted player lifecycle", () => {
       const settings = screen.getByRole("button", { name: "Player settings" });
       expect(screen.getAllByRole("button", { name: "Player settings" })).toHaveLength(1);
       expect(view.container.querySelector<HTMLElement>("[data-player-root]")?.dataset.mobilePlayer).toBe("true");
-      expect(settings.closest(".mobile-player-bottom")).not.toBeNull();
+      expect(settings.closest(".mobile-player-topbar")).not.toBeNull();
+      expect(settings.closest(".mobile-player-bottom")).toBeNull();
       expect(settings.closest(".player-topbar")).toBeNull();
-      expect(settings.textContent).toBe("Settings");
+      expect(settings.textContent).toBe("");
       pointerClick(settings);
       expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
     } finally {
