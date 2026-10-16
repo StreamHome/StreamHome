@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,28 @@ from unittest.mock import patch
 import uuid
 
 from lifecycle import drive_connection as publication
+
+
+RCLONE_COMMENT_PREAMBLE = b"# Encrypted rclone configuration File\n\n"
+SYNTHETIC_ENCRYPTED_CONFIG = RCLONE_COMMENT_PREAMBLE + b"RCLONE_ENCRYPT_V0:\nprivate-synthetic-encrypted-content\n"
+
+
+def malformed_encrypted_configs():
+    return {
+        "plaintext": b"[streamhome-drive]\ntype = local\n",
+        "unknown-version": RCLONE_COMMENT_PREAMBLE + b"RCLONE_ENCRYPT_V1:\nciphertext\n",
+        "partial-version": b"RCLONE_ENCRYPT_V\n",
+        "missing-colon": b"RCLONE_ENCRYPT_V0\nciphertext\n",
+        "marker-suffix": b"RCLONE_ENCRYPT_V0:junk\nciphertext\n",
+        "marker-substring": b"prefix RCLONE_ENCRYPT_V0:\nciphertext\n",
+        "marker-in-value": b"token = RCLONE_ENCRYPT_V0:\n",
+        "marker-in-comment": b"# RCLONE_ENCRYPT_V0:\nciphertext\n",
+        "marker-in-semicolon-comment": b"; RCLONE_ENCRYPT_V0:\nciphertext\n",
+        "marker-after-plaintext": b"[streamhome-drive]\nRCLONE_ENCRYPT_V0:\nciphertext\n",
+        "comment-marker-before-plaintext": b"# RCLONE_ENCRYPT_V0:\n[streamhome-drive]\n",
+        "comments-without-marker": b"\n # Encrypted file\n ; RCLONE_ENCRYPT_V0:\n\n",
+        "empty": b"",
+    }
 
 
 class DriveConnectionPublicationTests(unittest.TestCase):
@@ -25,7 +48,7 @@ class DriveConnectionPublicationTests(unittest.TestCase):
         self.previous = b'{"storage_engine":"LOCAL","hevc_compression_mode":"off","custom":{"keep":true}}\n'
         self.settings.write_bytes(self.previous)
         self.candidate = self.directory / "encrypted-candidate"
-        self.candidate.write_bytes(b"RCLONE_ENCRYPT_V0:\nprivate-synthetic-encrypted-content\n")
+        self.candidate.write_bytes(SYNTHETIC_ENCRYPTED_CONFIG)
         self.config = self.directory / "rclone.conf"
         self.job_id = str(uuid.uuid4())
         self.arguments = dict(root=self.root, job_id=self.job_id, generation=1,
@@ -56,7 +79,7 @@ class DriveConnectionPublicationTests(unittest.TestCase):
 
     def test_repeated_save_preserves_rotated_tokens_and_new_preferences(self):
         receipt = publication.publish_drive_connection(**self.arguments)
-        self.config.write_bytes(b"RCLONE_ENCRYPT_V0:\nrotated-token-content\n")
+        self.config.write_bytes(RCLONE_COMMENT_PREAMBLE + b"RCLONE_ENCRYPT_V0:\nrotated-token-content\n")
         saved = json.loads(self.settings.read_bytes())
         saved["hevc_compression_mode"] = "on"
         self.settings.write_text(json.dumps(saved))
@@ -140,11 +163,110 @@ p.publish_drive_connection(root=root, job_id=job, generation=1,
             publication.publish_drive_connection(**self.arguments)
         self.candidate.unlink()
         outside = self.root / "outside"
-        outside.write_bytes(b"RCLONE_ENCRYPT_V0:\nsynthetic\n")
+        outside.write_bytes(SYNTHETIC_ENCRYPTED_CONFIG)
         self.candidate.symlink_to(outside)
         with self.assertRaises(publication.DriveConnectionPublicationError):
             publication.publish_drive_connection(**self.arguments)
         self.assertFalse(self.config.exists())
+
+    def test_marker_at_byte_zero_remains_compatible(self):
+        self.candidate.write_bytes(b"RCLONE_ENCRYPT_V0:\nsynthetic-ciphertext\n")
+        receipt = publication.publish_drive_connection(**self.arguments)
+        self.assertEqual(publication.get_drive_connection_receipt(self.root, self.job_id, 1), receipt)
+        self.assertEqual(publication.recover_drive_connection(self.root), receipt)
+
+    def test_blank_and_comment_preamble_preserves_exact_published_bytes(self):
+        content = b"\n  # private configuration\n\t; native-style comment\n \n RCLONE_ENCRYPT_V0: \nsynthetic-ciphertext\n"
+        self.candidate.write_bytes(content)
+        receipt = publication.publish_drive_connection(**self.arguments)
+        self.assertEqual(self.config.read_bytes(), content)
+        self.assertEqual(publication.get_drive_connection_receipt(self.root, self.job_id, 1), receipt)
+        self.assertEqual(publication.recover_drive_connection(self.root), receipt)
+
+    def test_malformed_headers_are_rejected_before_first_publication(self):
+        for label, content in malformed_encrypted_configs().items():
+            with self.subTest(label=label):
+                self.candidate.write_bytes(content)
+                with self.assertRaises(publication.DriveConnectionPublicationError) as error:
+                    publication.publish_drive_connection(**self.arguments)
+                self.assertEqual(error.exception.code, "drive_encryption_required")
+                self.assertFalse(self.config.exists())
+                self.assertEqual(self.settings.read_bytes(), self.previous)
+                self.assertFalse((self.directory / publication.JOURNAL_NAME).exists())
+
+    def test_committed_malformed_headers_cannot_prove_a_saved_connection(self):
+        publication.publish_drive_connection(**self.arguments)
+        saved_settings = self.settings.read_bytes()
+        journal = self.directory / publication.JOURNAL_NAME
+        saved_journal = journal.read_bytes()
+        for label, content in malformed_encrypted_configs().items():
+            with self.subTest(label=label):
+                self.config.write_bytes(content)
+                for operation in (
+                    lambda: publication.get_drive_connection_receipt(self.root, self.job_id, 1),
+                    lambda: publication.recover_drive_connection(self.root),
+                    lambda: publication.publish_drive_connection(**self.arguments),
+                ):
+                    with self.assertRaises(publication.DriveConnectionPublicationError):
+                        operation()
+                self.assertEqual(self.config.read_bytes(), content)
+                self.assertEqual(self.settings.read_bytes(), saved_settings)
+                self.assertEqual(journal.read_bytes(), saved_journal)
+
+    def test_native_rclone_encryption_publication_receipt_recovery_and_rotation(self):
+        executable = Path(__file__).resolve().parents[3] / "bin/rclone"
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            self.skipTest("Application-owned Rclone is unavailable for native encryption verification.")
+        home = self.root / "native-home"
+        home.mkdir(mode=0o700)
+        # The child receives no installed environment, Rclone password, config,
+        # credentials or provider endpoint. Every command operates on local files.
+        environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}
+        environment.update(HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
+                           STREAMHOME_TEST_RCLONE_PASSWORD=secrets.token_urlsafe(48))
+
+        def native(config_path, *arguments):
+            result = subprocess.run(
+                [str(executable), "--config", str(config_path), "--password-command",
+                 "printenv STREAMHOME_TEST_RCLONE_PASSWORD", *arguments],
+                cwd=self.root, env=environment, stdin=subprocess.DEVNULL,
+                capture_output=True, timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, f"Native Rclone {' '.join(arguments)} failed with exit status {result.returncode}.")
+            return result
+
+        def encrypt_local(path, extra=""):
+            path.write_text("[streamhome-drive]\ntype = local\n" + extra, encoding="utf-8")
+            path.chmod(0o600)
+            native(path, "config", "encryption", "set")
+            native(path, "config", "encryption", "check")
+            encrypted = path.read_bytes()
+            self.assertTrue(encrypted.startswith(b"#"), "Native Rclone should exercise its real comment preamble.")
+            self.assertNotIn(b"[streamhome-drive]", encrypted)
+            self.assertEqual(json.loads(native(path, "config", "dump").stdout)["streamhome-drive"]["type"], "local")
+            return encrypted
+
+        encrypted = encrypt_local(self.candidate)
+        receipt = publication.publish_drive_connection(**self.arguments)
+        self.assertEqual(self.config.read_bytes(), encrypted)
+        native(self.config, "config", "encryption", "check")
+        self.assertEqual(publication.get_drive_connection_receipt(self.root, self.job_id, 1), receipt)
+        self.assertEqual(publication.recover_drive_connection(self.root), receipt)
+        saved = json.loads(self.settings.read_bytes())
+        self.assertEqual(saved["storage_engine"], "LOCAL")
+        self.assertEqual(saved["hevc_compression_mode"], "off")
+        self.assertEqual(saved["custom"], {"keep": True})
+
+        rotated = encrypt_local(self.directory / "rotated-candidate", "copy_links = true\n")
+        self.assertNotEqual(rotated, encrypted)
+        self.config.write_bytes(rotated)
+        native(self.config, "config", "encryption", "check")
+        self.assertEqual(json.loads(native(self.config, "config", "dump").stdout)["streamhome-drive"]["copy_links"], "true")
+        self.assertEqual(publication.get_drive_connection_receipt(self.root, self.job_id, 1), receipt)
+        self.assertEqual(publication.recover_drive_connection(self.root), receipt)
+        self.assertEqual(publication.publish_drive_connection(**self.arguments), receipt)
+        self.assertEqual(self.config.read_bytes(), rotated)
+        self.assertEqual(json.loads(self.settings.read_bytes()), saved)
 
     def test_inspection_without_a_connection_does_not_write(self):
         before = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*"))

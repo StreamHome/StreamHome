@@ -18,7 +18,7 @@ from lifecycle.state import qualify_local_filesystem
 
 MAX_FILE_BYTES = 4 * 1024 * 1024
 JOURNAL_NAME = ".admin-drive-publication.json"
-CONFIG_HEADER = b"RCLONE_ENCRYPT_V"
+CONFIG_HEADER = b"RCLONE_ENCRYPT_V0:"
 REMOTE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
 
 
@@ -30,6 +30,18 @@ class DriveConnectionPublicationError(RuntimeError):
 
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _is_encrypted_config(data: bytes | None) -> bool:
+    """Recognize Rclone's encryption marker after leading comments and blanks."""
+    if data is None:
+        return False
+    for line in data.splitlines():
+        line = line.strip()
+        if not line or line.startswith((b"#", b";")):
+            continue
+        return line == CONFIG_HEADER
+    return False
 
 
 def _read(path: Path) -> bytes | None:
@@ -196,7 +208,7 @@ def _receipt(record: dict) -> dict:
 def _verify_committed(record: dict, config: Path, settings: Path) -> dict:
     current = _read(config)
     saved = _read(settings)
-    if not current or not current.startswith(CONFIG_HEADER) or saved is None:
+    if not _is_encrypted_config(current) or saved is None:
         raise DriveConnectionPublicationError()
     payload = _json(saved)
     identity = record["identity"]
@@ -302,7 +314,7 @@ def publish_drive_connection(*, root: Path, job_id: str, generation: int,
         if encrypted_config.parent.resolve() != directory.resolve() or encrypted_config.name in {config.name, JOURNAL_NAME}:
             raise DriveConnectionPublicationError("drive_publication_invalid")
         encrypted = _read(encrypted_config)
-        if not encrypted or not encrypted.startswith(CONFIG_HEADER):
+        if not _is_encrypted_config(encrypted):
             raise DriveConnectionPublicationError("drive_encryption_required")
         original = _read(settings)
         payload = _json(original) if original is not None else {}
