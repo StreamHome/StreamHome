@@ -1,5 +1,5 @@
 import { renderHook } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdminSection, AppView } from "./queryState";
 import { useViewScrollToTop } from "./useViewScrollToTop";
 
@@ -14,6 +14,29 @@ describe("view scroll restoration", () => {
     root.scrollTop = 120;
     root.scrollLeft = 30;
     document.body.appendChild(root);
+  });
+
+  afterEach(() => { document.getElementById("root")?.remove(); });
+
+  it("resets only the active catalog panel on a view change and preserves same-view and rail positions", () => {
+    const root = document.getElementById("root")!;
+    root.innerHTML = '<div class="catalog-layout" data-catalog-present="false"><main data-catalog-scroll></main></div><div class="catalog-layout" data-catalog-present="true"><main data-catalog-scroll><div class="rail"></div></main></div>';
+    const active = root.querySelector<HTMLElement>('[data-catalog-present="true"] > main')!;
+    const retiring = root.querySelector<HTMLElement>('[data-catalog-present="false"] > main')!;
+    const rail = root.querySelector<HTMLElement>(".rail")!;
+    active.scrollTop = 540;
+    retiring.scrollTop = 850;
+    rail.scrollLeft = 320;
+    const { rerender } = renderHook(({ view }: { view: AppView }) => useViewScrollToTop(view), { initialProps: { view: "home" as AppView } });
+    expect(active.scrollTop).toBe(0);
+    expect(retiring.scrollTop).toBe(850);
+    expect(rail.scrollLeft).toBe(320);
+    active.scrollTop = 700;
+    rerender({ view: "home" });
+    expect(active.scrollTop).toBe(700);
+    rerender({ view: "movies" });
+    expect(active.scrollTop).toBe(0);
+    expect(retiring.scrollTop).toBe(850);
   });
 
   it("scrolls for a changed view but not a rerender of the same view", () => {

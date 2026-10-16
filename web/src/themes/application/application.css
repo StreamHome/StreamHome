@@ -57,10 +57,6 @@
 .theme-app:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) :is(.theme-search,.search-page-form):focus-within { outline: 2px solid #fff; outline-offset: 3px; }
 .theme-app:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) :is(.theme-search,.search-page-form) button:focus-visible { outline: 2px solid #fff; outline-offset: -3px; }
 .mobile-app-nav { display: none; }
-/* Theme inheritance without a layout box, page decoration or animation ancestor. */
-.theme-app.mobile-navigation-layer { display: contents; }
-.theme-app.mobile-navigation-layer::before,.theme-app.mobile-navigation-layer::after { content: none; }
-body:has([aria-modal="true"]) .mobile-navigation-layer { visibility: hidden; }
 
 /* Ember / Obsidian Frost */
 .theme-nav--ember { inset: 0 0 auto; min-height: 72px; display: grid; grid-template-columns: 220px 1fr auto; align-items: stretch; padding: 0 42px; border-bottom: 1px solid rgba(255,95,31,.22); background: rgba(18,8,5,.78); backdrop-filter: blur(20px); box-shadow: 0 0 28px rgba(255,95,31,.08); font-family: var(--font-mono); }
@@ -1198,8 +1194,6 @@ body:has([aria-modal="true"]) .mobile-navigation-layer { visibility: hidden; }
 }
 
 @media (max-width: 760px) {
-  /* Preserve native root scrollbars; forced widths misplace fixed chrome in Firefox Android. */
-  :is(html,body):has(.mobile-navigation-layer:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema))::-webkit-scrollbar { width: auto; height: auto; }
   .brand-logo--login { gap: 12px; }
   .brand-logo--login .brand-logo__image { width: 64px; height: 64px; flex-basis: 64px; }
   .brand-logo--profiles .brand-logo__image { width: 58px; height: 58px; flex-basis: 58px; }
@@ -1211,15 +1205,6 @@ body:has([aria-modal="true"]) .mobile-navigation-layer { visibility: hidden; }
   .mobile-navigation-icon { width: 22px; height: 22px; transition: transform .14s cubic-bezier(.2,0,0,1),opacity .14s linear; }
   .mobile-app-nav button[data-active="true"] .mobile-navigation-icon { transform: translateY(-1px) scale(1.03); }
   .mobile-app-nav button:active .mobile-navigation-icon { transform: scale(.88); }
-  .theme-app--ember .mobile-app-nav { border-radius: 2px; }
-  .theme-app--ember .mobile-app-nav button[data-active="true"] { background: rgba(255,95,31,.13); color: #ff9a73; }
-  .theme-app--ember .mobile-app-nav button[data-active="true"]::after { content: ""; position: absolute; inset: 0 18% auto; height: 2px; background: #ff5f1f; box-shadow: 0 0 10px rgba(255,95,31,.55); }
-  .theme-app--aurora .mobile-app-nav { border-radius: 22px; padding: 3px; }
-  .theme-app--aurora .mobile-app-nav button { border: 0; border-radius: 18px; }
-  .theme-app--aurora .mobile-app-nav button[data-active="true"] { background: rgba(255,255,255,.12); color: #fff; }
-  .theme-app--cinema .mobile-app-nav { border-radius: 4px; }
-  .theme-app--cinema .mobile-app-nav button[data-active="true"] { background: rgba(229,9,20,.13); color: #fff; }
-  .theme-app--cinema .mobile-app-nav button[data-active="true"]::after { content: ""; position: absolute; inset: auto 20% 0; height: 2px; background: #e50914; }
   .theme-app--gemini .mobile-app-nav { border-radius: 16px; padding: 3px; }
   .theme-app--gemini .mobile-app-nav button { border: 0; border-radius: 12px; }
   .theme-app--gemini .mobile-app-nav button[data-active="true"] { background: rgba(66,133,244,.18); color: #8ab4f8; }

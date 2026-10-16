@@ -1,6 +1,8 @@
 import React, { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, MotionConfig, motion, type Variants } from "framer-motion";
 import type { ThemeId } from "../types/theme";
+import { resetApplicationScroll } from "../navigation/applicationScroll";
+export { resetApplicationScroll } from "../navigation/applicationScroll";
 
 export const MOTION_TIMINGS = {
   instant: 0.07,
@@ -145,15 +147,6 @@ export function MotionProvider({ children }: { children: React.ReactNode }) {
 
 export function useAppMotion(): MotionContextValue {
   return useContext(MotionContext);
-}
-
-export function resetApplicationScroll(): void {
-  const root = document.getElementById("root");
-  if (root) {
-    root.scrollTop = 0;
-    root.scrollLeft = 0;
-  }
-  window.scrollTo({ top: 0, left: 0, behavior: "auto" });
 }
 
 const VIEW_ORDER = ["home", "movies", "series", "watchlist", "downloads", "search", "details", "watch", "admin"];

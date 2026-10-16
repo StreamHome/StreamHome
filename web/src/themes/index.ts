@@ -5,3 +5,4 @@ import "./gemini/gemini.css";
 import "./application/application.css";
 import "./ember/ember-application.css";
 import "./application/interactions.css";
+import "./application/catalog-layout.css";

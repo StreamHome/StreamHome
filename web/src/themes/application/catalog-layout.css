@@ -1,0 +1,49 @@
+.catalog-dock-row { display: none; }
+
+/* Match the phone-tested layout; short touch landscapes keep the same dock. */
+@media (max-width: 760px), (max-width: 1100px) and (max-height: 500px) and (pointer: coarse) {
+  :is(html,body,#root):has(.catalog-layout[data-catalog-present="true"]) { height: 100%; min-height: 0; overflow: hidden; }
+  :is(html,body):has(.catalog-layout[data-catalog-present="true"])::-webkit-scrollbar,
+  .catalog-layout > [data-catalog-scroll]::-webkit-scrollbar { width: auto; height: auto; }
+  .application-motion-surface:has(.catalog-layout) { position: absolute; inset: 0; min-height: 0; }
+  .theme-app.catalog-layout { height: 100vh; height: 100dvh; min-height: 0; display: grid; grid-template-rows: auto minmax(0,1fr) auto; overflow: hidden; }
+  .theme-app.catalog-layout > .theme-main { grid-row: 2; min-width: 0; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior-y: contain; padding: 0; scroll-padding-block: 16px; }
+  .theme-app.catalog-layout > .theme-main.ember-main { padding: 0; }
+  .catalog-layout > .theme-nav { grid-row: 1; position: relative; inset: auto; height: auto; min-height: 64px; padding: max(6px,env(safe-area-inset-top)) 16px 6px; }
+  .theme-app.catalog-layout > .theme-nav--ember,
+  .catalog-layout > .theme-nav--cinema { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 12px; }
+  .catalog-layout > .theme-nav--ember .theme-brand { border: 0; }
+  .catalog-layout > .theme-nav--cinema { background-color: #141414; }
+  .catalog-layout > .theme-nav--cinema .brand-logo__wordmark { font-size: clamp(16px,5vw,24px); }
+  .catalog-layout > .theme-nav--aurora { padding-inline: 8px; background: var(--bg-body); }
+  .catalog-layout > .theme-nav--aurora .aurora-pill { width: 100%; min-height: 48px; justify-content: space-between; gap: 10px; padding: 4px 12px; }
+  .catalog-layout > .theme-nav nav,
+  .catalog-layout > .theme-nav .theme-search,
+  .catalog-layout > .theme-nav .nav-admin,
+  .catalog-layout > .theme-nav .theme-nav__tools > button:not(.theme-profile-control) { display: none; }
+  .catalog-layout > .theme-nav .theme-nav__tools { display: flex; }
+  .catalog-layout > .theme-nav .theme-profile-control { min-width: 44px; min-height: 44px; justify-content: center; }
+  .catalog-layout > .theme-nav .theme-profile-control b { display: none; }
+  .catalog-layout > .theme-nav .theme-profile-menu__panel { max-height: max(44px,calc(100dvh - 168px - env(safe-area-inset-bottom))); }
+  .catalog-layout > .catalog-dock-row { grid-row: 3; position: static; z-index: 65; display: block; min-width: 0; padding: 7px 4px max(10px,env(safe-area-inset-bottom)); border-top: 1px solid var(--glass-border); background: var(--bg-surface-container-low,var(--bg-body)); }
+  .catalog-dock { display: grid; grid-template-columns: repeat(auto-fit,minmax(44px,1fr)); }
+  .catalog-dock button { position: relative; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 6px; min-width: 44px; min-height: 56px; padding: 6px 1px; border: 0; border-right: 1px solid var(--glass-border); border-radius: 0; background: transparent; color: var(--text-secondary); font-family: system-ui,sans-serif; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+  .catalog-dock button:last-child { border-right: 0; }
+  .catalog-dock button[aria-current="page"] { background: var(--accent-container); color: var(--text-primary); }
+  .catalog-dock button[aria-current="page"]::before { position: absolute; content: ""; inset: 0 20% auto; height: 2px; background: var(--accent-primary); }
+  .catalog-dock button:active { background: color-mix(in srgb,var(--accent-primary) 20%,transparent); }
+  .catalog-dock button:focus-visible { outline-offset: -3px; }
+  .catalog-dock-icon { flex-shrink: 0; width: 22px; height: 22px; }
+  .catalog-dock button > span { max-width: 100%; font-size: 9px; line-height: 1.1; white-space: nowrap; }
+  .theme-app--ember .catalog-dock-row { border-color: #7e462b; background: #24120c; }
+  .theme-app--ember .catalog-dock button { border-color: #63372066; color: #d4b4a1; }
+  .theme-app--ember .catalog-dock button[aria-current="page"] { color: #ffad86; background: #ff70351c; }
+  .theme-app--ember .catalog-dock button[aria-current="page"]::before { background: #ff8c55; }
+  .theme-app--aurora .catalog-dock-row { background: #141119; }
+  .theme-app--aurora .catalog-dock button { border: 0; border-radius: 8px; }
+  .theme-app--aurora .catalog-dock button[aria-current="page"] { color: #fff; background: #ffffff14; }
+  .theme-app--cinema .catalog-dock-row { background: #181818; }
+  .theme-app--cinema .catalog-dock button[aria-current="page"] { color: #fff; background: #e5091421; }
+  body:has([aria-modal="true"]) .catalog-layout > [data-catalog-scroll] { overflow-y: hidden; }
+  body:has([aria-modal="true"]) .catalog-layout > .catalog-dock-row { visibility: hidden; }
+}
