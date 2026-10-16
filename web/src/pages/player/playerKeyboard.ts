@@ -8,6 +8,7 @@ export function playerControlOwnsKey(event: KeyboardEvent): boolean {
   if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return true;
   const target = event.target;
   if (!(target instanceof Element)) return false;
+  if (target.closest("[data-player-settings-dialog]")) return true;
   if (target.closest("textarea, select, a, [role='textbox']")) return true;
   const editable = target.closest<HTMLElement>("[contenteditable]");
   if (editable && editable.getAttribute("contenteditable") !== "false") return true;

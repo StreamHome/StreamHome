@@ -3377,6 +3377,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (containerRef.current?.querySelector("[data-player-settings-dialog][aria-modal='true']")) return;
       if (event.key === "Tab" && !showControlsRef.current) {
         event.preventDefault();
         revealControls();
@@ -3429,6 +3430,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       revealControls();
     };
     const handleKeyUp = (event: KeyboardEvent) => {
+      if (containerRef.current?.querySelector("[data-player-settings-dialog][aria-modal='true']")) return;
       if (playerControlOwnsKey(event) || !playerKeyboardShortcut(event)) return;
       suppressPlayerShortcutEvent(event);
     };
@@ -4564,7 +4566,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                 {asset.subtitle && <p>{asset.subtitle}</p>}
               </div>
               <PlayerSettings playbackRate={preferences.playbackRate} onRateChange={(value) => setPreferences((current) => ({ ...current, playbackRate: value }))}
-                captions={hasSubtitles && preferences.subtitleTrackId !== "off"} captionScale={preferences.captionScale}
+                captions={hasSubtitles} captionScale={preferences.captionScale} modal
                 onCaptionScaleChange={(value) => setPreferences((current) => ({ ...current, captionScale: value }))}
                 subtitleOffset={preferences.subtitleOffset} onSubtitleOffsetChange={(value) => setPreferences((current) => ({ ...current, subtitleOffset: value }))}
                 onOpenChange={handleControlMenuOpenChange} compact className="mobile-player-topbar__settings" />
@@ -4694,7 +4696,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             </div>
             <PlayerSettings compact className="player-topbar__settings"
               playbackRate={preferences.playbackRate} onRateChange={(value) => setPreferences((current) => ({ ...current, playbackRate: value }))}
-              captions={hasSubtitles && preferences.subtitleTrackId !== "off"} captionScale={preferences.captionScale}
+              captions={hasSubtitles} captionScale={preferences.captionScale}
               onCaptionScaleChange={(value) => setPreferences((current) => ({ ...current, captionScale: value }))}
               subtitleOffset={preferences.subtitleOffset} onSubtitleOffsetChange={(value) => setPreferences((current) => ({ ...current, subtitleOffset: value }))}
               onOpenChange={handleControlMenuOpenChange} />

@@ -12,6 +12,15 @@ function keyEvent(target: Element, key: string, init: KeyboardEventInit = {}) {
 }
 
 describe("player keyboard ownership", () => {
+  it("leaves every key with Settings while a group is being edited", () => {
+    const dialog = document.createElement("div");
+    dialog.dataset.playerSettingsDialog = "true";
+    const range = dialog.appendChild(document.createElement("input"));
+    range.type = "range";
+    for (const key of [...navigationKeys, ...playbackKeys, "Enter", "Escape", "Tab"]) {
+      expect(playerControlOwnsKey(keyEvent(range, key))).toBe(true);
+    }
+  });
   it.each(["input", "aria slider"])("keeps native %s navigation while allowing unrelated playback keys", (kind) => {
     const target = document.createElement(kind === "input" ? "input" : "div");
     if (target instanceof HTMLInputElement) target.type = "range";

@@ -8,6 +8,7 @@ export type PlayerIconName =
   | "captions"
   | "check"
   | "chevron"
+  | "close"
   | "exit"
   | "forward"
   | "fullscreen"
@@ -66,6 +67,7 @@ export function PlayerIcon({ name, className = "", prominent = false }: PlayerIc
   if (name === "fullscreen-exit") return <svg {...common}><path d="M4 8h4V4M20 8h-4V4M4 16h4v4M20 16h-4v4" /></svg>;
   if (name === "exit") return <svg {...common}><path d="M14 5h5v14h-5M10 8l-4 4 4 4M6 12h9" /></svg>;
   if (name === "back") return <svg {...common}><path d="m10 5-7 7 7 7M3 12h18" /></svg>;
+  if (name === "close") return <svg {...common}><path d="m6 6 12 12M18 6 6 18" /></svg>;
   if (name === "chevron") return <svg {...common}><path d="m7 9 5 5 5-5" /></svg>;
   return <svg {...common}><path d="m7 12 3 3 7-7" /></svg>;
 }
@@ -123,7 +125,7 @@ export function PlayerMenuProvider({ children, onOpenChange }: { children: React
   return <MenuContext.Provider value={value}>{children}</MenuContext.Provider>;
 }
 
-function usePlayerPopup(onOpenChange?: (open: boolean) => void, preferredWidth?: number, alignment: "end" | "center" = "end") {
+function usePlayerPopup(onOpenChange?: (open: boolean) => void, preferredWidth?: number, alignment: "end" | "center" = "end", modal = false) {
   const id = useId();
   const owner = useContext(MenuContext);
   const [localOpen, setLocalOpen] = useState(false);
@@ -146,6 +148,7 @@ function usePlayerPopup(onOpenChange?: (open: boolean) => void, preferredWidth?:
     const anchor = rootRef.current;
     const player = anchor?.closest<HTMLElement>("[data-player-root='true']") ?? null;
     setHost(player ?? document.body);
+    if (modal) return;
     const position = () => {
       const popup = popupRef.current;
       if (!anchor || !popup) return;
@@ -176,16 +179,16 @@ function usePlayerPopup(onOpenChange?: (open: boolean) => void, preferredWidth?:
     observer?.observe(anchor!);
     if (popupRef.current) observer?.observe(popupRef.current);
     return () => { window.removeEventListener("resize", position); observer?.disconnect(); };
-  }, [alignment, host, open, preferredWidth]);
+  }, [alignment, host, modal, open, preferredWidth]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || modal) return;
     const outside = (event: PointerEvent) => {
       if (!rootRef.current?.contains(event.target as Node) && !popupRef.current?.contains(event.target as Node)) updateOpen(false);
     };
     document.addEventListener("pointerdown", outside);
     return () => document.removeEventListener("pointerdown", outside);
-  }, [open, updateOpen]);
+  }, [modal, open, updateOpen]);
 
   const dismiss = () => { updateOpen(false); triggerRef.current?.focus(); };
   const onBlur = (event: React.FocusEvent) => {
@@ -193,7 +196,7 @@ function usePlayerPopup(onOpenChange?: (open: boolean) => void, preferredWidth?:
     if (!rootRef.current?.contains(target) && !popupRef.current?.contains(target)) updateOpen(false);
   };
   const render = (content: React.ReactElement) => host ? createPortal(content, host) : content;
-  return { id, open, updateOpen, rootRef, triggerRef, popupRef, style, render, dismiss, onBlur };
+  return { id, open, updateOpen, rootRef, triggerRef, popupRef, host, style, render, dismiss, onBlur };
 }
 
 export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOpenChange }: {
@@ -373,37 +376,128 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
   </div>;
 }
 
-export function PlayerSettings({ playbackRate, onRateChange, captions, captionScale, onCaptionScaleChange, subtitleOffset, onSubtitleOffsetChange, onOpenChange, compact = false, className = "" }: {
+export function PlayerSettings({ playbackRate, onRateChange, captions, captionScale, onCaptionScaleChange, subtitleOffset, onSubtitleOffsetChange, onOpenChange, compact = false, modal = false, className = "" }: {
   playbackRate: number; onRateChange: (value: number) => void; captions: boolean;
   captionScale: number; onCaptionScaleChange: (value: number) => void;
   subtitleOffset: number; onSubtitleOffsetChange: (value: number) => void;
   onOpenChange?: (open: boolean) => void;
   compact?: boolean;
+  modal?: boolean;
   className?: string;
 }) {
-  const popup = usePlayerPopup(onOpenChange);
-  const completePointerChoice = (event: React.MouseEvent<HTMLButtonElement>) => {
-    if (event.detail === 0) return;
-    restorePlayerPointerClickFocus(event);
-    popup.updateOpen(false);
-  };
-  const completePointerRange = (event: React.PointerEvent<HTMLInputElement>) => {
-    restorePlayerPointerFocus(event.currentTarget);
-    popup.updateOpen(false);
-  };
-  return <div className={`player-control-menu ${className}`.trim()} ref={popup.rootRef} data-open={popup.open}>
-    <button ref={popup.triggerRef} type="button" className={compact ? "player-control-button player-control-menu__trigger" : "player-control-menu__trigger"} aria-label="Player settings" aria-haspopup="dialog" aria-expanded={popup.open} aria-controls={popup.id}
-      onClick={(event) => { popup.updateOpen(!popup.open); if (popup.open) restorePlayerPointerClickFocus(event); }}
-      onKeyDown={(event) => { if (event.key === "ArrowDown") { event.preventDefault(); popup.updateOpen(true); window.requestAnimationFrame(() => popup.popupRef.current?.querySelector<HTMLButtonElement>("button")?.focus()); } else if (event.key === "Escape" && popup.open) { event.preventDefault(); popup.dismiss(); } }}>
+  const popup = usePlayerPopup(onOpenChange, 384, "end", modal);
+  const [group, setGroup] = useState<"root" | "subtitles" | "speed">("root");
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const pointerDismissRef = useRef(false);
+  const { open, host, popupRef, triggerRef, updateOpen } = popup;
+  const dismiss = useCallback((pointer = false) => {
+    pointerDismissRef.current = pointer;
+    updateOpen(false);
+    if (!modal) {
+      if (pointer) restorePlayerPointerFocus(popupRef.current?.contains(document.activeElement) ? popupRef.current : triggerRef.current);
+      else triggerRef.current?.focus({ preventScroll: true });
+    }
+  }, [modal, popupRef, triggerRef, updateOpen]);
+
+  useLayoutEffect(() => {
+    if (!open || (group === "subtitles" && !captions)) { setGroup("root"); return; }
+    popupRef.current?.querySelector<HTMLElement>("[data-settings-initial]")?.focus({ preventScroll: true });
+  }, [captions, group, host, open, popupRef]);
+
+  useLayoutEffect(() => {
+    const overlay = overlayRef.current;
+    const dialog = popupRef.current;
+    if (!open || !modal || !host || overlay?.parentElement !== host || !dialog) return;
+    const player = triggerRef.current?.closest<HTMLElement>("[data-player-root='true']");
+    // Keep the portal interactive inside native fullscreen and the rotated player.
+    const siblings: Array<{ element: HTMLElement; inert: boolean }> = [];
+    for (let child: HTMLElement | null = overlay; child?.parentElement; child = child.parentElement) {
+      for (const sibling of Array.from(child.parentElement.children)) {
+        if (sibling !== child && sibling instanceof HTMLElement) {
+          siblings.push({ element: sibling, inert: sibling.hasAttribute("inert") });
+          sibling.setAttribute("inert", "");
+        }
+      }
+      if (child.parentElement === document.body) break;
+    }
+    const overflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const focusFirst = () => (dialog.querySelector<HTMLElement>("[data-settings-initial]") ?? dialog.querySelector<HTMLElement>("button, input"))?.focus({ preventScroll: true });
+    const containFocus = (event: FocusEvent) => {
+      if (!dialog.contains(event.target as Node)) focusFirst();
+    };
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault(); event.stopPropagation(); dismiss();
+      } else if (event.key === "Tab") {
+        const controls = Array.from(dialog.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), [tabindex='0']"));
+        const first = controls[0];
+        const last = controls[controls.length - 1];
+        if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+          event.preventDefault(); last?.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+          event.preventDefault(); first?.focus();
+        }
+      }
+    };
+    document.addEventListener("focusin", containFocus);
+    document.addEventListener("keydown", keydown, true);
+    return () => {
+      document.removeEventListener("focusin", containFocus);
+      document.removeEventListener("keydown", keydown, true);
+      for (const { element, inert } of siblings) element.toggleAttribute("inert", inert);
+      document.body.style.overflow = overflow;
+      if (pointerDismissRef.current) (player ?? triggerRef.current)?.focus({ preventScroll: true });
+      else triggerRef.current?.focus({ preventScroll: true });
+      pointerDismissRef.current = false;
+    };
+  }, [dismiss, host, modal, open, popupRef, triggerRef]);
+
+  const title = group === "subtitles" ? "Subtitles" : group === "speed" ? "Playback speed" : "Settings";
+  const panel = <div ref={popupRef} id={popup.id} role="dialog" aria-label="Player settings" aria-modal={modal || undefined}
+    data-player-settings-dialog="true" className={`player-settings-panel${modal ? " player-settings-panel--modal" : ""}`}
+    style={modal ? undefined : { ...popup.style, overflowY: "hidden" }}
+    onBlur={modal ? undefined : popup.onBlur}
+    onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}
+    onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); dismiss(); } }}>
+    <header className="player-settings-header">
+      {group !== "root" ? <button type="button" aria-label="Back to settings" className="player-settings-header__button" data-settings-initial
+        onClick={() => setGroup("root")}><PlayerIcon name="back" /></button> : <span aria-hidden="true" />}
+      <h2>{title}</h2>
+      <button type="button" aria-label="Close settings" className="player-settings-header__button" onClick={(event) => dismiss(event.detail > 0)}><PlayerIcon name="close" /></button>
+    </header>
+    <div className="player-settings-body" key={group}>
+      {group === "root" && <div className="player-settings-groups">
+        {captions && <button type="button" className="player-settings-group" data-settings-initial onClick={() => setGroup("subtitles")}>
+          <PlayerIcon name="captions" /><span>Subtitles</span><PlayerIcon name="chevron" className="player-settings-group__chevron" />
+        </button>}
+        <button type="button" className="player-settings-group" data-settings-initial={!captions || undefined} onClick={() => setGroup("speed")}>
+          <PlayerIcon name="speed" /><span>Playback speed</span><span className="player-settings-group__value">{playbackRate}×</span><PlayerIcon name="chevron" className="player-settings-group__chevron" />
+        </button>
+      </div>}
+      {group === "speed" && <div className="player-settings-options" role="group" aria-label="Playback speed">{[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) =>
+        <button key={rate} type="button" aria-pressed={rate === playbackRate} onClick={() => onRateChange(rate)}>{rate}×{rate === playbackRate && <PlayerIcon name="check" />}</button>
+      )}</div>}
+      {group === "subtitles" && captions && <>
+        <fieldset><legend>Caption size</legend><div className="player-settings-options player-settings-options--captions">{[[0.8, "Small"], [1, "Medium"], [1.25, "Large"], [1.5, "Extra large"]].map(([scale, label]) =>
+          <button key={scale} type="button" aria-pressed={Number(scale) === captionScale} onClick={() => onCaptionScaleChange(Number(scale))}>{label}{Number(scale) === captionScale && <PlayerIcon name="check" />}</button>
+        )}</div></fieldset>
+        <label className="player-settings-timing"><span>Subtitle timing</span><output>{subtitleOffset === 0 ? "Synced" : `${Math.abs(subtitleOffset)}s ${subtitleOffset < 0 ? "earlier" : "later"}`}</output>
+          <input aria-label="Subtitle timing" type="range" min={-5} max={5} step={0.25} value={subtitleOffset} onChange={(event) => onSubtitleOffsetChange(Number(event.target.value))} />
+        </label>
+        <button type="button" className="player-settings-reset" disabled={subtitleOffset === 0} onClick={() => onSubtitleOffsetChange(0)}>Reset timing</button>
+      </>}
+    </div>
+  </div>;
+  return <div className={`player-control-menu ${className}`.trim()} ref={popup.rootRef} data-open={open}>
+    <button ref={triggerRef} type="button" className={compact ? "player-control-button player-control-menu__trigger" : "player-control-menu__trigger"} aria-label="Player settings" aria-haspopup="dialog" aria-expanded={open} aria-controls={popup.id}
+      onClick={(event) => { if (open) dismiss(event.detail > 0); else updateOpen(true); }}
+      onKeyDown={(event) => { if (event.key === "ArrowDown") { event.preventDefault(); updateOpen(true); } else if (event.key === "Escape" && open) { event.preventDefault(); dismiss(); } }}>
       <PlayerIcon name="settings" />{!compact && <span>Settings</span>}
     </button>
-    {popup.open && popup.render(<div ref={popup.popupRef} id={popup.id} role="dialog" aria-label="Player settings" className="player-control-menu__list player-settings-panel" style={popup.style} onBlur={popup.onBlur}
-      onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); popup.dismiss(); } }}>
-      <span className="player-control-menu__label">Settings</span>
-      <fieldset><legend>Playback speed</legend><div className="player-settings-options">{[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) => <button key={rate} type="button" aria-pressed={rate === playbackRate} onClick={(event) => { onRateChange(rate); completePointerChoice(event); }}>{rate}×</button>)}</div></fieldset>
-      {captions && <><fieldset><legend>Caption size</legend><div className="player-settings-options">{[[0.8, "Small"], [1, "Medium"], [1.25, "Large"], [1.5, "Extra large"]].map(([scale, label]) => <button key={scale} type="button" aria-pressed={Number(scale) === captionScale} onClick={(event) => { onCaptionScaleChange(Number(scale)); completePointerChoice(event); }}>{label}</button>)}</div></fieldset>
-      <label className="player-settings-timing">Subtitle timing<input aria-label="Subtitle timing" type="range" min={-5} max={5} step={0.25} value={subtitleOffset} onChange={(event) => onSubtitleOffsetChange(Number(event.target.value))} onPointerUp={completePointerRange} onPointerCancel={completePointerRange} /><span>{subtitleOffset === 0 ? "Synced" : `${Math.abs(subtitleOffset)}s ${subtitleOffset < 0 ? "earlier" : "later"}`}</span></label><button type="button" className="player-settings-reset" onClick={(event) => { onSubtitleOffsetChange(0); completePointerChoice(event); }}>Reset timing</button></>}
-    </div>)}
+    {open && popup.render(modal ? <div ref={overlayRef} className="player-settings-overlay"
+      onPointerDown={(event) => { event.stopPropagation(); if (event.target === event.currentTarget) { event.preventDefault(); dismiss(true); } }}
+      onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}>{panel}</div> : panel)}
   </div>;
 }
 

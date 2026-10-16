@@ -283,7 +283,92 @@ describe("player volume control", () => {
   });
 });
 
-describe("player settings pointer completion", () => {
+describe("grouped player settings", () => {
+  function SettingsFixture({ modal = false, captions = true }: { modal?: boolean; captions?: boolean }) {
+    const [rate, setRate] = useState(1);
+    const [scale, setScale] = useState(1);
+    const [offset, setOffset] = useState(0);
+    return <PlayerSettings modal={modal} captions={captions} playbackRate={rate} onRateChange={setRate}
+      captionScale={scale} onCaptionScaleChange={setScale} subtitleOffset={offset} onSubtitleOffsetChange={setOffset} />;
+  }
+
+  it("navigates within one panel, keeps live selections and starts at the group list on reopen", () => {
+    render(<SettingsFixture />);
+    fireEvent.click(screen.getByRole("button", { name: "Player settings" }));
+    const dialog = screen.getByRole("dialog", { name: "Player settings" });
+    expect(dialog.getAttribute("aria-modal")).toBeNull();
+    expect(screen.queryByRole("slider")).toBeNull();
+    pointerClick(screen.getByRole("button", { name: /Playback speed/ }));
+    pointerClick(screen.getByRole("button", { name: "1.5×" }));
+    expect(screen.getByRole("button", { name: "1.5×" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("dialog", { name: "Player settings" })).toBe(dialog);
+    pointerClick(screen.getByRole("button", { name: "Back to settings" }));
+    expect(screen.getByRole("button", { name: /Playback speed/ }).textContent).toContain("1.5×");
+    pointerClick(screen.getByRole("button", { name: "Subtitles" }));
+    pointerClick(screen.getByRole("button", { name: "Large" }));
+    expect(screen.getByRole("button", { name: "Large" }).getAttribute("aria-pressed")).toBe("true");
+    const timing = screen.getByRole("slider", { name: "Subtitle timing" });
+    fireEvent.change(timing, { target: { value: "-0.5" } });
+    expect(screen.getByText("0.5s earlier")).toBeTruthy();
+    pointerClick(screen.getByRole("button", { name: "Reset timing" }));
+    expect((timing as HTMLInputElement).value).toBe("0");
+    expect((screen.getByRole("button", { name: "Reset timing" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.keyDown(timing, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "Player settings" }));
+    expect(screen.getByRole("heading", { name: "Settings" })).toBeTruthy();
+    expect(screen.queryByRole("slider")).toBeNull();
+    expect(screen.getByRole("button", { name: /Playback speed/ }).textContent).toContain("1.5×");
+  });
+
+  it("omits unavailable subtitles without inventing options", () => {
+    render(<SettingsFixture captions={false} />);
+    fireEvent.click(screen.getByRole("button", { name: "Player settings" }));
+    expect(screen.queryByRole("button", { name: "Subtitles" })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: /Playback speed/ }));
+  });
+
+  it("contains mobile focus, blocks the background and restores existing inert state on dismissal", () => {
+    const view = render(<div data-player-root="true" tabIndex={-1}>
+      <button type="button" inert>Already inert</button><button type="button">Background</button>
+      <SettingsFixture modal />
+    </div>);
+    const trigger = screen.getByRole("button", { name: "Player settings" });
+    fireEvent.click(trigger);
+    const dialog = screen.getByRole("dialog", { name: "Player settings" });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(dialog.parentElement?.parentElement).toBe(view.container.firstElementChild);
+    expect(screen.getByRole("button", { name: "Background" }).hasAttribute("inert")).toBe(true);
+    const close = screen.getByRole("button", { name: "Close settings" });
+    const speed = screen.getByRole("button", { name: /Playback speed/ });
+    act(() => speed.focus());
+    fireEvent.keyDown(speed, { key: "Tab" });
+    expect(document.activeElement).toBe(close);
+    fireEvent.keyDown(close, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(speed);
+    act(() => screen.getByRole("button", { name: "Background" }).focus());
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    expect(screen.getByRole("button", { name: "Background" }).hasAttribute("inert")).toBe(false);
+    expect(screen.getByRole("button", { name: "Already inert" }).hasAttribute("inert")).toBe(true);
+    expect(document.body.style.overflow).toBe("");
+  });
+
+  it("dismisses a mobile backdrop without leaking gestures and cleans up on unmount", () => {
+    const surface = vi.fn();
+    const view = render(<div data-player-root="true" tabIndex={-1} onPointerDown={surface}><SettingsFixture modal /></div>);
+    fireEvent.click(screen.getByRole("button", { name: "Player settings" }));
+    fireEvent.pointerDown(view.container.querySelector(".player-settings-overlay")!);
+    expect(surface).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(view.container.firstElementChild);
+    fireEvent.click(screen.getByRole("button", { name: "Player settings" }));
+    view.unmount();
+    expect(document.body.style.overflow).toBe("");
+    expect(view.container.hasAttribute("inert")).toBe(false);
+  });
+
   it.each([700, 180])("opens compact topbar Settings below its anchor within a %ipx player", async (height) => {
     const bounds = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
       if (this.dataset.playerRoot === "true") return new DOMRect(100, 50, 1200, height);
@@ -310,7 +395,7 @@ describe("player settings pointer completion", () => {
       act(() => trigger.focus());
       fireEvent.keyDown(trigger, { key: "ArrowDown" });
       const dialog = screen.getByRole("dialog", { name: "Player settings" });
-      await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "0.5×" })));
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Subtitles" })));
 
       expect(trigger.getAttribute("aria-controls")).toBe(dialog.id);
       expect(trigger.getAttribute("aria-expanded")).toBe("true");
@@ -319,7 +404,7 @@ describe("player settings pointer completion", () => {
       expect(Number.parseFloat(dialog.style.top)).toBe(72);
       expect(Number.parseFloat(dialog.style.maxHeight)).toBe(height - 84);
       expect(Number.parseFloat(dialog.style.top) + Math.min(420, Number.parseFloat(dialog.style.maxHeight))).toBeLessThanOrEqual(height - 12);
-      expect(dialog.style.overflowY).toBe("auto");
+      expect(dialog.style.overflowY).toBe("hidden");
 
       fireEvent.keyDown(dialog, { key: "Escape" });
       expect(screen.queryByRole("dialog", { name: "Player settings" })).toBeNull();
@@ -338,19 +423,24 @@ describe("player settings pointer completion", () => {
     { label: "1.5×", kind: "rate", value: 1.5 },
     { label: "Large", kind: "caption", value: 1.25 },
     { label: "Reset timing", kind: "timing", value: 0 },
-  ])("closes after pointer selection of $label and restores player focus", ({ label, kind, value }) => {
+   ])("keeps the group open after pointer selection of $label", ({ label, kind, value }) => {
     const callbacks = { rate: vi.fn(), caption: vi.fn(), timing: vi.fn() };
     const view = render(<div data-player-root="true" tabIndex={-1}>
-      <PlayerSettings playbackRate={1} onRateChange={callbacks.rate} captions captionScale={1} onCaptionScaleChange={callbacks.caption} subtitleOffset={0} onSubtitleOffsetChange={callbacks.timing} />
+      <PlayerSettings playbackRate={1} onRateChange={callbacks.rate} captions captionScale={1} onCaptionScaleChange={callbacks.caption} subtitleOffset={1} onSubtitleOffsetChange={callbacks.timing} />
     </div>);
     pointerClick(screen.getByRole("button", { name: "Player settings" }));
-    pointerClick(screen.getByRole("button", { name: label }));
+    pointerClick(screen.getByRole("button", { name: kind === "rate" ? /Playback speed/ : "Subtitles" }));
+    const choice = screen.getByRole("button", { name: label });
+    pointerClick(choice);
     expect(callbacks[kind as keyof typeof callbacks]).toHaveBeenCalledWith(value);
+    expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
+    expect(document.activeElement).toBe(choice);
+    pointerClick(screen.getByRole("button", { name: "Close settings" }));
     expect(screen.queryByRole("dialog", { name: "Player settings" })).toBeNull();
     expect(document.activeElement).toBe(view.container.firstElementChild);
   });
 
-  it("keeps keyboard choices focused and restores focus only after timing pointer completion", () => {
+  it("keeps keyboard choices and timing adjustments open until explicitly dismissed", () => {
     const onTimingChange = vi.fn();
     const view = render(<div data-player-root="true" tabIndex={-1}>
       <PlayerSettings playbackRate={1} onRateChange={() => undefined} captions captionScale={1} onCaptionScaleChange={() => undefined} subtitleOffset={0} onSubtitleOffsetChange={onTimingChange} />
@@ -358,12 +448,15 @@ describe("player settings pointer completion", () => {
     const trigger = screen.getByRole("button", { name: "Player settings" });
     act(() => trigger.focus());
     fireEvent.click(trigger, { detail: 0 });
+    fireEvent.click(screen.getByRole("button", { name: /Playback speed/ }));
     const rate = screen.getByRole("button", { name: "1.5×" });
     act(() => rate.focus());
     fireEvent.click(rate, { detail: 0 });
     expect(screen.getByRole("dialog", { name: "Player settings" })).not.toBeNull();
     expect(document.activeElement).toBe(rate);
 
+    fireEvent.click(screen.getByRole("button", { name: "Back to settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Subtitles" }));
     const timing = screen.getByRole("slider", { name: "Subtitle timing" });
     act(() => timing.focus());
     fireEvent.change(timing, { target: { value: "0.25" } });
@@ -373,8 +466,12 @@ describe("player settings pointer completion", () => {
     fireEvent.change(timing, { target: { value: "0.5" } });
     fireEvent.pointerUp(timing, { pointerType: "mouse", pointerId: 1 });
     expect(onTimingChange).toHaveBeenLastCalledWith(0.5);
+    expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
+    expect(document.activeElement).toBe(timing);
+    fireEvent.keyDown(timing, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Player settings" })).toBeNull();
-    expect(document.activeElement).toBe(view.container.firstElementChild);
+    expect(document.activeElement).toBe(trigger);
+    view.unmount();
   });
 });
 

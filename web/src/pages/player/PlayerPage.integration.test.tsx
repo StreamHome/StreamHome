@@ -911,7 +911,7 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
-  it.each(["Playback position", "Volume", "Subtitle timing"])("keeps native %s navigation while routing unrelated playback shortcuts", async (label) => {
+  it.each(["Playback position", "Volume"])("keeps native %s navigation while routing unrelated playback shortcuts", async (label) => {
     localStorage.setItem(playerPreferencesKey, JSON.stringify({ subtitleTrackId: "subtitle-en" }));
     const captionPlayback: ResolvedPlayback = {
       ...playback,
@@ -922,7 +922,6 @@ describe("mounted player lifecycle", () => {
     const video = view.container.querySelector("video") as HTMLVideoElement;
     showPlayingVideo(video);
     if (label === "Volume") act(() => screen.getByRole("button", { name: "Volume" }).focus());
-    if (label === "Subtitle timing") pointerClick(screen.getByRole("button", { name: "Player settings" }));
     const slider = screen.getByRole("slider", { name: label });
     act(() => slider.focus());
     const volume = video.volume;
@@ -1260,7 +1259,10 @@ describe("mounted player lifecycle", () => {
       expect(settings.textContent).toBe("");
 
       pointerClick(settings);
+      pointerClick(screen.getByRole("button", { name: /Playback speed/ }));
       pointerClick(screen.getByRole("button", { name: "1.5×" }));
+      expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
+      pointerClick(screen.getByRole("button", { name: "Close settings" }));
       expect(screen.queryByRole("dialog", { name: "Player settings" })).toBeNull();
       expect(document.activeElement).toBe(root);
       expect(root.dataset.playerPhase).toBe("paused");
@@ -1458,7 +1460,7 @@ describe("mounted player lifecycle", () => {
       const time = player.video.currentTime;
       pointerClick(screen.getByRole("button", { name: "Player settings" }));
       expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
-      mobileTap(right);
+      mobileTap(player.view.container.querySelector<HTMLElement>(".player-settings-overlay")!);
       await act(async () => { await vi.advanceTimersByTimeAsync(400); });
       expect(screen.queryByRole("dialog", { name: "Player settings" })).toBeNull();
       expect(player.root.dataset.controlsVisible).toBe("true");
@@ -1503,7 +1505,80 @@ describe("mounted player lifecycle", () => {
     }
   });
 
-  it("retains playing chrome for focused or open topbar Settings and releases it after pointer completion", async () => {
+  it.each(["ember", "aurora", "cinema"] as const)("keeps paused phone %s transport intact while modal settings own keys and touch", async (theme) => {
+    const previousTheme = useThemeStore.getState().activeTheme;
+    useThemeStore.setState({ activeTheme: theme });
+    const player = await mountPhonePlayer();
+    try {
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      fireEvent.pause(player.video);
+      const source = player.video.getAttribute("src");
+      const time = player.video.currentTime;
+      const loads = videoCallCount("load", player.video);
+      const plays = videoCallCount("play", player.video);
+      const pauses = videoCallCount("pause", player.video);
+      pointerClick(screen.getByRole("button", { name: "Player settings" }));
+      const dialog = screen.getByRole("dialog", { name: "Player settings" });
+      expect(dialog.getAttribute("aria-modal")).toBe("true");
+      pointerClick(screen.getByRole("button", { name: /Playback speed/ }));
+      pointerClick(screen.getByRole("button", { name: "1.25×" }));
+      for (const key of ["k", "m", "f", "p", "ArrowRight", " "]) pressFocusedKey(key);
+      // Even an event sent to the obscured surface cannot reach playback shortcuts.
+      fireEvent.keyDown(player.root, { key: "k" });
+      fireEvent.keyUp(player.root, { key: "k" });
+      mobileTap(player.view.container.querySelector<HTMLElement>(".mobile-player-gesture-zone--right")!);
+      await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+      expect(screen.getByRole("dialog", { name: "Player settings" })).toBe(dialog);
+      expect(player.video.playbackRate).toBe(1.25);
+      expect(player.video.currentTime).toBe(time);
+      expect(player.video.paused).toBe(true);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      pointerClick(screen.getByRole("button", { name: "Close settings" }));
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement).toBe(player.root);
+      expect(player.view.container.querySelector("video")).toBe(player.video);
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+      expect(videoCallCount("pause", player.video)).toBe(pauses);
+      expect(JSON.parse(localStorage.getItem(playerPreferencesKey)!).playbackRate).toBe(1.25);
+    } finally { player.close(); useThemeStore.setState({ activeTheme: previousTheme }); }
+  });
+
+  it("allows caption tuning while subtitles stay off and retains native range keys without playback shortcuts", async () => {
+    const captionPlayback: ResolvedPlayback = {
+      ...playback,
+      runResponse: { ...playback.runResponse, subtitles: [{ id: "subtitle-en", language: "en", label: "English" }] },
+    };
+    const view = render(<MemoryRouter><PlayerPage visualFixture={captionPlayback} /></MemoryRouter>);
+    try {
+      await act(async () => { await import("hls.js"); });
+      const video = view.container.querySelector("video") as HTMLVideoElement;
+      showPlayingVideo(video);
+      const pauses = videoCallCount("pause", video);
+      pointerClick(screen.getByRole("button", { name: "Player settings" }));
+      pointerClick(screen.getByRole("button", { name: "Subtitles" }));
+      pointerClick(screen.getByRole("button", { name: "Large" }));
+      const timing = screen.getByRole("slider", { name: "Subtitle timing" });
+      act(() => timing.focus());
+      fireEvent.change(timing, { target: { value: "0.5" } });
+      for (const key of ["ArrowLeft", "ArrowRight", "Home", "End"]) {
+        expect(pressFocusedKey(key).down.defaultPrevented).toBe(false);
+      }
+      for (const key of ["k", "m", " ", "f"]) pressFocusedKey(key);
+      expect(video.currentTime).toBe(30);
+      expect(video.muted).toBe(false);
+      expect(videoCallCount("pause", video)).toBe(pauses);
+      expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
+      const saved = JSON.parse(localStorage.getItem(playerPreferencesKey)!);
+      expect(saved.subtitleTrackId).toBe("off");
+      expect(saved.captionScale).toBe(1.25);
+      expect(saved.subtitleOffset).toBe(0.5);
+    } finally { view.unmount(); }
+  });
+
+  it("retains playing chrome while Settings is open and releases it after pointer dismissal", async () => {
     const settingsPlayback = {
       ...playback,
       runResponse: { ...playback.runResponse, ticketExpiresAt: Math.floor(Date.now() / 1_000) + 3_600 },
@@ -1539,12 +1614,16 @@ describe("mounted player lifecycle", () => {
 
       pressFocusedKey("ArrowDown");
       act(() => vi.advanceTimersByTime(20));
-      expect(document.activeElement).toBe(screen.getByRole("button", { name: "0.5×" }));
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: /Playback speed/ }));
+      pointerClick(screen.getByRole("button", { name: /Playback speed/ }));
       advancePlaying();
       expect(root.dataset.controlsVisible).toBe("true");
       expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
 
       pointerClick(screen.getByRole("button", { name: "1.5×" }));
+      advancePlaying();
+      expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
+      pointerClick(screen.getByRole("button", { name: "Close settings" }));
       expect(screen.queryByRole("dialog", { name: "Player settings" })).toBeNull();
       expect(document.activeElement).toBe(root);
       advancePlaying();

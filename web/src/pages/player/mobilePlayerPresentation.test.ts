@@ -24,7 +24,7 @@ describe("dedicated mobile player presentation", () => {
     expect(mobilePresentation).not.toContain('className="player-volume"');
     expect(mobilePresentation).not.toContain('icon={muted ? "mute" : "volume"}');
     expect((playerPage.match(/\{hasSubtitles && \(/g) ?? [])).toHaveLength(2);
-    expect((playerPage.match(/captions=\{hasSubtitles && preferences\.subtitleTrackId !== "off"\}/g) ?? [])).toHaveLength(2);
+    expect((playerPage.match(/captions=\{hasSubtitles\}/g) ?? [])).toHaveLength(2);
   });
 
   it("defines automatic locked-portrait landscape fallback, safe areas, gesture feedback, and touch tooltip suppression", () => {
