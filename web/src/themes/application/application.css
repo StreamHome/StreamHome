@@ -1199,6 +1199,15 @@
   .brand-logo--profiles .brand-logo__image { width: 58px; height: 58px; flex-basis: 58px; }
   .brand-logo--admin .brand-logo__image { width: 40px; height: 40px; flex-basis: 40px; }
   .mobile-app-nav { position: fixed; z-index: 65; inset: auto 4px max(10px,env(safe-area-inset-bottom)); display: grid; grid-template-columns: repeat(auto-fit,minmax(44px,1fr)); overflow: hidden; border: 1px solid var(--glass-border); border-radius: var(--radius); background: color-mix(in srgb,var(--bg-body) 88%,transparent); backdrop-filter: blur(20px); box-shadow: 0 16px 55px rgba(0,0,0,.45); }
+  @supports (height: 100dvh) {
+    /* Anchor to the dynamic viewport instead of bottom-fixed toolbar adjustments.
+       Self translation also keeps wrapped navigation rows above the safe inset. */
+    :is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .mobile-app-nav {
+      top: calc(100dvh - max(10px,env(safe-area-inset-bottom)));
+      bottom: auto;
+      transform: translateY(-100%);
+    }
+  }
   .mobile-app-nav button { position: relative; min-width: 44px; min-height: 52px; display: grid; place-items: center; border: 0; border-right: 1px solid var(--glass-border); padding: 0; background: transparent; color: var(--text-muted); }
   .mobile-app-nav button:last-child { border-right: 0; }
   .mobile-app-nav button[data-active="true"] { background: var(--accent-container); color: var(--accent-on-primary); }
