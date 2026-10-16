@@ -1281,6 +1281,46 @@ describe("mounted player lifecycle", () => {
     }
   });
 
+  it("keeps inline mobile time attached to the timeline and preserves paused ten-second button seeking", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      const { root, video, view } = player;
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(video, "paused", { configurable: true, value: true });
+      fireEvent.pause(video);
+      video.currentTime = 45;
+      fireEvent.timeUpdate(video);
+      const elapsed = screen.getByLabelText("Elapsed time");
+      const total = screen.getByLabelText("Total duration");
+      const timeline = screen.getByRole("slider", { name: "Playback position" }) as HTMLInputElement;
+      expect(elapsed.textContent).toBe("0:45");
+      expect(total.textContent).toBe("2:00");
+      const row = root.querySelector(".mobile-player-progress")!;
+      expect(Array.from(row.children)).toEqual([elapsed, timeline.parentElement, total]);
+      expect(root.querySelector(".mobile-player-bottom__row .mobile-player-time")).toBeNull();
+      const source = video.getAttribute("src");
+      const loads = videoCallCount("load", video);
+      const plays = videoCallCount("play", video);
+      pointerClick(screen.getByRole("button", { name: "Rewind 10 seconds" }));
+      expect(video.currentTime).toBeCloseTo(35);
+      fireEvent.seeked(video);
+      pointerClick(screen.getByRole("button", { name: "Forward 10 seconds" }));
+      expect(video.currentTime).toBeCloseTo(45);
+      fireEvent.seeked(video);
+      // A shorter measured timeline still owns scrub coordinates and one commit.
+      vi.spyOn(timeline, "getBoundingClientRect").mockReturnValue({ left: 100, top: 300, right: 700, bottom: 332, width: 600, height: 32, x: 100, y: 300, toJSON: () => ({}) });
+      timelinePointer(timeline, "pointerdown", 400);
+      expect(video.currentTime).toBeCloseTo(45);
+      timelinePointer(timeline, "pointerup", 400);
+      expect(video.currentTime).toBeCloseTo(60);
+      expect(root.dataset.playerPhase).toBe("paused");
+      expect(videoCallCount("load", video)).toBe(loads);
+      expect(videoCallCount("play", video)).toBe(plays);
+      expect(view.container.querySelector("video")).toBe(video);
+      expect(video.getAttribute("src")).toBe(source);
+    } finally { player.close(); }
+  });
+
   it("dismisses and reveals paused phone chrome without touching the mounted transport", async () => {
     const player = await mountPhonePlayer();
     try {

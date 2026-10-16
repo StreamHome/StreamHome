@@ -792,6 +792,7 @@ body[data-player-viewport-fullscreen="true"] {
 
 /* Phones use a purpose-built landscape player instead of the compressed desktop control bar. */
 .player-view[data-mobile-player="true"] {
+  --player-font: system-ui, sans-serif;
   --mobile-safe-area: max(1rem, env(safe-area-inset-top), env(safe-area-inset-right), env(safe-area-inset-bottom), env(safe-area-inset-left));
   --mobile-chrome-edge-padding: .3125rem;
   --mobile-chrome-top-inset: max(var(--mobile-chrome-edge-padding), env(safe-area-inset-top));
@@ -863,6 +864,7 @@ body[data-player-viewport-fullscreen="true"] {
   z-index: 32;
   inset: 0;
   pointer-events: none;
+  font-family: var(--player-font);
 }
 
 .mobile-player-topbar {
@@ -968,18 +970,17 @@ body[data-player-viewport-fullscreen="true"] {
   opacity: .75;
 }
 
-.mobile-player-transport__seek {
+.mobile-player-transport .mobile-player-transport__seek {
   width: 4rem;
   min-height: 4rem;
 }
 
-.mobile-player-transport__play {
+.mobile-player-transport .mobile-player-transport__play {
   width: 4.5rem;
   min-height: 4.5rem;
 }
 
-.mobile-player-transport__seek .player-icon { width: 2rem; height: 2rem; }
-.mobile-player-transport__play .player-icon { width: 3rem; height: 3rem; }
+.mobile-player-chrome .player-icon--mobile { width: 1rem; height: 1rem; }
 
 .mobile-player-bottom {
   position: absolute;
@@ -1009,6 +1010,17 @@ body[data-player-viewport-fullscreen="true"] {
   --player-timeline-track-size: .38rem;
 }
 
+.mobile-player-progress {
+  display: grid;
+  grid-template-columns: var(--mobile-player-time-width, 7ch) minmax(0, 1fr) var(--mobile-player-time-width, 7ch);
+  align-items: center;
+  column-gap: .75rem;
+  min-width: 0;
+  font-size: .9rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
 .mobile-player-bottom__row {
   min-width: 0;
   display: flex;
@@ -1028,7 +1040,7 @@ body[data-player-viewport-fullscreen="true"] {
   white-space: nowrap;
 }
 
-.mobile-player-time i { color: rgba(255,255,255,.5); font-style: normal; }
+.mobile-player-time--total { text-align: right; }
 
 .mobile-player-settings {
   min-width: 0;
@@ -1038,7 +1050,7 @@ body[data-player-viewport-fullscreen="true"] {
   margin-left: auto;
   gap: .42rem;
   overflow-x: auto;
-  padding: .15rem;
+  padding: 0;
   scrollbar-width: none;
   touch-action: pan-x;
   pointer-events: auto;
@@ -1046,7 +1058,11 @@ body[data-player-viewport-fullscreen="true"] {
 
 .mobile-player-settings::-webkit-scrollbar { display: none; }
 .mobile-player-settings .player-control-menu { flex: 0 0 auto; }
-.mobile-player-settings .player-control-button { flex: 0 0 auto; }
+.mobile-player-settings .player-control-button {
+  flex: 0 0 2.75rem;
+  width: 2.75rem;
+  min-height: 2.75rem;
+}
 .mobile-player-settings .player-control-menu__trigger { min-height: 2.75rem; max-width: 8.5rem; }
 .mobile-player-settings .player-control-menu__trigger > span { max-width: 5.2rem; }
 

@@ -4584,12 +4584,14 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
             <div className="mobile-player-transport">
               <PlayerIconButton
+                iconVariant="mobile"
                 icon="rewind"
                 label="Rewind 10 seconds"
                 className="mobile-player-transport__seek"
                 onClick={() => seek(currentTimeRef.current - 10)}
               />
               <PlayerIconButton
+                iconVariant="mobile"
                 icon={playbackControlShowsPause ? "pause" : "play"}
                 label={playbackControlShowsPause ? "Pause" : "Play"}
                 className="mobile-player-transport__play"
@@ -4597,6 +4599,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                 onClick={() => playbackControlShowsPause ? pausePlayback() : startMobilePlayback()}
               />
               <PlayerIconButton
+                iconVariant="mobile"
                 icon="forward"
                 label="Forward 10 seconds"
                 className="mobile-player-transport__seek"
@@ -4605,41 +4608,43 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             </div>
 
             <div className="mobile-player-bottom">
-              <PlayerTimelineShell regions={markerRegions} duration={duration} time={currentTime} preview={timelinePreview} obstacleKey={timelineObstacleKey}>
-              <input
-                ref={timelineRef}
-                aria-label="Playback position"
-                aria-valuetext={timelineValueText}
-                type="range"
-                min={0}
-                max={duration > 0 ? duration : Math.max(runResponse.sourceMetadata.duration, currentTime, 1)}
-                step={0.1}
-                value={Math.min(currentTime, duration || currentTime)}
-                onPointerDown={beginTimelineScrub}
-                onPointerMove={moveTimelinePointer}
-                onPointerLeave={() => { if (!scrubbingRef.current) setTimelinePreview(null); }}
-                onInput={(event) => previewTimelineScrub(Number(event.currentTarget.value))}
-                onPointerUp={endTimelineScrub}
-                onPointerCancel={cancelTimelineScrub}
-                onChange={(event) => {
-                  if (!scrubbingRef.current) seek(Number(event.currentTarget.value));
-                }}
-                className="player-timeline mobile-player-timeline"
-                style={{
-                  "--player-progress": `${duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0}%`,
-                  "--player-buffered": `${duration > 0 ? Math.min(100, (bufferedEnd / duration) * 100) : 0}%`,
-                } as React.CSSProperties}
-              />
-              </PlayerTimelineShell>
+              <div className="mobile-player-progress" style={{ "--mobile-player-time-width": `${(duration ? formatDuration(duration) : asset.durationLabel).length}ch` } as React.CSSProperties}>
+                <span className="mobile-player-time" aria-label="Elapsed time">{formatDuration(currentTime)}</span>
+                <PlayerTimelineShell regions={markerRegions} duration={duration} time={currentTime} preview={timelinePreview} obstacleKey={timelineObstacleKey}>
+                <input
+                  ref={timelineRef}
+                  aria-label="Playback position"
+                  aria-valuetext={timelineValueText}
+                  type="range"
+                  min={0}
+                  max={duration > 0 ? duration : Math.max(runResponse.sourceMetadata.duration, currentTime, 1)}
+                  step={0.1}
+                  value={Math.min(currentTime, duration || currentTime)}
+                  onPointerDown={beginTimelineScrub}
+                  onPointerMove={moveTimelinePointer}
+                  onPointerLeave={() => { if (!scrubbingRef.current) setTimelinePreview(null); }}
+                  onInput={(event) => previewTimelineScrub(Number(event.currentTarget.value))}
+                  onPointerUp={endTimelineScrub}
+                  onPointerCancel={cancelTimelineScrub}
+                  onChange={(event) => {
+                    if (!scrubbingRef.current) seek(Number(event.currentTarget.value));
+                  }}
+                  className="player-timeline mobile-player-timeline"
+                  style={{
+                    "--player-progress": `${duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0}%`,
+                    "--player-buffered": `${duration > 0 ? Math.min(100, (bufferedEnd / duration) * 100) : 0}%`,
+                  } as React.CSSProperties}
+                />
+                </PlayerTimelineShell>
+                <span className="mobile-player-time mobile-player-time--total" aria-label="Total duration">{duration ? formatDuration(duration) : asset.durationLabel}</span>
+              </div>
               <div className="mobile-player-bottom__row">
-                <span className="mobile-player-time">
-                  {formatDuration(currentTime)} <i>/</i> {duration ? formatDuration(duration) : asset.durationLabel}
-                </span>
                 <div className="mobile-player-settings">
                   {document.pictureInPictureEnabled && (
-                    <PlayerIconButton icon="pip" label="Picture in picture" onClick={togglePictureInPicture} />
+                    <PlayerIconButton iconVariant="mobile" icon="pip" label="Picture in picture" onClick={togglePictureInPicture} />
                   )}
                   <PlayerIconButton
+                    iconVariant="mobile"
                     icon={fullscreenActive ? "fullscreen-exit" : "fullscreen"}
                     label={fullscreenActive ? "Exit fullscreen" : "Fullscreen"}
                     aria-pressed={fullscreenActive}

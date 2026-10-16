@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { restorePlayerPointerClickFocus, restorePlayerPointerFocus } from "./playerKeyboard";
+import { mobilePlayerIcon } from "./PlayerMobileIcon";
 
 export type PlayerIconName =
   | "audio"
@@ -29,13 +30,18 @@ interface PlayerIconProps {
   name: PlayerIconName;
   className?: string;
   prominent?: boolean;
+  variant?: "default" | "mobile";
 }
 
 export function hasSubtitleOptions(options: readonly unknown[]): boolean {
   return options.length > 0;
 }
 
-export function PlayerIcon({ name, className = "", prominent = false }: PlayerIconProps) {
+export function PlayerIcon({ name, className = "", prominent = false, variant = "default" }: PlayerIconProps) {
+  if (variant === "mobile") {
+    const icon = mobilePlayerIcon(name, `player-icon ${className}`.trim());
+    if (icon) return icon;
+  }
   const common = {
     className: `player-icon ${className}`.trim(),
     viewBox: "0 0 24 24",
@@ -76,9 +82,10 @@ interface PlayerIconButtonProps extends React.ButtonHTMLAttributes<HTMLButtonEle
   icon: PlayerIconName;
   label: string;
   prominentIcon?: boolean;
+  iconVariant?: PlayerIconProps["variant"];
 }
 
-export function PlayerIconButton({ icon, label, className = "", onClick, prominentIcon = false, ...props }: PlayerIconButtonProps) {
+export function PlayerIconButton({ icon, label, className = "", onClick, prominentIcon = false, iconVariant = "default", ...props }: PlayerIconButtonProps) {
   return (
     <button
       type="button"
@@ -91,7 +98,7 @@ export function PlayerIconButton({ icon, label, className = "", onClick, promine
         if (!event.defaultPrevented && !event.currentTarget.hasAttribute("aria-haspopup")) restorePlayerPointerClickFocus(event);
       }}
     >
-      <PlayerIcon name={icon} prominent={prominentIcon} />
+      <PlayerIcon name={icon} prominent={prominentIcon} variant={iconVariant} />
     </button>
   );
 }
