@@ -24,7 +24,7 @@ export function AuthenticatedApp() {
       className={surface === "dashboard" ? "application-motion-surface" : "standalone-motion-view"}
       variants={reduced || surface === "watch" ? opacityVariants : THEME_MOTION[theme].view}
       custom={surface === "dashboard" ? -1 : 1}
-      initial="initial"
+      initial={surface === "watch" ? false : "initial"}
       animate="animate"
       exit="exit"
     >

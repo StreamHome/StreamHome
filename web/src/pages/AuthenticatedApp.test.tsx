@@ -23,6 +23,7 @@ describe("watch route entry", () => {
       expect(loading.style.getPropertyValue("--mobile-player-height")).toBe("390px");
       const ancestor = loading.closest<HTMLElement>(".standalone-motion-view")!;
       expect(ancestor.style.transform).toBe("");
+      expect(ancestor.style.opacity).toBe("1");
       await screen.findByText("Loaded player");
       expect(ancestor.style.transform).toBe("");
     } finally {
