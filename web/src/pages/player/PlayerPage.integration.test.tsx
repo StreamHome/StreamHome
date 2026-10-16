@@ -341,12 +341,12 @@ async function mountFramePlayer(fixture: ResolvedPlayback = playback, frameCallb
   };
 }
 
-async function mountPhonePlayer() {
+async function mountPhonePlayer(fixture: ResolvedPlayback = playback) {
   const restore = phoneViewport();
   try {
     const player = await mountFramePlayer({
-      ...playback,
-      runResponse: { ...playback.runResponse, ticketExpiresAt: Math.floor(Date.now() / 1_000) + 3_600 },
+      ...fixture,
+      runResponse: { ...fixture.runResponse, ticketExpiresAt: Math.floor(Date.now() / 1_000) + 3_600 },
     });
     return { ...player, close: () => { player.close(); restore(); } };
   } catch (error) {
@@ -1323,10 +1323,21 @@ describe("mounted player lifecycle", () => {
   });
 
   it("dismisses and reveals paused phone chrome without touching the mounted transport", async () => {
-    const player = await mountPhonePlayer();
+    localStorage.setItem(playerPreferencesKey, JSON.stringify({ subtitleTrackId: "subtitle-en" }));
+    const player = await mountPhonePlayer({ ...markerPlayback, runResponse: {
+      ...markerPlayback.runResponse, subtitles: [{ id: "subtitle-en", language: "en", label: "English" }],
+    } });
     try {
+      const track = player.view.container.querySelector<HTMLTrackElement>("track")!;
+      Object.defineProperty(track, "track", { configurable: true, value: Object.assign(new EventTarget(), {
+        mode: "disabled", cues: { 0: { startTime: 0, endTime: 120, text: "Persistent mobile caption" }, length: 1 },
+      }) });
+      fireEvent.load(track);
+      fireEvent.timeUpdate(player.video);
       pointerClick(screen.getByRole("button", { name: "Pause" }));
       Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      const caption = screen.getByRole("region", { name: "Subtitles" });
+      const skip = screen.getByRole("button", { name: "Skip intro" });
       const source = player.video.getAttribute("src");
       const time = player.video.currentTime;
       const calls = ["play", "pause", "load"].map((method) => videoCallCount(method as "play" | "pause" | "load", player.video));
@@ -1341,10 +1352,15 @@ describe("mounted player lifecycle", () => {
       expect(chrome.getAttribute("aria-hidden")).toBe("true");
       expect(chrome.hasAttribute("inert")).toBe(true);
       expect(document.activeElement).toBe(player.root);
+      expect(screen.getByRole("region", { name: "Subtitles" })).toBe(caption);
+      expect(caption.textContent).toBe("Persistent mobile caption");
+      expect(screen.getByRole("button", { name: "Skip intro" })).toBe(skip);
       mobileTap(center);
       await act(async () => { await vi.advanceTimersByTimeAsync(200); });
       expect(chrome.getAttribute("data-visible")).toBe("true");
       expect(chrome.hasAttribute("inert")).toBe(false);
+      expect(screen.getByRole("region", { name: "Subtitles" })).toBe(caption);
+      expect(screen.getByRole("button", { name: "Skip intro" })).toBe(skip);
       expect(player.root.dataset.playerPhase).toBe("paused");
       expect(player.video.currentTime).toBe(time);
       expect(player.video.getAttribute("src")).toBe(source);

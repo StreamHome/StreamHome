@@ -748,6 +748,23 @@
   bottom: max(clamp(6.5rem, 25vh, 9rem), calc(env(safe-area-inset-bottom) + 1.5rem));
 }
 
+.player-view[data-mobile-player="true"] :is(.player-caption-layer, .player-skip-control) {
+  transform: translateY(0);
+  transition: transform 120ms cubic-bezier(.2, 0, 0, 1);
+}
+
+.player-view[data-mobile-player="true"][data-controls-visible="false"] .player-caption-layer {
+  transform: translateY(var(--player-caption-hidden-offset, 0px));
+}
+
+.player-view[data-mobile-player="true"][data-controls-visible="false"] .player-skip-control {
+  transform: translateY(var(--player-skip-hidden-offset, 0px));
+}
+
+.player-view[data-mobile-player="true"] :is(.player-caption-layer, .player-skip-control)[data-reduced-motion="true"] {
+  transition: none;
+}
+
 .player-view[data-player-theme="terminal"] .player-caption-layer > span {
   border-radius: 0;
 }

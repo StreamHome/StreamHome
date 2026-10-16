@@ -8,6 +8,48 @@ export const PLAYER_SKIP_COUNTDOWN_DURATION_MS = 4000;
 
 type SkipCountdownStage = "idle" | "waiting" | "filling" | "hidden";
 
+function overlayTranslation(element: Element | null) {
+  if (!element || typeof DOMMatrixReadOnly === "undefined") return 0;
+  const transform = getComputedStyle(element).transform;
+  return transform && transform !== "none" ? new DOMMatrixReadOnly(transform).m42 : 0;
+}
+
+function mobileOverlayInset(root: HTMLElement) {
+  const chrome = root.querySelector(".mobile-player-bottom");
+  return Math.max(16, chrome ? Number.parseFloat(getComputedStyle(chrome).paddingBottom) || 0 : 0);
+}
+
+export function PlayerCaptionLayer({ children, signature, mobile, reduced }: {
+  children: React.ReactNode;
+  signature: string;
+  mobile: boolean;
+  reduced: boolean;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const layer = ref.current;
+    const root = layer?.closest<HTMLElement>("[data-player-root='true']");
+    if (!mobile || !layer || !root) return;
+    const position = () => {
+      if (!root.clientHeight) return;
+      const frame = root.getBoundingClientRect();
+      const rect = layer.getBoundingClientRect();
+      const bottom = root.dataset.mobileOrientation === "forced-landscape"
+        ? frame.right - rect.left : rect.bottom - frame.top;
+      // Measure the resting box, even if controls are toggled mid-transition.
+      const restingBottom = bottom - overlayTranslation(layer);
+      layer.style.setProperty("--player-caption-hidden-offset", `${Math.max(0, root.clientHeight - mobileOverlayInset(root) - restingBottom)}px`);
+    };
+    position();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(position);
+    [root, layer, root.querySelector(".mobile-player-bottom")].forEach((element) => { if (element) observer?.observe(element); });
+    window.addEventListener("resize", position);
+    return () => { observer?.disconnect(); window.removeEventListener("resize", position); };
+  }, [mobile, signature]);
+  return <div ref={ref} className="player-caption-layer" role="region" aria-label="Subtitles" aria-live="off"
+    data-reduced-motion={reduced ? "true" : undefined}>{children}</div>;
+}
+
 const TimelineRegions = memo(function TimelineRegions({ regions, duration, activeId }: {
   regions: readonly MarkerRegion[];
   duration: number;
@@ -51,7 +93,12 @@ export function PlayerTimelineShell({ regions, duration, time, preview, obstacle
     const obstacles = Array.from(root?.querySelectorAll(".player-skip-control:not([hidden]), .player-caption-layer > span") ?? []).map((element) => {
       const rect = element.getBoundingClientRect();
       const left = rotated ? rect.top - frame.top : rect.left - frame.left;
-      const top = rotated ? frame.right - rect.right : rect.top - frame.top;
+      let top = rotated ? frame.right - rect.right : rect.top - frame.top;
+      // Scrubbing reveals chrome; avoid its destination overlays, not a transient
+      // in-flight rectangle while those overlays move back above the timeline.
+      if (root?.dataset.mobilePlayer === "true" && root.dataset.controlsVisible === "true") {
+        top -= overlayTranslation(element.closest(".player-skip-control, .player-caption-layer"));
+      }
       return { left, top, right: left + (rotated ? rect.height : rect.width), bottom: top + (rotated ? rect.width : rect.height) };
     }).sort((a, b) => b.top - a.top);
     let top = -8 - tooltipHeight;
@@ -139,7 +186,7 @@ export function PlayerSkipControl({ region, captionSignature, mobile, reduced, c
       if (!width || !height) return;
       const button = bounds(control);
       const track = timeline ? bounds(timeline) : null;
-      const chrome = timeline?.closest(".player-controls");
+      const chrome = timeline?.closest(".player-controls, .mobile-player-bottom");
       // The contextual action stays anchored to resting chrome geometry while
       // Framer translates that chrome during its entrance and idle animations.
       if (track && chrome && typeof DOMMatrixReadOnly !== "undefined") {
@@ -148,23 +195,34 @@ export function PlayerSkipControl({ region, captionSignature, mobile, reduced, c
       }
       const left = Math.max(16, Math.min(width - button.width - 16, (track?.right ?? width - 24) - button.width));
       let top = (track?.top ?? height - 84) - button.height - 12;
-      const lines = Array.from(captions?.children ?? []).map(bounds).sort((a, b) => b.top - a.top);
-      for (const line of lines) {
-        if (line.right > left - 12 && line.left < left + button.width + 12
-          && line.bottom > top - 12 && line.top < top + button.height + 12) {
-          top = line.top - button.height - 12;
+      const captionTranslation = mobile ? overlayTranslation(captions) : 0;
+      const lines = Array.from(captions?.children ?? []).map((element) => {
+        const line = bounds(element);
+        return { ...line, top: line.top - captionTranslation, bottom: line.bottom - captionTranslation };
+      }).sort((a, b) => b.top - a.top);
+      const avoidCaptions = (candidate: number, offset = 0) => {
+        for (const line of lines) {
+          if (line.right > left - 12 && line.left < left + button.width + 12
+            && line.bottom + offset > candidate - 12 && line.top + offset < candidate + button.height + 12) {
+            candidate = line.top + offset - button.height - 12;
+          }
         }
-      }
+        return Math.max(16, candidate);
+      };
+      top = avoidCaptions(top);
+      const captionOffset = Number.parseFloat(captions?.style.getPropertyValue("--player-caption-hidden-offset") ?? "") || 0;
+      const loweredTop = avoidCaptions(height - mobileOverlayInset(root) - button.height, captionOffset);
       control.style.left = `${left}px`;
-      control.style.bottom = `${Math.max(16, height - Math.max(16, top) - button.height)}px`;
+      control.style.bottom = `${Math.max(16, height - top - button.height)}px`;
       control.style.right = "auto";
+      if (mobile) control.style.setProperty("--player-skip-hidden-offset", `${Math.max(0, loweredTop - top)}px`);
     };
     position();
     const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(position);
     [root, control, timeline, captions].forEach((element) => { if (element) observer?.observe(element); });
     window.addEventListener("resize", position);
     return () => { observer?.disconnect(); window.removeEventListener("resize", position); };
-  }, [captionSignature, hidden, mobile, region.id]);
+  }, [captionSignature, controlsVisible, hidden, mobile, region.id]);
 
   useLayoutEffect(() => {
     const control = controlRef.current;

@@ -37,7 +37,7 @@ import { hasSubtitleOptions, PlayerControlMenu, PlayerIcon, PlayerIconButton, Pl
 import { languageDisplayName, normalizeLanguageTag } from "./language";
 import { playerControlOwnsKey, restorePlayerPointerFocus } from "./playerKeyboard";
 import { activeMarkerRegion, canSkipMarkerRegion, deriveMarkerRegions } from "./playerMarkers";
-import { PlayerSkipControl, PlayerTimelineShell } from "./PlayerMarkerControls";
+import { PlayerCaptionLayer, PlayerSkipControl, PlayerTimelineShell } from "./PlayerMarkerControls";
 import {
   ensurePlayerFullscreen,
   playerFullscreenMode,
@@ -4404,9 +4404,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         </div>
       </>, captionPip.host)}
       {captionLines.length > 0 && !nativeCaptionSurface && !captionPip && (
-        <div className="player-caption-layer" role="region" aria-label="Subtitles" aria-live="off">
+        <PlayerCaptionLayer signature={captionSignature} mobile={mobilePlayer} reduced={reduced}>
           {captionLines.map((line, index) => <span key={`${index}-${line.key}`}>{line.content}</span>)}
-        </div>
+        </PlayerCaptionLayer>
       )}
 
       {mobilePlayer && phase !== "ended" && (

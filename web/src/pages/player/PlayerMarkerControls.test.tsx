@@ -1,7 +1,7 @@
 import React from "react";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PLAYER_SKIP_COUNTDOWN_DELAY_MS, PLAYER_SKIP_COUNTDOWN_DURATION_MS, PlayerSkipControl, PlayerTimelineShell } from "./PlayerMarkerControls";
+import { PLAYER_SKIP_COUNTDOWN_DELAY_MS, PLAYER_SKIP_COUNTDOWN_DURATION_MS, PlayerCaptionLayer, PlayerSkipControl, PlayerTimelineShell } from "./PlayerMarkerControls";
 import type { MarkerRegion } from "./playerMarkers";
 
 const region: MarkerRegion = { id: "credits:80:100:0", kind: "credits", label: "Credits", start: 80, end: 100 };
@@ -19,7 +19,7 @@ const RIGHT_EDGE_PREVIEW = { x: TRACK_WIDTH - 1, time: 95 };
 
 interface Rect { left: number; top: number; width: number; height: number }
 
-function installLayout({ rotated = false, translation = 18 }: { rotated?: boolean; translation?: number } = {}) {
+function installLayout({ rotated = false, translation = 18, captionTranslation = 0 }: { rotated?: boolean; translation?: number; captionTranslation?: number } = {}) {
   const physicalRect = ({ left, top, width, height }: Rect) => rotated
     ? new DOMRect(100 + ROOT_HEIGHT - top - height, 50 + left, height, width)
     : new DOMRect(100 + left, 50 + top, width, height);
@@ -39,7 +39,10 @@ function installLayout({ rotated = false, translation = 18 }: { rotated?: boolea
       });
     }
     if (this.parentElement?.classList.contains("player-caption-layer")) {
-      return physicalRect({ left: 600, top: 410, width: 360, height: 58 });
+      return physicalRect({ left: 600, top: 410 + captionTranslation, width: 360, height: 58 });
+    }
+    if (this.classList.contains("player-caption-layer")) {
+      return physicalRect({ left: 16, top: 410 + captionTranslation, width: 968, height: 58 });
     }
     if (this.classList.contains("player-timeline-preview")) {
       return physicalRect({
@@ -69,25 +72,36 @@ function installLayout({ rotated = false, translation = 18 }: { rotated?: boolea
       this.m42 = Number(value.slice(value.indexOf("(") + 1, value.lastIndexOf(")")).split(",")[5]);
     }
   });
+  const computedStyle = window.getComputedStyle.bind(window);
+  vi.spyOn(window, "getComputedStyle").mockImplementation((element) => {
+    const style = computedStyle(element);
+    if (element.classList.contains("player-caption-layer")) {
+      Object.defineProperty(style, "transform", { value: `matrix(1, 0, 0, 1, 0, ${captionTranslation})` });
+    }
+    return style;
+  });
   // Resize events exercise the component's actual fallback when native observers
   // are unavailable, without running any asynchronous browser layout emulation.
   vi.stubGlobal("ResizeObserver", undefined);
 }
 
-function Fixture({ caption = false, preview = false, skip = true, rotated = false, translation = 18 }: {
+function Fixture({ caption = false, preview = false, skip = true, rotated = false, translation = 18, mobile = rotated, controlsVisible = true, inset = 5 }: {
   caption?: boolean;
   preview?: boolean;
   skip?: boolean;
   rotated?: boolean;
   translation?: number;
+  mobile?: boolean;
+  controlsVisible?: boolean;
+  inset?: number;
 }) {
-  return <div data-player-root="true" data-mobile-orientation={rotated ? "forced-landscape" : "native-landscape"}>
-    <div className="player-caption-layer">
+  return <div data-player-root="true" data-mobile-player={mobile ? "true" : "false"} data-controls-visible={String(controlsVisible)} data-mobile-orientation={rotated ? "forced-landscape" : "native-landscape"}>
+    <PlayerCaptionLayer signature={caption ? "long-cue" : ""} mobile={mobile} reduced={false}>
       {caption && <span>A long subtitle cue extends into the contextual action's normal position.</span>}
-    </div>
+    </PlayerCaptionLayer>
     {skip && <PlayerSkipControl region={region} captionSignature={caption ? "long-cue" : ""}
-      mobile={rotated} reduced={false} onSkip={() => undefined} onFocus={() => undefined} onBlur={() => undefined} />}
-    <div className="player-controls" style={{ transform: `matrix(1, 0, 0, 1, 0, ${translation})` }}>
+      mobile={mobile} reduced={false} controlsVisible={controlsVisible} onSkip={() => undefined} onFocus={() => undefined} onBlur={() => undefined} />}
+    <div className={mobile ? "mobile-player-bottom" : "player-controls"} style={{ paddingBottom: inset, transform: `matrix(1, 0, 0, 1, 0, ${translation})` }}>
       <PlayerTimelineShell regions={[region]} duration={100} time={85} preview={preview ? RIGHT_EDGE_PREVIEW : null}
         obstacleKey={`${skip ? region.id : ""}:${caption ? "long-cue" : ""}:${rotated}`}>
         <input aria-label="Playback position" type="range" />
@@ -240,6 +254,33 @@ describe("intro action countdown", () => {
 });
 
 describe("contextual player marker layout", () => {
+  it.each([false, true])("lowers mobile overlays together without losing their caption gap (rotated: %s)", (rotated) => {
+    installLayout({ rotated, translation: 6, captionTranslation: 70 });
+    const view = render(<Fixture caption mobile rotated={rotated} translation={6} />);
+    const caption = view.container.querySelector<HTMLElement>(".player-caption-layer")!;
+    const skip = view.container.querySelector<HTMLElement>(".player-skip-control")!;
+    expect(caption.style.getPropertyValue("--player-caption-hidden-offset")).toBe("116px");
+    expect(skip.style.getPropertyValue("--player-skip-hidden-offset")).toBe("116px");
+    const restingBottom = skip.style.bottom;
+    const restingTop = ROOT_HEIGHT - Number.parseFloat(restingBottom) - BUTTON_HEIGHT;
+    expect(410 - restingTop - BUTTON_HEIGHT).toBe(12);
+    view.rerender(<Fixture caption mobile rotated={rotated} translation={6} controlsVisible={false} />);
+    fireEvent.resize(window);
+    view.rerender(<Fixture caption mobile rotated={rotated} translation={6} />);
+    expect(skip.style.bottom).toBe(restingBottom);
+    expect(skip.style.getPropertyValue("--player-skip-hidden-offset")).toBe("116px");
+    expect(caption.style.getPropertyValue("--player-caption-hidden-offset")).toBe("116px");
+  });
+
+  it("lowers a caption-free mobile Skip only as far as the safe bottom inset", () => {
+    installLayout({ translation: 0 });
+    const view = render(<Fixture mobile translation={0} inset={34} />);
+    const skip = view.container.querySelector<HTMLElement>(".player-skip-control")!;
+    const shownBottom = Number.parseFloat(skip.style.bottom);
+    const offset = Number.parseFloat(skip.style.getPropertyValue("--player-skip-hidden-offset"));
+    expect(shownBottom - offset).toBe(34);
+  });
+
   it("anchors Skip 12px above the resting timeline during an 18px chrome entrance", () => {
     installLayout();
     const view = render(<Fixture />);
