@@ -1673,3 +1673,24 @@
   .theme-nav--cinema nav button { font-size: 12px; }
   .theme-nav--cinema .theme-nav__tools { gap: 8px; }
 }
+
+/* Automatic landing states are limited to the three supported catalog presentations. */
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) :is(.catalog-landing-state,.catalog-landing-notice) { margin: 24px max(18px,4vw); padding: 24px; color: var(--text-primary); background: var(--bg-surface-container-low); border: 1px solid var(--glass-border); overflow-wrap: anywhere; }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .catalog-landing-state { min-height: 45vh; display: flex; flex-direction: column; justify-content: center; align-items: flex-start; gap: 18px; }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .catalog-landing-state h1 { font: 700 clamp(28px,4vw,48px)/1.2 var(--font-headline); }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) :is(.catalog-landing-state,.catalog-landing-notice) p { color: var(--text-secondary); line-height: 1.6; }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .catalog-landing-notice { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; font-size: 14px; }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .catalog-landing-notice > div { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) :is(.catalog-landing-state,.catalog-landing-notice) button { min-height: 44px; padding: 10px 18px; background: var(--bg-surface-container-high); color: var(--text-primary); border: 1px solid var(--glass-border); border-radius: var(--radius); font: inherit; scroll-margin-block: 132px; }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) :is(.catalog-landing-state,.catalog-landing-notice) button:focus-visible { outline: 2px solid var(--text-primary); outline-offset: 3px; }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .catalog-landing-skeleton__hero { min-height: clamp(420px,65vh,740px); padding: max(48px,8vh) max(18px,4vw); display: flex; flex-direction: column; justify-content: flex-end; gap: 18px; background: var(--bg-surface-container-low); }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .catalog-landing-skeleton i { display: block; background: var(--bg-surface-container-high); border-radius: var(--radius); }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .catalog-landing-skeleton__hero i { width: min(580px,80%); height: 24px; }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .catalog-landing-skeleton__hero i:first-child { width: min(440px,70%); height: 52px; }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .catalog-landing-skeleton__hero i:last-child { width: min(280px,50%); height: 44px; }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .catalog-landing-skeleton__rail { display: grid; grid-template-columns: repeat(6,minmax(0,1fr)); gap: 16px; padding: 32px max(18px,4vw); overflow: hidden; }
+:is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .catalog-landing-skeleton__rail i { aspect-ratio: 2 / 3; }
+@media (max-width: 760px) {
+  :is(.theme-app--ember,.theme-app--aurora,.theme-app--cinema) .catalog-landing-skeleton__rail { grid-template-columns: repeat(3,minmax(0,1fr)); }
+  .theme-app--cinema :is(.catalog-landing-skeleton,.catalog-landing-state) { padding-top: 88px; }
+}

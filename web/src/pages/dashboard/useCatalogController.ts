@@ -7,6 +7,7 @@ import { getMediaPreferences, getRecommendations, setMediaPreference } from "../
 import { getWatchlist } from "../../api/watchlist";
 import { isCatalogView, type AppQueryState, type CatalogView } from "../../navigation/queryState";
 import type { DiscoverMovie, MediaPreference, Movie, PlaybackSession, Profile, RecommendationFeed } from "../../types/api";
+import { landingCacheGeneration, readLandingFeed, saveLandingFeed } from "./catalogLandingCache";
 
 const FEED_PAGE_SIZE = 48;
 
@@ -77,6 +78,8 @@ export interface CatalogController {
   loadMoreRecommendations: () => Promise<void>;
   resolveMovie: (id: string) => Movie | null;
   loading: boolean;
+  catalogError?: string;
+  retryCatalog?: () => void;
   searching: boolean;
   error: string;
   setError: React.Dispatch<React.SetStateAction<string>>;
@@ -129,7 +132,9 @@ function appendUnique(current: RecommendationFeed, page: RecommendationFeed): Re
   };
 }
 
-export function useCatalogController(profile: Profile, query: AppQueryState): CatalogController {
+export function useCatalogController(profile: Profile, query: AppQueryState, automaticLanding = false): CatalogController {
+  const initialFeedKey = isCatalogView(query.view) ? `${profile.id}:${query.view}:${(query.genre?.trim() || "recommended").toLocaleLowerCase()}` : "";
+  const initialFeed = automaticLanding ? readLandingFeed(initialFeedKey) : null;
   const initialBootstrap = catalogBootstrapCache.get(profile.id);
   const [baseMovies, setBaseMovies] = useState<Movie[]>(() => initialBootstrap?.movies ?? []);
   const [sessions, setSessions] = useState<PlaybackSession[]>(() => initialBootstrap?.sessions ?? []);
@@ -178,10 +183,13 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   }, [profile.id]);
   const [results, setResults] = useState<DiscoverMovie[]>([]);
   const [retainedMovies, setRetainedMovies] = useState<Record<string, Movie>>({});
-  const [recommendation, setRecommendation] = useState<RecommendationFeed | null>(null);
-  const [recommendationKey, setRecommendationKey] = useState("");
+  const [recommendation, setRecommendation] = useState<RecommendationFeed | null>(initialFeed);
+  const [recommendationKey, setRecommendationKey] = useState(initialFeed ? initialFeedKey : "");
+  const [validatedFeedKey, setValidatedFeedKey] = useState("");
   const [catalogLoading, setCatalogLoading] = useState(initialBootstrap?.movies === undefined);
-  const [recommendationLoading, setRecommendationLoading] = useState(false);
+  const [catalogError, setCatalogError] = useState("");
+  const [catalogVersion, setCatalogVersion] = useState(0);
+  const [recommendationLoading, setRecommendationLoading] = useState(automaticLanding && Boolean(initialFeedKey));
   const [recommendationLoadingMore, setRecommendationLoadingMore] = useState(false);
   const [searchRead, setSearchRead] = useState({ key: "", status: "idle" as "idle" | "pending" | "success" | "error", error: "" });
   const [searchVersion, setSearchVersion] = useState(0);
@@ -198,6 +206,8 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   const scope: CatalogView | null = isCatalogView(query.view) ? query.view : null;
   const category = query.genre?.trim() || "recommended";
   const requestedKey = scope ? `${profile.id}:${scope}:${category.toLocaleLowerCase()}` : "";
+  const enteringRequest = automaticLanding && activeFeedKey.current !== requestedKey;
+  const displayedRecommendation = scope && enteringRequest ? readLandingFeed(requestedKey) : scope && recommendationKey !== requestedKey ? null : recommendation;
 
   useEffect(() => {
     const abort = new AbortController();
@@ -215,6 +225,7 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
       setCatalogLoading(true);
     }
     setError("");
+    setCatalogError("");
     void getMovies(profile.id, abort.signal)
       .then((catalog) => {
         if (abort.signal.aborted) return;
@@ -222,7 +233,10 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
         updateCatalogBootstrap(profile.id, { movies: catalog });
       })
       .catch((requestError: unknown) => {
-        if (!abort.signal.aborted) setError(requestError instanceof Error ? requestError.message : "The catalog could not be loaded.");
+        if (!abort.signal.aborted) {
+          const message = requestError instanceof Error ? requestError.message : "The catalog could not be loaded.";
+          setCatalogError(message); setError(message);
+        }
       })
       .finally(() => { if (!abort.signal.aborted) setCatalogLoading(false); });
     const preferenceReadOwner = preferenceOwner.current;
@@ -233,7 +247,7 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
       mergePreferenceRead(preferenceReadOwner, preferenceMap, preferenceRequestsAtDispatch, preferencePendingAtDispatch);
     }).catch(() => { /* A preference read cannot delay independent catalog data. */ });
     return () => abort.abort();
-  }, [profile.id]);
+  }, [profile.id, catalogVersion]);
 
   useEffect(() => {
     const abort = new AbortController();
@@ -292,16 +306,25 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
     pageAbort.current?.abort();
     pageAbort.current = null;
     setRecommendationLoadingMore(false);
+    const previousKey = activeFeedKey.current;
     activeFeedKey.current = requestedKey;
-    if (!scope) { setRecommendationLoading(false); return; }
+    if (!scope) { setRecommendationLoading(false); setValidatedFeedKey(""); return; }
     const abort = new AbortController();
-    if (recommendationKey !== requestedKey) setRecommendation(null);
+    const cacheOwner = landingCacheGeneration();
+    if (recommendationKey !== requestedKey || (automaticLanding && previousKey !== requestedKey)) {
+      const cached = automaticLanding ? readLandingFeed(requestedKey) : null;
+      setRecommendation(cached);
+      if (cached || automaticLanding) setRecommendationKey(requestedKey);
+    }
+    setValidatedFeedKey("");
     setRecommendationLoading(true);
     setRecommendationError("");
     getRecommendations({ profileId: profile.id, scope, category, limit: FEED_PAGE_SIZE, offset: 0, signal: abort.signal })
       .then((feed) => {
         if (abort.signal.aborted || activeFeedKey.current !== requestedKey) return;
         setRecommendation(feed); setRecommendationKey(requestedKey);
+        setValidatedFeedKey(requestedKey);
+        if (automaticLanding) saveLandingFeed(requestedKey, feed, cacheOwner);
       })
       .catch((requestError: unknown) => {
         if (!abort.signal.aborted && activeFeedKey.current === requestedKey) setRecommendationError(requestError instanceof Error ? requestError.message : "Recommendations could not be loaded.");
@@ -310,7 +333,7 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
         if (!abort.signal.aborted && activeFeedKey.current === requestedKey) setRecommendationLoading(false);
       });
     return () => abort.abort();
-  }, [category, profile.id, refreshVersion, requestedKey, scope]);
+  }, [automaticLanding, category, profile.id, refreshVersion, requestedKey, scope]);
 
   const searchKey = query.view === "search" && query.q ? `${profile.id}:${query.q}` : "";
   useEffect(() => {
@@ -398,7 +421,7 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   const resolveMovie = useCallback((id: string) => mediaById.get(id) ?? null, [mediaById]);
   const movieItems = useMemo(() => movies.filter((movie) => movie.type === "movie"), [movies]);
   const seriesItems = useMemo(() => movies.filter((movie) => movie.type === "series"), [movies]);
-  const categoriesReady = Boolean(scope && recommendation && recommendationKey === requestedKey);
+  const categoriesReady = Boolean(scope && recommendation && recommendationKey === requestedKey && (!automaticLanding || (validatedFeedKey === requestedKey && !enteringRequest)));
   const categories = useMemo(() => categoriesReady ? recommendation!.categories.map((item) => item.value) : [], [categoriesReady, recommendation]);
   const genres = useMemo(() => recommendation?.categories.filter((item) => item.value !== "recommended" && item.value !== "all").map((item) => item.label) ?? [], [recommendation]);
   const continueWatching = useMemo(() => {
@@ -434,6 +457,7 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
 
   const retryRecommendations = useCallback(() => setRefreshVersion((value) => value + 1), []);
   const retryDetails = useCallback(() => setDetailsVersion((value) => value + 1), []);
+  const retryCatalog = useCallback(() => setCatalogVersion((value) => value + 1), []);
   const refreshRecommendations = retryRecommendations;
   const reconcilePreference = async (owner: PreferenceOwner, movieId: string, request: number, uncertain: boolean, failureMessage: string) => {
     const owned = () => owner.active && preferenceOwner.current === owner && owner.requests.get(movieId) === request;
@@ -527,10 +551,10 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   return {
     catalogItems: catalogProfile === profile.id ? baseMovies : [], categoriesReady, watchlistKnown, watchlistStatus, watchlistError, retryWatchlist, searchStatus, searchError, retrySearch,
     movies, movieItems, seriesItems, continueWatching, sessions, watchlist, watchlistItems, setWatchlist,
-    categories, genres, results: currentResults, recommendation: scope && recommendationKey !== requestedKey ? null : recommendation, recommendationLoading, recommendationRefreshing,
-    recommendationLoadingMore, recommendationError, recommendationHasMore, retryRecommendations,
+    categories, genres, results: currentResults, recommendation: automaticLanding ? displayedRecommendation : scope && recommendationKey !== requestedKey ? null : recommendation, recommendationLoading: recommendationLoading || (enteringRequest && Boolean(scope)), recommendationRefreshing,
+    recommendationLoadingMore, recommendationError: enteringRequest ? "" : recommendationError, recommendationHasMore, retryRecommendations,
     refreshRecommendations, loadMoreRecommendations, resolveMovie, loading, searching, error, setError,
-    detailsLoading, detailsError, retryDetails,
+    detailsLoading, detailsError, retryDetails, catalogError, retryCatalog,
     preferences: catalogProfile === profile.id ? preferences : catalogBootstrapCache.get(profile.id)?.preferences ?? {}, updatePreference,
     preferencesKnown: preferenceUi.profileId === profile.id && preferenceUi.known,
     preferenceKnownIds: preferenceUi.profileId === profile.id ? preferenceUi.knownIds : {},

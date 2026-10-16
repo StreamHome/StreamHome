@@ -20,7 +20,7 @@ describe("category renderer parity", () => {
     const shared = read("src/pages/dashboard/ThemeDashboard.tsx");
     const ember = read("src/pages/dashboard/ember/EmberDashboard.tsx");
     for (const source of [shared, ember]) {
-      expect(source).toContain("buildCatalogPresentation");
+      expect(source).toContain("useCatalogLanding");
       expect(source).toContain("<CategoryFilterRail");
       expect(source).toContain("<GenreCategoryGallery");
       expect(source).toContain("cards={model.genreCards}");
@@ -31,7 +31,7 @@ describe("category renderer parity", () => {
       expect(source).toContain("collection.showReasons");
       expect(source).toContain("recommendationHasMore");
       expect(source).toContain("loadMoreRecommendations");
-      expect(source).toContain("recommendationError");
+      expect(source).toContain("CatalogLandingNotice");
       expect(source).toContain("AvailabilityBadge");
     }
   });

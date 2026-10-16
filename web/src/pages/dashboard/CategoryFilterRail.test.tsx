@@ -7,6 +7,26 @@ import { CategoryFilterRail } from "./CategoryFilterRail";
 const matchMedia = () => ({ matches: false, media: "(prefers-reduced-motion: reduce)", onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => true });
 
 describe("category filter rail", () => {
+  it("scrolls only its own track for automatic landing and retains the legacy default", () => {
+    const intoView = vi.fn(); const trackScroll = vi.fn();
+    const previousIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
+    const previousScroll = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTo");
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: intoView });
+    Object.defineProperty(HTMLElement.prototype, "scrollTo", { configurable: true, value: trackScroll });
+    Object.defineProperty(window, "matchMedia", { configurable: true, value: matchMedia });
+    const options = [{ value: "recommended", label: "Recommended", kind: "virtual" as const, count: 3 }, { value: "Action", label: "Action", kind: "genre" as const, count: 2 }];
+    try {
+      const { rerender } = render(<MotionProvider><CategoryFilterRail preservePageScroll variant="shared" active="recommended" options={options} onSelect={() => undefined} /></MotionProvider>);
+      expect(trackScroll).toHaveBeenCalledTimes(1); expect(intoView).not.toHaveBeenCalled();
+      rerender(<MotionProvider><CategoryFilterRail preservePageScroll variant="shared" active="Action" options={options} onSelect={() => undefined} /></MotionProvider>);
+      expect(trackScroll).toHaveBeenCalledTimes(2); expect(intoView).not.toHaveBeenCalled();
+      rerender(<MotionProvider><CategoryFilterRail variant="shared" active="Action" options={options} onSelect={() => undefined} /></MotionProvider>);
+      expect(intoView).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previousIntoView) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", previousIntoView); else delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
+      if (previousScroll) Object.defineProperty(HTMLElement.prototype, "scrollTo", previousScroll); else delete (HTMLElement.prototype as Partial<HTMLElement>).scrollTo;
+    }
+  });
   it("exposes one pressed category and reports semantic selections", () => {
     Object.defineProperty(window, "matchMedia", { configurable: true, value: matchMedia });
     const onSelect = vi.fn();

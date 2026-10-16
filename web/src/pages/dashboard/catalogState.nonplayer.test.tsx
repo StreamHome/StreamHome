@@ -350,17 +350,17 @@ describe("included catalog request ownership", () => {
     const pending = deferred<Response>(); routes.set("/api/recommendations/", () => pending.promise);
     const profile = viewer(); useProfileStore.setState({ activeProfile: profile }); const changes: string[] = [];
     render(<MemoryRouter initialEntries={[`/app?profile=${profile.id}&view=movies&genre=${genre}`]}><MotionProvider><DashboardRouter /><CurrentRoute changes={changes} /></MotionProvider></MemoryRouter>);
-    await waitFor(() => expect(screen.getByText(/The catalog below is unfiltered/)).toBeTruthy());
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith("/api/movies?"))).toBe(true));
     expect(screen.getByLabelText("Catalog route").textContent).toContain(`genre=${genre}`);
     await act(async () => pending.resolve(reply({ ...catalogFeed(["Recommendation"], "Drama"), profileId: profile.id, scope: "movies" })));
-    await waitFor(() => expect(screen.getByText("Recommendations ready")).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Recommendation" })).toBeTruthy());
     expect(screen.getByLabelText("Catalog route").textContent).toContain(`genre=${genre}`); expect(changes.length).toBe(1);
   });
   it("canonicalizes a truly invalid genre exactly once after successful authoritative categories", async () => {
     const pending = deferred<Response>(); routes.set("/api/recommendations/", () => pending.promise);
     const profile = viewer(); useProfileStore.setState({ activeProfile: profile }); const changes: string[] = [];
     render(<MemoryRouter initialEntries={[`/app?profile=${profile.id}&view=movies&genre=Unknown`]}><MotionProvider><DashboardRouter /><CurrentRoute changes={changes} /></MotionProvider></MemoryRouter>);
-    await waitFor(() => expect(screen.getByText(/The catalog below is unfiltered/)).toBeTruthy()); expect(changes.length).toBe(1);
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith("/api/movies?"))).toBe(true)); expect(changes.length).toBe(1);
     routes.set("/api/recommendations/", () => reply({ ...catalogFeed(), profileId: profile.id, scope: "movies" }));
     await act(async () => pending.resolve(reply({ ...catalogFeed(["Recommendation"], "Unknown"), profileId: profile.id, scope: "movies" })));
     await waitFor(() => expect(screen.getByLabelText("Catalog route").textContent).not.toContain("genre="));

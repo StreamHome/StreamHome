@@ -25,43 +25,132 @@ function App({ theme, query, controller }: { theme: ThemeId; query: AppQueryStat
   return <MemoryRouter><MotionProvider><Component query={query} controller={controller} presentation={getThemeDefinition(theme)} /></MotionProvider></MemoryRouter>;
 }
 describe.each(themes)("%s truthful catalog presentation", (theme) => {
-  it("retains painted base catalog DOM and focused record until explicit recommendation handoff", async () => {
-    const base = catalogMovie("Base catalog title"); const remote = catalogMovie("Recommended title");
-    const controller = catalogController({ catalogItems: [base], movies: [base], movieItems: [base], resolveMovie: (id) => id === base.id ? base : remote });
+  it("opens with a real hero and rails and automatically adopts late recommendations", async () => {
+    const base = catalogMovie("Base catalog title");
+    const controller = catalogController({ catalogItems: [base], movies: [base], movieItems: [base] });
     const query: AppQueryState = { profile: catalogProfile.id, view: "movies" };
-    const { rerender, container } = render(<App theme={theme} query={query} controller={controller} />);
-    expect(screen.getByText("Loading recommendations")).toBeTruthy();
-    const record = screen.getByRole("button", { name: /Base catalog title/ }); act(() => record.focus());
-    const updated = { ...controller, movies: [base, remote], recommendation: catalogFeed([remote.id]), recommendationLoading: false };
-    rerender(<App theme={theme} query={query} controller={updated} />);
-    expect(screen.getByRole("button", { name: /Base catalog title/ })).toBe(record);
-    expect(document.activeElement).toBe(record); expect(screen.queryByRole("heading", { name: remote.title })).toBeNull();
-    expect(screen.getByText("Recommendations ready")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Show recommendations" }));
-    await waitFor(() => expect(screen.getByRole("heading", { name: remote.title })).toBeTruthy());
-    expect(document.activeElement).toBe(container.querySelector("[data-catalog-region]"));
-    expect(container.querySelector("[data-catalog-region]")?.getAttribute("aria-label")).toBe("Recommendations");
+    const { rerender } = render(<App theme={theme} query={query} controller={controller} />);
+    expect(screen.getByRole("heading", { name: base.title })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Featured Movies" })).toBeTruthy();
+    expect(screen.queryByText("Loading recommendations")).toBeNull();
+    expect(screen.queryByText("Your server library")).toBeNull();
+    rerender(<App theme={theme} query={query} controller={{ ...controller, recommendation: catalogFeed(["Recommended title"]), recommendationLoading: false }} />);
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Recommended title" })).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "Show recommendations" })).toBeNull();
+    expect(screen.queryByText("Recommendations ready")).toBeNull();
   });
-  it("returns focused hero controls to the persistent shell before a parent fallback retires the hero", async () => {
-    const controller = catalogController({ recommendation: catalogFeed(["Feature one", "Feature two"]), recommendationLoading: false, catalogItems: [catalogMovie("Base")] });
+  it("keeps an active hero action stable until focus leaves, then updates without a handoff button", async () => {
+    const controller = catalogController({ catalogItems: [catalogMovie("Base")] });
     const query: AppQueryState = { profile: catalogProfile.id, view: "movies" };
     const { rerender, container } = render(<App theme={theme} query={query} controller={controller} />);
-    act(() => screen.getByRole("button", { name: "Pause automatic rotation" }).focus());
-    rerender(<App theme={theme} query={{ ...query, genre: "Drama" }} controller={{ ...controller, recommendation: null, recommendationLoading: true }} />);
-    expect(screen.queryByRole("button", { name: "Pause automatic rotation" })).toBeNull();
-    expect(document.activeElement).toBe(container.querySelector("[data-catalog-focus-anchor]"));
-    rerender(<App theme={theme} query={query} controller={controller} />);
     const action = screen.getByRole("button", { name: "View details" }); act(() => action.focus());
-    rerender(<App theme={theme} query={query} controller={{ ...controller, recommendation: catalogFeed([]), recommendationLoading: false }} />);
+    rerender(<App theme={theme} query={query} controller={{ ...controller, recommendation: catalogFeed(["New feature"]), recommendationLoading: false }} />);
+    expect(screen.getByRole("heading", { name: "Base" })).toBeTruthy();
+    expect(document.activeElement).toBe(action);
+    act(() => container.querySelector<HTMLElement>("[data-catalog-focus-anchor]")!.focus());
+    await waitFor(() => expect(screen.getByRole("heading", { name: "New feature" })).toBeTruthy());
     expect(document.activeElement).not.toBe(document.body);
-    expect(document.activeElement).toBe(container.querySelector("[data-catalog-region]"));
   });
-  it("renders feed-first discovery and never labels unfiltered fallback as the pending genre", () => {
+  it("renders feed-first content and filters pending genres using real catalog metadata", () => {
     const query: AppQueryState = { profile: catalogProfile.id, view: "movies", genre: "Drama" };
     const first = render(<App theme={theme} query={query} controller={catalogController({ loading: true, catalogItems: [], recommendation: catalogFeed(["First ready"], "Drama"), recommendationLoading: false })} />);
     expect(screen.getByRole("heading", { name: "First ready" })).toBeTruthy(); first.unmount();
-    render(<App theme={theme} query={query} controller={catalogController({ catalogItems: [catalogMovie("Base")], movies: [catalogMovie("Base")] })} />);
-    expect(screen.getByText(/The catalog below is unfiltered/)).toBeTruthy();
+    const other = { ...catalogMovie("Other genre"), genres: ["Comedy"] };
+    render(<App theme={theme} query={query} controller={catalogController({ catalogItems: [catalogMovie("Drama title"), other] })} />);
+    expect(screen.getByRole("heading", { name: "Drama title" })).toBeTruthy();
+    expect(screen.queryByText("Other genre")).toBeNull();
+    expect(screen.queryByText(/The catalog below is unfiltered/)).toBeNull();
+  });
+  it("keeps the page usable on suggestion failure and separates loading, empty and failure", () => {
+    const query: AppQueryState = { profile: catalogProfile.id, view: "home" };
+    const retry = vi.fn();
+    const { rerender } = render(<App theme={theme} query={query} controller={catalogController({ loading: true })} />);
+    expect(screen.getByRole("status", { name: "Loading titles" })).toBeTruthy();
+    expect(screen.queryByText("Your library is empty")).toBeNull();
+    rerender(<App theme={theme} query={query} controller={catalogController({ catalogItems: [catalogMovie("Still usable")], recommendationLoading: false, recommendationError: "Failed", retryRecommendations: retry })} />);
+    expect(screen.getByRole("heading", { name: "Still usable" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retry suggestions" })); expect(retry).toHaveBeenCalledTimes(1);
+    rerender(<App theme={theme} query={query} controller={catalogController({ recommendationLoading: false })} />);
+    expect(screen.getByRole("heading", { name: "Your library is empty" })).toBeTruthy();
+    rerender(<App theme={theme} query={query} controller={catalogController({ recommendationLoading: false, catalogError: "Failed", recommendationError: "Failed" })} />);
+    expect(screen.getByRole("heading", { name: "Titles unavailable" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry loading titles" })).toBeTruthy();
+  });
+  it.each(["home", "movies", "series"] as const)("opens %s with matching real hero content while suggestions are pending", (view) => {
+    const movie = catalogMovie("Film"); const series = { ...catalogMovie("Show"), type: "series" as const };
+    render(<App theme={theme} query={{ profile: catalogProfile.id, view }} controller={catalogController({ catalogItems: [movie, series] })} />);
+    expect(screen.getByRole("heading", { name: view === "series" ? "Show" : "Film" })).toBeTruthy();
+    expect(screen.queryByText("Your server library")).toBeNull();
+    expect(screen.queryByText("Loading recommendations")).toBeNull();
+    expect(document.querySelector("[data-category-mode=catalog-fallback]")).toBeNull();
+  });
+  it("retains category escape controls in a successful empty genre", () => {
+    const query: AppQueryState = { profile: catalogProfile.id, view: "movies", genre: "Drama" };
+    render(<App theme={theme} query={query} controller={catalogController({ recommendation: catalogFeed([], "Drama"), recommendationLoading: false, loading: true, catalogError: "Unrelated catalog failure" })} />);
+    expect(screen.getByRole("heading", { name: "No Drama titles" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "recommended" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "all" })).toBeTruthy();
+  });
+  it("keeps retry feedback reachable when an empty explicit feed fails to refresh", () => {
+    const query: AppQueryState = { profile: catalogProfile.id, view: "movies", genre: "Drama" };
+    const retryRecommendations = vi.fn();
+    render(<App theme={theme} query={query} controller={catalogController({ recommendation: catalogFeed([], "Drama"), recommendationLoading: false, recommendationError: "Refresh failed", retryRecommendations })} />);
+    expect(screen.getByRole("heading", { name: "No Drama titles" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retry suggestions" }));
+    expect(retryRecommendations).toHaveBeenCalledTimes(1);
+  });
+  it("offers library refresh recovery and preserves keyboard focus when retry feedback retires", async () => {
+    const query: AppQueryState = { profile: catalogProfile.id, view: "movies" };
+    const retryCatalog = vi.fn(); const retryRecommendations = vi.fn();
+    const controller = catalogController({ catalogItems: [catalogMovie("Retained")], catalogError: "Offline", recommendationError: "Offline", recommendationLoading: false, retryCatalog, retryRecommendations });
+    const { rerender, container } = render(<App theme={theme} query={query} controller={controller} />);
+    const retry = screen.getByRole("button", { name: "Retry library" }); act(() => retry.focus()); fireEvent.click(retry);
+    expect(retryCatalog).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(container.querySelector("[data-catalog-region]"));
+    const suggestions = screen.getByRole("button", { name: "Retry suggestions" }); act(() => suggestions.focus()); fireEvent.click(suggestions);
+    expect(retryRecommendations).toHaveBeenCalledTimes(1);
+    rerender(<App theme={theme} query={query} controller={{ ...controller, catalogError: "", recommendationError: "", recommendationLoading: true }} />);
+    expect(document.activeElement).toBe(container.querySelector("[data-catalog-region]"));
+    expect(screen.getByRole("heading", { name: "Retained" })).toBeTruthy();
+  });
+  it("does not replace a pointer target between pointerdown and its click", async () => {
+    const query: AppQueryState = { profile: catalogProfile.id, view: "movies" };
+    const controller = catalogController({ catalogItems: [catalogMovie("Pressed title")] });
+    const { rerender, container } = render(<App theme={theme} query={query} controller={catalogController({ loading: true })} />);
+    rerender(<App theme={theme} query={query} controller={controller} />);
+    const action = screen.getByRole("button", { name: "View details" });
+    fireEvent.pointerDown(action);
+    rerender(<App theme={theme} query={query} controller={{ ...controller, recommendation: catalogFeed(["New target"]), recommendationLoading: false }} />);
+    expect(screen.getByRole("heading", { name: "Pressed title" })).toBeTruthy();
+    fireEvent.pointerUp(document); act(() => container.querySelector<HTMLElement>("[data-catalog-region]")!.focus());
+    await waitFor(() => expect(screen.getByRole("heading", { name: "New target" })).toBeTruthy());
+  });
+  it("records exposure against the painted generation while a focused hero delays refresh", async () => {
+    vi.useFakeTimers();
+    class VisibleObserver {
+      constructor(private callback: IntersectionObserverCallback) {}
+      observe(target: Element) { this.callback([{ isIntersecting: true, intersectionRatio: 1, target } as IntersectionObserverEntry], this as unknown as IntersectionObserver); }
+      disconnect() {} unobserve() {} takeRecords() { return []; }
+    }
+    vi.stubGlobal("IntersectionObserver", VisibleObserver);
+    const profileId = `painted-exposure-${theme}`;
+    useProfileStore.setState({ activeProfile: { ...catalogProfile, id: profileId } });
+    const controller = catalogController({ recommendation: { ...catalogFeed(["Old visible"]), generatedAt: 1 }, recommendationLoading: false });
+    const query: AppQueryState = { profile: profileId, view: "movies" };
+    try {
+      const { rerender, container } = render(<App theme={theme} query={query} controller={controller} />);
+      act(() => screen.getByRole("button", { name: "View details" }).focus());
+      rerender(<App theme={theme} query={query} controller={{ ...controller, recommendation: { ...catalogFeed(["New visible"]), generatedAt: 2 } }} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1100); });
+      const queued = JSON.parse(window.localStorage.getItem(`streamhome_pending_exposures:${profileId}`) || "[]");
+      expect(queued.some((entry: { movie_id: string; feed_generation: string }) => entry.movie_id === "Old visible" && entry.feed_generation === "1")).toBe(true);
+      expect(queued.some((entry: { feed_generation: string }) => entry.feed_generation === "2")).toBe(false);
+      act(() => container.querySelector<HTMLElement>("[data-catalog-region]")!.focus());
+      await act(async () => { await vi.advanceTimersByTimeAsync(1200); });
+      expect(screen.getByRole("heading", { name: "New visible" })).toBeTruthy();
+      cleanup();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    } finally { vi.useRealTimers(); }
   });
   it("shows local saved-list pending, error, successful empty and unavailable record details independently", async () => {
     const retryWatchlist = vi.fn(); const query: AppQueryState = { profile: catalogProfile.id, view: "watchlist" };
@@ -86,4 +175,16 @@ describe.each(themes)("%s truthful catalog presentation", (theme) => {
     rerender(<App theme={theme} query={query} controller={{ ...controller, searchStatus: "success", searchError: "" }} />);
     await waitFor(() => expect(screen.getByRole("heading", { name: "No results" })).toBeTruthy());
   });
+});
+
+it("preserves Gemini's existing catalog and manual recommendation handoff", async () => {
+  const query: AppQueryState = { profile: catalogProfile.id, view: "movies" };
+  const controller = catalogController({ catalogItems: [catalogMovie("Gemini base")] });
+  const { rerender } = render(<App theme="gemini" query={query} controller={controller} />);
+  expect(screen.getByRole("heading", { name: "Your server library" })).toBeTruthy();
+  rerender(<App theme="gemini" query={query} controller={{ ...controller, recommendation: catalogFeed(["Gemini recommended"]), recommendationLoading: false }} />);
+  expect(screen.getByRole("button", { name: "Show recommendations" })).toBeTruthy();
+  expect(screen.queryByRole("heading", { name: "Gemini recommended" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Show recommendations" }));
+  await waitFor(() => expect(screen.getByRole("heading", { name: "Gemini recommended" })).toBeTruthy());
 });
