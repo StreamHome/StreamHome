@@ -49,6 +49,7 @@ import {
   isMobileTapCandidate,
   isPhonePlayerViewport,
   lockPlayerLandscape,
+  MOBILE_SEEK_CONTROLS_GRACE_MS,
   MOBILE_SEEK_FEEDBACK_MS,
   MOBILE_TAP_CHAIN_WINDOW,
   nextMobileTap,
@@ -875,6 +876,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const mobileSingleTapTimerRef = useRef<number | null>(null);
   const mobileTapResetTimerRef = useRef<number | null>(null);
   const mobileSeekFeedbackTimerRef = useRef<number | null>(null);
+  const mobileSeekControlsTimerRef = useRef<number | null>(null);
   const mobileFullscreenAttemptedAtRef = useRef(0);
   const mobilePointerGestureRef = useRef<MobilePointerGesture | null>(null);
   const desktopPointerPositionRef = useRef<{ x: number; y: number } | null>(null);
@@ -904,6 +906,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [volume, setVolume] = useState(initialPreferences.volume);
   const [muted, setMuted] = useState(initialPreferences.muted);
   const [showControls, setShowControls] = useState(true);
+  const [mobileSeekControlsHidden, setMobileSeekControlsHidden] = useState(false);
   const [skipControlVisible, setSkipControlVisible] = useState(true);
   const [controlMenuOpen, setControlMenuOpen] = useState(false);
   const [timelineScrubbing, setTimelineScrubbing] = useState(false);
@@ -3017,6 +3020,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [playerControlsContainFocus, setControlsVisibility]);
 
   const revealControls = useCallback(() => {
+    if (mobileSeekControlsTimerRef.current !== null) window.clearTimeout(mobileSeekControlsTimerRef.current);
+    mobileSeekControlsTimerRef.current = null;
+    setMobileSeekControlsHidden(false);
     if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
     controlsTimerRef.current = null;
     setControlsVisibility(true);
@@ -3044,6 +3050,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   useEffect(() => {
     phaseRef.current = phase;
     controlMenuOpenRef.current = controlMenuOpen;
+    // Native seek events briefly re-enter loading even when no controls were requested.
+    if (mobilePlayer && mobileSeekControlsTimerRef.current !== null && !showControlsRef.current
+      && !controlMenuOpen && !timelineScrubbing
+      && ["playing", "paused", "loading", "buffering", "recovering", "preparing"].includes(phase)) return;
     if (!shouldAutoHidePlayerControls(phase, controlMenuOpenRef.current, scrubbingRef.current)) {
       setControlsVisibility(true);
       if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
@@ -3053,7 +3063,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (showControlsRef.current && controlsTimerRef.current === null) {
       scheduleControlsHide();
     }
-  }, [controlMenuOpen, phase, scheduleControlsHide, setControlsVisibility, timelineScrubbing]);
+  }, [controlMenuOpen, mobilePlayer, phase, scheduleControlsHide, setControlsVisibility, timelineScrubbing]);
 
   useEffect(() => {
     if (phase !== "playing") return;
@@ -3469,6 +3479,15 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     if (result.seekDelta !== 0) {
       if (mobileSingleTapTimerRef.current !== null) window.clearTimeout(mobileSingleTapTimerRef.current);
       mobileSingleTapTimerRef.current = null;
+      if (!showControlsRef.current) {
+        setMobileSeekControlsHidden(true);
+        if (mobileSeekControlsTimerRef.current !== null) window.clearTimeout(mobileSeekControlsTimerRef.current);
+        mobileSeekControlsTimerRef.current = window.setTimeout(() => {
+          mobileSeekControlsTimerRef.current = null;
+          setMobileSeekControlsHidden(false);
+          if (["loading", "buffering", "recovering", "preparing"].includes(phaseRef.current)) revealControls();
+        }, MOBILE_SEEK_CONTROLS_GRACE_MS);
+      }
       seek(currentTimeRef.current + result.seekDelta, false);
       setMobileSeekFeedback({ side, seconds: result.accumulatedSeconds });
       if (mobileSeekFeedbackTimerRef.current !== null) window.clearTimeout(mobileSeekFeedbackTimerRef.current);
@@ -3485,7 +3504,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       mobileTapChainRef.current = null;
       mobileSingleTapTimerRef.current = null;
     }, MOBILE_TAP_CHAIN_WINDOW);
-  }, [ensureMobileLandscape, reportConfirmedSeek, seek, toggleMobileControls]);
+  }, [ensureMobileLandscape, reportConfirmedSeek, revealControls, seek, toggleMobileControls]);
 
   const handleMobileCenterTap = useCallback(() => {
     ensureMobileLandscape();
@@ -3498,6 +3517,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
   useEffect(() => () => {
     resetMobileTapTimers();
+    if (mobileSeekControlsTimerRef.current !== null) window.clearTimeout(mobileSeekControlsTimerRef.current);
   }, [resetMobileTapTimers]);
 
   const handleMobilePointerDown = useCallback((side: MobileTapSide | "center", event: React.PointerEvent<HTMLDivElement>) => {
@@ -3792,7 +3812,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const playbackControlShowsPause = playbackIntentRef.current
     && ["loading", "recovering", "buffering", "playing"].includes(phase);
   const controlsVisible = mobilePlayer
-    ? shouldShowMobileChrome(phase, showControls, controlMenuOpen, timelineScrubbing)
+    ? shouldShowMobileChrome(phase, showControls, controlMenuOpen, timelineScrubbing, mobileSeekControlsHidden)
     : showControls;
   const phaseMessage: Record<PlayerPhase, string> = {
     resolving: "Resolving secure playback",

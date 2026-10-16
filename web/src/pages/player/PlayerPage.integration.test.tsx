@@ -10,7 +10,7 @@ import * as moviesApi from "../../api/movies";
 import * as playbackApi from "../../api/playback";
 import { getPlaybackSessionRevision, subscribePlaybackSessions } from "../../api/playbackSessionEvents";
 import { PLAYER_SKIP_COUNTDOWN_DELAY_MS, PLAYER_SKIP_COUNTDOWN_DURATION_MS } from "./PlayerMarkerControls";
-import { MOBILE_SEEK_FEEDBACK_MS } from "./mobilePlayer";
+import { MOBILE_SEEK_CONTROLS_GRACE_MS, MOBILE_SEEK_FEEDBACK_MS } from "./mobilePlayer";
 import {
   PLAYER_CONTROLS_IDLE_MS,
   PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS,
@@ -1312,6 +1312,92 @@ describe("mounted player lifecycle", () => {
       expect(player.root.dataset.controlsVisible).toBe("true");
       mobileTap(center);
       expect(player.root.dataset.controlsVisible).toBe("true");
+    } finally { player.close(); }
+  });
+
+  it.each([
+    ["playing", "right", 10],
+    ["playing", "left", -10],
+    ["paused", "right", 10],
+    ["paused", "left", -10],
+  ] as const)("retains hidden %s phone controls through %s repeated-tap seek events", async (intent, side, delta) => {
+    const player = await mountPhonePlayer();
+    try {
+      if (intent === "paused") {
+        pointerClick(screen.getByRole("button", { name: "Pause" }));
+        Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      }
+      const source = player.video.getAttribute("src");
+      const loads = videoCallCount("load", player.video);
+      const plays = videoCallCount("play", player.video);
+      const start = player.video.currentTime;
+      mobileTap(player.view.container.querySelector<HTMLElement>(".mobile-player-gesture-zone--center")!);
+      const zone = player.view.container.querySelector<HTMLElement>(`.mobile-player-gesture-zone--${side}`)!;
+      mobileTap(zone);
+      act(() => vi.advanceTimersByTime(80));
+      mobileTap(zone);
+      expect(player.video.currentTime).toBeCloseTo(start + delta);
+      fireEvent.seeking(player.video);
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.controlsVisible).toBe("false");
+      if (intent === "playing") fireEvent.playing(player.video);
+      expect(player.root.dataset.controlsVisible).toBe("false");
+      fireEvent.seeked(player.video);
+      if (intent === "playing") {
+        fireEvent.playing(player.video);
+        player.video.currentTime += 0.1;
+        fireEvent.timeUpdate(player.video);
+      }
+      expect(player.root.dataset.controlsVisible).toBe("false");
+      player.advance(MOBILE_SEEK_CONTROLS_GRACE_MS + 100, intent === "playing", intent === "playing");
+      expect(player.root.dataset.controlsVisible).toBe("false");
+      expect(player.root.dataset.playerPhase).toBe(intent);
+      expect(player.video.paused).toBe(intent === "paused");
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+    } finally { player.close(); }
+  });
+
+  it("reveals phone controls when gesture-seek buffering outlasts its bounded grace", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      mobileTap(player.view.container.querySelector<HTMLElement>(".mobile-player-gesture-zone--center")!);
+      const right = player.view.container.querySelector<HTMLElement>(".mobile-player-gesture-zone--right")!;
+      mobileTap(right);
+      act(() => vi.advanceTimersByTime(80));
+      mobileTap(right);
+      fireEvent.waiting(player.video);
+      act(() => vi.advanceTimersByTime(MOBILE_SEEK_CONTROLS_GRACE_MS - 1));
+      expect(player.root.dataset.controlsVisible).toBe("false");
+      act(() => vi.advanceTimersByTime(1));
+      expect(player.root.dataset.controlsVisible).toBe("true");
+      expect(screen.getByRole("button", { name: "Pause" })).toBeTruthy();
+    } finally { player.close(); }
+  });
+
+  it("allows a single phone tap and explicit Pause during gesture-seek loading", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      const center = player.view.container.querySelector<HTMLElement>(".mobile-player-gesture-zone--center")!;
+      const right = player.view.container.querySelector<HTMLElement>(".mobile-player-gesture-zone--right")!;
+      mobileTap(center);
+      mobileTap(right);
+      act(() => vi.advanceTimersByTime(80));
+      mobileTap(right);
+      fireEvent.waiting(player.video);
+      expect(player.root.dataset.controlsVisible).toBe("false");
+      mobileTap(center);
+      expect(player.root.dataset.controlsVisible).toBe("true");
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      const plays = videoCallCount("play", player.video);
+      fireEvent.seeked(player.video);
+      fireEvent.canPlay(player.video);
+      player.advance(MOBILE_SEEK_CONTROLS_GRACE_MS + 100, false, false);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(player.root.dataset.controlsVisible).toBe("true");
+      expect(videoCallCount("play", player.video)).toBe(plays);
     } finally { player.close(); }
   });
 

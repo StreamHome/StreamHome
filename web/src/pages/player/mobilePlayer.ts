@@ -37,6 +37,7 @@ export const MOBILE_TAP_CHAIN_WINDOW = 300;
 export const MOBILE_TAP_MAX_DURATION = 450;
 export const MOBILE_TAP_MAX_DISTANCE = 14;
 export const MOBILE_SEEK_FEEDBACK_MS = 700;
+export const MOBILE_SEEK_CONTROLS_GRACE_MS = 1_000;
 
 export function isPhonePlayerViewport(metrics: MobileViewportMetrics): boolean {
   const shortEdge = Math.min(metrics.width, metrics.height);
@@ -67,9 +68,9 @@ export function isMobileTapCandidate(
   return Math.hypot(end.x - start.x, end.y - start.y) <= maxDistance;
 }
 
-export function shouldShowMobileChrome(phase: string, requested: boolean, menuOpen = false, scrubbing = false): boolean {
+export function shouldShowMobileChrome(phase: string, requested: boolean, menuOpen = false, scrubbing = false, seekControlsHidden = false): boolean {
   // Pause reveals chrome on entry, but a deliberate surface tap may dismiss it.
-  return requested || menuOpen || scrubbing || ["loading", "buffering", "recovering", "preparing"].includes(phase);
+  return requested || menuOpen || scrubbing || (!seekControlsHidden && ["loading", "buffering", "recovering", "preparing"].includes(phase));
 }
 
 export function nextMobileTap(
