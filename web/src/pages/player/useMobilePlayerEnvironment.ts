@@ -1,24 +1,35 @@
-import { useLayoutEffect, useState } from "react";
+import { useLayoutEffect, useState, type CSSProperties } from "react";
 import { isForcedLandscape, isPhonePlayerViewport, readMobileViewport } from "./mobilePlayer";
 
-function readEnvironment(wasPhone = false) {
-  if (typeof window === "undefined") return { mobilePlayer: false, forcedLandscape: false };
+interface PlayerEnvironment {
+  mobilePlayer: boolean;
+  forcedLandscape: boolean;
+  width: number;
+  height: number;
+}
+
+function readEnvironment(previous?: PlayerEnvironment): PlayerEnvironment {
+  if (typeof window === "undefined") return { mobilePlayer: false, forcedLandscape: false, width: 0, height: 0 };
   const metrics = readMobileViewport();
+  if (previous && (metrics.width <= 0 || metrics.height <= 0)) return previous;
   // Fullscreen and browser chrome can briefly report tablet-sized geometry.
-  // Once this viewing session is a phone, retain its controls and rotation fallback.
-  const mobilePlayer = wasPhone || isPhonePlayerViewport(metrics);
-  const portrait = typeof window.matchMedia === "function"
-    ? window.matchMedia("(orientation: portrait)").matches
-    : isForcedLandscape(metrics.width, metrics.height, true);
-  return { mobilePlayer, forcedLandscape: mobilePlayer && portrait };
+  // Keep the last phone layout through the ambiguous square transition as well.
+  if (previous?.mobilePlayer
+    && Math.abs(metrics.width - metrics.height) < Math.min(metrics.width, metrics.height) * .1) return previous;
+  const mobilePlayer = previous?.mobilePlayer || isPhonePlayerViewport(metrics);
+  // Size and rotation must come from the same sample. Orientation media queries
+  // can update before the viewport dimensions during native fullscreen entry.
+  return { mobilePlayer, forcedLandscape: isForcedLandscape(metrics.width, metrics.height, mobilePlayer),
+    width: metrics.width, height: metrics.height };
 }
 
 export function useMobilePlayerEnvironment() {
   const [environment, setEnvironment] = useState(() => readEnvironment());
   useLayoutEffect(() => {
     const refresh = () => setEnvironment((previous) => {
-      const next = readEnvironment(previous.mobilePlayer);
+      const next = readEnvironment(previous);
       return next.mobilePlayer === previous.mobilePlayer && next.forcedLandscape === previous.forcedLandscape
+        && next.width === previous.width && next.height === previous.height
         ? previous : next;
     });
     const orientation = window.matchMedia?.("(orientation: portrait)");
@@ -44,5 +55,9 @@ export function useMobilePlayerEnvironment() {
       document.removeEventListener("visibilitychange", refresh);
     };
   }, []);
-  return environment;
+  const stageStyle: CSSProperties | undefined = environment.mobilePlayer ? {
+    "--mobile-player-width": `${Math.max(environment.width, environment.height)}px`,
+    "--mobile-player-height": `${Math.min(environment.width, environment.height)}px`,
+  } as CSSProperties : undefined;
+  return { ...environment, stageStyle };
 }

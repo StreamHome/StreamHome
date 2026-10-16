@@ -11,6 +11,7 @@ import * as playbackApi from "../../api/playback";
 import { getPlaybackSessionRevision, subscribePlaybackSessions } from "../../api/playbackSessionEvents";
 import { PLAYER_SKIP_COUNTDOWN_DELAY_MS, PLAYER_SKIP_COUNTDOWN_DURATION_MS } from "./PlayerMarkerControls";
 import { MOBILE_SEEK_CONTROLS_GRACE_MS, MOBILE_SEEK_FEEDBACK_MS } from "./mobilePlayer";
+import { PlayerRouteLoading } from "./PlayerRouteLoading";
 import {
   PLAYER_CONTROLS_IDLE_MS,
   PLAYBACK_CLOCK_ADVANCE_TIMEOUT_MS,
@@ -2240,6 +2241,73 @@ describe("mounted player lifecycle", () => {
     await waitFor(() => expect(root.dataset.playerPhase).toBe("buffering"));
     expect(screen.queryByText("Press play once to allow the selected dubbing track.")).toBeNull();
     view.unmount();
+  });
+
+  it("keeps the first portrait lazy-loading paint and the mounted player in the same landscape layout", async () => {
+    const restore = phoneViewport();
+    const matchMedia = Object.getOwnPropertyDescriptor(window, "matchMedia");
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 390 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 844 });
+    // Reproduce the orientation query lagging behind the actual viewport size.
+    Object.defineProperty(window, "matchMedia", { configurable: true, value: vi.fn((media) => ({
+      media, matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    })) });
+    let finish!: (module: { default: typeof PlayerPage }) => void;
+    const DeferredPlayer = React.lazy(() => new Promise<{ default: typeof PlayerPage }>((resolve) => { finish = resolve; }));
+    const view = render(<MemoryRouter><React.Suspense fallback={<PlayerRouteLoading />}>
+      <DeferredPlayer visualFixture={playback} />
+    </React.Suspense></MemoryRouter>);
+    try {
+      const loading = screen.getByRole("status", { name: "Loading player" });
+      expect(loading.dataset.mobileOrientation).toBe("forced-landscape");
+      expect(loading.style.getPropertyValue("--mobile-player-width")).toBe("844px");
+      expect(loading.style.getPropertyValue("--mobile-player-height")).toBe("390px");
+      expect(view.container.querySelector("video")).toBeNull();
+      await act(async () => { finish({ default: PlayerPage }); });
+      const root = view.container.querySelector<HTMLElement>("[data-player-root]")!;
+      expect(root.dataset.mobileOrientation).toBe("forced-landscape");
+      expect(root.style.getPropertyValue("--mobile-player-width")).toBe("844px");
+      expect(root.style.getPropertyValue("--mobile-player-height")).toBe("390px");
+      expect(view.container.querySelector("video")).toBeTruthy();
+    } finally {
+      view.unmount(); restore();
+      if (matchMedia) Object.defineProperty(window, "matchMedia", matchMedia);
+      else Reflect.deleteProperty(window, "matchMedia");
+    }
+  });
+
+  it("commits phone size and rotation together and ignores ambiguous fullscreen dimensions without media operations", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      const { root, video, view } = player;
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(video, "paused", { configurable: true, value: true });
+      fireEvent.pause(video);
+      const source = video.getAttribute("src");
+      const time = video.currentTime;
+      const loads = videoCallCount("load", video);
+      const plays = videoCallCount("play", video);
+      for (const [width, height, mode] of [
+        [390, 844, "forced-landscape"],
+        [900, 900, "forced-landscape"],
+        [0, 0, "forced-landscape"],
+        [844, 390, "native-landscape"],
+        [780, 360, "native-landscape"],
+      ] as const) {
+        Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+        Object.defineProperty(window, "innerHeight", { configurable: true, value: height });
+        act(() => fireEvent(window, new Event("resize")));
+        expect(root.dataset.mobileOrientation).toBe(mode);
+        expect(root.style.getPropertyValue("--mobile-player-width")).toBe(width === 780 ? "780px" : "844px");
+        expect(root.style.getPropertyValue("--mobile-player-height")).toBe(width === 780 ? "360px" : "390px");
+      }
+      expect(view.container.querySelector("video")).toBe(video);
+      expect(video.getAttribute("src")).toBe(source);
+      expect(video.currentTime).toBe(time);
+      expect(root.dataset.playerPhase).toBe("paused");
+      expect(videoCallCount("load", video)).toBe(loads);
+      expect(videoCallCount("play", video)).toBe(plays);
+    } finally { player.close(); }
   });
 
   it.each(["allowed", "denied"])("retains paused landscape through native fullscreen and rotation with orientation locking %s", async (permission) => {

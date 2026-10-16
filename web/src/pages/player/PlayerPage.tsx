@@ -935,7 +935,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [hasLastFrame, setHasLastFrame] = useState(false);
   const [activeFrameCanvas, setActiveFrameCanvas] = useState(0);
   const [pausedFrameValid, setPausedFrameValid] = useState(false);
-  const { mobilePlayer, forcedLandscape } = useMobilePlayerEnvironment();
+  const { mobilePlayer, forcedLandscape, stageStyle } = useMobilePlayerEnvironment();
   const [mobileSeekFeedback, setMobileSeekFeedback] = useState<{
     side: MobileTapSide;
     seconds: number;
@@ -3838,6 +3838,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         data-player-theme={definition.playerVariant}
         data-mobile-player={mobilePlayer ? "true" : "false"}
         data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
+        style={stageStyle}
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
@@ -3868,6 +3869,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         className="player-view player-state-view fixed inset-0 grid min-h-screen place-items-center bg-black p-6 text-white"
         data-mobile-player={mobilePlayer ? "true" : "false"}
         data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
+        style={stageStyle}
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
       >
@@ -3901,7 +3903,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       data-mobile-player={mobilePlayer ? "true" : "false"}
       data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
       tabIndex={-1}
-      style={{ "--caption-scale": preferences.captionScale } as React.CSSProperties}
+      style={{ ...stageStyle, "--caption-scale": preferences.captionScale } as React.CSSProperties}
       onMouseMove={mobilePlayer ? undefined : handleDesktopPointerActivity}
       onClick={handleDesktopSurfaceClick}
       onDoubleClick={mobilePlayer ? undefined : handleDesktopSurfaceDoubleClick}

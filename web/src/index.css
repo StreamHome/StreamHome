@@ -769,6 +769,15 @@ body[data-player-viewport-fullscreen="true"] {
   background: black;
 }
 
+.player-route-loading {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  place-items: center;
+  background: black;
+}
+
 .player-fullscreen-shell[data-player-viewport-fullscreen="true"] {
   position: fixed !important;
   z-index: 2147483647 !important;
@@ -797,8 +806,8 @@ body[data-player-viewport-fullscreen="true"] {
   --mobile-chrome-edge-padding: .3125rem;
   --mobile-chrome-top-inset: max(var(--mobile-chrome-edge-padding), env(safe-area-inset-top));
   --mobile-chrome-bottom-inset: max(var(--mobile-chrome-edge-padding), env(safe-area-inset-bottom));
-  width: 100dvw;
-  height: 100dvh;
+  width: var(--mobile-player-width, 100dvw);
+  height: var(--mobile-player-height, 100dvh);
   min-height: 0;
   overscroll-behavior: none;
   touch-action: manipulation;
@@ -807,19 +816,15 @@ body[data-player-viewport-fullscreen="true"] {
   -webkit-touch-callout: none;
 }
 
-/* Native fullscreen resets only the outer shell; this stage keeps its rotation.
-   A media query also covers the first paint and transient orientation events. */
-@media (orientation: portrait) {
-  .player-view[data-mobile-player="true"] {
-    /* Clockwise rotation maps the top to the physical right and bottom to left. */
-    --mobile-chrome-top-inset: max(var(--mobile-chrome-edge-padding), env(safe-area-inset-right));
-    --mobile-chrome-bottom-inset: max(var(--mobile-chrome-edge-padding), env(safe-area-inset-left));
-    inset: 50% auto auto 50%;
-    width: 100dvh;
-    height: 100dvw;
-    transform: translate(-50%, -50%) rotate(90deg);
-    transform-origin: center;
-  }
+/* Geometry and rotation commit together, including the first loading paint.
+   Native fullscreen resets only the outer shell, not this landscape stage. */
+.player-view[data-mobile-player="true"][data-mobile-orientation="forced-landscape"] {
+  /* Clockwise rotation maps the top to the physical right and bottom to left. */
+  --mobile-chrome-top-inset: max(var(--mobile-chrome-edge-padding), env(safe-area-inset-right));
+  --mobile-chrome-bottom-inset: max(var(--mobile-chrome-edge-padding), env(safe-area-inset-left));
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%) rotate(90deg);
+  transform-origin: center;
 }
 
 .mobile-player-gesture-layer {

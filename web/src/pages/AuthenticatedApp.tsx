@@ -4,6 +4,7 @@ import { useLocation } from "react-router-dom";
 import { parseAppQuery } from "../navigation/queryState";
 import { MOTION_EASE, MOTION_TIMINGS, resetApplicationScroll, THEME_MOTION, useAppMotion } from "../motion/motionSystem";
 import { useThemeStore } from "../stores/themeStore";
+import { PlayerRouteLoading } from "./player/PlayerRouteLoading";
 
 const AdminGate = lazy(() => import("./admin/AdminGate").then((module) => ({ default: module.AdminGate })));
 const DashboardRouter = lazy(() => import("./dashboard/DashboardRouter").then((module) => ({ default: module.DashboardRouter })));
@@ -16,18 +17,18 @@ export function AuthenticatedApp() {
   const { reduced } = useAppMotion();
   const surface = query.view === "watch" ? "watch" : query.view === "admin" ? "admin" : "dashboard";
   useLayoutEffect(() => { resetApplicationScroll(); }, [surface]);
-  const reducedVariants = { initial: { opacity: 0 }, animate: { opacity: 1, transition: { duration: MOTION_TIMINGS.reduced } }, exit: { opacity: 0, transition: { duration: MOTION_TIMINGS.reduced } } };
+  const opacityVariants = { initial: { opacity: 0 }, animate: { opacity: 1, transition: { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.viewEnter } }, exit: { opacity: 0, transition: { duration: reduced ? MOTION_TIMINGS.reduced : MOTION_TIMINGS.viewExit } } };
   return <AnimatePresence mode="sync" initial={false}>
     <motion.div
       key={surface}
       className={surface === "dashboard" ? "application-motion-surface" : "standalone-motion-view"}
-      variants={reduced ? reducedVariants : THEME_MOTION[theme].view}
+      variants={reduced || surface === "watch" ? opacityVariants : THEME_MOTION[theme].view}
       custom={surface === "dashboard" ? -1 : 1}
       initial="initial"
       animate="animate"
       exit="exit"
     >
-      <Suspense fallback={<div role="status" aria-live="polite" className="application-surface-loading">Loading view...</div>}>
+      <Suspense fallback={surface === "watch" ? <PlayerRouteLoading /> : <div role="status" aria-live="polite" className="application-surface-loading">Loading view...</div>}>
         {surface === "watch" ? <PlayerPage /> : surface === "admin" ? <AdminGate /> : <DashboardRouter />}
       </Suspense>
     </motion.div>
