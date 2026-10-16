@@ -1,6 +1,7 @@
 import React from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import { AnimatePresence, motion } from "framer-motion";
 import { THEME_DEFINITIONS } from "./themeRegistry";
 import { MotionProvider } from "../../motion/motionSystem";
 
@@ -92,8 +93,8 @@ describe("theme definition registry", () => {
   it("renders every phone navigation as accessible icon-only controls", () => {
     for (const definition of Object.values(THEME_DEFINITIONS)) {
       const onView = vi.fn();
-      const { container, unmount } = render(React.createElement(definition.Navigation, { ...navigationProps, onView }));
-      const mobileNavigation = container.querySelector(".mobile-app-nav");
+      const { unmount } = render(React.createElement(definition.Navigation, { ...navigationProps, onView }));
+      const mobileNavigation = screen.getByRole("navigation", { name: "Catalog mobile" });
       const home = mobileNavigation?.querySelector<HTMLButtonElement>('button[aria-label="Home"]');
       const movies = mobileNavigation?.querySelector<HTMLButtonElement>('button[aria-label="Movies"]');
       expect(mobileNavigation).not.toBeNull();
@@ -105,5 +106,47 @@ describe("theme definition registry", () => {
       expect(onView).toHaveBeenCalledWith("movies");
       unmount();
     }
+  });
+
+  it.each(["ember", "aurora", "cinema"] as const)("keeps %s phone navigation outside animated pages and retires it on unmount", (theme) => {
+    const onView = vi.fn();
+    const { container, rerender, unmount } = render(React.createElement("div", { style: { transform: "translateY(12px)" } },
+      React.createElement(THEME_DEFINITIONS[theme].Navigation, { ...navigationProps, onView })));
+    const navigation = screen.getByRole("navigation", { name: "Catalog mobile" });
+    const layer = navigation.parentElement!;
+    expect(container.contains(navigation)).toBe(false);
+    expect(layer.parentElement).toBe(document.body);
+    expect(layer.dataset.theme).toBe(theme);
+    expect(layer.dataset.interaction).toBe(THEME_DEFINITIONS[theme].interaction.id);
+    expect(layer.classList.contains(`theme-app--${theme}`)).toBe(true);
+    const movies = navigation.querySelector<HTMLButtonElement>('button[aria-label="Movies"]')!;
+    movies.focus();
+    fireEvent.click(movies);
+    expect(onView).toHaveBeenCalledWith("movies");
+    rerender(React.createElement("div", { style: { transform: "translateY(12px)" } },
+      React.createElement(THEME_DEFINITIONS[theme].Navigation, { ...navigationProps, activeView: "movies", onView })));
+    expect(screen.getByRole("navigation", { name: "Catalog mobile" })).toBe(navigation);
+    expect(document.activeElement).toBe(movies);
+    expect(movies.getAttribute("aria-current")).toBe("page");
+    unmount();
+    expect(layer.isConnected).toBe(false);
+    expect(screen.queryByRole("navigation", { name: "Catalog mobile" })).toBeNull();
+  });
+
+  it("keeps Gemini phone navigation in its original presentation tree", () => {
+    const { container } = render(React.createElement(THEME_DEFINITIONS.gemini.Navigation, navigationProps));
+    expect(container.contains(screen.getByRole("navigation", { name: "Catalog mobile" }))).toBe(true);
+    expect(document.querySelector(".mobile-navigation-layer")).toBeNull();
+  });
+
+  it("retires detached navigation as the owning page starts its exit animation", () => {
+    const page = (open: boolean) => React.createElement(AnimatePresence, null, open &&
+      React.createElement(motion.div, { key: "catalog", exit: { opacity: 0 }, transition: { duration: 1 }, className: "retiring-catalog" },
+        React.createElement(THEME_DEFINITIONS.ember.Navigation, navigationProps)));
+    const { container, rerender } = render(page(true));
+    expect(screen.getByRole("navigation", { name: "Catalog mobile" })).not.toBeNull();
+    rerender(page(false));
+    expect(container.querySelector(".retiring-catalog")).not.toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Catalog mobile" })).toBeNull();
   });
 });
