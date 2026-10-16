@@ -115,7 +115,7 @@ describe("dedicated mobile player presentation", () => {
     expect(emberControls).toContain("box-shadow: none");
     expect(emberControls).toContain("rgba(0,0,0,.42)");
     expect(emberControls).not.toContain("rgba(15,6,3,.46)");
-    expect(playerStyles).toContain('background: linear-gradient(to top, rgba(0, 0, 0, 0.94)');
+    expect(playerStyles).toContain('background: linear-gradient(to top, rgba(0, 0, 0, 0.32)');
     expect(applicationStyles).toContain('@media (max-height: 420px) and (min-width: 641px)');
     expect(applicationStyles).toContain('.player-controls__transport { margin-top: .35rem; flex-wrap: nowrap; gap: .35rem; }');
   });
