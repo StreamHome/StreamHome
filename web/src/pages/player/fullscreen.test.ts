@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   canUsePlayerFullscreen,
+  ensurePlayerFullscreen,
   fullscreenElement,
   isPlayerFullscreen,
   isViewportPlayerFullscreen,
@@ -59,6 +60,45 @@ function fullscreenVideo(properties: Partial<HTMLVideoElement> = {}): HTMLVideoE
 }
 
 describe("player fullscreen controller", () => {
+  it("coalesces playback entry and never toggles an already active player out", async () => {
+    const harness = fullscreenDocument();
+    const requestFullscreen = vi.fn().mockResolvedValue(undefined);
+    const container = fullscreenContainer({ requestFullscreen });
+    const video = fullscreenVideo();
+    const first = ensurePlayerFullscreen(container, video, harness.documentObject);
+    const second = ensurePlayerFullscreen(container, video, harness.documentObject);
+    expect(second).toBe(first);
+    expect(requestFullscreen).toHaveBeenCalledOnce();
+    harness.setActiveElement(container);
+    harness.dispatch("fullscreenchange");
+    await expect(first).resolves.toBe("entered");
+    await expect(ensurePlayerFullscreen(container, video, harness.documentObject)).resolves.toBe("entered");
+    expect(requestFullscreen).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a pending entry without enabling viewport fullscreen after the player closes", async () => {
+    const harness = fullscreenDocument();
+    const controller = new AbortController();
+    const container = fullscreenContainer({ requestFullscreen: vi.fn(() => new Promise<void>(() => undefined)) });
+    const entry = ensurePlayerFullscreen(container, fullscreenVideo(), harness.documentObject, { signal: controller.signal });
+    controller.abort();
+    await expect(entry).rejects.toMatchObject({ name: "AbortError" });
+    expect(isViewportPlayerFullscreen(container)).toBe(false);
+    expect(harness.documentObject.body.getAttribute("data-player-viewport-fullscreen")).toBeNull();
+  });
+
+  it("keeps custom mobile controls in the viewport when only native video fullscreen is available", async () => {
+    const harness = fullscreenDocument();
+    const requestFullscreen = vi.fn();
+    const webkitEnterFullscreen = vi.fn();
+    const video = fullscreenVideo({ requestFullscreen, ...{ webkitEnterFullscreen } });
+    const container = fullscreenContainer();
+    await expect(ensurePlayerFullscreen(container, video, harness.documentObject, { allowVideoFallback: false })).resolves.toBe("entered");
+    expect(playerFullscreenMode(container, video, harness.documentObject)).toBe("viewport");
+    expect(requestFullscreen).not.toHaveBeenCalled();
+    expect(webkitEnterFullscreen).not.toHaveBeenCalled();
+  });
+
   it("uses the player container before the application root", async () => {
     const harness = fullscreenDocument();
     let container: HTMLElement;

@@ -20,6 +20,7 @@ export interface PlayerFullscreenOptions {
   allowVideoFallback?: boolean;
   allowViewportFallback?: boolean;
   transitionTimeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 const DEFAULT_TRANSITION_TIMEOUT_MS = 2_500;
@@ -160,6 +161,7 @@ function observePlayerFullscreenState(
   documentObject: Document,
   expectedActive: boolean,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): FullscreenStateObservation {
   const hasExpectedState = () => isPlayerFullscreen(container, video, documentObject) === expectedActive;
   if (hasExpectedState()) {
@@ -179,6 +181,7 @@ function observePlayerFullscreenState(
       if (settled) return;
       settled = true;
       if (timer !== null) clearTimeout(timer);
+      signal?.removeEventListener("abort", cancel);
       for (const { target, events } of targets) {
         for (const eventName of events) target.removeEventListener(eventName, onTransition);
       }
@@ -194,6 +197,7 @@ function observePlayerFullscreenState(
     };
 
     cancel = () => finish(false);
+    signal?.addEventListener("abort", cancel, { once: true });
     for (const { target, events } of targets) {
       for (const eventName of events) target.addEventListener(eventName, onTransition);
     }
@@ -210,6 +214,7 @@ async function requestVerifiedFullscreenTransition(
   documentObject: Document,
   expectedActive: boolean,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   const observation = observePlayerFullscreenState(
     container,
@@ -217,6 +222,7 @@ async function requestVerifiedFullscreenTransition(
     documentObject,
     expectedActive,
     timeoutMs,
+    signal,
   );
   let requestResult: Promise<void> | void;
   try {
@@ -313,6 +319,7 @@ async function enterPlayerFullscreen(
   allowVideoFallback: boolean,
   allowViewportFallback: boolean,
   transitionTimeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   const webkitDocument = documentObject as WebKitFullscreenDocument;
   const webkitContainer = container as WebKitFullscreenElement;
@@ -356,6 +363,7 @@ async function enterPlayerFullscreen(
         documentObject,
         true,
         transitionTimeoutMs,
+        signal,
       )) return;
       failure = `${attempt.label}: the browser accepted the request but did not enter fullscreen.`;
     } catch (error) {
@@ -363,6 +371,7 @@ async function enterPlayerFullscreen(
     }
   }
 
+  if (signal?.aborted) throw new DOMException("The player was closed.", "AbortError");
   if (allowViewportFallback) {
     setViewportPlayerFullscreen(container, documentObject, true);
     return;
@@ -383,13 +392,34 @@ export async function togglePlayerFullscreen(
     return "exited";
   }
 
-  await enterPlayerFullscreen(
+  return ensurePlayerFullscreen(container, video, documentObject, options);
+}
+
+const pendingEntries = new WeakMap<HTMLElement, Promise<PlayerFullscreenResult>>();
+
+// Starting playback may request fullscreen again before React observes the first
+// transition. Entry must be idempotent; only the explicit fullscreen button toggles.
+export function ensurePlayerFullscreen(
+  container: HTMLElement,
+  video: HTMLVideoElement,
+  documentObject: Document = document,
+  options: PlayerFullscreenOptions = {},
+): Promise<PlayerFullscreenResult> {
+  if (options.signal?.aborted) return Promise.reject(new DOMException("The player was closed.", "AbortError"));
+  if (isPlayerFullscreen(container, video, documentObject)) return Promise.resolve("entered");
+  const pending = pendingEntries.get(container);
+  if (pending) return pending;
+  const entry = enterPlayerFullscreen(
     container,
     video,
     documentObject,
     options.allowVideoFallback ?? true,
     options.allowViewportFallback ?? true,
-    transitionTimeoutMs,
-  );
-  return "entered";
+    options.transitionTimeoutMs ?? DEFAULT_TRANSITION_TIMEOUT_MS,
+    options.signal,
+  ).then(() => "entered" as const).finally(() => {
+    if (pendingEntries.get(container) === entry) pendingEntries.delete(container);
+  });
+  pendingEntries.set(container, entry);
+  return entry;
 }

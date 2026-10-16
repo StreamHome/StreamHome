@@ -28,10 +28,10 @@ describe("dedicated mobile player presentation", () => {
   });
 
   it("defines automatic locked-portrait landscape fallback, safe areas, gesture feedback, and touch tooltip suppression", () => {
-    expect(playerStyles).toContain('[data-mobile-orientation="forced-landscape"]');
+    expect(playerStyles).toContain('@media (orientation: portrait)');
     expect(playerStyles).toContain('transform: translate(-50%, -50%) rotate(90deg)');
     expect(playerPage).toContain("startMobilePlayback()");
-    expect(playerPage).toContain("{ allowVideoFallback: true }");
+    expect(playerPage).toContain("ensurePlayerFullscreen(container, video, document, { allowVideoFallback: false, signal })");
     expect(playerPage).not.toContain('icon="rotate"');
     expect(playerPage).not.toContain('label="Start over"');
     expect(playerPage).toContain("const startOver = useCallback");

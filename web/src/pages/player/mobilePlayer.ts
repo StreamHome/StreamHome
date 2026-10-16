@@ -119,3 +119,30 @@ export function unlockPlayerLandscape(screenObject: Screen = screen): void {
     // Some mobile browsers throw when the document is no longer active.
   }
 }
+
+export function createLandscapeLockController(screenObject: Screen = screen) {
+  let wanted = false;
+  let pending = false;
+  let revision = 0;
+  const request = () => {
+    wanted = true;
+    revision += 1;
+    run();
+  };
+  const run = () => {
+    if (pending || !wanted) return;
+    pending = true;
+    const started = revision;
+    void lockPlayerLandscape(screenObject).then(() => {
+      pending = false;
+      if (!wanted) unlockPlayerLandscape(screenObject);
+      else if (started !== revision) run();
+    });
+  };
+  const release = () => {
+    wanted = false;
+    revision += 1;
+    unlockPlayerLandscape(screenObject);
+  };
+  return { request, release };
+}

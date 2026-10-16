@@ -39,27 +39,24 @@ import { playerControlOwnsKey, restorePlayerPointerFocus } from "./playerKeyboar
 import { activeMarkerRegion, canSkipMarkerRegion, deriveMarkerRegions } from "./playerMarkers";
 import { PlayerSkipControl, PlayerTimelineShell } from "./PlayerMarkerControls";
 import {
+  ensurePlayerFullscreen,
   playerFullscreenMode,
   releaseViewportPlayerFullscreen,
   togglePlayerFullscreen,
   type PlayerFullscreenMode,
 } from "./fullscreen";
 import {
-  isForcedLandscape,
+  createLandscapeLockController,
   isMobileTapCandidate,
-  isPhonePlayerViewport,
-  lockPlayerLandscape,
   MOBILE_SEEK_CONTROLS_GRACE_MS,
   MOBILE_SEEK_FEEDBACK_MS,
   MOBILE_TAP_CHAIN_WINDOW,
   nextMobileTap,
-  readMobileViewport,
   shouldShowMobileChrome,
-  unlockPlayerLandscape,
   type MobileTapChain,
   type MobileTapSide,
 } from "./mobilePlayer";
-
+import { useMobilePlayerEnvironment } from "./useMobilePlayerEnvironment";
 
 export type PlayerPhase =
   | "resolving"
@@ -789,6 +786,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     [profile],
   );
 
+  const fullscreenShellRef = useRef<HTMLDivElement>(null);
+  const fullscreenLifecycleRef = useRef(new AbortController());
+  const landscapeLock = useMemo(() => createLandscapeLockController(), []);
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const externalAudioRef = useRef<HTMLAudioElement>(null);
@@ -935,8 +935,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const [hasLastFrame, setHasLastFrame] = useState(false);
   const [activeFrameCanvas, setActiveFrameCanvas] = useState(0);
   const [pausedFrameValid, setPausedFrameValid] = useState(false);
-  const [mobilePlayer, setMobilePlayer] = useState(() => typeof window !== "undefined" && isPhonePlayerViewport(readMobileViewport(window)));
-  const [forcedLandscape, setForcedLandscape] = useState(() => typeof window !== "undefined" && isForcedLandscape(window.innerWidth, window.innerHeight, isPhonePlayerViewport(readMobileViewport(window))));
+  const { mobilePlayer, forcedLandscape } = useMobilePlayerEnvironment();
   const [mobileSeekFeedback, setMobileSeekFeedback] = useState<{
     side: MobileTapSide;
     seconds: number;
@@ -1041,7 +1040,8 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   }, [profile?.id, visualFixture]);
 
   const exitPlayer = useCallback(() => {
-    unlockPlayerLandscape();
+    fullscreenLifecycleRef.current.abort();
+    landscapeLock.release();
     closeActiveRun();
     if (!profile) {
       navigate("/profiles", { replace: true });
@@ -1049,31 +1049,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     }
     if ((location.state as { fromApp?: boolean } | null)?.fromApp) navigate(-1);
     else navigate(appUrl(profile.id, "home"), { replace: true });
-  }, [closeActiveRun, location.state, navigate, profile]);
-
-  useEffect(() => {
-    const updateMobileEnvironment = () => {
-      const metrics = readMobileViewport();
-      const nextMobilePlayer = isPhonePlayerViewport(metrics);
-      setMobilePlayer(nextMobilePlayer);
-      setForcedLandscape(isForcedLandscape(metrics.width, metrics.height, nextMobilePlayer));
-      if (!nextMobilePlayer) {
-        mobileFullscreenAttemptedAtRef.current = 0;
-        unlockPlayerLandscape();
-      }
-    };
-
-    updateMobileEnvironment();
-    window.addEventListener("resize", updateMobileEnvironment);
-    window.addEventListener("orientationchange", updateMobileEnvironment);
-    screen.orientation?.addEventListener?.("change", updateMobileEnvironment);
-    return () => {
-      window.removeEventListener("resize", updateMobileEnvironment);
-      window.removeEventListener("orientationchange", updateMobileEnvironment);
-      screen.orientation?.removeEventListener?.("change", updateMobileEnvironment);
-      unlockPlayerLandscape();
-    };
-  }, []);
+  }, [closeActiveRun, landscapeLock, location.state, navigate, profile]);
 
   useEffect(() => {
     showControlsRef.current = showControls;
@@ -3117,28 +3093,32 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       ?? document.querySelector<HTMLElement>("[data-player-root='true']");
   }, []);
 
+  const resolveFullscreenContainer = useCallback((interactionTarget?: HTMLElement | null) => {
+    return fullscreenShellRef.current ?? resolvePlayerContainer(interactionTarget);
+  }, [resolvePlayerContainer]);
+
   useEffect(() => {
-    const container = resolvePlayerContainer();
+    const container = resolveFullscreenContainer();
     const video = videoRef.current;
+    const lifecycle = new AbortController();
+    fullscreenLifecycleRef.current = lifecycle;
     const updateFullscreenState = () => {
       const nextMode = playerFullscreenMode(container, video);
       const active = nextMode !== null;
       setFullscreenMode(nextMode);
       setFullscreenActive(active);
       if (active) setFullscreenError("");
-      if (mobilePlayer) {
-        if (active) void lockPlayerLandscape();
-        else {
-          mobileFullscreenAttemptedAtRef.current = 0;
-          unlockPlayerLandscape();
-        }
+      if (mobilePlayer && active && document.visibilityState !== "hidden") landscapeLock.request();
+      else {
+        mobileFullscreenAttemptedAtRef.current = 0;
+        landscapeLock.release();
       }
     };
     const reportFullscreenError = () => {
       const nextMode = playerFullscreenMode(container, video);
       setFullscreenMode(nextMode);
       setFullscreenActive(nextMode !== null);
-      if (nextMode !== null) {
+      if (nextMode !== null || mobilePlayer) {
         setFullscreenError("");
         return;
       }
@@ -3151,30 +3131,37 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     document.addEventListener("fullscreenerror", reportFullscreenError);
     document.addEventListener("webkitfullscreenchange", updateFullscreenState);
     document.addEventListener("webkitfullscreenerror", reportFullscreenError);
+    document.addEventListener("visibilitychange", updateFullscreenState);
+    window.addEventListener("pageshow", updateFullscreenState);
     video?.addEventListener("webkitbeginfullscreen", updateFullscreenState);
     video?.addEventListener("webkitendfullscreen", updateFullscreenState);
     return () => {
+      lifecycle.abort();
+      landscapeLock.release();
       document.removeEventListener("fullscreenchange", updateFullscreenState);
       document.removeEventListener("fullscreenerror", reportFullscreenError);
       document.removeEventListener("webkitfullscreenchange", updateFullscreenState);
       document.removeEventListener("webkitfullscreenerror", reportFullscreenError);
+      document.removeEventListener("visibilitychange", updateFullscreenState);
+      window.removeEventListener("pageshow", updateFullscreenState);
       video?.removeEventListener("webkitbeginfullscreen", updateFullscreenState);
       video?.removeEventListener("webkitendfullscreen", updateFullscreenState);
       releaseViewportPlayerFullscreen(container);
     };
-  }, [mobilePlayer, resolvePlayerContainer, runResponse?.runId, setControlsVisibility]);
+  }, [landscapeLock, mobilePlayer, resolveFullscreenContainer, runResponse?.runId, setControlsVisibility]);
 
   const toggleFullscreen = useCallback((interactionTarget?: HTMLElement | null) => {
-    const container = resolvePlayerContainer(interactionTarget);
+    const container = resolveFullscreenContainer(interactionTarget);
     const video = videoRef.current;
     if (!container || !video) return;
-
+    const signal = fullscreenLifecycleRef.current.signal;
     setFullscreenError("");
-    const operation = togglePlayerFullscreen(container, video, document, { allowVideoFallback: true });
+    const operation = togglePlayerFullscreen(container, video, document, { allowVideoFallback: !mobilePlayer, signal });
     interactionTarget?.blur();
-    container.focus({ preventScroll: true });
+    resolvePlayerContainer()?.focus({ preventScroll: true });
     void operation
       .then((result) => {
+        if (signal.aborted) return;
         const nextMode = playerFullscreenMode(container, video);
         const active = result === "entered" && nextMode !== null;
         setFullscreenMode(nextMode);
@@ -3183,11 +3170,12 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         if (active && nextMode === "viewport") {
           setPlayerNotice("This browser uses app fullscreen because native fullscreen is unavailable.");
         }
-        if (mobilePlayer && active) void lockPlayerLandscape();
-        if (mobilePlayer && !active) unlockPlayerLandscape();
+        if (mobilePlayer && active && document.visibilityState !== "hidden") landscapeLock.request();
+        if (!active) landscapeLock.release();
         revealControls();
       })
       .catch((error: unknown) => {
+        if (signal.aborted) return;
         const nextMode = playerFullscreenMode(container, video);
         setFullscreenMode(nextMode);
         setFullscreenActive(nextMode !== null);
@@ -3197,35 +3185,38 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         setControlsVisibility(true);
       })
       .finally(() => {
-        window.requestAnimationFrame(() => container.focus({ preventScroll: true }));
+        if (!signal.aborted) window.requestAnimationFrame(() => {
+          if (!signal.aborted) resolvePlayerContainer()?.focus({ preventScroll: true });
+        });
       });
-  }, [mobilePlayer, resolvePlayerContainer, revealControls, setControlsVisibility]);
+  }, [landscapeLock, mobilePlayer, resolveFullscreenContainer, resolvePlayerContainer, revealControls, setControlsVisibility]);
 
   const ensureMobileLandscape = useCallback(() => {
     if (!mobilePlayer) return;
-    if (fullscreenActive) {
-      void lockPlayerLandscape();
-      return;
-    }
-    const container = resolvePlayerContainer();
+    const container = resolveFullscreenContainer();
     const video = videoRef.current;
     if (!container || !video) return;
+    if (playerFullscreenMode(container, video) !== null) {
+      landscapeLock.request();
+      return;
+    }
     const now = performance.now();
     if (mobileFullscreenAttemptedAtRef.current > 0 && now - mobileFullscreenAttemptedAtRef.current < 2_000) return;
     mobileFullscreenAttemptedAtRef.current = now;
-    void togglePlayerFullscreen(container, video, document, { allowVideoFallback: true })
-      .then(async (result) => {
+    const signal = fullscreenLifecycleRef.current.signal;
+    void ensurePlayerFullscreen(container, video, document, { allowVideoFallback: false, signal })
+      .then(() => {
+        if (signal.aborted) return;
         const nextMode = playerFullscreenMode(container, video);
-        const active = result === "entered" && nextMode !== null;
         setFullscreenMode(nextMode);
-        setFullscreenActive(active);
-        if (active) await lockPlayerLandscape();
+        setFullscreenActive(nextMode !== null);
+        if (nextMode !== null && document.visibilityState !== "hidden") landscapeLock.request();
       })
       .catch(() => {
-        mobileFullscreenAttemptedAtRef.current = 0;
-        // The CSS-rotated landscape presentation remains active when browser policy rejects fullscreen.
+        if (!signal.aborted) mobileFullscreenAttemptedAtRef.current = 0;
+        // CSS landscape is independent of fullscreen and orientation permissions.
       });
-  }, [fullscreenActive, mobilePlayer, resolvePlayerContainer]);
+  }, [landscapeLock, mobilePlayer, resolveFullscreenContainer]);
 
   const startMobilePlayback = useCallback(() => {
     ensureMobileLandscape();
@@ -3895,6 +3886,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
 
   return (
     <PlayerMenuProvider onOpenChange={handleControlMenuOpenChange}>
+    <div ref={fullscreenShellRef} className="player-fullscreen-shell" data-player-fullscreen-shell="true">
     <motion.div
       ref={containerRef}
       className="player-view fixed inset-0 z-[200] overflow-hidden bg-black text-white"
@@ -3908,7 +3900,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       data-controls-visible={controlsVisible ? "true" : "false"}
       data-mobile-player={mobilePlayer ? "true" : "false"}
       data-mobile-orientation={forcedLandscape ? "forced-landscape" : "native-landscape"}
-      data-player-viewport-fullscreen={fullscreenMode === "viewport" ? "true" : undefined}
       tabIndex={-1}
       style={{ "--caption-scale": preferences.captionScale } as React.CSSProperties}
       onMouseMove={mobilePlayer ? undefined : handleDesktopPointerActivity}
@@ -4790,6 +4781,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
         )}
       </AnimatePresence>
     </motion.div>
+    </div>
     </PlayerMenuProvider>
   );
 }

@@ -372,6 +372,7 @@ describe("mounted player lifecycle", () => {
     document.documentElement.removeAttribute("data-player-viewport-fullscreen");
     document.body.removeAttribute("data-player-viewport-fullscreen");
     Reflect.deleteProperty(document, "fullscreenEnabled");
+    Reflect.deleteProperty(document, "fullscreenElement");
     Reflect.deleteProperty(document, "webkitFullscreenEnabled");
     Reflect.deleteProperty(document, "pictureInPictureElement");
   });
@@ -2201,6 +2202,143 @@ describe("mounted player lifecycle", () => {
     view.unmount();
   });
 
+  it.each(["allowed", "denied"])("retains paused landscape through native fullscreen and rotation with orientation locking %s", async (permission) => {
+    const orientation = Object.getOwnPropertyDescriptor(window.screen, "orientation");
+    const lock = vi.fn().mockImplementation(() => permission === "allowed" ? Promise.resolve() : Promise.reject(new DOMException("Denied", "SecurityError")));
+    Object.defineProperty(window.screen, "orientation", { configurable: true, value: Object.assign(new EventTarget(), { lock, unlock: vi.fn() }) });
+    const player = await mountPhonePlayer();
+    try {
+      const { video, root, view } = player;
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(video, "paused", { configurable: true, value: true });
+      fireEvent.pause(video);
+      const source = video.getAttribute("src");
+      const time = video.currentTime;
+      const loads = videoCallCount("load", video);
+      const plays = videoCallCount("play", video);
+      const shell = root.closest<HTMLElement>("[data-player-fullscreen-shell]")!;
+      let active: Element | null = null;
+      Object.defineProperty(document, "fullscreenElement", { configurable: true, get: () => active });
+      Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: true });
+      const enter = vi.fn(async () => { active = shell; fireEvent(document, new Event("fullscreenchange")); });
+      Object.defineProperty(shell, "requestFullscreen", { configurable: true, value: enter });
+      const stageRequest = vi.fn();
+      Object.defineProperty(root, "requestFullscreen", { configurable: true, value: stageRequest });
+      const exit = vi.fn(async () => { active = null; fireEvent(document, new Event("fullscreenchange")); });
+      Object.defineProperty(document, "exitFullscreen", { configurable: true, value: exit });
+      for (let cycle = 0; cycle < 2; cycle += 1) {
+        await act(async () => { pointerClick(screen.getByRole("button", { name: "Fullscreen" })); });
+        expect(active).toBe(shell);
+        expect(stageRequest).not.toHaveBeenCalled();
+        expect(lock).toHaveBeenCalledWith("landscape");
+        Object.defineProperty(window, "innerWidth", { configurable: true, value: 900 });
+        Object.defineProperty(window, "innerHeight", { configurable: true, value: 900 });
+        act(() => fireEvent(window, new Event("resize")));
+        expect(root.dataset.mobilePlayer).toBe("true");
+        Object.defineProperty(window, "innerWidth", { configurable: true, value: 390 });
+        Object.defineProperty(window, "innerHeight", { configurable: true, value: 844 });
+        act(() => fireEvent(window, new Event("orientationchange")));
+        expect(root.dataset.mobileOrientation).toBe("forced-landscape");
+        pointerClick(screen.getByRole("button", { name: "Player settings" }));
+        expect(root.querySelector("[data-player-settings-dialog][aria-modal='true']")).toBeTruthy();
+        pointerClick(screen.getByRole("button", { name: "Close settings" }));
+        player.setVisibility("hidden");
+        player.setVisibility("visible");
+        act(() => fireEvent(window, new Event("pageshow")));
+        await act(async () => { pointerClick(screen.getByRole("button", { name: "Exit fullscreen" })); });
+        expect(active).toBeNull();
+        expect(root.dataset.mobileOrientation).toBe("forced-landscape");
+        Object.defineProperty(window, "innerWidth", { configurable: true, value: 844 });
+        Object.defineProperty(window, "innerHeight", { configurable: true, value: 390 });
+        act(() => fireEvent(window, new Event("resize")));
+        expect(root.dataset.mobileOrientation).toBe("native-landscape");
+      }
+      expect(enter).toHaveBeenCalledTimes(2);
+      expect(view.container.querySelector("video")).toBe(video);
+      expect(video.getAttribute("src")).toBe(source);
+      expect(video.currentTime).toBe(time);
+      expect(root.dataset.playerPhase).toBe("paused");
+      expect(videoCallCount("load", video)).toBe(loads);
+      expect(videoCallCount("play", video)).toBe(plays);
+    } finally {
+      player.close();
+      Reflect.deleteProperty(document, "exitFullscreen");
+      if (orientation) Object.defineProperty(window.screen, "orientation", orientation);
+      else Reflect.deleteProperty(window.screen, "orientation");
+    }
+  });
+
+  it("maps a portrait timeline to screen Y after foreground refresh without restarting Pause", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      const { video, root } = player;
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(video, "paused", { configurable: true, value: true });
+      fireEvent.pause(video);
+      const loads = videoCallCount("load", video);
+      const plays = videoCallCount("play", video);
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: 390 });
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: 844 });
+      act(() => fireEvent(window, new Event("pageshow")));
+      expect(root.dataset.mobileOrientation).toBe("forced-landscape");
+      const timeline = screen.getByRole("slider", { name: "Playback position" }) as HTMLInputElement;
+      vi.spyOn(timeline, "getBoundingClientRect").mockReturnValue({ left: 350, top: 20, width: 32, height: 800, right: 382, bottom: 820, x: 350, y: 20, toJSON: () => ({}) });
+      for (const type of ["pointerdown", "pointerup"]) {
+        const event = new MouseEvent(type, { bubbles: true, clientX: 360, clientY: 420 });
+        Object.defineProperty(event, "pointerId", { value: 1 });
+        fireEvent(timeline, event);
+      }
+      expect(video.currentTime).toBeCloseTo(60);
+      expect(root.dataset.playerPhase).toBe("paused");
+      expect(videoCallCount("load", video)).toBe(loads);
+      expect(videoCallCount("play", video)).toBe(plays);
+    } finally { player.close(); }
+  });
+
+  it("starts Play immediately during pending fullscreen and honors Pause before the transition finishes", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      const { root, video } = player;
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(video, "paused", { configurable: true, value: true });
+      fireEvent.pause(video);
+      const shell = root.closest<HTMLElement>("[data-player-fullscreen-shell]")!;
+      Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: true });
+      let active: Element | null = null;
+      Object.defineProperty(document, "fullscreenElement", { configurable: true, get: () => active });
+      const enter = vi.fn(() => new Promise<void>(() => undefined));
+      Object.defineProperty(shell, "requestFullscreen", { configurable: true, value: enter });
+      const plays = videoCallCount("play", video);
+      pointerClick(screen.getByRole("button", { name: "Play" }));
+      expect(enter).toHaveBeenCalledOnce();
+      expect(videoCallCount("play", video)).toBe(plays + 1);
+      Object.defineProperty(video, "paused", { configurable: true, value: false });
+      fireEvent.playing(video);
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(video, "paused", { configurable: true, value: true });
+      fireEvent.pause(video);
+      const time = video.currentTime;
+      await act(async () => { active = shell; fireEvent(document, new Event("fullscreenchange")); });
+      expect(root.dataset.playerPhase).toBe("paused");
+      expect(videoCallCount("play", video)).toBe(plays + 1);
+      expect(video.currentTime).toBe(time);
+      expect(player.view.container.querySelector("video")).toBe(video);
+    } finally { player.close(); }
+  });
+
+  it("fences pending native fullscreen after unmount without leaving viewport locks behind", async () => {
+    const player = await mountPhonePlayer();
+    const shell = player.root.closest<HTMLElement>("[data-player-fullscreen-shell]")!;
+    Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: true });
+    Object.defineProperty(shell, "requestFullscreen", { configurable: true, value: vi.fn(() => new Promise<void>(() => undefined)) });
+    pointerClick(screen.getByRole("button", { name: "Fullscreen" }));
+    player.close();
+    await act(async () => { await Promise.resolve(); });
+    expect(shell.getAttribute("data-player-viewport-fullscreen")).toBeNull();
+    expect(document.body.getAttribute("data-player-viewport-fullscreen")).toBeNull();
+    expect(document.documentElement.getAttribute("data-player-viewport-fullscreen")).toBeNull();
+  });
+
   it("enters viewport fullscreen, releases button focus, and honors global fullscreen keys", async () => {
     Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: false });
     Object.defineProperty(document, "webkitFullscreenEnabled", { configurable: true, value: false });
@@ -2226,7 +2364,7 @@ describe("mounted player lifecycle", () => {
       () => expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeTruthy(),
       { timeout: 4_000 },
     );
-    expect(player.getAttribute("data-player-viewport-fullscreen")).toBe("true");
+    expect(player.closest("[data-player-fullscreen-shell]")?.getAttribute("data-player-viewport-fullscreen")).toBe("true");
     expect(document.documentElement.getAttribute("data-player-viewport-fullscreen")).toBe("true");
     expect(document.body.getAttribute("data-player-viewport-fullscreen")).toBe("true");
     fireEvent(document, new Event("fullscreenerror"));

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  createLandscapeLockController,
   isForcedLandscape,
   isMobileTapCandidate,
   isPhonePlayerViewport,
@@ -69,6 +70,37 @@ describe("mobile tap recognition", () => {
 });
 
 describe("mobile orientation locking", () => {
+  it("releases a delayed successful lock after exit without starting another request", async () => {
+    let finish!: () => void;
+    const lock = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const unlock = vi.fn();
+    const controller = createLandscapeLockController({ orientation: { lock, unlock } } as unknown as Screen);
+    controller.request();
+    controller.request();
+    expect(lock).toHaveBeenCalledOnce();
+    controller.release();
+    finish();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(unlock).toHaveBeenCalledTimes(2);
+    expect(lock).toHaveBeenCalledOnce();
+  });
+
+  it("serializes a new foreground request behind an aborted earlier lock", async () => {
+    let reject!: (error: Error) => void;
+    const lock = vi.fn().mockImplementationOnce(() => new Promise<void>((_, fail) => { reject = fail; })).mockResolvedValue(undefined);
+    const controller = createLandscapeLockController({ orientation: { lock, unlock: vi.fn() } } as unknown as Screen);
+    controller.request();
+    controller.release();
+    controller.request();
+    expect(lock).toHaveBeenCalledOnce();
+    reject(new DOMException("Aborted", "AbortError"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(lock).toHaveBeenCalledTimes(2);
+    controller.release();
+  });
+
   it("locks and unlocks landscape when the browser exposes the orientation API", async () => {
     const lock = vi.fn().mockResolvedValue(undefined);
     const unlock = vi.fn();
