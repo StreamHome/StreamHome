@@ -197,7 +197,10 @@ function frameCanvasHarness() {
   const contexts = new WeakMap<HTMLCanvasElement, CanvasRenderingContext2D>();
   let presented = "initial picture";
   let rejectCapture = false;
+  let ignoreCapture = false;
+  let rejectReadback = false;
   const draws = vi.fn();
+  const reads = vi.fn();
   const publishedMutations = vi.fn();
   const recordMutation = (canvas: HTMLCanvasElement, operation: string) => {
     if (canvas.dataset.frameActive === "true" && canvas.closest("[data-frame-hold='true']")) publishedMutations(canvas, operation);
@@ -210,12 +213,18 @@ function frameCanvasHarness() {
         drawImage: (source: CanvasImageSource) => {
           draws(canvas, source);
           if (source instanceof HTMLVideoElement && rejectCapture) throw new DOMException("Frame unavailable", "InvalidStateError");
+          if (source instanceof HTMLVideoElement && ignoreCapture) return;
           recordMutation(canvas, "draw");
           const picture = source instanceof HTMLCanvasElement ? pixels.get(source) : presented;
           if (picture === undefined) pixels.delete(canvas);
           else pixels.set(canvas, picture);
         },
-        clearRect: () => pixels.delete(canvas),
+        clearRect: () => { recordMutation(canvas, "clear"); pixels.delete(canvas); },
+        getImageData: (x: number, y: number, width: number, height: number) => {
+          reads(canvas, x, y, width, height);
+          if (rejectReadback) throw new DOMException("Readback unavailable", "SecurityError");
+          return { data: new Uint8ClampedArray([0, 0, 0, pixels.has(canvas) ? 255 : 0]) };
+        },
       } as unknown as CanvasRenderingContext2D;
       contexts.set(canvas, context);
     }
@@ -231,10 +240,13 @@ function frameCanvasHarness() {
   }
   return {
     draws,
+    reads,
     publishedMutations,
     picture: (canvas: HTMLCanvasElement | null) => canvas ? pixels.get(canvas) : undefined,
     present: (picture: string) => { presented = picture; },
     reject: (value: boolean) => { rejectCapture = value; },
+    ignore: (value: boolean) => { ignoreCapture = value; },
+    rejectReadback: (value: boolean) => { rejectReadback = value; },
   };
 }
 
@@ -2805,6 +2817,121 @@ describe("mounted player lifecycle", () => {
     } finally {
       player.close();
     }
+  });
+
+  it.each([false, true])("rejects a silently empty phone Pause snapshot with frame callbacks: %s", async (frameCallbacks) => {
+    const restore = phoneViewport();
+    const player = await mountFramePlayer(playback, frameCallbacks);
+    try {
+      const source = player.video.getAttribute("src");
+      const plays = videoCallCount("play", player.video);
+      const loads = videoCallCount("load", player.video);
+      player.canvas.ignore(true);
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      fireEvent.pause(player.video);
+      fireEvent.loadedData(player.video);
+      if (frameCallbacks) player.frame();
+      expect(player.root.dataset.frameHold).toBe("false");
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      player.advance(3_000, false, false);
+      expect(player.root.dataset.frameHold).toBe("false");
+      expect(player.video.paused).toBe(true);
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+    } finally { player.close(); restore(); }
+  });
+
+  it("does not relabel an inactive old bitmap after a silent phone Pause copy failure", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      const pause = () => {
+        player.frame();
+        pointerClick(screen.getByRole("button", { name: "Pause" }));
+        Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+        fireEvent.pause(player.video);
+      };
+      const resume = () => {
+        pointerClick(screen.getByRole("button", { name: "Play" }));
+        Object.defineProperty(player.video, "paused", { configurable: true, value: false });
+        fireEvent.play(player.video);
+        fireEvent.playing(player.video);
+        player.video.currentTime += 1;
+        fireEvent.timeUpdate(player.video);
+      };
+      pause();
+      const firstCanvas = player.activeCanvas();
+      resume();
+      pause();
+      const validCanvas = player.activeCanvas();
+      const validPicture = player.canvas.picture(validCanvas);
+      expect(validCanvas).not.toBe(firstCanvas);
+      resume();
+      const source = player.video.getAttribute("src");
+      const plays = videoCallCount("play", player.video);
+      const loads = videoCallCount("load", player.video);
+      player.canvas.ignore(true);
+      player.canvas.publishedMutations.mockClear();
+      pause();
+      expect(player.root.dataset.frameHold).toBe("false");
+      expect(player.activeCanvas()).toBe(validCanvas);
+      expect(player.canvas.picture(validCanvas)).toBe(validPicture);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(player.video.getAttribute("src")).toBe(source);
+      expect(videoCallCount("play", player.video)).toBe(plays);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+    } finally { player.close(); }
+  });
+
+  it("freezes phone video before synchronous snapshot readback", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      const pause = vi.mocked(HTMLMediaElement.prototype.pause);
+      const baseline = pause.mock.calls.length;
+      player.canvas.reads.mockClear();
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      const call = pause.mock.contexts.findIndex((media, index) => index >= baseline && media === player.video);
+      expect(call).toBeGreaterThanOrEqual(0);
+      expect(player.canvas.reads).toHaveBeenCalled();
+      expect(pause.mock.invocationCallOrder[call]).toBeLessThan(player.canvas.reads.mock.invocationCallOrder[0]);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+    } finally { player.close(); }
+  });
+
+  it("accepts a genuine opaque black phone frame with bounded discrete readback", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      player.canvas.present("opaque black video frame");
+      player.canvas.reads.mockClear();
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      fireEvent.pause(player.video);
+      expect(player.root.dataset.frameHold).toBe("true");
+      expect(player.canvas.picture(player.activeCanvas())).toBe("opaque black video frame");
+      expect(player.canvas.reads).toHaveBeenCalled();
+      for (const [, , , width, height] of player.canvas.reads.mock.calls) expect([width, height]).toEqual([1, 1]);
+      const reads = player.canvas.reads.mock.calls.length;
+      player.advance(3_000, false, false);
+      expect(player.canvas.reads).toHaveBeenCalledTimes(reads);
+    } finally { player.close(); }
+  });
+
+  it("keeps native paused video visible when snapshot readback is unavailable", async () => {
+    const player = await mountPhonePlayer();
+    try {
+      const plays = videoCallCount("play", player.video);
+      const loads = videoCallCount("load", player.video);
+      player.canvas.rejectReadback(true);
+      pointerClick(screen.getByRole("button", { name: "Pause" }));
+      Object.defineProperty(player.video, "paused", { configurable: true, value: true });
+      fireEvent.pause(player.video);
+      expect(player.root.dataset.frameHold).toBe("false");
+      expect(player.video.paused).toBe(true);
+      expect(player.root.dataset.playerPhase).toBe("paused");
+      expect(videoCallCount("play", player.video)).toBe(plays);
+      expect(videoCallCount("load", player.video)).toBe(loads);
+    } finally { player.close(); }
   });
 
   it.each([false, true])("keeps paused capture failure safe when a valid snapshot already exists: %s", async (existingSnapshot) => {

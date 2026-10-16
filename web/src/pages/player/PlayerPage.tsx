@@ -1349,7 +1349,13 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
       if (canvas.height !== height) canvas.height = height;
       const context = canvas.getContext("2d");
       if (!context) return false;
+      // Some mobile decoders silently skip video draws. Clear the inactive buffer
+      // so neither its old bitmap nor transparent pixels can be published as fresh.
+      context.clearRect(0, 0, canvas.width, canvas.height);
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      // Read one pixel only on discrete captures. An opaque black film frame is
+      // valid; an untouched transparent buffer is not proof of a copied frame.
+      if (context.getImageData(Math.floor(canvas.width / 2), Math.floor(canvas.height / 2), 1, 1).data[3] === 0) return false;
     } catch {
       return false;
     }
@@ -2778,8 +2784,9 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
     playbackIntentRef.current = false;
     cancelPendingVideoPlay();
     pauseExternalAudio();
-    capturePausedFrame();
+    // Freeze playback before synchronous snapshot validation can take any time.
     videoRef.current?.pause();
+    capturePausedFrame();
     settlePausedPlayback();
   }, [cancelPendingVideoPlay, capturePausedFrame, pauseExternalAudio, settlePausedPlayback]);
 
