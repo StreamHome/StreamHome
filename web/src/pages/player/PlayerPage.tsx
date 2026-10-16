@@ -3814,6 +3814,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
   const controlsVisible = mobilePlayer
     ? shouldShowMobileChrome(phase, showControls, controlMenuOpen, timelineScrubbing, mobileSeekControlsHidden)
     : showControls;
+  const mobileChromeTransition = {
+    duration: reduced ? MOTION_TIMINGS.reduced : controlsVisible ? 0.18 : 0.12,
+    ease: MOTION_EASE,
+  };
   const phaseMessage: Record<PlayerPhase, string> = {
     resolving: "Resolving secure playback",
     preparing: "Preparing adaptive stream",
@@ -4542,9 +4546,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
             initial={{ opacity: 0 }}
             animate={{ opacity: controlsVisible ? 1 : 0 }}
             exit={{ opacity: 0 }}
-            transition={{ duration: reduced ? MOTION_TIMINGS.reduced : 0.16, ease: MOTION_EASE }}
+            transition={mobileChromeTransition}
           >
-            <header className="mobile-player-topbar">
+            <motion.header className="mobile-player-topbar" initial={false}
+              animate={{ y: reduced || controlsVisible ? 0 : -6 }} transition={mobileChromeTransition}>
               <div className="mobile-player-topbar__actions">
                 <PlayerIconButton
                   icon="back"
@@ -4582,9 +4587,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                   } : undefined,
                 }}
                 onOpenChange={handleControlMenuOpenChange} compact className="mobile-player-topbar__settings" />
-            </header>
+            </motion.header>
 
-            <div className="mobile-player-transport">
+            <motion.div className="mobile-player-transport" initial={false}
+              animate={{ scale: reduced || controlsVisible ? 1 : 0.96 }} transition={mobileChromeTransition}>
               <PlayerIconButton
                 iconVariant="mobile"
                 icon="rewind"
@@ -4607,9 +4613,10 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                 className="mobile-player-transport__seek"
                 onClick={() => seek(currentTimeRef.current + 10)}
               />
-            </div>
+            </motion.div>
 
-            <div className="mobile-player-bottom">
+            <motion.div className="mobile-player-bottom" initial={false}
+              animate={{ y: reduced || controlsVisible ? 0 : 6 }} transition={mobileChromeTransition}>
               <div className="mobile-player-progress" style={{ "--mobile-player-time-width": `${(duration ? formatDuration(duration) : asset.durationLabel).length}ch` } as React.CSSProperties}>
                 <span className="mobile-player-time" aria-label="Elapsed time">{formatDuration(currentTime)}</span>
                 <PlayerTimelineShell regions={markerRegions} duration={duration} time={currentTime} preview={timelinePreview} obstacleKey={timelineObstacleKey}>
@@ -4654,7 +4661,7 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                   />
                 </div>
               </div>
-            </div>
+            </motion.div>
           </motion.div>
         )}
       </AnimatePresence>
