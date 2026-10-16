@@ -268,7 +268,7 @@ async def start_job(payload: StartRequest, session: AuthSession = Depends(requir
     except BaseException:
         # A cancelled commit is ambiguous: retain credentials for reconciliation.
         raise
-    authorization_url = f"{GOOGLE_AUTHORIZE_URL}?{urlencode({'client_id': client_id, 'redirect_uri': _drive_callback_url(public_url), 'response_type': 'code', 'scope': DRIVE_SCOPE, 'access_type': 'offline', 'prompt': 'consent', 'include_granted_scopes': 'true', 'state': state, 'code_challenge': challenge, 'code_challenge_method': 'S256'})}"
+    authorization_url = f"{GOOGLE_AUTHORIZE_URL}?{urlencode({'client_id': client_id, 'redirect_uri': _drive_callback_url(public_url), 'response_type': 'code', 'scope': DRIVE_SCOPE, 'access_type': 'offline', 'prompt': 'consent', 'state': state, 'code_challenge': challenge, 'code_challenge_method': 'S256'})}"
     return {"jobId": job.id, "authorizationUrl": authorization_url, "expiresAt": job.expires_at}
 
 

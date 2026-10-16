@@ -601,7 +601,6 @@ async def start_drive_oauth(payload: DriveOAuthStartRequest, request: Request, d
         'scope': DRIVE_SCOPE,
         'access_type': 'offline',
         'prompt': 'consent',
-        'include_granted_scopes': 'true',
         'state': state_value,
         'code_challenge': challenge,
         'code_challenge_method': 'S256',
