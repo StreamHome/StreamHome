@@ -1,6 +1,6 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getSetupStatus } from "../../api/setup";
 import { SetupStateGate } from "./SetupStateGate";
 
@@ -16,6 +16,8 @@ function renderGate(path: string) {
   </Routes></SetupStateGate></MemoryRouter>);
 }
 
+afterEach(cleanup);
+
 describe("SetupStateGate", () => {
   beforeEach(() => vi.resetAllMocks());
 
@@ -30,4 +32,24 @@ describe("SetupStateGate", () => {
     renderGate("/setup");
     await waitFor(() => expect(screen.getByText("Login page")).toBeTruthy());
   });
+  it("distinguishes failed status from a locked server and retries without reloading", async () => {
+    vi.mocked(getSetupStatus).mockRejectedValueOnce(new Error("Unavailable"));
+    renderGate("/profiles");
+    await screen.findByRole("heading", { name: "StreamHome is unavailable" });
+    expect(screen.queryByText("Setup wizard")).toBeNull();
+    vi.mocked(getSetupStatus).mockResolvedValue({ ...configured, required: true });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await screen.findByText("Setup wizard");
+  });
+
+  it("aborts and ignores status completion after unmount", async () => {
+    let resolve!: (value: typeof configured) => void;
+    vi.mocked(getSetupStatus).mockReturnValueOnce(new Promise((yes) => { resolve = yes; }));
+    const { unmount } = renderGate("/profiles");
+    const signal = vi.mocked(getSetupStatus).mock.calls[0][0]?.signal;
+    unmount(); expect(signal?.aborted).toBe(true);
+    await act(async () => resolve(configured));
+    expect(screen.queryByText("Profiles")).toBeNull();
+  });
+
 });

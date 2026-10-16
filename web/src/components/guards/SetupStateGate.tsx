@@ -6,16 +6,20 @@ export function SetupStateGate({ children }: { children: ReactNode }) {
   const location = useLocation();
   const [status, setStatus] = useState<SetupStatus | null>(null);
   const [error, setError] = useState("");
+  const [retry, setRetry] = useState(0);
 
   useEffect(() => {
     let active = true;
-    getSetupStatus().then((value) => { if (active) { setStatus(value); setError(""); } }).catch((reason) => {
+    const controller = new AbortController();
+    setStatus(null);
+    setError("");
+    getSetupStatus({ signal: controller.signal }).then((value) => { if (active) { setStatus(value); setError(""); } }).catch((reason) => {
       if (active) setError(reason instanceof Error ? reason.message : "Setup status is unavailable.");
     });
-    return () => { active = false; };
-  }, [location.pathname]);
+    return () => { active = false; controller.abort(); };
+  }, [location.pathname, retry]);
 
-  if (error) return <main className="setup-gate-state"><h1>StreamHome is unavailable</h1><p>{error}</p><button onClick={() => window.location.reload()}>Retry</button></main>;
+  if (error) return <main className="setup-gate-state"><h1>StreamHome is unavailable</h1><p>{error}</p><button onClick={() => setRetry((value) => value + 1)}>Retry</button></main>;
   if (!status) return <main className="setup-gate-state" aria-busy="true"><span className="setup-spinner" /><p>Checking server state…</p></main>;
   if (status.required && location.pathname !== "/setup") return <Navigate to="/setup" replace />;
   if (!status.required && location.pathname === "/setup") return <Navigate to="/login" replace />;

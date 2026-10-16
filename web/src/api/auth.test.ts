@@ -59,3 +59,29 @@ describe("authentication response normalization", () => {
     expect(options?.method).toBe("DELETE");
   });
 });
+
+
+describe("account mutation wire validation", () => {
+  it.each([null, {}])("does not acknowledge an incomplete successful account mutation %j", async (body) => {
+    const auth = await import("./auth");
+    const calls = [() => auth.updateAccountEmail("new@example.test", "synthetic"), () => auth.updateAccountPassword("synthetic", "replacement"), () => auth.updateSessionPolicy(45), () => auth.revokeAuthSession("fixture"), () => auth.revokeOtherSessions(), () => auth.setup2FA(), () => auth.verifySetup2FA("fixture", "123456"), () => auth.regenerateRecoveryCodes(), () => auth.disable2FA("123456")];
+    for (const call of calls) { respond(body); await expect(call()).rejects.toMatchObject({ status: 0, code: "invalid_response" }); }
+  });
+  it("preserves valid zero-count acknowledgements and the unchanged-session policy contract", async () => {
+    const auth = await import("./auth");
+    respond({ email: "new@example.test", message: "Email updated.", otherSessionsRevoked: 0 });
+    await expect(auth.updateAccountEmail("new@example.test", "synthetic")).resolves.toMatchObject({ otherSessionsRevoked: 0 });
+    respond({ message: "Password updated.", otherSessionsRevoked: 0 });
+    await expect(auth.updateAccountPassword("synthetic", "replacement")).resolves.toMatchObject({ otherSessionsRevoked: 0 });
+    respond({ message: "Policy updated.", sessionLifetimeDays: 45, existingSessionsChanged: false });
+    await expect(auth.updateSessionPolicy(45)).resolves.toMatchObject({ sessionLifetimeDays: 45, existingSessionsChanged: false });
+    respond({ revoked: true, currentSession: false }); await expect(auth.revokeAuthSession("fixture")).resolves.toMatchObject({ currentSession: false });
+    respond({ revokedCount: 0 }); await expect(auth.revokeOtherSessions()).resolves.toEqual({ revokedCount: 0 });
+    respond({ recoveryCodes: ["synthetic-recovery"], remaining: 1 }); await expect(auth.regenerateRecoveryCodes()).resolves.toEqual({ recoveryCodes: ["synthetic-recovery"], remaining: 1 });
+    respond({ message: "Enabled", recoveryCodes: ["synthetic-recovery"] }); await expect(auth.verifySetup2FA("fixture", "123456")).resolves.toMatchObject({ recoveryCodes: ["synthetic-recovery"] });
+    respond({ message: "Disabled" }); await expect(auth.disable2FA("123456")).resolves.toEqual({ message: "Disabled" });
+  });
+  it.each([{ message: "Generated", recoveryCodes: [null], remaining: 1 }, { recoveryCodes: [], remaining: 0 }, { recoveryCodes: ["synthetic"], remaining: -1 }])("keeps malformed show-once material %j unconfirmed", async (body) => {
+    const auth = await import("./auth"); respond(body); await expect(auth.regenerateRecoveryCodes()).rejects.toMatchObject({ code: "invalid_response" });
+  });
+});

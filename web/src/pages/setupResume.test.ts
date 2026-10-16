@@ -74,7 +74,9 @@ describe("setup clipboard fallback", () => {
     const execCommand = vi.fn().mockReturnValue(true);
     Object.defineProperty(document, "execCommand", { configurable: true, value: execCommand });
 
+    const button = document.createElement("button"); document.body.appendChild(button); button.focus();
     await expect(copySetupText("callback", { writeText }, document)).resolves.toBe(true);
+    expect(document.activeElement).toBe(button); button.remove();
     expect(execCommand).toHaveBeenCalledWith("copy");
     expect(document.querySelector("textarea[aria-hidden=true]")).toBeNull();
   });

@@ -61,4 +61,53 @@ describe("recommendation API", () => {
     expect(await getRecommendationDiagnostics("1")).toMatchObject({ periodDays: 30, candidatePool: 12, playRate: .2 });
     expect(await getRecommendationOnboarding("1")).toEqual({ genres: ["action"], titleIds: ["m_1"] });
   });
+  it.each([{}, null, {scope:"series",category:"recommended",categories:[]}, {scope:"home",category:"Drama",categories:[]}, {scope:"home",category:"recommended",profile_id:"other",categories:[]}, {scope:"home",category:"recommended"}, {scope:"home",category:"recommended",categories:[{}]}, {scope:"home",category:"recommended",categories:[],items:{}}, {scope:"home",category:"recommended",categories:[],items:[{}]}])("does not grant category authority from an invalid or mismatched feed %j", async (value) => {
+    vi.stubGlobal("fetch",vi.fn(async()=>new Response(JSON.stringify(value),{status:200})));
+    await expect(getRecommendations({profileId:"1",scope:"home"})).rejects.toMatchObject({status:0,code:"invalid_response"});
+  });
+  it.each([{}, {preferences:[]}, {preferences:{m_1:null}}, {preferences:{m_1:"invalid"}}])("does not interpret malformed preferences as a known empty map %j", async (value) => {
+    vi.stubGlobal("fetch",vi.fn(async()=>new Response(JSON.stringify(value),{status:200})));
+    await expect(getMediaPreferences("1")).rejects.toMatchObject({status:0,code:"invalid_response"});
+  });
+  it("accepts an explicitly confirmed empty preference map", async () => {
+    vi.stubGlobal("fetch",vi.fn(async()=>new Response(JSON.stringify({preferences:{}}),{status:200})));
+    await expect(getMediaPreferences("1")).resolves.toEqual({});
+  });
+  it.each([{}, {movie_id:"other",preference:"love"}, {movie_id:"m_1",preference:"like"}])("classifies an incomplete or mismatched mutation acknowledgement as unknown %j", async (value) => {
+    vi.stubGlobal("fetch",vi.fn(async()=>new Response(JSON.stringify(value),{status:200})));
+    await expect(setMediaPreference("1","m_1","love")).rejects.toMatchObject({status:0,code:"invalid_response"});
+  });
+  it("accepts an acknowledged removal without inventing a replacement preference", async () => {
+    vi.stubGlobal("fetch",vi.fn(async()=>new Response(JSON.stringify({movie_id:"m_1",preference:null}),{status:200})));
+    await expect(setMediaPreference("1","m_1",null)).resolves.toBeUndefined();
+  });
+
+});
+
+
+describe("included recommendation display metadata boundaries", () => {
+  const mediaValues = [{ id: "m_1", title: {} }, { id: "m_1", description: {} }, { id: "m_1", genres: [{}] }, { id: "m_1", cast: [{}] }, { id: "m_1", duration: {} }, { id: "m_1", episodes: [{ id: "ep_1", title: {} }] }];
+  for (const collection of ["items", "watchAgain", "vibeRails"] as const) {
+    it.each(mediaValues)(`rejects malformed ${collection} media before it reaches renderers %j`, async (media) => {
+      const items = [{ media }];
+      const body = { profileId: "1", scope: "home", category: "recommended", categories: [], [collection]: collection === "vibeRails" ? [{ id: "vibe", items }] : items };
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(body), { status: 200 })));
+      await expect(getRecommendations({ profileId: "1", scope: "home" })).rejects.toMatchObject({ status: 0, code: "invalid_response" });
+    });
+  }
+  it.each([
+    { items: [{ media: { id: "m_1" }, reasons: [{}] }] },
+    { items: [{ media: { id: "m_1" }, reasonDetails: [{ code: "taste", fallbackText: {} }] }] },
+    { vibeRails: [{ id: "vibe", label: {}, items: [] }] },
+    { vibeRails: [{ id: "vibe", tropeIds: [{}], items: [] }] },
+    { total: {} }, { stale: "false" },
+  ])("rejects malformed displayed feed metadata %j", async (fields) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ profileId: "1", scope: "home", category: "recommended", categories: [], ...fields }), { status: 200 })));
+    await expect(getRecommendations({ profileId: "1", scope: "home" })).rejects.toMatchObject({ status: 0, code: "invalid_response" });
+  });
+  it("keeps valid missing optional media metadata as defaults", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ profileId: "1", scope: "home", category: "recommended", categories: [], items: [{ media: { id: "m_1", title: "Minimal valid title", genres: null } }] }), { status: 200 })));
+    const feed = await getRecommendations({ profileId: "1", scope: "home" });
+    expect(feed.items[0].media).toMatchObject({ id: "m_1", title: "Minimal valid title", description: "", genres: [], cast: [], recommendationReasons: [] });
+  });
 });

@@ -1,5 +1,5 @@
-import { apiDelete, apiGet, apiPost, apiPut } from "./client";
-import { normalizeMovie } from "./movies";
+import { ApiError, apiDelete, apiGet, apiPost, apiPut } from "./client";
+import { normalizeMovie, validCatalogMetadata, validReasonDetails } from "./movies";
 import type { MediaPreference, RecommendationCategory, RecommendationDiagnostics, RecommendationFeed, RecommendationItem, RecommendationReasonDetail, RecommendationVibeRail } from "../types/api";
 import type { CatalogView } from "../navigation/queryState";
 
@@ -78,11 +78,18 @@ function normalizeVibeRail(raw: RawRecommendationVibeRail): RecommendationVibeRa
 
 export async function getMediaPreferences(profileId: string, signal?: AbortSignal): Promise<Record<string, Exclude<MediaPreference, null>>> {
   const response = await apiGet<{ preferences: Record<string, Exclude<MediaPreference, null>> }>(`/api/recommendations/${encodeURIComponent(profileId)}/preferences`, { signal });
-  return response.preferences ?? {};
+  if (!response || !response.preferences || typeof response.preferences !== "object" || Array.isArray(response.preferences)
+      || !Object.entries(response.preferences).every(([id, value]) => id.trim() && ["like", "love", "dislike"].includes(value))) {
+    throw new ApiError("The server returned invalid saved preferences. Check them again.", 0, "invalid_response");
+  }
+  return response.preferences;
 }
 
 export async function setMediaPreference(profileId: string, movieId: string, preference: MediaPreference): Promise<void> {
-  await apiPut(`/api/recommendations/${encodeURIComponent(profileId)}/preferences/${encodeURIComponent(movieId)}`, { preference });
+  const value = await apiPut<{ movieId?: string; movie_id?: string; preference: MediaPreference }>(`/api/recommendations/${encodeURIComponent(profileId)}/preferences/${encodeURIComponent(movieId)}`, { preference });
+  if (!value || (value.movieId ?? value.movie_id) !== movieId || value.preference !== preference) {
+    throw new ApiError("The preference update returned an incomplete response. Check its outcome before trying again.", 0, "invalid_response");
+  }
 }
 
 export interface RecommendationExposurePayload { movie_id: string; feed_generation: string; surface: string; scope: string; category: string; position: number }
@@ -127,6 +134,31 @@ export async function getRecommendations({
 }: RecommendationRequest): Promise<RecommendationFeed> {
   const params = new URLSearchParams({ scope, category, limit: String(limit), offset: String(offset) });
   const raw = await apiGet<RawRecommendationFeed>(`/api/recommendations/${encodeURIComponent(profileId)}?${params.toString()}`, { signal });
+  // Only an explicit, current feed can authorize category URL canonicalization.
+  const declaredProfile = raw?.profileId ?? raw?.profile_id;
+  const finiteOptional = (value: unknown) => value == null || (typeof value === "number" && Number.isFinite(value));
+  const validItems = (value: unknown): boolean => value == null || (Array.isArray(value) && value.every((item) => item && typeof item === "object"
+    && validCatalogMetadata(item.media)
+    && [item.source, item.availability, item.candidateSource].every((field) => field == null || typeof field === "string")
+    && finiteOptional(item.score) && finiteOptional(item.sourceConfidence)
+    && validReasonDetails(item.reasonDetails ?? item.reason_details)
+    && (item.reasons == null || (Array.isArray(item.reasons) && item.reasons.every((reason: unknown) => typeof reason === "string")))));
+  if (!raw || raw.scope !== scope || typeof raw.category !== "string" || raw.category.trim().toLocaleLowerCase() !== category.trim().toLocaleLowerCase()
+      || (declaredProfile != null && declaredProfile !== profileId)
+      || !Array.isArray(raw.categories) || !raw.categories.every((item) => item && typeof item.value === "string" && item.value.trim()
+        && (item.label == null || typeof item.label === "string") && finiteOptional(item.affinity)
+        && finiteOptional(item.serverCount ?? item.server_count) && finiteOptional(item.cachedCount ?? item.cached_count))
+      || ![raw.total, raw.offset, raw.limit, raw.generatedAt ?? raw.generated_at].every(finiteOptional)
+      || (raw.stale != null && typeof raw.stale !== "boolean")
+      || [raw.algorithmVersion, raw.algorithm_version].some((field) => field != null && typeof field !== "string")
+      || !validItems(raw.items) || !validItems(raw.watchAgain ?? raw.watch_again)
+      || !((raw.vibeRails ?? raw.vibe_rails) == null || (Array.isArray(raw.vibeRails ?? raw.vibe_rails)
+        && (raw.vibeRails ?? raw.vibe_rails)!.every((rail) => rail && typeof rail.id === "string" && rail.id.trim()
+          && [rail.label, rail.reasonCode, rail.reason_code].every((field) => field == null || typeof field === "string")
+          && ((rail.tropeIds ?? rail.trope_ids) == null || (Array.isArray(rail.tropeIds ?? rail.trope_ids) && (rail.tropeIds ?? rail.trope_ids)!.every((id) => typeof id === "string")))
+          && validItems(rail.items))))) {
+    throw new ApiError("The server returned an invalid or outdated recommendation feed. Try loading it again.", 0, "invalid_response");
+  }
   const watchAgain = raw.watchAgain ?? raw.watch_again;
   const vibeRails = raw.vibeRails ?? raw.vibe_rails;
   return {

@@ -4,6 +4,7 @@ import { useAuthStore } from './stores/authStore';
 import './themes/index';
 
 import { AuthGuard } from './components/guards/AuthGuard';
+import { useSessionHydration } from './components/guards/useSessionHydration';
 import { AnonymousOnlyGuard } from './components/guards/AnonymousOnlyGuard';
 import { QueryProfileGuard } from './components/guards/QueryProfileGuard';
 import { ErrorBoundary } from './components/ui/ErrorBoundary';
@@ -22,12 +23,8 @@ function RouteChunkFallback() {
 }
 
 export default function App() {
-  const hydrate = useAuthStore((state) => state.hydrate);
+  useSessionHydration();
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
-
-  useEffect(() => {
-    hydrate();
-  }, [hydrate]);
 
   useEffect(() => {
     if (!isAuthenticated) return;

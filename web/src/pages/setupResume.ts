@@ -94,6 +94,7 @@ export async function copySetupText(
     }
   }
 
+  const previousFocus = documentRef.activeElement instanceof HTMLElement ? documentRef.activeElement : null;
   const textarea = documentRef.createElement("textarea");
   textarea.value = value;
   textarea.readOnly = true;
@@ -109,5 +110,6 @@ export async function copySetupText(
     return false;
   } finally {
     textarea.remove();
+    if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
   }
 }

@@ -58,7 +58,7 @@ describe("ApiKeysPanel", () => {
   it("lists server-wide keys and makes Manage media readiness explicit", async () => {
     render(<ApiKeysPanel />);
     expect(await screen.findByRole("heading", { name: "Existing API keys" })).toBeTruthy();
-    expect(screen.getByText("Bedroom sender")).toBeTruthy();
+    expect(await screen.findByText("Bedroom sender")).toBeTruthy();
     expect(screen.getByText("Queue monitor")).toBeTruthy();
     expect(screen.getByText("Manage media enabled")).toBeTruthy();
     expect(screen.getByText("Manage media disabled")).toBeTruthy();

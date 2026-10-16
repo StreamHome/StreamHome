@@ -107,8 +107,10 @@ const MOTION_PREFERENCE_KEY = "streamhome.motion-preference";
 
 function storedMotionPreference(): MotionPreference {
   if (typeof window === "undefined") return "full";
-  const stored = window.localStorage.getItem(MOTION_PREFERENCE_KEY);
-  return stored === "system" || stored === "reduced" ? stored : "full";
+  try {
+    const stored = window.localStorage.getItem(MOTION_PREFERENCE_KEY);
+    return stored === "system" || stored === "reduced" ? stored : "full";
+  } catch { return "full"; }
 }
 
 const MotionContext = createContext<MotionContextValue>({ reduced: false, documentHidden: false, preference: "full", setPreference: () => undefined });
@@ -129,7 +131,7 @@ export function MotionProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
   const setPreference = (nextPreference: MotionPreference) => {
-    window.localStorage.setItem(MOTION_PREFERENCE_KEY, nextPreference);
+    try { window.localStorage.setItem(MOTION_PREFERENCE_KEY, nextPreference); } catch { /* The current choice still works without persistence. */ }
     setPreferenceState(nextPreference);
   };
   const reduced = preference === "reduced" || (preference === "system" && prefersReduced);

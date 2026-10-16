@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ApiError } from "../../api/client";
 import { getMovie, getMovies, search as searchServer } from "../../api/movies";
 import { getPlaybackSessions } from "../../api/playback";
 import { getPlaybackSessionRevision, subscribePlaybackSessions } from "../../api/playbackSessionEvents";
@@ -9,21 +10,51 @@ import type { DiscoverMovie, MediaPreference, Movie, PlaybackSession, Profile, R
 
 const FEED_PAGE_SIZE = 48;
 
+export interface PreferenceOperation {
+  status: "saving" | "checking" | "unknown" | "saved" | "error";
+  desired: MediaPreference;
+  uncertain: boolean;
+  message: string;
+}
+
 interface CatalogBootstrapState {
-  movies: Movie[];
+  movies?: Movie[];
   sessions: PlaybackSession[];
-  watchlist: string[];
+  watchlist?: string[];
   preferences: Record<string, Exclude<MediaPreference, null>>;
+  preferencesKnown?: boolean;
+  preferenceKnownIds?: Record<string, true>;
+  preferenceOperations?: Record<string, PreferenceOperation>;
 }
 
 const catalogBootstrapCache = new Map<string, CatalogBootstrapState>();
 
 function updateCatalogBootstrap(profileId: string, update: Partial<CatalogBootstrapState>): void {
-  const current = catalogBootstrapCache.get(profileId) ?? { movies: [], sessions: [], watchlist: [], preferences: {} };
+  const current = catalogBootstrapCache.get(profileId) ?? { sessions: [], preferences: {} };
   catalogBootstrapCache.set(profileId, { ...current, ...update });
 }
 
+function retirePreferenceOperation(operation: PreferenceOperation): PreferenceOperation {
+  if (operation.status !== "saving" && operation.status !== "checking") return operation;
+  return { ...operation, status: "unknown", uncertain: operation.status === "saving" || operation.uncertain, message: "The saved preference is unconfirmed. Check preference before making another change." };
+}
+function createPreferenceOwner(profileId: string) {
+  const cached = catalogBootstrapCache.get(profileId);
+  const operations = Object.fromEntries(Object.entries(cached?.preferenceOperations ?? {}).map(([id, operation]) => [id, retirePreferenceOperation(operation)]));
+  return { profileId, active: true, requests: new Map<string, number>(), busy: new Set<string>(), reads: new Set<AbortController>(), known: cached?.preferencesKnown ?? false, knownIds: cached?.preferenceKnownIds ?? {}, operations };
+}
+type PreferenceOwner = ReturnType<typeof createPreferenceOwner>;
+
 export interface CatalogController {
+  catalogItems: Movie[];
+  categoriesReady: boolean;
+  watchlistKnown: boolean;
+  watchlistStatus: "pending" | "success" | "error";
+  watchlistError: string;
+  retryWatchlist: () => void;
+  searchStatus: "idle" | "pending" | "success" | "error";
+  searchError: string;
+  retrySearch: () => void;
   movies: Movie[];
   movieItems: Movie[];
   seriesItems: Movie[];
@@ -54,6 +85,10 @@ export interface CatalogController {
   retryDetails: () => void;
   preferences: Record<string, Exclude<MediaPreference, null>>;
   updatePreference: (movieId: string, preference: MediaPreference) => Promise<void>;
+  preferencesKnown?: boolean;
+  preferenceKnownIds?: Record<string, true>;
+  preferenceOperations?: Record<string, PreferenceOperation>;
+  checkPreference?: (movieId: string) => Promise<void>;
 }
 
 function discoverId(result: DiscoverMovie): string {
@@ -98,16 +133,59 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   const initialBootstrap = catalogBootstrapCache.get(profile.id);
   const [baseMovies, setBaseMovies] = useState<Movie[]>(() => initialBootstrap?.movies ?? []);
   const [sessions, setSessions] = useState<PlaybackSession[]>(() => initialBootstrap?.sessions ?? []);
-  const [watchlist, setWatchlist] = useState<string[]>(() => initialBootstrap?.watchlist ?? []);
+  const [watchlistRead, setWatchlistRead] = useState(() => ({ profileId: profile.id, ids: initialBootstrap?.watchlist ?? [], known: initialBootstrap?.watchlist !== undefined, status: "pending" as "pending" | "success" | "error", error: "" }));
+  const [watchlistVersion, setWatchlistVersion] = useState(0);
+  const watchlistGeneration = useRef(0);
+  const watchlistAbort = useRef<AbortController | null>(null);
   const [preferences, setPreferences] = useState<Record<string, Exclude<MediaPreference, null>>>(() => initialBootstrap?.preferences ?? {});
+  const preferenceOwner = useRef(createPreferenceOwner(profile.id));
+  if (preferenceOwner.current.profileId !== profile.id) preferenceOwner.current = createPreferenceOwner(profile.id);
+  const [preferenceUi, setPreferenceUi] = useState(() => ({ profileId: profile.id, known: preferenceOwner.current.known, knownIds: preferenceOwner.current.knownIds, operations: preferenceOwner.current.operations }));
+  const publishPreferenceUi = (owner: PreferenceOwner) => {
+    if (!owner.active || preferenceOwner.current !== owner) return;
+    setPreferenceUi({ profileId: owner.profileId, known: owner.known, knownIds: owner.knownIds, operations: owner.operations });
+    updateCatalogBootstrap(owner.profileId, { preferencesKnown: owner.known, preferenceKnownIds: owner.knownIds, preferenceOperations: owner.operations });
+  };
+  const mergePreferenceRead = (owner: PreferenceOwner, incoming: Record<string, Exclude<MediaPreference, null>>, snapshot: Map<string, number>, pendingAtDispatch: ReadonlySet<string>, resolvedId?: string) => {
+    if (!owner.active || preferenceOwner.current !== owner) return;
+    owner.known = true;
+    publishPreferenceUi(owner);
+    setPreferences((current) => {
+      if (!owner.active || preferenceOwner.current !== owner) return current;
+      const next = { ...incoming };
+      const guardedIds = new Set([...owner.requests.keys(), ...Object.keys(owner.operations)]);
+      guardedIds.forEach((id) => {
+        const operation = owner.operations[id];
+        const protectedRead = id !== resolvedId && ((owner.requests.get(id) ?? 0) !== (snapshot.get(id) ?? 0) || pendingAtDispatch.has(id) || owner.busy.has(id) || operation?.status === "unknown");
+        if (!protectedRead) return;
+        if (current[id]) next[id] = current[id]; else delete next[id];
+      });
+      updateCatalogBootstrap(owner.profileId, { preferences: next });
+      return next;
+    });
+  };
+  useEffect(() => {
+    const owner = preferenceOwner.current;
+    owner.active = true;
+    publishPreferenceUi(owner);
+    return () => {
+      owner.active = false;
+      owner.reads.forEach((read) => read.abort());
+      const operations = { ...owner.operations };
+      owner.busy.forEach((id) => { const operation = operations[id]; if (operation) operations[id] = retirePreferenceOperation(operation); });
+      updateCatalogBootstrap(owner.profileId, { preferenceOperations: operations });
+    };
+  }, [profile.id]);
   const [results, setResults] = useState<DiscoverMovie[]>([]);
   const [retainedMovies, setRetainedMovies] = useState<Record<string, Movie>>({});
   const [recommendation, setRecommendation] = useState<RecommendationFeed | null>(null);
   const [recommendationKey, setRecommendationKey] = useState("");
-  const [catalogLoading, setCatalogLoading] = useState(!initialBootstrap);
+  const [catalogLoading, setCatalogLoading] = useState(initialBootstrap?.movies === undefined);
   const [recommendationLoading, setRecommendationLoading] = useState(false);
   const [recommendationLoadingMore, setRecommendationLoadingMore] = useState(false);
-  const [searching, setSearching] = useState(false);
+  const [searchRead, setSearchRead] = useState({ key: "", status: "idle" as "idle" | "pending" | "success" | "error", error: "" });
+  const [searchVersion, setSearchVersion] = useState(0);
+  const [catalogProfile, setCatalogProfile] = useState(profile.id);
   const [error, setError] = useState("");
   const [recommendationError, setRecommendationError] = useState("");
   const [detailsLoading, setDetailsLoading] = useState(false);
@@ -124,16 +202,15 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   useEffect(() => {
     const abort = new AbortController();
     const cached = catalogBootstrapCache.get(profile.id);
+    setCatalogProfile(profile.id);
     if (cached) {
-      setBaseMovies(cached.movies);
+      setBaseMovies(cached.movies ?? []);
       setSessions(cached.sessions);
-      setWatchlist(cached.watchlist);
       setPreferences(cached.preferences);
-      setCatalogLoading(false);
+      setCatalogLoading(cached.movies === undefined);
     } else {
       setBaseMovies([]);
       setSessions([]);
-      setWatchlist([]);
       setPreferences({});
       setCatalogLoading(true);
     }
@@ -148,22 +225,44 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
         if (!abort.signal.aborted) setError(requestError instanceof Error ? requestError.message : "The catalog could not be loaded.");
       })
       .finally(() => { if (!abort.signal.aborted) setCatalogLoading(false); });
-    void Promise.allSettled([
-      getWatchlist(profile.id, abort.signal),
-      getMediaPreferences(profile.id, abort.signal),
-    ]).then(([saved, preferenceMap]) => {
-      if (abort.signal.aborted) return;
-      if (saved.status === "fulfilled") {
-        setWatchlist(saved.value);
-        updateCatalogBootstrap(profile.id, { watchlist: saved.value });
-      }
-      if (preferenceMap.status === "fulfilled") {
-        setPreferences(preferenceMap.value);
-        updateCatalogBootstrap(profile.id, { preferences: preferenceMap.value });
-      }
-    });
+    const preferenceReadOwner = preferenceOwner.current;
+    const preferenceRequestsAtDispatch = new Map(preferenceReadOwner.requests);
+    const preferencePendingAtDispatch = new Set(preferenceReadOwner.busy);
+    void getMediaPreferences(profile.id, abort.signal).then((preferenceMap) => {
+      if (abort.signal.aborted || !preferenceReadOwner.active || preferenceOwner.current !== preferenceReadOwner) return;
+      mergePreferenceRead(preferenceReadOwner, preferenceMap, preferenceRequestsAtDispatch, preferencePendingAtDispatch);
+    }).catch(() => { /* A preference read cannot delay independent catalog data. */ });
     return () => abort.abort();
   }, [profile.id]);
+
+  useEffect(() => {
+    const abort = new AbortController();
+    watchlistAbort.current = abort;
+    const generation = ++watchlistGeneration.current;
+    const cached = catalogBootstrapCache.get(profile.id)?.watchlist;
+    setWatchlistRead((current) => ({ profileId: profile.id, ids: current.profileId === profile.id ? current.ids : cached ?? [], known: current.profileId === profile.id ? current.known : cached !== undefined, status: "pending", error: "" }));
+    void getWatchlist(profile.id, abort.signal).then((ids) => {
+      if (abort.signal.aborted || generation !== watchlistGeneration.current) return;
+      setWatchlistRead({ profileId: profile.id, ids, known: true, status: "success", error: "" });
+      updateCatalogBootstrap(profile.id, { watchlist: ids });
+    }).catch((requestError: unknown) => {
+      if (abort.signal.aborted || generation !== watchlistGeneration.current) return;
+      setWatchlistRead((current) => ({ ...current, status: "error", error: requestError instanceof Error ? requestError.message : "Your saved list could not be loaded." }));
+    });
+    return () => abort.abort();
+  }, [profile.id, watchlistVersion]);
+
+  const setWatchlist = useCallback<React.Dispatch<React.SetStateAction<string[]>>>((update) => {
+    // The toggle response is newer authority than any already-started GET.
+    watchlistGeneration.current += 1;
+    watchlistAbort.current?.abort();
+    setWatchlistRead((current) => {
+      const ids = typeof update === "function" ? update(current.profileId === profile.id ? current.ids : []) : update;
+      updateCatalogBootstrap(profile.id, { watchlist: ids });
+      return { profileId: profile.id, ids, known: true, status: "success", error: "" };
+    });
+  }, [profile.id]);
+  const retryWatchlist = useCallback(() => setWatchlistVersion((value) => value + 1), []);
 
   useEffect(() => {
     let disposed = false;
@@ -190,11 +289,12 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
   }, [profile.id]);
 
   useEffect(() => {
-    if (!scope) return;
-    const abort = new AbortController();
     pageAbort.current?.abort();
     pageAbort.current = null;
+    setRecommendationLoadingMore(false);
     activeFeedKey.current = requestedKey;
+    if (!scope) { setRecommendationLoading(false); return; }
+    const abort = new AbortController();
     if (recommendationKey !== requestedKey) setRecommendation(null);
     setRecommendationLoading(true);
     setRecommendationError("");
@@ -212,25 +312,31 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
     return () => abort.abort();
   }, [category, profile.id, refreshVersion, requestedKey, scope]);
 
+  const searchKey = query.view === "search" && query.q ? `${profile.id}:${query.q}` : "";
   useEffect(() => {
-    if (query.view !== "search" || !query.q) { setSearching(false); return; }
+    if (!searchKey || !query.q) { setSearchRead({ key: "", status: "idle", error: "" }); setResults([]); return; }
     const abort = new AbortController();
-    setSearching(true);
-    setError("");
-    searchServer(query.q, abort.signal)
-      .then((items) => {
-        if (abort.signal.aborted) return;
-        setResults(items);
-        setRetainedMovies((current) => {
-          const next = { ...current };
-          items.forEach((item) => { next[discoverId(item)] = discoverAsMovie(item); });
-          return next;
-        });
-      })
-      .catch((requestError: unknown) => { if (!abort.signal.aborted) setError(requestError instanceof Error ? requestError.message : "Search failed."); })
-      .finally(() => { if (!abort.signal.aborted) setSearching(false); });
+    setSearchRead({ key: searchKey, status: "pending", error: "" });
+    setResults([]);
+    searchServer(query.q, abort.signal).then((items) => {
+      if (abort.signal.aborted) return;
+      setResults(items);
+      setSearchRead({ key: searchKey, status: "success", error: "" });
+      setRetainedMovies((current) => {
+        const next = { ...current };
+        items.forEach((item) => { next[discoverId(item)] = discoverAsMovie(item); });
+        return next;
+      });
+    }).catch((requestError: unknown) => {
+      if (!abort.signal.aborted) setSearchRead({ key: searchKey, status: "error", error: requestError instanceof Error ? requestError.message : "Search could not be completed." });
+    });
     return () => abort.abort();
-  }, [query.q, query.view]);
+  }, [query.q, searchKey, searchVersion]);
+  const retrySearch = useCallback(() => setSearchVersion((value) => value + 1), []);
+  const searchStatus = !searchKey ? "idle" : searchRead.key === searchKey ? searchRead.status : "pending";
+  const searchError = searchRead.key === searchKey ? searchRead.error : "";
+  const searching = searchStatus === "pending";
+  const currentResults = searchRead.key === searchKey && searchStatus === "success" ? results : [];
 
   useEffect(() => {
     if (query.view !== "details" || !query.media) { setDetailsLoading(false); setDetailsError(""); return; }
@@ -271,10 +377,11 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
       const index = ordered.findIndex((item) => item.id === movie.id);
       if (index >= 0) ordered[index] = merged;
     };
-    baseMovies.forEach(add);
-    recommendation?.items.forEach((item) => add(item.media));
-    recommendation?.watchAgain.forEach((item) => add(item.media));
-    recommendation?.vibeRails?.forEach((rail) => rail.items.forEach((item) => add(item.media)));
+    if (catalogProfile === profile.id) baseMovies.forEach(add);
+    const ownedRecommendation = recommendationKey.startsWith(`${profile.id}:`) ? recommendation : null;
+    ownedRecommendation?.items.forEach((item) => add(item.media));
+    ownedRecommendation?.watchAgain.forEach((item) => add(item.media));
+    ownedRecommendation?.vibeRails?.forEach((rail) => rail.items.forEach((item) => add(item.media)));
     results.forEach((result) => { if (!byId.has(discoverId(result))) add(discoverAsMovie(result)); });
     Object.values(retainedMovies).forEach((movie) => {
       const existing = byId.get(movie.id);
@@ -285,13 +392,14 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
       if (index >= 0) ordered[index] = merged;
     });
     return ordered;
-  }, [baseMovies, recommendation, results, retainedMovies]);
+  }, [baseMovies, catalogProfile, profile.id, recommendation, recommendationKey, results, retainedMovies]);
 
   const mediaById = useMemo(() => new Map(movies.map((movie) => [movie.id, movie])), [movies]);
   const resolveMovie = useCallback((id: string) => mediaById.get(id) ?? null, [mediaById]);
   const movieItems = useMemo(() => movies.filter((movie) => movie.type === "movie"), [movies]);
   const seriesItems = useMemo(() => movies.filter((movie) => movie.type === "series"), [movies]);
-  const categories = useMemo(() => recommendation?.categories.map((item) => item.value) ?? [], [recommendation]);
+  const categoriesReady = Boolean(scope && recommendation && recommendationKey === requestedKey);
+  const categories = useMemo(() => categoriesReady ? recommendation!.categories.map((item) => item.value) : [], [categoriesReady, recommendation]);
   const genres = useMemo(() => recommendation?.categories.filter((item) => item.value !== "recommended" && item.value !== "all").map((item) => item.label) ?? [], [recommendation]);
   const continueWatching = useMemo(() => {
     const seen = new Set<string>();
@@ -302,53 +410,103 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
       .filter((movie): movie is Movie => Boolean(movie))
       .filter((movie) => !seen.has(movie.id) && Boolean(seen.add(movie.id)));
   }, [mediaById, sessions]);
+  const watchlist = watchlistRead.profileId === profile.id ? watchlistRead.ids : [];
+  const watchlistKnown = watchlistRead.profileId === profile.id && watchlistRead.known;
+  const watchlistStatus = watchlistRead.profileId === profile.id ? watchlistRead.status : "pending";
+  const watchlistError = watchlistRead.profileId === profile.id ? watchlistRead.error : "";
   const watchlistItems = useMemo(() => watchlist.map((id) => mediaById.get(id)).filter((movie): movie is Movie => Boolean(movie)), [mediaById, watchlist]);
+  useEffect(() => {
+    if (!watchlistKnown || catalogLoading) return;
+    const missing = watchlist.filter((id) => !mediaById.has(id));
+    if (!missing.length) return;
+    const abort = new AbortController();
+    void Promise.allSettled(missing.map(async (id) => {
+      const movie = await getMovie(id, abort.signal);
+      if (!abort.signal.aborted) setRetainedMovies((current) => ({ ...current, [movie.id]: movie }));
+    }));
+    return () => abort.abort();
+    // Lookup only when the saved roster/catalog settles or the user retries;
+    // a failed lookup must not create a render-driven retry loop.
+  }, [catalogLoading, profile.id, watchlistRead.ids, watchlistKnown, watchlistVersion]);
+
   const recommendationHasMore = Boolean(recommendation && recommendation.items.length < recommendation.total);
   const recommendationRefreshing = recommendationLoading && Boolean(recommendation) && recommendationKey === requestedKey;
 
   const retryRecommendations = useCallback(() => setRefreshVersion((value) => value + 1), []);
   const retryDetails = useCallback(() => setDetailsVersion((value) => value + 1), []);
   const refreshRecommendations = retryRecommendations;
+  const reconcilePreference = async (owner: PreferenceOwner, movieId: string, request: number, uncertain: boolean, failureMessage: string) => {
+    const owned = () => owner.active && preferenceOwner.current === owner && owner.requests.get(movieId) === request;
+    if (!owned()) return;
+    const desired = owner.operations[movieId].desired;
+    owner.operations = { ...owner.operations, [movieId]: { status: "checking", desired, uncertain, message: "Checking the saved preference…" } };
+    publishPreferenceUi(owner);
+    const abort = new AbortController();
+    owner.reads.add(abort);
+    const snapshot = new Map(owner.requests);
+    const pendingAtDispatch = new Set(owner.busy);
+    try {
+      const incoming = await getMediaPreferences(owner.profileId, abort.signal);
+      if (!owned() || abort.signal.aborted) return;
+      const observed = incoming[movieId] ?? null;
+      if (uncertain && observed !== desired) {
+        owner.operations = { ...owner.operations, [movieId]: { status: "unknown", desired, uncertain, message: "The update is still unconfirmed. Check preference before making another change." } };
+        mergePreferenceRead(owner, incoming, snapshot, pendingAtDispatch);
+        return;
+      }
+      owner.knownIds = { ...owner.knownIds, [movieId]: true };
+      owner.operations = { ...owner.operations, [movieId]: { status: uncertain ? "saved" : "error", desired, uncertain, message: uncertain ? "Preference checked. The saved preference is confirmed." : `${failureMessage} The current saved preference was checked.` } };
+      mergePreferenceRead(owner, incoming, snapshot, pendingAtDispatch, movieId);
+      setRefreshVersion((value) => value + 1);
+    } catch {
+      if (!owned() || abort.signal.aborted) return;
+      owner.operations = { ...owner.operations, [movieId]: { status: "unknown", desired, uncertain, message: "The saved preference is unavailable. Check preference before making another change." } };
+      publishPreferenceUi(owner);
+    } finally { owner.reads.delete(abort); }
+  };
+  const checkPreference = async (movieId: string) => {
+    const owner = preferenceOwner.current;
+    const operation = owner.operations[movieId];
+    if (!owner.active || owner.profileId !== profile.id || owner.busy.has(movieId) || operation?.status !== "unknown") return;
+    const request = (owner.requests.get(movieId) ?? 0) + 1;
+    owner.requests.set(movieId, request); owner.busy.add(movieId);
+    try { await reconcilePreference(owner, movieId, request, operation.uncertain, "The preference change was not saved."); }
+    finally { owner.busy.delete(movieId); }
+  };
   const updatePreference = useCallback(async (movieId: string, preference: MediaPreference) => {
-    const previous = preferences[movieId] ?? null;
+    const owner = preferenceOwner.current;
+    if (!owner.active || owner.profileId !== profile.id || owner.busy.has(movieId) || owner.operations[movieId]?.status === "unknown") return;
+    const request = (owner.requests.get(movieId) ?? 0) + 1;
+    owner.requests.set(movieId, request); owner.busy.add(movieId);
+    const owned = () => owner.active && preferenceOwner.current === owner && owner.requests.get(movieId) === request;
+    owner.operations = { ...owner.operations, [movieId]: { status: "saving", desired: preference, uncertain: false, message: "Saving preference…" } };
+    publishPreferenceUi(owner);
     setError("");
     setPreferences((current) => {
-      const next = { ...current };
-      if (preference) next[movieId] = preference;
-      else delete next[movieId];
+      if (!owned()) return current;
+      const next = { ...current }; if (preference) next[movieId] = preference; else delete next[movieId];
+      updateCatalogBootstrap(owner.profileId, { preferences: next });
       return next;
     });
-    setRecommendation((current) => current ? {
-      ...current,
-      items: current.items.filter((item) => preference !== "dislike" || item.media.id !== movieId).map((item) => item.media.id === movieId ? { ...item, viewerPreference: preference, media: { ...item.media, viewerPreference: preference } } : item),
-      watchAgain: current.watchAgain.map((item) => item.media.id === movieId ? { ...item, viewerPreference: preference, media: { ...item.media, viewerPreference: preference } } : item),
-      vibeRails: current.vibeRails?.map((rail) => ({
-        ...rail,
-        items: rail.items
-          .filter((item) => preference !== "dislike" || item.media.id !== movieId)
-          .map((item) => item.media.id === movieId ? { ...item, viewerPreference: preference, media: { ...item.media, viewerPreference: preference } } : item),
-      })),
-    } : current);
     try {
-      await setMediaPreference(profile.id, movieId, preference);
+      await setMediaPreference(owner.profileId, movieId, preference);
+      if (!owned()) return;
+      owner.knownIds = { ...owner.knownIds, [movieId]: true };
+      owner.operations = { ...owner.operations, [movieId]: { status: "saved", desired: preference, uncertain: false, message: "Preference saved." } };
+      publishPreferenceUi(owner);
       setRefreshVersion((value) => value + 1);
     } catch (requestError) {
-      setPreferences((current) => {
-        const next = { ...current };
-        if (previous) next[movieId] = previous;
-        else delete next[movieId];
-        return next;
-      });
-      setRefreshVersion((value) => value + 1);
-      setError(requestError instanceof Error ? requestError.message : "Your recommendation feedback could not be saved.");
-      throw requestError;
-    }
-  }, [preferences, profile.id]);
+      if (!owned()) return;
+      const uncertain = (requestError instanceof ApiError && requestError.status === 0) || requestError instanceof SyntaxError;
+      await reconcilePreference(owner, movieId, request, uncertain, requestError instanceof Error ? requestError.message : "The preference change was not saved.");
+      if (owned() && owner.operations[movieId]?.status !== "saved") throw requestError;
+    } finally { owner.busy.delete(movieId); }
+  }, [profile.id]);
   const loadMoreRecommendations = useCallback(async () => {
-    if (!scope || !recommendation || recommendationLoadingMore || recommendation.items.length >= recommendation.total) return;
+    if (!scope || !recommendation || recommendationLoading || recommendationLoadingMore || pageAbort.current
+        || recommendationKey !== requestedKey || activeFeedKey.current !== requestedKey || recommendation.items.length >= recommendation.total) return;
     const key = requestedKey;
     const abort = new AbortController();
-    pageAbort.current?.abort();
     pageAbort.current = abort;
     setRecommendationLoadingMore(true);
     setRecommendationError("");
@@ -358,17 +516,24 @@ export function useCatalogController(profile: Profile, query: AppQueryState): Ca
     } catch (requestError) {
       if (!abort.signal.aborted && activeFeedKey.current === key) setRecommendationError(requestError instanceof Error ? requestError.message : "More recommendations could not be loaded.");
     } finally {
-      if (!abort.signal.aborted && activeFeedKey.current === key) setRecommendationLoadingMore(false);
+      if (pageAbort.current === abort) {
+        pageAbort.current = null;
+        if (!abort.signal.aborted && activeFeedKey.current === key) setRecommendationLoadingMore(false);
+      }
     }
-  }, [category, profile.id, recommendation, recommendationLoadingMore, requestedKey, scope]);
+  }, [category, profile.id, recommendation, recommendationKey, recommendationLoading, recommendationLoadingMore, requestedKey, scope]);
 
   const loading = catalogLoading;
   return {
+    catalogItems: catalogProfile === profile.id ? baseMovies : [], categoriesReady, watchlistKnown, watchlistStatus, watchlistError, retryWatchlist, searchStatus, searchError, retrySearch,
     movies, movieItems, seriesItems, continueWatching, sessions, watchlist, watchlistItems, setWatchlist,
-    categories, genres, results, recommendation, recommendationLoading, recommendationRefreshing,
+    categories, genres, results: currentResults, recommendation: scope && recommendationKey !== requestedKey ? null : recommendation, recommendationLoading, recommendationRefreshing,
     recommendationLoadingMore, recommendationError, recommendationHasMore, retryRecommendations,
     refreshRecommendations, loadMoreRecommendations, resolveMovie, loading, searching, error, setError,
     detailsLoading, detailsError, retryDetails,
-    preferences, updatePreference,
+    preferences: catalogProfile === profile.id ? preferences : catalogBootstrapCache.get(profile.id)?.preferences ?? {}, updatePreference,
+    preferencesKnown: preferenceUi.profileId === profile.id && preferenceUi.known,
+    preferenceKnownIds: preferenceUi.profileId === profile.id ? preferenceUi.knownIds : {},
+    preferenceOperations: preferenceUi.profileId === profile.id ? preferenceUi.operations : {}, checkPreference,
   };
 }

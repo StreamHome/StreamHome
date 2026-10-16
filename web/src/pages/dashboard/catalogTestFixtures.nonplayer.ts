@@ -1,0 +1,12 @@
+import { vi } from "vitest";
+import type { Movie, Profile, RecommendationFeed } from "../../types/api";
+import type { CatalogController } from "./useCatalogController";
+export const catalogProfile: Profile = { id: "included-catalog", name: "Viewer", avatarColor: "", theme: "ember", pinEnabled: false };
+export const catalogMovie = (id: string): Movie => ({ id, title: id, description: "Server description", thumbnailUrl: "", bannerUrl: null, videoUrl: "", genres: ["Drama"], duration: "", releaseYear: 2025, rating: null, cast: [], director: null, type: "movie", quality: "Source", languages: [], subtitles: [], voteAverage: 0, voteCount: 0, skipMarkers: {}, availability: "cached", episodes: null });
+export function catalogFeed(ids: string[] = ["recommended-title"], category = "recommended"): RecommendationFeed {
+  return { profileId: catalogProfile.id, scope: "movies", category, generatedAt: 1, stale: false, total: ids.length, offset: 0, limit: 48, categories: ["recommended", "all", "Drama"].map((value) => ({ value, label: value, affinity: 0, serverCount: 0, cachedCount: 0 })), items: ids.map((id) => ({ media: catalogMovie(id), source: "tmdb_cache", availability: "cached", score: 1, reasons: [] })), watchAgain: [] };
+}
+export function catalogController(update: Partial<CatalogController> = {}): CatalogController {
+  return { catalogItems: [], categoriesReady: false, movies: [], movieItems: [], seriesItems: [], continueWatching: [], sessions: [], watchlist: [], watchlistItems: [], watchlistKnown: false, watchlistStatus: "pending", watchlistError: "", retryWatchlist: vi.fn(), setWatchlist: vi.fn(), categories: [], genres: [], results: [], searchStatus: "idle", searchError: "", retrySearch: vi.fn(), recommendation: null, recommendationLoading: true, recommendationRefreshing: false, recommendationLoadingMore: false, recommendationError: "", recommendationHasMore: false, retryRecommendations: vi.fn(), refreshRecommendations: vi.fn(), loadMoreRecommendations: vi.fn().mockResolvedValue(undefined), resolveMovie: () => null, loading: false, searching: false, error: "", setError: vi.fn(), detailsLoading: false, detailsError: "", retryDetails: vi.fn(), preferences: {}, updatePreference: vi.fn().mockResolvedValue(undefined), ...update };
+}
+export function deferred<T>() { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }

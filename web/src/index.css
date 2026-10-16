@@ -1596,3 +1596,10 @@ button:disabled {
   .player-topbar__title { padding-top: 0.65rem; }
   .player-error-notice { top: calc(max(0.75rem, env(safe-area-inset-top)) + 3rem); }
 }
+
+/* Scoped profile controls retain contrast under generic hover rules. */
+.profile-dialog__actions button[type="submit"]:not(:disabled):is(:hover,:focus-visible,:active) { background:#fff; color:#180b07; border-color:#fff; }
+.profile-editor__panel label.profile-editor__pin-toggle { flex-direction:row; align-items:center; gap:10px; }
+.profile-editor__panel .profile-editor__pin-toggle input[type="checkbox"] { width:18px; height:18px; flex:0 0 18px; padding:0; accent-color:var(--accent-primary); }
+
+.profile-editor__pin-toggle > span { display:inline-flex; align-items:center; gap:10px; }

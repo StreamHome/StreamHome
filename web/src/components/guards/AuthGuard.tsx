@@ -1,4 +1,5 @@
 import React from "react";
+import { AuthenticationState } from "./AuthenticationState";
 import { Navigate, useLocation } from "react-router-dom";
 import { useAuthStore } from "../../stores/authStore";
 
@@ -8,7 +9,7 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
   const location = useLocation();
 
   if (!isHydrated) {
-    return <div className="min-h-screen bg-[#0a0a0a]" aria-label="Loading authentication" />;
+    return <AuthenticationState />;
   }
   if (!isAuthenticated) {
     return <Navigate to="/login" state={{ from: location }} replace />;
