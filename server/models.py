@@ -536,6 +536,30 @@ class DriveSetupJob(SQLModel, table=True):
     updated_at: float
     expires_at: float = Field(index=True)
 
+class AdminDriveJob(SQLModel, table=True):
+    """A human-session-owned first connection, separate from bootstrap setup."""
+    id: str = Field(primary_key=True)
+    auth_session_id: str = Field(foreign_key="authsession.id", index=True)
+    active_session_key: Optional[str] = Field(default=None, unique=True, index=True)
+    state_hash: str = Field(unique=True, index=True)
+    status: str = Field(index=True)
+    remote_name: str = Field(default="streamhome-drive")
+    audience: str = Field(default="external")
+    publishing_status: str = Field(default="production")
+    public_url: str
+    selected_path: Optional[str] = Field(default=None)
+    library_state: str = Field(default="unknown")
+    progress: str = Field(default="Waiting for Google authorization")
+    error_code: Optional[str] = Field(default=None)
+    operation: Optional[str] = Field(default=None)
+    operation_owner: Optional[str] = Field(default=None)
+    pending_folder_path: Optional[str] = Field(default=None)
+    generation: int = Field(default=0)
+    health_name: Optional[str] = Field(default=None)
+    created_at: float
+    updated_at: float
+    expires_at: float = Field(index=True)
+
 class PlaybackSession(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("profile_id", "movie_id", "episode_id", name="uq_profile_movie_episode_playback_session"),)
     id: Optional[int] = Field(default=None, primary_key=True)

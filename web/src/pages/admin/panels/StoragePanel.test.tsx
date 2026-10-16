@@ -5,6 +5,7 @@ import * as api from "../../../api/system";
 import type { SystemSettings } from "../../../types/api";
 import { StoragePanel, type StorageDraft } from "./StoragePanel";
 
+vi.mock("../../../api/adminDrive", () => ({ getAdminDriveSetup: vi.fn(async () => ({ configured: false, publicUrl: "https://fixture.invalid", callbackUrl: "https://fixture.invalid/api/setup/rclone/drive/callback", guideUrl: "https://console.cloud.google.com/apis/credentials", job: null })) }));
 vi.mock("../../../api/system", () => ({ getSettings: vi.fn(), testGoogleDrive: vi.fn(), updateSettings: vi.fn() }));
 vi.mock("../SudoModal", () => ({ SudoModal: ({ isOpen, onSuccess }: { isOpen: boolean; onSuccess: () => void }) => isOpen ? <button onClick={onSuccess}>Authorize save</button> : null }));
 const settings: SystemSettings = { storageEngine: "LOCAL", hevcCompressionMode: "auto", driveConfigured: true, driveReachable: false, rcloneRemotePath: "fixture:" };
@@ -18,7 +19,7 @@ async function chooseCompression(option: string) {
   fireEvent.click(await screen.findByRole("combobox", { name: "HEVC compression" }));
   fireEvent.click(screen.getByRole("option", { name: option }));
 }
-beforeEach(() => { vi.resetAllMocks(); vi.mocked(api.getSettings).mockResolvedValue(settings); vi.mocked(api.updateSettings).mockImplementation(async value => value); });
+beforeEach(() => { vi.clearAllMocks(); vi.mocked(api.getSettings).mockResolvedValue(settings); vi.mocked(api.updateSettings).mockImplementation(async value => value); });
 describe("storage preference drafts", () => {
   it("keeps a newer draft when an earlier visit's save finishes after navigation", async () => {
     let finish!: (value: SystemSettings) => void;
@@ -64,7 +65,7 @@ describe("storage preference drafts", () => {
     vi.mocked(api.getSettings).mockResolvedValue({ ...settings, driveConfigured: false, driveReachable: false });
     render(<StoragePanel />);
     expect(await screen.findByText("Not configured")).toBeTruthy();
-    expect(screen.getByRole("link", { name: "Google Drive setup guide ↗" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Google Cloud setup guide ↗" })).toBeTruthy();
     const engine = screen.getByRole("combobox", { name: "Storage engine" });
     fireEvent.click(engine);
     const unavailableDrive = screen.getByRole("option", { name: "Google Drive" });

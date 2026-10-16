@@ -6,6 +6,26 @@ No manual Rclone terminal configuration is required. StreamHome manages its own 
 
 Rclone runs only on the StreamHome server. Browser clients never receive the Rclone configuration or cloud credentials.
 
+## Connect Drive After Initial Setup
+
+On an already configured server, open **Admin Center → Server → Storage and HEVC** and select **Connect Google Drive**. This flow adds the first Drive connection. An existing connection is protected; replacing or disconnecting it is outside this flow.
+
+1. Complete account authorization when requested.
+2. Enter your Web application **Client ID** and **Client secret**. The **OAuth app settings** remain visible throughout setup.
+3. Copy the displayed **Authorized redirect URI** into the Google Cloud OAuth client. The server's configured public URL determines this address.
+4. Set **Audience** and **Publishing status** to match Google Cloud, then select **Authorize Google Drive**. These fields record your app's configuration; they do not change it in Google Cloud.
+5. Finish Google authorization in the opened window, then return to the storage page. Browse or create a dedicated folder and select **Use this folder**. The root of My Drive cannot be selected.
+6. Allow the temporary test file, then select **Verify folder**. StreamHome must create the file, read its exact content and confirm its deletion before saving is available.
+7. Review the selected target and the bounded folder inspection, acknowledge the selection and select **Save connection**.
+
+The folder inspection reports an empty folder, existing files, or recognized StreamHome metadata. It does not import or count a library. Existing files remain in place. Large folders may exceed the inspection limit; choose a smaller dedicated folder in that case.
+
+Saving a connection preserves the current storage mode and HEVC policy, including unsaved policy drafts. It does not transfer or delete existing media, import a catalog, or restart the server. Selecting cloud storage is a separate policy change after the connection has been saved and tested.
+
+If a response is lost, use **Check status** before retrying. An unconfirmed folder creation stays blocked until the server positively observes the requested folder; cancellation preserves that folder. A failed temporary-file cleanup must be resolved by retrying verification or cancellation. Reloading or returning to this page can recover the current job in the same authenticated session. A saved connection persists independently of the setup job.
+
+The numbered Google Cloud instructions below also support the initial setup wizard. The wizard's completion and restart steps do not apply to this Admin Center connection flow.
+
 > [!IMPORTANT]
 > Google Cloud Console changes occasionally. Labels or button positions may differ slightly, but the required configuration remains the same.
 >
@@ -561,7 +581,9 @@ Review the publishing status under:
 
 **Google Auth Platform → Audience**
 
-For a long-running installation, move the project to **In production** when appropriate and complete any Google requirements that apply to the selected scopes and audience.
+For an External OAuth app in **Testing**, Google normally expires refresh tokens after seven days when Drive access is requested. For a long-running installation, move the project to **In production** in Google Cloud when appropriate and complete any Google requirements that apply to the selected scopes and audience. Update StreamHome's recorded publishing status to match during setup.
+
+Production removes that testing-specific seven-day limit; it does not guarantee that authorization can never expire or be revoked. See Google's [refresh token expiration documentation](https://developers.google.com/identity/protocols/oauth2#expiration).
 
 ### Unverified app warning
 

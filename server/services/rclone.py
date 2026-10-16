@@ -27,6 +27,9 @@ MINIMUM_ENCRYPTION_VERSION = (1, 68)
 class RcloneConfigEncryptionError(RuntimeError):
     pass
 
+class _OutputLimitExceeded(RuntimeError):
+    pass
+
 
 @dataclass(slots=True)
 class RcloneResult:
@@ -170,6 +173,7 @@ class RcloneService:
         input_data: Optional[bytes] = None,
         output_limit: Optional[int] = 8000,
         password_command: bool = False,
+        hard_output_limit: Optional[int] = None,
     ) -> RcloneResult:
         normalized = tuple(map(str, arguments))
         if self._mutates_cloud_remote(normalized):
@@ -181,6 +185,7 @@ class RcloneService:
                     input_data=input_data,
                     output_limit=output_limit,
                     password_command=password_command,
+                    hard_output_limit=hard_output_limit,
                 )
         return await self._run_command(
             *normalized,
@@ -189,6 +194,7 @@ class RcloneService:
             input_data=input_data,
             output_limit=output_limit,
             password_command=password_command,
+            hard_output_limit=hard_output_limit,
         )
 
     @staticmethod
@@ -232,6 +238,7 @@ class RcloneService:
         input_data: Optional[bytes] = None,
         output_limit: Optional[int] = 8000,
         password_command: bool = False,
+        hard_output_limit: Optional[int] = None,
     ) -> RcloneResult:
         active_remote = self._uses_active_remote(tuple(map(str, arguments)), config_path)
         try:
@@ -253,7 +260,18 @@ class RcloneService:
             process_key = f"rclone:{process.pid}:{id(process)}"
             register_process(process_key, process)
             try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(input_data), timeout=timeout)
+                communication = (
+                    self._bounded_communicate(process, input_data, hard_output_limit)
+                    if hard_output_limit is not None else process.communicate(input_data)
+                )
+                stdout, stderr = await asyncio.wait_for(communication, timeout=timeout)
+            except _OutputLimitExceeded:
+                if process.returncode is None:
+                    process.kill()
+                # The producer has stopped. Drain its bounded kernel/asyncio pipe
+                # buffers so a paused transport cannot prevent child reaping.
+                await asyncio.wait_for(process.communicate(), timeout=5)
+                return RcloneResult(1, error_code="rclone_output_limit")
             except asyncio.TimeoutError:
                 process.kill()
                 try:
@@ -294,6 +312,39 @@ class RcloneService:
         if active_remote:
             self._observe_cloud_result(result)
         return result
+
+    @staticmethod
+    async def _bounded_communicate(process, input_data: Optional[bytes], limit: int) -> tuple[bytes, bytes]:
+        """Bound both pipes while reading, rather than truncating after allocation."""
+        async def read_pipe(pipe):
+            chunks: list[bytes] = []
+            size = 0
+            while True:
+                chunk = await pipe.read(min(8192, limit + 1))
+                if not chunk:
+                    return b"".join(chunks)
+                size += len(chunk)
+                if size > limit:
+                    raise _OutputLimitExceeded()
+                chunks.append(chunk)
+
+        async def write_pipe():
+            if process.stdin is not None:
+                if input_data is not None:
+                    process.stdin.write(input_data)
+                    await process.stdin.drain()
+                process.stdin.close()
+
+        tasks = [asyncio.create_task(read_pipe(process.stdout)), asyncio.create_task(read_pipe(process.stderr)), asyncio.create_task(write_pipe())]
+        try:
+            stdout, stderr, _ = await asyncio.gather(*tasks)
+            await process.wait()
+            return stdout, stderr
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def open_stream(
         self,
@@ -437,7 +488,7 @@ class RcloneService:
             if not check.ok:
                 raise RcloneConfigEncryptionError("The encrypted Rclone configuration could not be verified.")
             return temporary
-        except Exception:
+        except BaseException:
             temporary.unlink(missing_ok=True)
             raise
 

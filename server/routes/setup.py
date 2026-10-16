@@ -613,6 +613,11 @@ async def start_drive_oauth(payload: DriveOAuthStartRequest, request: Request, d
 async def drive_oauth_callback(request: Request, db: AsyncSession = Depends(get_session)):
     state_value = request.query_params.get("state", "")
     state_hash = _hash_value(state_value) if state_value else ""
+    # Admin jobs have a separate owner/table and may never enter bootstrap setup.
+    from routes.admin_drive import oauth_callback
+    admin_response = await oauth_callback(request, db, state_hash)
+    if admin_response is not None:
+        return admin_response
     result = await db.execute(select(DriveSetupJob).where(DriveSetupJob.state_hash == state_hash))
     job = result.scalars().first()
     if not job:

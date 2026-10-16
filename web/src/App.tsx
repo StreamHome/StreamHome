@@ -16,6 +16,7 @@ const LoginPage = lazy(() => import('./pages/LoginPage').then((module) => ({ def
 const ProfileSelectPage = lazy(() => import('./pages/ProfileSelectPage').then((module) => ({ default: module.ProfileSelectPage })));
 const ProfileEditPage = lazy(() => import('./pages/ProfileEditPage').then((module) => ({ default: module.ProfileEditPage })));
 const AuthenticatedApp = lazy(() => import('./pages/AuthenticatedApp').then((module) => ({ default: module.AuthenticatedApp })));
+const DriveCallbackPage = lazy(() => import('./pages/admin/DriveCallbackPage').then((module) => ({ default: module.DriveCallbackPage })));
 const SetupPage = lazy(() => import('./pages/SetupPage').then((module) => ({ default: module.SetupPage })));
 
 function RouteChunkFallback() {
@@ -70,6 +71,7 @@ export default function App() {
           </AuthGuard>
         } />
         
+        <Route path="/admin/drive/callback" element={<AuthGuard><DriveCallbackPage /></AuthGuard>} />
         <Route path="/admin/*" element={
           <AuthGuard>
             <LegacyAdminRedirect />

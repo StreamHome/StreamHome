@@ -19,6 +19,7 @@ import mimetypes
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import List, Optional
 from datetime import datetime
+from pathlib import Path
 
 import time
 from fastapi import FastAPI, Depends, HTTPException, Request, Query
@@ -87,6 +88,7 @@ from routes.backup import router as backup_router
 from routes.update import router as update_router
 from routes.lifecycle import router as lifecycle_router
 from routes.setup import router as setup_router
+from routes.admin_drive import router as admin_drive_router
 from routes.playback import router as playback_router
 from routes.admin_profiles import router as admin_profiles_router
 from routes.media_updates import router as media_updates_router
@@ -169,6 +171,14 @@ async def _harden_rclone_configuration() -> None:
         raise RuntimeError("rclone_configuration_hardening_failed")
 
 
+async def _recover_admin_drive_publication() -> None:
+    from lifecycle.drive_connection import recover_drive_connection
+    from lifecycle.coordination import run_cancellation_safe_thread
+    async with rclone_service._config_lock:
+        await run_cancellation_safe_thread(recover_drive_connection, Path(settings.BASE_DIR))
+        settings.load_from_json()
+
+
 async def _report_tmdb_configuration() -> None:
     try:
         from services.tmdb import tmdb_client
@@ -186,6 +196,8 @@ async def _report_tmdb_configuration() -> None:
 
 async def _recover_drive_setup() -> None:
     async with AsyncSession(engine) as db:
+        from routes.admin_drive import recover_jobs
+        await recover_jobs(db)
         drive_jobs = (await db.exec(select(DriveSetupJob))).all()
         changed = False
         for job in drive_jobs:
@@ -412,6 +424,7 @@ def _normal_recovery_steps() -> tuple[MandatoryRecoveryStep, ...]:
             frozenset({ReadinessCapability.DATABASE}),
         ),
         MandatoryRecoveryStep("setup_state", _recover_setup_state),
+        MandatoryRecoveryStep("admin_drive_publication", _recover_admin_drive_publication),
         MandatoryRecoveryStep(
             "rclone_hardening",
             _harden_rclone_configuration,
@@ -826,7 +839,7 @@ class RuntimeWriteCoordinationMiddleware(BaseHTTPMiddleware):
         hidden_setup_write = request.url.path in {
             "/api/setup/readiness",
             "/api/setup/rclone/drive/callback",
-        }
+        } or request.url.path.startswith("/api/system/drive/")
         if request.method not in {"POST", "PUT", "PATCH", "DELETE"} and not hidden_setup_write:
             return await call_next(request)
         path = request.url.path
@@ -843,7 +856,7 @@ class RuntimeWriteCoordinationMiddleware(BaseHTTPMiddleware):
             # operations declare their narrower effects in the backup service.
             return await call_next(request)
         effects = {EffectClass.DB_WRITE}
-        if path.startswith("/api/setup") or path in {
+        if path.startswith(("/api/setup", "/api/system/drive/")) or path in {
             "/api/system/settings",
             "/api/update/policy",
         }:
@@ -921,6 +934,7 @@ app.include_router(backup_router, prefix="/api/backup", tags=["backup"])
 app.include_router(update_router, prefix="/api/update", tags=["update"])
 app.include_router(lifecycle_router, prefix="/api/lifecycle", tags=["lifecycle"])
 app.include_router(setup_router)
+app.include_router(admin_drive_router)
 app.include_router(admin_profiles_router)
 
 from fastapi.responses import FileResponse, StreamingResponse
@@ -1635,6 +1649,11 @@ class SystemSettingsResponse(APIModel):
     google_drive_publishing_status: str = "production"
 
 async def _drive_settings_status() -> tuple[bool, Optional[bool], Optional[str]]:
+    async with rclone_service._config_lock:
+        return await _drive_settings_status_locked()
+
+
+async def _drive_settings_status_locked() -> tuple[bool, Optional[bool], Optional[str]]:
     configured = rclone_service.config_path.exists() and ":" in settings.RCLONE_REMOTE_PATH
     if not configured:
         return False, None, None
@@ -1660,15 +1679,20 @@ async def get_system_settings(user = Depends(get_current_user)):
 @app.post("/api/system/settings", response_model=SystemSettingsResponse)
 async def save_system_settings(req: SystemSettingsRequest, session = Depends(require_recent_reauth)):
     """Updates server storage engine settings and persists them to settings.json."""
+    async with rclone_service._config_lock:
+        return await _save_system_settings_locked(req)
+
+
+async def _save_system_settings_locked(req: SystemSettingsRequest):
     if req.storage_engine not in ["LOCAL", "CLOUD"]:
         raise HTTPException(status_code=400, detail="Invalid storage engine value. Must be LOCAL or CLOUD.")
 
     if req.hevc_compression_mode not in ["auto", "on", "off"]:
         raise HTTPException(status_code=400, detail="Invalid hevc compression mode. Must be auto, on, or off.")
+    if req.rclone_remote_path != settings.RCLONE_REMOTE_PATH:
+        raise HTTPException(status_code=409, detail={"code": "drive_target_changed", "message": "The Google Drive connection changed. Refresh server settings before saving this policy."})
     if req.storage_engine == "CLOUD":
-        if req.rclone_remote_path != settings.RCLONE_REMOTE_PATH:
-            raise HTTPException(status_code=400, detail="Google Drive targets must be changed through the guided Drive connection flow.")
-        configured, reachable, error_code = await _drive_settings_status()
+        configured, reachable, error_code = await _drive_settings_status_locked()
         if not configured or not reachable:
             raise HTTPException(status_code=422, detail={"code": error_code or "drive_not_configured", "message": "Connect and test Google Drive before enabling cloud storage."})
 
@@ -1681,7 +1705,7 @@ async def save_system_settings(req: SystemSettingsRequest, session = Depends(req
     except OSError as exc:
         settings.STORAGE_ENGINE, settings.RCLONE_REMOTE_PATH, settings.HEVC_COMPRESSION_MODE = previous
         raise HTTPException(status_code=500, detail={"code": "settings_save_failed", "message": "Server settings could not be saved."}) from exc
-    drive_configured, drive_reachable, drive_error_code = await _drive_settings_status()
+    drive_configured, drive_reachable, drive_error_code = await _drive_settings_status_locked()
     return SystemSettingsResponse(
         storage_engine=settings.STORAGE_ENGINE,
         rclone_remote_path=settings.RCLONE_REMOTE_PATH,

@@ -1,4 +1,5 @@
 import os
+import threading
 import json
 import base64
 import secrets
@@ -14,6 +15,7 @@ config_dir = os.path.dirname(os.path.abspath(__file__))
 base_dir = os.path.abspath(os.path.join(config_dir, ".."))
 root_env_path = os.path.join(base_dir, ".env")
 server_env_path = os.path.join(config_dir, ".env")
+SETTINGS_WRITE_LOCK = threading.RLock()
 
 def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     try:
@@ -208,6 +210,10 @@ class Settings:
                 print(f"Error loading settings.json: {e}")
 
     def save_to_json(self):
+        with SETTINGS_WRITE_LOCK:
+            self._save_to_json_locked()
+
+    def _save_to_json_locked(self):
         json_path = os.path.join(config_dir, "settings.json")
         temporary = f"{json_path}.{secrets.token_hex(8)}.tmp"
         with open(temporary, "w", encoding="utf-8", newline="\n") as f:

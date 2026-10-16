@@ -1,6 +1,6 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { getSettings, testGoogleDrive, updateSettings } from "../../../api/system";
+import { getSettings, updateSettings } from "../../../api/system";
 import { Button } from "../../../components/ui/Button";
 import { GlassPane } from "../../../components/ui/GlassPane";
 import { AdminSelect } from "../../../components/ui/AdminSelect";
@@ -8,6 +8,7 @@ import type { SystemSettings } from "../../../types/api";
 import { SudoModal } from "../SudoModal";
 import { MOTION_TIMINGS } from "../../../motion/motionSystem";
 import { AdminHelp } from "../AdminHelp";
+import { DriveSetupCard } from "./DriveSetupCard";
 
 export type StorageDraft = Pick<SystemSettings, "storageEngine" | "hevcCompressionMode">;
 
@@ -18,12 +19,11 @@ export function StoragePanel({ retainedDraft, onDraftChange }: { retainedDraft?:
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
-  const [testingDrive, setTestingDrive] = useState(false);
   const draftRef = useRef(retainedDraft);
   const active = useRef(true);
   const requestId = useRef(0);
 
-  const loadSettings = () => {
+  const loadSettings = useCallback(() => {
     const request = ++requestId.current;
     setLoading(true);
     setError("");
@@ -35,7 +35,7 @@ export function StoragePanel({ retainedDraft, onDraftChange }: { retainedDraft?:
       })
       .catch((requestError: unknown) => { if (active.current && request === requestId.current) setError(requestError instanceof Error ? requestError.message : "Settings could not be loaded."); })
       .finally(() => { if (active.current && request === requestId.current) setLoading(false); });
-  };
+  }, []);
 
   useEffect(() => { active.current = true; loadSettings(); return () => { active.current = false; requestId.current += 1; }; }, []);
 
@@ -61,21 +61,6 @@ export function StoragePanel({ retainedDraft, onDraftChange }: { retainedDraft?:
     setSudoOpen(false);
   };
 
-  const testDrive = async () => {
-    setTestingDrive(true);
-    setError("");
-    setMessage("");
-    try {
-      await testGoogleDrive();
-      setMessage("Google Drive is reachable and authorized.");
-      loadSettings();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Google Drive could not be tested.");
-    } finally {
-      setTestingDrive(false);
-    }
-  };
-
   const header = (
     <header className="admin-panel__header">
       <p>SERVER / STORAGE</p>
@@ -88,6 +73,7 @@ export function StoragePanel({ retainedDraft, onDraftChange }: { retainedDraft?:
     return (
       <section className="admin-panel admin-panel--storage">
         {header}
+        <DriveSetupCard settings={settings} onSettingsRefresh={loadSettings} />
         <GlassPane className="admin-state-card" spotlight={false}>
           <p>{loading ? "CONTACTING SERVER" : "SETTINGS UNAVAILABLE"}</p>
           <h2>{loading ? "Loading server settings…" : "Storage settings could not be loaded."}</h2>
@@ -102,6 +88,7 @@ export function StoragePanel({ retainedDraft, onDraftChange }: { retainedDraft?:
   return (
     <section className="admin-panel admin-panel--storage">
       {header}
+      <DriveSetupCard settings={settings} onSettingsRefresh={loadSettings} />
       <GlassPane className="admin-settings-card" spotlight={false}>
         <form onSubmit={(event) => { event.preventDefault(); if (dirty) { setMessage(""); setSudoOpen(true); } }}>
           <div className="admin-settings-grid">
@@ -124,15 +111,7 @@ export function StoragePanel({ retainedDraft, onDraftChange }: { retainedDraft?:
         </form>
         <div className="admin-storage-help">
           <AdminHelp label="HEVC compatibility and processing"><p>Automatic enables background HEVC compression when the server is idle and has enough CPU capacity. Always enabled also permits it on lower-capacity servers, while still waiting for idle time. Disabled stops background compression. Eligible existing local videos can also be converted.</p><p>HEVC can reduce file size but takes processing time and may be less compatible with older devices.</p></AdminHelp>
-          <AdminHelp label="Google Drive connection"><p>Google Drive stores newly ingested media in the configured server remote. Configure the connection on the server before selecting cloud storage.</p><p>Testing the connection checks whether the server can reach its configured remote. It does not save your storage or compression changes.</p></AdminHelp>
         </div>
-        <section className="admin-control admin-drive-status" aria-label="Google Drive status" data-ready={draft.driveReachable === true}>
-              <span>Google Drive</span>
-              <strong>{draft.driveConfigured ? draft.driveReachable ? "Connected" : "Needs attention" : "Not configured"}</strong>
-              <small>{draft.driveConfigured ? draft.rcloneRemotePath : "Configure the server’s Google Drive connection using the setup guide below. Cloud storage stays unavailable until the connection is configured."}</small>
-              {draft.driveConfigured && <Button type="button" variant="secondary" disabled={testingDrive} onClick={testDrive}>{testingDrive ? "Testing…" : "Test connection"}</Button>}
-              <a href="https://github.com/StreamHome/StreamHome/blob/v0.1.0-alpha.1/docs/google-drive.md" target="_blank" rel="noreferrer">Google Drive setup guide ↗</a>
-            </section>
       </GlassPane>
       <SudoModal isOpen={sudoOpen} actionLabel="Save server settings" onCancel={() => setSudoOpen(false)} onSuccess={save} />
     </section>
