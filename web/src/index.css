@@ -1322,7 +1322,7 @@ button:disabled {
 }
 .player-settings-group > span:first-of-type { flex: 1; min-width: 0; }
 .player-settings-group:hover { background: var(--player-menu-hover); }
-.player-settings-group__value { color: var(--player-menu-muted); font-size: .8rem; font-variant-numeric: tabular-nums; }
+.player-settings-group__value { max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--player-menu-muted); font-size: .8rem; font-variant-numeric: tabular-nums; }
 .player-settings-group .player-settings-group__chevron { width: 1rem; height: 1rem; transform: rotate(-90deg); color: var(--player-menu-muted); }
 .player-settings-panel fieldset { border: 0; margin: 0 0 1rem; padding: 0; }
 .player-settings-panel legend { color: var(--player-menu-muted); font-size: .75rem; line-height: 1.4; margin-bottom: .5rem; }
@@ -1358,6 +1358,15 @@ button:disabled {
 .player-settings-reset { display: block; min-height: 2.75rem; width: 100%; padding: .5rem; border: 1px solid var(--player-border); color: var(--player-menu-text); background: transparent; border-radius: var(--player-menu-option-radius); text-align: center; font: inherit; font-size: .8rem; cursor: pointer; }
 .player-settings-reset:not(:disabled):hover { background: var(--player-menu-hover); }
 .player-settings-reset:disabled { color: var(--player-menu-muted); opacity: .55; cursor: default; }
+.player-settings-subpage { margin-bottom: .5rem; border-bottom: 1px solid var(--player-border); }
+.player-settings-selection { display: grid; gap: .25rem; }
+.player-settings-selection > button { display: grid; grid-template-columns: minmax(0, 1fr) 1.1rem; align-items: center; gap: .75rem; width: 100%; min-height: 2.75rem; padding: .6rem .75rem; border: 1px solid transparent; border-radius: var(--player-menu-option-radius); background: transparent; color: var(--player-menu-text); font: inherit; font-size: .85rem; line-height: 1.4; text-align: left; cursor: pointer; }
+.player-settings-selection > button:not(:disabled):hover { background: var(--player-menu-hover); }
+.player-settings-selection > button[aria-selected="true"] { background: var(--player-accent-soft); color: var(--player-menu-selected); }
+.player-settings-selection > button:disabled { color: var(--player-menu-muted); opacity: .55; cursor: default; }
+.player-settings-selection > button > span { min-width: 0; overflow-wrap: anywhere; }
+.player-settings-selection small { display: block; margin-top: .15rem; color: var(--player-menu-muted); font-size: .7rem; }
+.player-settings-selection__status { margin: .25rem .75rem .75rem; color: var(--player-menu-muted); font-size: .75rem; line-height: 1.4; }
 .player-settings-overlay {
   position: absolute;
   z-index: 90;
@@ -1371,6 +1380,7 @@ button:disabled {
   animation: player-settings-enter 140ms ease-out both;
 }
 .player-settings-panel--modal { position: relative; width: min(100%, 30rem); max-height: 100%; }
+.player-settings-panel--modal .player-settings-group { min-height: 2.75rem; padding: .5rem .75rem; }
 @keyframes player-settings-enter {
   from { opacity: 0; }
   to { opacity: 1; }

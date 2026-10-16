@@ -284,6 +284,67 @@ describe("player volume control", () => {
 });
 
 describe("grouped player settings", () => {
+  function MobileSelectionFixture({ onAudio = () => undefined }: { onAudio?: (value: string) => void }) {
+    const [audio, setAudio] = useState("en");
+    const [subtitle, setSubtitle] = useState("off");
+    const [quality, setQuality] = useState("auto");
+    return <div data-player-root="true" tabIndex={-1}><PlayerSettings modal captions playbackRate={1} onRateChange={() => undefined}
+      captionScale={1} onCaptionScaleChange={() => undefined} subtitleOffset={0} onSubtitleOffsetChange={() => undefined}
+      selections={{
+        audio: { value: audio, options: [{ value: "en", label: "English" }, { value: "failed", label: "Unavailable dubbing", disabled: true, status: "Unavailable" }, { value: "tr", label: "Turkish" }], onSelect: (value) => { setAudio(value); onAudio(value); } },
+        subtitles: { value: subtitle, options: [{ value: "off", label: "Subtitles off", shortLabel: "Off" }, { value: "en", label: "English" }], onSelect: setSubtitle },
+        quality: { value: quality, options: [{ value: "auto", label: "Auto" }, { value: "1080", label: "1080p · Original", shortLabel: "1080p" }], onSelect: setQuality, status: "Switching · Playing 720p", summary: "Switching · Playing 720p" },
+      }} /></div>;
+  }
+
+  it("keeps mobile language and quality choices inside the same settings modal", () => {
+    render(<MobileSelectionFixture />);
+    pointerClick(screen.getByRole("button", { name: "Player settings" }));
+    const dialog = screen.getByRole("dialog", { name: "Player settings" });
+    pointerClick(screen.getByRole("button", { name: "Audio language English" }));
+    pointerClick(screen.getByRole("option", { name: "Turkish" }));
+    expect(screen.getByRole("option", { name: "Turkish" }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("dialog")).toBe(dialog);
+    pointerClick(screen.getByRole("button", { name: "Back to settings" }));
+    expect(screen.getByRole("button", { name: "Audio language Turkish" })).toBeTruthy();
+    pointerClick(screen.getByRole("button", { name: "Subtitles Off" }));
+    pointerClick(screen.getByRole("option", { name: "English" }));
+    pointerClick(screen.getByRole("button", { name: "Appearance & timing" }));
+    expect(screen.getByRole("slider", { name: "Subtitle timing" })).toBeTruthy();
+    pointerClick(screen.getByRole("button", { name: "Back to subtitles" }));
+    expect(screen.getByRole("option", { name: "English" }).getAttribute("aria-selected")).toBe("true");
+    pointerClick(screen.getByRole("button", { name: "Back to settings" }));
+    pointerClick(screen.getByRole("button", { name: "Quality Auto" }));
+    expect(screen.getByRole("status").textContent).toBe("Switching · Playing 720p");
+    pointerClick(screen.getByRole("option", { name: "1080p · Original" }));
+    expect(screen.getByRole("option", { name: "1080p · Original" }).getAttribute("aria-selected")).toBe("true");
+    pointerClick(screen.getByRole("button", { name: "Back to settings" }));
+    expect(screen.getByRole("button", { name: "Quality 1080p" })).toBeTruthy();
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+  });
+
+  it("skips disabled choices and contains Tab after roving to an unselected mobile option", () => {
+    const onAudio = vi.fn();
+    render(<MobileSelectionFixture onAudio={onAudio} />);
+    pointerClick(screen.getByRole("button", { name: "Player settings" }));
+    pointerClick(screen.getByRole("button", { name: "Audio language English" }));
+    const english = screen.getByRole("option", { name: "English" });
+    const turkish = screen.getByRole("option", { name: "Turkish" });
+    act(() => english.focus());
+    fireEvent.keyDown(english, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(turkish);
+    expect(turkish.tabIndex).toBe(0);
+    expect(english.tabIndex).toBe(-1);
+    expect(onAudio).not.toHaveBeenCalled();
+    fireEvent.keyDown(turkish, { key: "Tab" });
+    const back = screen.getByRole("button", { name: "Back to settings" });
+    expect(document.activeElement).toBe(back);
+    fireEvent.keyDown(back, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(turkish);
+    fireEvent.click(screen.getByRole("option", { name: /Unavailable dubbing/ }));
+    expect(onAudio).not.toHaveBeenCalled();
+  });
+
   function SettingsFixture({ modal = false, captions = true }: { modal?: boolean; captions?: boolean }) {
     const [rate, setRate] = useState(1);
     const [scale, setScale] = useState(1);

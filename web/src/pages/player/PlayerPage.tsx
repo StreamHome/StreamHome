@@ -4569,6 +4569,25 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                 captions={hasSubtitles} captionScale={preferences.captionScale} modal
                 onCaptionScaleChange={(value) => setPreferences((current) => ({ ...current, captionScale: value }))}
                 subtitleOffset={preferences.subtitleOffset} onSubtitleOffsetChange={(value) => setPreferences((current) => ({ ...current, subtitleOffset: value }))}
+                selections={{
+                  audio: availableAudioTracks.length > 0 ? {
+                    value: selectedAudioTrackId,
+                    options: availableAudioTracks.map((track) => ({ value: track.id, label: track.label, disabled: track.status === "failed", status: track.status === "failed" ? "Unavailable" : undefined })),
+                    onSelect: changeAudio,
+                  } : undefined,
+                  subtitles: hasSubtitles ? {
+                    value: preferences.subtitleTrackId,
+                    options: [{ value: "off", label: "Subtitles off", shortLabel: "Off" }, ...runResponse.subtitles.map((subtitle) => ({ value: subtitle.id, label: languageDisplayName(subtitle.language, subtitle.label) }))],
+                    onSelect: (value) => setPreferences((current) => ({ ...current, subtitleTrackId: value })),
+                  } : undefined,
+                  quality: availableQualities.length > 1 ? {
+                    value: selectedQualityId,
+                    status: qualityStatus,
+                    summary: qualityStatus?.startsWith("Switching") ? qualityStatus : undefined,
+                    options: availableQualities.map((item) => ({ value: item.id, label: item.label, shortLabel: item.label.split(" · ")[0], disabled: item.status === "failed", status: item.ready ? undefined : item.status === "failed" ? "Unavailable" : item.status === "idle" ? "Prepare on request" : "Preparing" })),
+                    onSelect: changeQuality,
+                  } : undefined,
+                }}
                 onOpenChange={handleControlMenuOpenChange} compact className="mobile-player-topbar__settings" />
             </header>
 
@@ -4626,39 +4645,6 @@ export function PlayerPage({ visualFixture }: PlayerPageProps = {}) {
                   {formatDuration(currentTime)} <i>/</i> {duration ? formatDuration(duration) : asset.durationLabel}
                 </span>
                 <div className="mobile-player-settings">
-                  {availableAudioTracks.length > 0 && (
-                    <PlayerControlMenu
-                      label="Audio language"
-                      icon="audio"
-                      value={selectedAudioTrackId}
-                      options={availableAudioTracks.map((track) => ({ value: track.id, label: track.label, disabled: track.status === "failed", status: track.status === "failed" ? "Unavailable" : undefined }))}
-                      onSelect={changeAudio}
-                      onOpenChange={handleControlMenuOpenChange}
-                    />
-                  )}
-                  {hasSubtitles && (
-                    <PlayerControlMenu
-                      label="Subtitles"
-                      icon="captions"
-                      value={preferences.subtitleTrackId}
-                      options={[{ value: "off", label: "Subtitles off" }, ...runResponse.subtitles.map((subtitle) => ({ value: subtitle.id, label: languageDisplayName(subtitle.language, subtitle.label) }))]}
-                      onSelect={(value) => setPreferences((current) => ({ ...current, subtitleTrackId: value }))}
-                      onOpenChange={handleControlMenuOpenChange}
-                    />
-                  )}
-                  {availableQualities.length > 1 && (
-                    <PlayerControlMenu
-                      label="Quality"
-                      icon="quality"
-                      value={selectedQualityId}
-                      status={qualityStatus}
-                      summary={qualityStatus?.startsWith("Switching") ? qualityStatus : undefined}
-                      compact
-                      options={availableQualities.map((item) => ({ value: item.id, label: item.label, shortLabel: item.label.split(" · ")[0], disabled: item.status === "failed", status: item.ready ? undefined : item.status === "failed" ? "Unavailable" : item.status === "idle" ? "Prepare on request" : "Preparing" }))}
-                      onSelect={changeQuality}
-                      onOpenChange={handleControlMenuOpenChange}
-                    />
-                  )}
                   {document.pictureInPictureEnabled && (
                     <PlayerIconButton icon="pip" label="Picture in picture" onClick={togglePictureInPicture} />
                   )}

@@ -376,17 +376,67 @@ export function PlayerVolume({ volume, muted, onVolumeChange, onToggleMute, onOp
   </div>;
 }
 
-export function PlayerSettings({ playbackRate, onRateChange, captions, captionScale, onCaptionScaleChange, subtitleOffset, onSubtitleOffsetChange, onOpenChange, compact = false, modal = false, className = "" }: {
+export interface PlayerSettingsSelection {
+  value: string;
+  options: PlayerMenuOption<string>[];
+  onSelect: (value: string) => void;
+  status?: string;
+  summary?: string;
+}
+
+function SettingsSelectionList({ label, selection }: { label: string; selection: PlayerSettingsSelection }) {
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const [focusedValue, setFocusedValue] = useState<string | null>(null);
+  const selected = selection.options.findIndex((option) => option.value === selection.value && !option.disabled);
+  const focused = selection.options.findIndex((option) => option.value === focusedValue && !option.disabled);
+  const tabIndex = focused >= 0 ? focused : selected >= 0 ? selected : selection.options.findIndex((option) => !option.disabled);
+  const focusOption = (start: number, direction = 1) => {
+    const count = selection.options.length;
+    for (let step = 0; step < count; step += 1) {
+      const index = (start + step * direction + count * 2) % count;
+      if (!selection.options[index].disabled) { optionRefs.current[index]?.focus(); return; }
+    }
+  };
+  return <>
+    {selection.summary && <p className="player-settings-selection__status" role="status">{selection.summary}</p>}
+    <div role="listbox" aria-label={label} className="player-settings-selection" onKeyDown={(event) => {
+      const active = optionRefs.current.findIndex((option) => option === document.activeElement);
+      if (event.key === "ArrowDown") { event.preventDefault(); focusOption(active + 1); }
+      else if (event.key === "ArrowUp") { event.preventDefault(); focusOption(active - 1, -1); }
+      else if (event.key === "Home") { event.preventDefault(); focusOption(0); }
+      else if (event.key === "End") { event.preventDefault(); focusOption(selection.options.length - 1, -1); }
+    }}>
+      {selection.options.map((option, index) => <button key={option.value} ref={(element) => { optionRefs.current[index] = element; }}
+        type="button" role="option" aria-selected={option.value === selection.value} disabled={option.disabled} tabIndex={index === tabIndex ? 0 : -1}
+        onFocus={() => setFocusedValue(option.value)}
+        onClick={() => { if (!option.disabled) selection.onSelect(option.value); }}>
+        <span>{option.label}{option.status && <small>{option.status}</small>}</span>
+        {option.value === selection.value && <PlayerIcon name="check" />}
+      </button>)}
+    </div>
+  </>;
+}
+
+export function PlayerSettings({ playbackRate, onRateChange, captions, captionScale, onCaptionScaleChange, subtitleOffset, onSubtitleOffsetChange, onOpenChange, compact = false, modal = false, selections, className = "" }: {
   playbackRate: number; onRateChange: (value: number) => void; captions: boolean;
   captionScale: number; onCaptionScaleChange: (value: number) => void;
   subtitleOffset: number; onSubtitleOffsetChange: (value: number) => void;
   onOpenChange?: (open: boolean) => void;
   compact?: boolean;
   modal?: boolean;
+  selections?: { audio?: PlayerSettingsSelection; subtitles?: PlayerSettingsSelection; quality?: PlayerSettingsSelection };
   className?: string;
 }) {
   const popup = usePlayerPopup(onOpenChange, 384, "end", modal);
-  const [group, setGroup] = useState<"root" | "subtitles" | "speed">("root");
+  const [group, setGroup] = useState<"root" | "audio" | "subtitles" | "captions" | "quality" | "speed">("root");
+  const audio = selections?.audio?.options.length ? selections.audio : undefined;
+  const subtitles = selections?.subtitles?.options.length ? selections.subtitles : undefined;
+  const quality = selections?.quality?.options.length ? selections.quality : undefined;
+  const activeSelection = group === "audio" ? audio : group === "subtitles" ? subtitles : group === "quality" ? quality : undefined;
+  const selectionLabel = (selection: PlayerSettingsSelection) => {
+    const option = selection.options.find((item) => item.value === selection.value) ?? selection.options[0];
+    return option?.shortLabel ?? option?.label;
+  };
   const overlayRef = useRef<HTMLDivElement>(null);
   const pointerDismissRef = useRef(false);
   const { open, host, popupRef, triggerRef, updateOpen } = popup;
@@ -400,9 +450,10 @@ export function PlayerSettings({ playbackRate, onRateChange, captions, captionSc
   }, [modal, popupRef, triggerRef, updateOpen]);
 
   useLayoutEffect(() => {
-    if (!open || (group === "subtitles" && !captions)) { setGroup("root"); return; }
+    if (!open || (group === "subtitles" && !captions && !subtitles) || (group === "captions" && !captions)
+      || (group === "audio" && !audio) || (group === "quality" && !quality)) { setGroup("root"); return; }
     popupRef.current?.querySelector<HTMLElement>("[data-settings-initial]")?.focus({ preventScroll: true });
-  }, [captions, group, host, open, popupRef]);
+  }, [captions, Boolean(audio), Boolean(subtitles), Boolean(quality), group, host, open, popupRef]);
 
   useLayoutEffect(() => {
     const overlay = overlayRef.current;
@@ -430,7 +481,7 @@ export function PlayerSettings({ playbackRate, onRateChange, captions, captionSc
       if (event.key === "Escape") {
         event.preventDefault(); event.stopPropagation(); dismiss();
       } else if (event.key === "Tab") {
-        const controls = Array.from(dialog.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), [tabindex='0']"));
+        const controls = Array.from(dialog.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), [tabindex='0']")).filter((element) => element.tabIndex >= 0);
         const first = controls[0];
         const last = controls[controls.length - 1];
         if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
@@ -453,7 +504,7 @@ export function PlayerSettings({ playbackRate, onRateChange, captions, captionSc
     };
   }, [dismiss, host, modal, open, popupRef, triggerRef]);
 
-  const title = group === "subtitles" ? "Subtitles" : group === "speed" ? "Playback speed" : "Settings";
+  const title = group === "subtitles" ? "Subtitles" : group === "captions" ? "Appearance & timing" : group === "audio" ? "Audio language" : group === "quality" ? "Quality" : group === "speed" ? "Playback speed" : "Settings";
   const panel = <div ref={popupRef} id={popup.id} role="dialog" aria-label="Player settings" aria-modal={modal || undefined}
     data-player-settings-dialog="true" className={`player-settings-panel${modal ? " player-settings-panel--modal" : ""}`}
     style={modal ? undefined : { ...popup.style, overflowY: "hidden" }}
@@ -461,24 +512,34 @@ export function PlayerSettings({ playbackRate, onRateChange, captions, captionSc
     onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}
     onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); dismiss(); } }}>
     <header className="player-settings-header">
-      {group !== "root" ? <button type="button" aria-label="Back to settings" className="player-settings-header__button" data-settings-initial
-        onClick={() => setGroup("root")}><PlayerIcon name="back" /></button> : <span aria-hidden="true" />}
+      {group !== "root" ? <button type="button" aria-label={group === "captions" && subtitles ? "Back to subtitles" : "Back to settings"} className="player-settings-header__button" data-settings-initial
+        onClick={() => setGroup(group === "captions" && subtitles ? "subtitles" : "root")}><PlayerIcon name="back" /></button> : <span aria-hidden="true" />}
       <h2>{title}</h2>
       <button type="button" aria-label="Close settings" className="player-settings-header__button" onClick={(event) => dismiss(event.detail > 0)}><PlayerIcon name="close" /></button>
     </header>
     <div className="player-settings-body" key={group}>
       {group === "root" && <div className="player-settings-groups">
-        {captions && <button type="button" className="player-settings-group" data-settings-initial onClick={() => setGroup("subtitles")}>
-          <PlayerIcon name="captions" /><span>Subtitles</span><PlayerIcon name="chevron" className="player-settings-group__chevron" />
+        {audio && <button type="button" className="player-settings-group" data-settings-initial onClick={() => setGroup("audio")}>
+          <PlayerIcon name="audio" /><span>Audio language</span><span className="player-settings-group__value">{selectionLabel(audio)}</span><PlayerIcon name="chevron" className="player-settings-group__chevron" />
         </button>}
-        <button type="button" className="player-settings-group" data-settings-initial={!captions || undefined} onClick={() => setGroup("speed")}>
+        {(captions || subtitles) && <button type="button" className="player-settings-group" data-settings-initial={!audio || undefined} onClick={() => setGroup("subtitles")}>
+          <PlayerIcon name="captions" /><span>Subtitles</span>{subtitles && <span className="player-settings-group__value">{selectionLabel(subtitles)}</span>}<PlayerIcon name="chevron" className="player-settings-group__chevron" />
+        </button>}
+        {quality && <button type="button" className="player-settings-group" data-settings-initial={!audio && !captions && !subtitles || undefined} aria-description={quality.status} onClick={() => setGroup("quality")}>
+          <PlayerIcon name="quality" /><span>Quality</span><span className="player-settings-group__value">{selectionLabel(quality)}</span><PlayerIcon name="chevron" className="player-settings-group__chevron" />
+        </button>}
+        <button type="button" className="player-settings-group" data-settings-initial={!audio && !captions && !subtitles && !quality || undefined} onClick={() => setGroup("speed")}>
           <PlayerIcon name="speed" /><span>Playback speed</span><span className="player-settings-group__value">{playbackRate}×</span><PlayerIcon name="chevron" className="player-settings-group__chevron" />
         </button>
       </div>}
+      {group === "subtitles" && subtitles && captions && <button type="button" className="player-settings-group player-settings-subpage" onClick={() => setGroup("captions")}>
+        <PlayerIcon name="settings" /><span>Appearance &amp; timing</span><PlayerIcon name="chevron" className="player-settings-group__chevron" />
+      </button>}
+      {activeSelection && <SettingsSelectionList label={title} selection={activeSelection} />}
       {group === "speed" && <div className="player-settings-options" role="group" aria-label="Playback speed">{[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) =>
         <button key={rate} type="button" aria-pressed={rate === playbackRate} onClick={() => onRateChange(rate)}>{rate}×{rate === playbackRate && <PlayerIcon name="check" />}</button>
       )}</div>}
-      {group === "subtitles" && captions && <>
+      {(group === "captions" || group === "subtitles" && !subtitles) && captions && <>
         <fieldset><legend>Caption size</legend><div className="player-settings-options player-settings-options--captions">{[[0.8, "Small"], [1, "Medium"], [1.25, "Large"], [1.5, "Extra large"]].map(([scale, label]) =>
           <button key={scale} type="button" aria-pressed={Number(scale) === captionScale} onClick={() => onCaptionScaleChange(Number(scale))}>{label}{Number(scale) === captionScale && <PlayerIcon name="check" />}</button>
         )}</div></fieldset>

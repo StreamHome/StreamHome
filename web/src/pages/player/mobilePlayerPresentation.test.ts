@@ -23,7 +23,7 @@ describe("dedicated mobile player presentation", () => {
 
     expect(mobilePresentation).not.toContain('className="player-volume"');
     expect(mobilePresentation).not.toContain('icon={muted ? "mute" : "volume"}');
-    expect((playerPage.match(/\{hasSubtitles && \(/g) ?? [])).toHaveLength(2);
+    expect((playerPage.match(/\{hasSubtitles && \(/g) ?? [])).toHaveLength(1);
     expect((playerPage.match(/captions=\{hasSubtitles\}/g) ?? [])).toHaveLength(2);
   });
 

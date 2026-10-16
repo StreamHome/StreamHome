@@ -1494,6 +1494,7 @@ describe("mounted player lifecycle", () => {
       expect(settings.closest(".mobile-player-bottom")).toBeNull();
       expect(settings.closest(".player-topbar")).toBeNull();
       expect(settings.textContent).toBe("");
+      expect(view.container.querySelector(".mobile-player-bottom button[aria-haspopup]")).toBeNull();
       pointerClick(settings);
       expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
     } finally {
@@ -2385,7 +2386,8 @@ describe("mounted player lifecycle", () => {
     }
   });
 
-  it("applies the preferred native audio and keeps manual quality changes paused", async () => {
+  it.each([false, true])("keeps preferred native audio and paused quality selection with mobile=%s", async (mobile) => {
+    const restoreViewport = mobile ? phoneViewport() : () => undefined;
     localStorage.setItem(playerPreferencesKey, JSON.stringify({ audioTrackId: "audio_0_en", audioLanguage: "en" }));
     vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((type) => type.includes("mpegurl") ? "probably" : "");
     const tracks = [{ language: "tr", label: "Turkish", enabled: true }, { language: "en", label: "English", enabled: false }];
@@ -2401,13 +2403,27 @@ describe("mounted player lifecycle", () => {
       expect(tracks.map((track) => track.enabled)).toEqual([false, true]);
       fireEvent.seeked(video);
       fireEvent.click(screen.getByRole("button", { name: "Pause" }));
-      fireEvent.click(screen.getByRole("button", { name: "Quality: Auto" }));
+      const plays = videoCallCount("play", video);
+      if (mobile) {
+        expect(view.container.querySelector(".mobile-player-bottom button[aria-haspopup]")).toBeNull();
+        pointerClick(screen.getByRole("button", { name: "Player settings" }));
+        pointerClick(screen.getByRole("button", { name: /Audio language/ }));
+        pointerClick(screen.getByRole("option", { name: "Turkish" }));
+        expect(tracks.map((track) => track.enabled)).toEqual([true, false]);
+        pointerClick(screen.getByRole("button", { name: "Back to settings" }));
+        pointerClick(screen.getByRole("button", { name: /^Quality/ }));
+      } else fireEvent.click(screen.getByRole("button", { name: "Quality: Auto" }));
       fireEvent.click(screen.getByRole("option", { name: /360p/ }));
       expect(video.src).toContain("rendition_id=video_original");
       fireEvent.loadedMetadata(video); fireEvent.seeked(video);
       expect(view.container.querySelector("[data-player-root]")?.getAttribute("data-player-phase")).toBe("paused");
       expect(JSON.parse(localStorage.getItem(playerPreferencesKey)!).qualityHeight).toBe(360);
-    } finally { view.unmount(); Reflect.deleteProperty(HTMLMediaElement.prototype, "audioTracks"); }
+      expect(videoCallCount("play", video)).toBe(plays);
+      if (mobile) {
+        expect(screen.getByRole("dialog", { name: "Player settings" })).toBeTruthy();
+        expect(JSON.parse(localStorage.getItem(playerPreferencesKey)!).audioLanguage).toBe("tr");
+      }
+    } finally { view.unmount(); Reflect.deleteProperty(HTMLMediaElement.prototype, "audioTracks"); restoreViewport(); }
   });
 
   it("serializes Replay, blocks old heartbeats, and respects Pause during the request", async () => {
