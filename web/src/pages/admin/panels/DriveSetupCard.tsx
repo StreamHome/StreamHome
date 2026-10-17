@@ -15,7 +15,7 @@ type Attempt = { kind: "start" | "cancel" | "create" | "select" | "test" | "save
 const terminal = new Set(["saved", "failed", "cancelled", "expired"]);
 const messageFor = (error: unknown) => error instanceof Error ? error.message : "Drive is unavailable. Check status before continuing.";
 
-export function DriveSetupCard({ settings, onSettingsRefresh }: { settings: SystemSettings | null; onSettingsRefresh: () => void }) {
+export function DriveSetupCard({ settings, onSettingsRefresh, initiallyExpanded = false }: { settings: SystemSettings | null; onSettingsRefresh: () => void; initiallyExpanded?: boolean }) {
   const [setup, setSetup] = useState<drive.AdminDriveSetup | null>(null);
   const [job, setJob] = useState<drive.AdminDriveJob | null>(null);
   const [loading, setLoading] = useState(true);
@@ -26,7 +26,7 @@ export function DriveSetupCard({ settings, onSettingsRefresh }: { settings: Syst
   const [unknown, setUnknown] = useState<Attempt | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [formVisible, setFormVisible] = useState(false);
+  const [formVisible, setFormVisible] = useState(initiallyExpanded);
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
   const [audience, setAudience] = useState<"external" | "internal">("external");
@@ -190,7 +190,7 @@ export function DriveSetupCard({ settings, onSettingsRefresh }: { settings: Syst
   };
 
   return <GlassPane className="admin-settings-card admin-drive-setup" spotlight={false}>
-    <header className="admin-drive-setup__header"><p>GOOGLE DRIVE</p><h2 ref={heading} tabIndex={-1}>Google Drive connection</h2><p>Connect a Drive folder. Your storage mode stays unchanged.</p></header>
+    <header className="admin-drive-setup__header"><p>GOOGLE DRIVE</p><h2 ref={heading} tabIndex={-1}>Google Drive connection</h2><p>Connect a Drive folder. Automatic offloading stays unchanged.</p></header>
     {error && <p className="admin-form-message admin-form-message--error" role="alert">{error}</p>}
     {notice && <p role="status">{notice}</p>}
     {loading && <p role="status">Checking Drive setup…</p>}
@@ -240,7 +240,7 @@ export function DriveSetupCard({ settings, onSettingsRefresh }: { settings: Syst
           <Button type="button" variant="secondary" disabled={disabled || !testConsent || !["selecting_folder", "ready"].includes(job.status)} onClick={() => void mutate({ kind: "test", id: job.id }, async () => { const value = await drive.testAdminDriveFolder(job.id); accept(value.job); })}>Verify folder</Button>
           {job.status === "ready" && <><p>{job.libraryState === "empty" ? "This folder is empty." : job.libraryState === "streamhome" ? "An existing StreamHome library was detected." : job.libraryState === "nonempty" ? "This folder contains files." : "Folder contents have not been classified."} Existing files remain in place.</p>
           <label className="admin-drive-setup__checkbox"><input type="checkbox" checked={acknowledged} disabled={disabled} onChange={event => setAcknowledged(event.target.checked)} /><span aria-hidden="true">{acknowledged ? "✓" : ""}</span><span>Use this folder for the Drive connection. Existing files stay in place.</span></label>
-          <p>Storage mode stays unchanged.</p><Button type="button" className="admin-primary-action" disabled={disabled || !acknowledged} onClick={() => void mutate({ kind: "save", id: job.id }, async () => { const value = await drive.saveAdminDrive(job.id); if (live.current) { accept(value.job); setSetup(current => current ? { ...current, configured: true, job: value.job } : current); setNotice("Drive connection saved. Choose storage mode separately below when you are ready."); onSettingsRefresh(); } })}>Save connection</Button></>}
+          <p>Automatic offloading stays unchanged.</p><Button type="button" className="admin-primary-action" disabled={disabled || !acknowledged} onClick={() => void mutate({ kind: "save", id: job.id }, async () => { const value = await drive.saveAdminDrive(job.id); if (live.current) { accept(value.job); setSetup(current => current ? { ...current, configured: true, job: value.job } : current); setNotice("Drive connection saved. Review automatic offloading separately on the Policy page."); onSettingsRefresh(); } })}>Save connection</Button></>}
         </section>}
         {job.status !== "saved" && job.status !== "cancelled" && <Button type="button" variant="ghost" disabled={job.pendingOperation === "mkdir_uncertain" ? pending || loading || locked : disabled} onClick={() => void mutate({ kind: "cancel", id: job.id }, async () => { const value = await drive.cancelAdminDrive(job.id); accept(value); publishUnknown(null); popup.current?.close(); setClientSecret(""); })}>Cancel connection</Button>}
       </section>}

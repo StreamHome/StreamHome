@@ -14,6 +14,7 @@ This documentation describes the supported `v0.1.0-alpha.1` Linux server release
 - [Adding Media](adding-media.md)
 - [MediaSender Integration](mediasender.md)
 - [Playback](playback.md)
+- [Storage Management](storage-management.md)
 - [Backup and Recovery](backup-and-recovery.md)
 - [Updating](updating.md)
 - [Troubleshooting](troubleshooting.md)

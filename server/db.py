@@ -39,6 +39,15 @@ async def init_db(
         check = sqlite3.connect(settings.db_path)
         try:
             existing_tables = {row[0] for row in check.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if existing_tables and 'storageasset' not in existing_tables and allow_migration_backups:
+                backup_dir = os.path.join(os.path.dirname(settings.db_path), 'backup')
+                os.makedirs(backup_dir, exist_ok=True)
+                backup_path = os.path.join(backup_dir, f"pre-storage-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.db")
+                target = sqlite3.connect(backup_path)
+                try:
+                    check.backup(target)
+                finally:
+                    target.close()
             movie_columns = {row[1] for row in check.execute("PRAGMA table_info(movie)").fetchall()}
             playback_run_columns = {row[1] for row in check.execute("PRAGMA table_info(playbackrun)").fetchall()} if "playbackrun" in existing_tables else set()
             playback_session_columns = {row[1] for row in check.execute("PRAGMA table_info(playbacksession)").fetchall()} if "playbacksession" in existing_tables else set()
@@ -76,6 +85,12 @@ async def init_db(
         def migrate(sync_conn):
             from sqlalchemy import inspect
             inspector = inspect(sync_conn)
+            if "storagereservation" in inspector.get_table_names():
+                storage_columns = {col["name"] for col in inspector.get_columns("storagereservation")}
+                if "baseline_bytes" not in storage_columns:
+                    sync_conn.exec_driver_sql("ALTER TABLE storagereservation ADD COLUMN baseline_bytes INTEGER NOT NULL DEFAULT 0")
+                if "track_materialized" not in storage_columns:
+                    sync_conn.exec_driver_sql("ALTER TABLE storagereservation ADD COLUMN track_materialized BOOLEAN NOT NULL DEFAULT 0")
             if "profile" in inspector.get_table_names():
                 profile_columns = [col["name"] for col in inspector.get_columns("profile")]
                 if "pin_hash" not in profile_columns:

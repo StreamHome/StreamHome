@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import event
 from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -33,12 +34,18 @@ SUBTITLE = {"Authorization": "Bearer synthetic-subtitle"}
 
 class PlaybackSourceHeaderTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        # Background admission monitoring can cancel a pooled connection. Match
+        # production's durable SQLite file rather than losing an in-memory DB.
+        self.database_directory = tempfile.TemporaryDirectory()
+        self.engine = create_async_engine("sqlite+aiosqlite:///" + str(Path(self.database_directory.name) / 'headers.db'))
+        from db import set_sqlite_pragma
+        event.listen(self.engine.sync_engine, 'connect', set_sqlite_pragma)
         async with self.engine.begin() as connection:
             await connection.run_sync(SQLModel.metadata.create_all)
 
     async def asyncTearDown(self) -> None:
         await self.engine.dispose()
+        self.database_directory.cleanup()
 
     async def seed(self, db, identifier, kind, raw_headers, subtitles):
         movie = Movie(id=f"m_{identifier}" if kind == "movie" else f"tv_{identifier}",
@@ -163,6 +170,7 @@ class PlaybackSourceHeaderTests(unittest.IsolatedAsyncioTestCase):
                             return False, IngestionFailure("SOURCE_FORBIDDEN", "Synthetic stop after actual probe and subtitle fetch")
                         with ExitStack() as stack:
                             stack.enter_context(patch.object(worker, "engine", self.engine))
+                            stack.enter_context(patch("db.engine", self.engine))
                             stack.enter_context(patch.object(worker, "download_and_merge", stop_merge))
                             stack.enter_context(patch.object(worker, "notify_video_sender", AsyncMock()))
                             stack.enter_context(patch.object(manager, "_reserve_storage", return_value=None))

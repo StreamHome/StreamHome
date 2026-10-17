@@ -20,7 +20,7 @@ On an already configured server, open **Admin Center → Server → Storage and 
 
 The folder inspection reports an empty folder, existing files, or recognized StreamHome metadata. It does not import or count a library. Existing files remain in place. Large folders may exceed the inspection limit; choose a smaller dedicated folder in that case.
 
-Saving a connection preserves the current storage mode and HEVC policy, including unsaved policy drafts. It does not transfer or delete existing media, import a catalog, or restart the server. Selecting cloud storage is a separate policy change after the connection has been saved and tested.
+Saving a connection preserves the current storage and HEVC policy, including unsaved policy drafts. It does not transfer or delete existing media, import a catalog, or restart the server. Enable automatic offloading separately in the [Storage workspace](storage-management.md) after the connection has been saved and tested.
 
 If a response is lost, use **Check status** before retrying. An unconfirmed folder creation stays blocked until the server positively observes the requested folder; cancellation preserves that folder. A failed temporary-file cleanup must be resolved by retrying verification or cancellation. Reloading or returning to this page can recover the current job in the same authenticated session. A saved connection persists independently of the setup job.
 

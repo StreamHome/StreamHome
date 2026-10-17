@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import os
 import re
@@ -43,6 +44,7 @@ class ResolvedMediaSource:
     cloud_exists: bool
     cloud_identity: Optional[str] = None
     cloud_size: Optional[int] = None
+    relocated_audio_changes: tuple[str, ...] = ()
 
     @property
     def available(self) -> bool:
@@ -50,8 +52,14 @@ class ResolvedMediaSource:
 
     @property
     def fingerprint(self) -> str:
+        from services.storage_inventory import accepted_identity
+        accepted, _ = accepted_identity(self.catalog_path, self.local_path if self.local_exists else None, self.cloud_identity)
+        if accepted and not self.relocated_audio_changes:
+            return accepted
         if self.local_exists:
             value = local_media_identity(self.local_path)
+            if self.relocated_audio_changes:
+                value += json.dumps(self.relocated_audio_changes)
         else:
             value = f"cloud:{self.cloud_identity or self.cloud_path or self.catalog_path}"
         return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
@@ -60,6 +68,10 @@ class ResolvedMediaSource:
     def video_fingerprint(self) -> str:
         """Identify the video bytes independently from replaceable audio sidecars."""
 
+        from services.storage_inventory import accepted_identity
+        _, accepted = accepted_identity(self.catalog_path, self.local_path if self.local_exists else None, self.cloud_identity)
+        if accepted:
+            return accepted
         if self.local_exists:
             return local_video_fingerprint(self.local_path)
         else:
@@ -103,13 +115,56 @@ def local_media_identity(media_path: Path) -> str:
                     "modified": audio_stat.st_mtime_ns,
                 }
             )
+    present = {str(item["name"]) for item in identity}
+    for entry, _ in accepted_relocated_audio(media_path):
+        if entry["name"] not in present:
+            identity.append(entry)
+    identity[1:] = sorted(identity[1:], key=lambda item: str(item["name"]).lower())
     return f"local:{json.dumps(identity, sort_keys=True, separators=(',', ':'))}"
+
+
+def accepted_relocated_audio(media_path: Path) -> list[tuple[dict, dict]]:
+    """Recover missing sidecar stat identities only from accepted placements."""
+    from services.storage_inventory import accepted_placement, MAX_MANIFEST_BYTES
+
+    directory = Path(settings.MEDIA_DIR) / ".storage-placements"
+    if directory.is_symlink() or not directory.is_dir() or media_path.parent.name == "audio":
+        return []
+    expected_parent = media_path.parent / "audio"
+    entries = []
+    for index, manifest in enumerate(directory.glob("*.json")):
+        if index >= 100_000:
+            raise MediaSourceError("Storage placement inventory exceeds its safe bound")
+        try:
+            if manifest.is_symlink() or manifest.stat().st_size > MAX_MANIFEST_BYTES:
+                continue
+            value = json.loads(manifest.read_text())
+            catalog = value.get("catalog_path")
+            if value.get("kind") != "audio" or not isinstance(catalog, str):
+                continue
+            path = local_path_for(catalog)
+            if path.parent != expected_parent or path.is_file() or path.suffix.lower() not in EXTERNAL_AUDIO_EXTENSIONS:
+                continue
+            accepted = accepted_placement(catalog)
+            if accepted is None:
+                continue
+            identity = json.loads(accepted["local_identity"])
+            entries.append(({"name": f"audio/{path.name}", "size": int(identity["size"]),
+                             "modified": int(identity["mtime_ns"])}, accepted))
+            if len(entries) >= 64:
+                break
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+    return entries
 
 
 def playback_source_fingerprint(source: ResolvedMediaSource, audio_metadata: list[dict] | tuple[dict, ...]) -> str:
     """Bind playback caches and tickets to retained external-audio identity."""
 
-    return bind_audio_fingerprint(source.fingerprint, audio_metadata)
+    from services.storage_inventory import accepted_identity
+    accepted, _ = accepted_identity(source.catalog_path, source.local_path if source.local_exists else None,
+                                    source.cloud_identity, audio_metadata=audio_metadata)
+    return accepted if accepted and not source.relocated_audio_changes else bind_audio_fingerprint(source.fingerprint, audio_metadata)
 
 
 def bind_audio_fingerprint(source_fingerprint: str, audio_metadata: list[dict] | tuple[dict, ...]) -> str:
@@ -202,6 +257,10 @@ def catalog_path_from_storage(file_path: str) -> str:
 
 def cloud_path_for(catalog_path: str) -> str:
     canonical = canonicalize_catalog_path(catalog_path)
+    from services.storage_inventory import accepted_placement
+    placement = accepted_placement(canonical)
+    if placement:
+        return str(placement["remote_path"])
     relative = canonical[len(CANONICAL_MEDIA_PREFIX):]
     return f"{settings.RCLONE_REMOTE_PATH.rstrip('/')}/{relative}"
 
@@ -210,8 +269,15 @@ def clear_cloud_object_cache() -> None:
     _cloud_object_cache.clear()
 
 
+def cloud_read_enabled() -> bool:
+    """Cloud readability is independent from the policy accepting new offloads."""
+    from services.storage_inventory import cloud_read_enabled as storage_cloud_read_enabled
+
+    return storage_cloud_read_enabled()
+
+
 async def cloud_object_info(remote_path: str, *, refresh: bool = False) -> Optional[CloudObjectInfo]:
-    if settings.STORAGE_ENGINE != "CLOUD" or not rclone_service.executable():
+    if not cloud_read_enabled() or not rclone_service.executable():
         return None
     now = time.monotonic()
     if len(_cloud_object_cache) > 1024:
@@ -268,13 +334,20 @@ async def resolve_media_source(catalog_path: str, *, check_cloud: bool = True, r
     relative = canonical[len(CANONICAL_MEDIA_PREFIX):]
     local_path = local_path_for(canonical)
     local_exists = local_path.is_file()
-    remote = cloud_path_for(canonical) if settings.STORAGE_ENGINE == "CLOUD" else None
+    remote = cloud_path_for(canonical) if cloud_read_enabled() else None
     cloud_identity: Optional[str] = None
     cloud_size: Optional[int] = None
     if check_cloud and (not local_exists or require_cloud) and remote:
         cloud_info = await cloud_object_info(remote, refresh=refresh_cloud)
         cloud_identity = cloud_info.identity if cloud_info else None
         cloud_size = cloud_info.size if cloud_info else None
+    relocated_changes = []
+    if check_cloud and local_exists and remote:
+        placements = accepted_relocated_audio(local_path)
+        observations = await asyncio.gather(*(cloud_object_info(value["remote_path"], refresh=refresh_cloud) for _, value in placements))
+        for (entry, placement), observed in zip(placements, observations):
+            if observed is not None and observed.identity != placement["remote_identity"]:
+                relocated_changes.append(f"{entry['name']}:{hashlib.sha256(observed.identity.encode()).hexdigest()}")
     return ResolvedMediaSource(
         catalog_path=canonical,
         relative_path=relative,
@@ -284,7 +357,18 @@ async def resolve_media_source(catalog_path: str, *, check_cloud: bool = True, r
         cloud_exists=cloud_identity is not None,
         cloud_identity=cloud_identity,
         cloud_size=cloud_size,
+        relocated_audio_changes=tuple(relocated_changes),
     )
+
+
+async def resolve_related_source(source: ResolvedMediaSource, relative_path: str) -> ResolvedMediaSource:
+    """Resolve an audio/subtitle asset on its own, regardless of video placement."""
+    normalized = str(relative_path).replace("\\", "/")
+    parts = PurePosixPath(normalized).parts
+    if not parts or normalized.startswith("/") or any(part in {".", ".."} for part in parts):
+        raise MediaSourceError("Related media path is unsafe")
+    parent = source.catalog_path.rsplit("/", 1)[0]
+    return await resolve_media_source(f"{parent}/{'/'.join(parts)}")
 
 
 def is_safe_presentation_asset(catalog_path: str) -> bool:

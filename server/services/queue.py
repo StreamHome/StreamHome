@@ -23,11 +23,14 @@ from services.media_probe import probe_media_stream, notify_video_sender, probe_
 from services.ingestion_errors import IngestionFailure, IngestionTaskError, prune_task_diagnostics, write_task_diagnostics
 from services.ingest_preview import ingest_preview_service
 from services.rclone import rclone_service
+from services.storage_capacity import StorageCapacityError, storage_capacity
+from services.storage_inventory import hybrid_policy_active
 from services.ingestion_security import UnsafeIngestionSource, validate_headers, validate_url, validated_stream_request
 from services.media_source import (
     MediaSourceError,
     ResolvedMediaSource,
     catalog_path_from_storage,
+    cloud_read_enabled,
     local_catalog_source_exists,
     local_path_for,
     local_playback_fingerprint,
@@ -649,6 +652,18 @@ class DownloadQueueManager:
         self.storage_reservations[task_id] = reservation
 
     @staticmethod
+    def _staging_size(root: Path) -> int:
+        size = 0
+        for path in root.rglob("*"):
+            try:
+                if path.is_file() and not path.is_symlink():
+                    size += path.stat().st_size
+            except FileNotFoundError:
+                # Owned FFmpeg/Rclone publication atomically renames parts.
+                continue
+        return size
+
+    @staticmethod
     def _assert_directory_within(path: str, root: str, label: str) -> Path:
         candidate = Path(path).resolve()
         expected_root = Path(root).resolve()
@@ -664,7 +679,7 @@ class DownloadQueueManager:
             EffectClass.DURABLE_MEDIA_WRITE,
             EffectClass.DISPOSABLE_CACHE_WRITE,
         }
-        if settings.STORAGE_ENGINE == "CLOUD":
+        if settings.STORAGE_ENGINE == "CLOUD" and not hybrid_policy_active():
             effects.add(EffectClass.CLOUD_WRITE)
         try:
             async with runtime_work("ingestion.worker", effects):
@@ -691,6 +706,9 @@ class DownloadQueueManager:
         task_completed = False
         mutation = None
         ownership = None
+        capacity_reservations: list[str] = []
+        capacity_monitor = None
+        capacity_failure = None
         try:
             async with AsyncSession(engine) as db:
                 task = await db.get(DownloadTask, task_id)
@@ -823,6 +841,35 @@ class DownloadQueueManager:
                 + self.STORAGE_SAFETY_MARGIN_BYTES
             )
             self._reserve_storage(task_id, estimated_bytes)
+            # Both staging rewrites/extracted audio and publication copies can
+            # coexist. The shared authority admits their peak on each device.
+            try:
+                temporary_ceiling = estimated_bytes * 3
+                temporary_reservation = await storage_capacity.reserve(f"ingestion-temp:{task_id}", temporary_ceiling, staging_task_root)
+                capacity_reservations.append(temporary_reservation)
+            except StorageCapacityError as exc:
+                raise IngestionTaskError(IngestionFailure(exc.code, "Local storage cannot admit the complete ingestion workspace.")) from exc
+            owner_task = asyncio.current_task()
+
+            async def watch_capacity():
+                nonlocal capacity_failure
+                written = 0
+                try:
+                    while True:
+                        size = await run_cancellation_safe_thread(self._staging_size, staging_task_root)
+                        if size > temporary_ceiling:
+                            raise StorageCapacityError("storage_reservation_exceeded")
+                        written = size
+                        await storage_capacity.progress(temporary_reservation, written)
+                        await asyncio.sleep(0.25)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    capacity_failure = IngestionFailure(getattr(exc, "code", "storage_measurement_unknown"), "Ingestion exceeded its admitted storage capacity.")
+                    if owner_task:
+                        owner_task.cancel()
+
+            capacity_monitor = asyncio.create_task(watch_capacity(), name=f"ingestion-capacity:{task_id}")
 
             raw_title = meta.get("title", f"Media_{tmdb_id}")
             clean_title = "".join(c for c in raw_title if c.isalnum() or c in " .-_")
@@ -971,7 +1018,7 @@ class DownloadQueueManager:
                     override_primary=bool(language),
                 )
                 
-                if settings.STORAGE_ENGINE == "CLOUD":
+                if settings.STORAGE_ENGINE == "CLOUD" and not hybrid_policy_active():
                     async with AsyncSession(engine) as db:
                         task_db = await db.get(DownloadTask, task_id)
                         if task_db:
@@ -981,7 +1028,7 @@ class DownloadQueueManager:
                 
             local_dir = os.path.dirname(output_abs_path)
             uploaded_to_cloud = False
-            cloud_ingestion = settings.STORAGE_ENGINE == "CLOUD"
+            cloud_ingestion = settings.STORAGE_ENGINE == "CLOUD" and not hybrid_policy_active()
             finalized_media_id = ""
             finalized_media_type = "movie" if media_type == "movie" else "episode"
             media_id = f"m_{tmdb_id}" if media_type == "movie" else f"ep_{tmdb_id}_s{season or 1}_e{episode or 1}"
@@ -1021,18 +1068,14 @@ class DownloadQueueManager:
                     raise IngestionTaskError(IngestionFailure("CLOUD_MOVE_FAILED", "The verified uploaded media is unavailable."))
                 if source.local_exists:
                     # A retained local fallback must receive the same accepted bytes.
-                    _, cancelled = await settle(asyncio.to_thread(mutation.publish_directory, local_dir, os.path.dirname(catalog_abs_path)))
-                    if cancelled:
-                        raise asyncio.CancelledError
+                    await mutation.publish_directory_admitted(local_dir, os.path.dirname(catalog_abs_path))
                     source = await resolve_media_source(candidate.video_url, require_cloud=True)
                 candidate_data["source_fingerprint"] = playback_source_fingerprint(source, candidate.audio_metadata)
             else:
-                _, cancelled = await settle(asyncio.to_thread(mutation.publish_directory, local_dir, os.path.dirname(catalog_abs_path)))
+                await mutation.publish_directory_admitted(local_dir, os.path.dirname(catalog_abs_path))
                 # Fingerprints include mtime/inode where appropriate; use the published bytes.
                 candidate_data["source_fingerprint"] = local_playback_fingerprint(Path(catalog_abs_path), candidate.audio_metadata)
-                if cancelled:
-                    raise asyncio.CancelledError
-            from services.media_updates import atomic_json_write, upload_cloud_file
+            from services.media_updates import admitted_json_write, upload_cloud_file
             portable = Path(local_dir) / ".metadata" / "metadata.json" if cloud_ingestion else Path(catalog_abs_path).parent / ".metadata" / "metadata.json"
             payload = json.loads(portable.read_text(encoding="utf-8"))
             payload["source_fingerprint"] = candidate_data["source_fingerprint"]
@@ -1044,18 +1087,18 @@ class DownloadQueueManager:
             payload["analysis"] = accepted_analysis
             if cloud_ingestion and source.local_exists:
                 local_portable = Path(catalog_abs_path).parent / ".metadata" / "metadata.json"
-                mutation.capture_local(str(local_portable))
-                atomic_json_write(local_portable, payload)
+                await mutation.capture_local_asset(str(local_portable))
+                await admitted_json_write(local_portable, payload)
             if not cloud_ingestion:
-                mutation.capture_local(str(portable))
-            atomic_json_write(portable, payload)
+                await mutation.capture_local_asset(str(portable))
+            await admitted_json_write(portable, payload)
             if cloud_ingestion:
                 await upload_cloud_file(portable, f"{source.cloud_path.rsplit('/', 1)[0]}/.metadata/metadata.json")
             if media_type != "movie":
                 compatible = portable.with_name(f"metadata_s{season or 1}_e{episode or 1}.json")
                 if not cloud_ingestion:
-                    mutation.capture_local(str(compatible))
-                atomic_json_write(compatible, payload)
+                    await mutation.capture_local_asset(str(compatible))
+                await admitted_json_write(compatible, payload)
                 if cloud_ingestion:
                     await upload_cloud_file(compatible, f"{source.cloud_path.rsplit('/', 1)[0]}/.metadata/{compatible.name}")
             async with AsyncSession(engine, expire_on_commit=False) as db:
@@ -1094,9 +1137,12 @@ class DownloadQueueManager:
             logger.error(f"[Queue Manager] Task {task_id} failed: {err.failure.display}")
             await self._record_task_failure(task_id, err.failure, submitted_video_url)
         except asyncio.CancelledError:
-            if task_id not in self.cancelled_tasks:
+            if capacity_failure is not None:
+                await self._record_task_failure(task_id, capacity_failure, submitted_video_url)
+            elif task_id not in self.cancelled_tasks:
                 await self._record_task_failure(task_id, IngestionFailure("INGESTION_INTERRUPTED", "The task was interrupted by server shutdown."), submitted_video_url)
-            raise
+            if capacity_failure is None:
+                raise
         except Exception as err:
             diagnostics_path = write_task_diagnostics(task_id, "queue exception", traceback.format_exc())
             failure = IngestionFailure("QUEUE_INTERNAL_ERROR", f"The queue encountered {type(err).__name__}.", False, diagnostics_path)
@@ -1104,6 +1150,9 @@ class DownloadQueueManager:
             await self._record_task_failure(task_id, failure, submitted_video_url)
                 
         finally:
+            if capacity_monitor is not None:
+                capacity_monitor.cancel()
+                await settle(asyncio.gather(capacity_monitor, return_exceptions=True))
             recovery_pending = False
             if mutation is not None:
                 try:
@@ -1136,6 +1185,8 @@ class DownloadQueueManager:
             self.storage_reservations.pop(task_id, None)
             from services.state import remove_task_metrics
             remove_task_metrics(task_id)
+            for reservation in capacity_reservations:
+                await settle(storage_capacity.release(reservation))
 
     async def _record_task_failure(self, task_id: str, failure: IngestionFailure, submitted_video_url: str) -> None:
         try:
@@ -1836,7 +1887,7 @@ class DownloadQueueManager:
             media_dir = os.path.abspath(settings.MEDIA_DIR)
 
             cloud_inventory: Optional[set[str]] = None
-            if settings.STORAGE_ENGINE == "CLOUD" and rclone_service.executable():
+            if cloud_read_enabled() and rclone_service.executable():
                 metadata_sync = await rclone_service.run(
                     "copy",
                     settings.RCLONE_REMOTE_PATH,
@@ -1883,14 +1934,22 @@ class DownloadQueueManager:
             def recovery_source_exists(catalog_path: str) -> Optional[bool]:
                 if local_catalog_source_exists(catalog_path):
                     return True
-                if settings.STORAGE_ENGINE != "CLOUD":
-                    return False
+                if not cloud_read_enabled():
+                    return None if hybrid_policy_active() else False
                 if cloud_inventory is None:
                     return None
+                from services.storage_inventory import accepted_placement
+                placement = accepted_placement(catalog_path)
+                if placement:
+                    remote_prefix = settings.RCLONE_REMOTE_PATH.rstrip("/") + "/"
+                    remote_path = str(placement["remote_path"])
+                    if not remote_path.startswith(remote_prefix):
+                        return None
+                    return remote_path[len(remote_prefix):] in cloud_inventory
                 normalized = catalog_path.replace("\\", "/").lstrip("/")
                 if normalized.startswith("media/"):
                     normalized = normalized[len("media/"):]
-                return normalized in cloud_inventory
+                return True if normalized in cloud_inventory else (None if hybrid_policy_active() else False)
             
             # Sweep DB first to reconcile URLs and check actual file/cloud presence
             logger.info("[Queue Manager Recovery] Sweeping database to reconcile video URLs...")
@@ -1990,7 +2049,7 @@ class DownloadQueueManager:
                         if (bundle["analysis"].get("video_fingerprint") == local_video_fingerprint(source)
                             or bundle["source_fingerprint"] == local_playback_fingerprint(source, bundle["audio_metadata"])):
                             accepted_sources[owner] = str(source)
-                    elif settings.STORAGE_ENGINE == "CLOUD":
+                    elif cloud_read_enabled():
                         cloud_candidates[owner] = bundle
                 except (OSError, ValueError, TypeError):
                     continue
@@ -2006,7 +2065,7 @@ class DownloadQueueManager:
                         key = _portable_media_source(portable, path)
                     except (OSError, ValueError):
                         continue
-                    if key is None or Path(key[1]).is_file() or settings.STORAGE_ENGINE != "CLOUD":
+                    if key is None or Path(key[1]).is_file() or not cloud_read_enabled():
                         continue
                     cloud_records.setdefault(key[0], []).append((str(path), portable))
                     candidate = cloud_candidates.get(key[0])

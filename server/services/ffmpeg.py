@@ -19,6 +19,8 @@ from services.ingestion_security import UnsafeIngestionSource, source_request_fa
 from services.ingest_preview import ingest_preview_service
 from services.media_timing import canonical_audio_filter_chain
 from lifecycle.coordination import run_cancellation_safe_thread
+from lifecycle.media_work import settle
+from services.storage_capacity import StorageCapacityError, storage_capacity
 
 # Regular expressions for parsing FFmpeg stderr progress
 time_regex = re.compile(r"time=\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)")
@@ -53,7 +55,7 @@ def _iter_ffmpeg_status_lines(stream: Any):
 async def download_and_cache_metadata_image(image_url: str, dest_path: str) -> Optional[str]:
     """
     Asynchronously downloads a remote TMDB image and caches it locally under dest_path.
-    Uses aiofiles to perform non-blocking disk I/O.
+    Admits the response bytes before a cancellation-safe atomic disk write.
     """
     if not image_url or not image_url.startswith("http"):
         return image_url
@@ -75,10 +77,20 @@ async def download_and_cache_metadata_image(image_url: str, dest_path: str) -> O
             response = await client.get(image_url, timeout=15.0)
             if response.status_code == 200:
                 temp_path = f"{dest_path}.{uuid.uuid4().hex}.part"
+                content = response.content
                 try:
-                    async with aiofiles.open(temp_path, "wb") as f:
-                        await f.write(response.content)
-                    os.replace(temp_path, dest_path)
+                    async with storage_capacity.allocation("metadata-artwork-download", len(content), temp_path) as reservation:
+                        def publish_image():
+                            with open(temp_path, "wb") as handle:
+                                if handle.write(content) != len(content):
+                                    raise OSError("Artwork write was incomplete")
+                                handle.flush()
+                                os.fsync(handle.fileno())
+                            os.replace(temp_path, dest_path)
+                        _, cancelled = await settle(asyncio.to_thread(publish_image))
+                        await storage_capacity.progress(reservation, len(content))
+                        if cancelled:
+                            raise asyncio.CancelledError
                 finally:
                     if os.path.exists(temp_path):
                         os.remove(temp_path)
@@ -93,6 +105,8 @@ async def download_and_cache_metadata_image(image_url: str, dest_path: str) -> O
                 return rel_url
             else:
                 logger.error(f"[Metadata Cache] Fetch error {response.status_code} for URL: {image_url}")
+    except StorageCapacityError:
+        raise
     except Exception as e:
         logger.error(f"[Metadata Cache] Exception occurred downloading metadata asset: {e}")
         

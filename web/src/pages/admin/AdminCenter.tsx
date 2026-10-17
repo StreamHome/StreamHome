@@ -4,7 +4,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { BrandLogo } from "../../components/brand/BrandLogo";
 import { AdminSelect } from "../../components/ui/AdminSelect";
 import { CONTENT_REVEAL, MOTION_EASE, MOTION_TIMINGS, resetApplicationScroll, useAppMotion } from "../../motion/motionSystem";
-import { appUrl, parseAppQuery, type AdminSection } from "../../navigation/queryState";
+import { appUrl, parseAppQuery, type AdminSection, type StorageView } from "../../navigation/queryState";
 import { useViewScrollToTop } from "../../navigation/useViewScrollToTop";
 import { useProfileStore } from "../../stores/profileStore";
 import { useThemeStore } from "../../stores/themeStore";
@@ -55,11 +55,17 @@ export function AdminCenter() {
   const query = useMemo(() => parseAppQuery(location.search), [location.search]);
   const section = query.section ?? "account";
   useViewScrollToTop(section);
+  const previousStorageView = useRef(query.storageView);
+  useLayoutEffect(() => {
+    if (section === "storage" && previousStorageView.current !== query.storageView) resetApplicationScroll();
+    previousStorageView.current = query.storageView;
+  }, [section, query.storageView]);
   const Background = definition.Background;
   const { reduced } = useAppMotion();
   const subjectProfile = profiles.find((item) => item.id === query.adminProfile) ?? profile;
   const profileAware = section === "profiles" || section === "recommendations";
   const select = (next: AdminSection) => navigate(appUrl(profile.id, "admin", { section: next, adminProfile: subjectProfile.id }));
+  const selectStorageView = (storageView: StorageView) => navigate(appUrl(profile.id, "admin", { section: "storage", adminProfile: query.adminProfile, storageView }));
   const selectSubject = (subjectId: string) => navigate(appUrl(profile.id, "admin", { section, adminProfile: subjectId, adminCategory: query.adminCategory }));
 
   return (
@@ -95,7 +101,7 @@ export function AdminCenter() {
             {section === "api-keys" && <ApiKeysPanel />}
             {section === "profiles" && <ProfileDataPanel profileId={subjectProfile.id} />}
             {section === "recommendations" && <RecommendationsPanel profileId={subjectProfile.id} draft={genreDrafts[subjectProfile.id]} onDraftChange={(draft) => setGenreDrafts((previous) => ({ ...previous, [subjectProfile.id]: draft }))} />}
-            {section === "storage" && <StoragePanel retainedDraft={storageDraft} onDraftChange={setStorageDraft} />}
+            {section === "storage" && <StoragePanel retainedDraft={storageDraft} onDraftChange={setStorageDraft} view={query.storageView ?? "overview"} onViewChange={selectStorageView} />}
             {section === "downloads" && <DownloadsPanel />}
             {section === "updates" && <UpdatesPanel />}
           </motion.div>

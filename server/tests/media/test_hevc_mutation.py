@@ -79,6 +79,8 @@ class HEVCMutationTests(unittest.IsolatedAsyncioTestCase):
         self.stack.enter_context(mock.patch.object(settings, "TEMP_DIR", str(self.temp)))
         self.stack.enter_context(mock.patch.object(settings, "HEVC_COMPRESSION_MODE", "force"))
         self.stack.enter_context(mock.patch.object(hevc, "engine", self.engine))
+        # Shared capacity admission belongs to the same disposable installation.
+        self.stack.enter_context(mock.patch("db.engine", self.engine))
         self.stack.enter_context(mock.patch.object(playback_prep_service, "reuse_verified_playback_cache", return_value=False))
         self.coordinator = RuntimeCoordinator()
         self.stack.enter_context(use_runtime_coordinator_for_testing(self.coordinator))
@@ -206,6 +208,8 @@ class HEVCMutationTests(unittest.IsolatedAsyncioTestCase):
         entered, release = asyncio.Event(), asyncio.Event()
         original_commit = AsyncSession.commit
         async def delayed_commit(session):
+            if not any(isinstance(item, (Movie, MediaOperationReceipt)) for item in [*session.new, *session.dirty]):
+                return await original_commit(session)
             entered.set()
             await release.wait()
             if fail:
@@ -240,7 +244,12 @@ class HEVCMutationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_catalog_commit_failure_restores_video_and_metadata(self):
         self.install_worker()
-        with mock.patch.object(AsyncSession, "commit", new=mock.AsyncMock(side_effect=RuntimeError("Injected catalog failure"))):
+        original_commit = AsyncSession.commit
+        async def fail_catalog_commit(session):
+            if any(isinstance(item, (Movie, MediaOperationReceipt)) for item in [*session.new, *session.dirty]):
+                raise RuntimeError("Injected catalog failure")
+            return await original_commit(session)
+        with mock.patch.object(AsyncSession, "commit", new=fail_catalog_commit):
             await self.worker._worker_loop()
         await self.assert_state(accepted=False)
 
@@ -252,13 +261,13 @@ class HEVCMutationTests(unittest.IsolatedAsyncioTestCase):
             if calls == 3:
                 raise asyncio.CancelledError
             return probe("h264", "original") if calls == 1 else probe("hevc", "optimized")
-        original_copy = shutil.copy2
+        original_copy = media_publication.copy_bounded
         def copy(source, destination, *args, **kwargs):
             if str(destination).endswith(".rollback"):
                 raise OSError("Injected rollback failure")
             return original_copy(source, destination, *args, **kwargs)
         self.install_worker(probe_override=inspect_file)
-        with mock.patch.object(media_publication.shutil, "copy2", side_effect=copy):
+        with mock.patch.object(media_publication, "copy_bounded", side_effect=copy):
             with self.assertRaises(asyncio.CancelledError):
                 await self.worker._worker_loop()
         operations = list(self.temp.glob("media-operations/*/operation.json"))
@@ -437,7 +446,7 @@ class HEVCMutationTests(unittest.IsolatedAsyncioTestCase):
         real_supervise = self.worker._supervise_transcode
         observed = {}
 
-        async def supervise(process, output, original_size, lease):
+        async def supervise(process, output, original_size, lease, reservation=None):
             real_stat = Path.stat
 
             def stat(path, *args, **kwargs):
@@ -448,7 +457,7 @@ class HEVCMutationTests(unittest.IsolatedAsyncioTestCase):
                 return result
 
             with mock.patch.object(Path, "stat", stat):
-                return await real_supervise(process, output, original_size, lease)
+                return await real_supervise(process, output, original_size, lease, reservation)
 
         with mock.patch.object(self.worker, "_supervise_transcode", supervise):
             await asyncio.wait_for(self.worker._worker_loop(), 30)
@@ -486,13 +495,21 @@ class HEVCMutationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_media_volume_floor_stops_child_before_storage_is_consumed(self):
         self.install_blocked_encoder()
-        with mock.patch.object(hevc.shutil, "disk_usage", return_value=SimpleNamespace(free=self.worker.STORAGE_SAFETY_MARGIN_BYTES)):
+        original_supervise = self.worker._supervise_transcode
+        async def floor_after_admission(*args, **kwargs):
+            with mock.patch.object(hevc.shutil, "disk_usage", return_value=SimpleNamespace(free=self.worker.STORAGE_SAFETY_MARGIN_BYTES)):
+                return await original_supervise(*args, **kwargs)
+        with mock.patch.object(self.worker, "_supervise_transcode", floor_after_admission):
             await asyncio.wait_for(self.worker._worker_loop(), 5)
         await self.assert_resource_rejection(ORIGINAL, json.dumps(self.old_metadata).encode())
 
     async def test_resource_watcher_failure_reaps_child_and_releases_lease(self):
         self.install_blocked_encoder()
-        with mock.patch.object(hevc.shutil, "disk_usage", side_effect=OSError("Injected storage watcher failure")):
+        original_supervise = self.worker._supervise_transcode
+        async def fail_after_admission(*args, **kwargs):
+            with mock.patch.object(hevc.shutil, "disk_usage", side_effect=OSError("Injected storage watcher failure")):
+                return await original_supervise(*args, **kwargs)
+        with mock.patch.object(self.worker, "_supervise_transcode", fail_after_admission):
             await asyncio.wait_for(self.worker._worker_loop(), 5)
         await self.assert_resource_rejection(ORIGINAL, json.dumps(self.old_metadata).encode())
 

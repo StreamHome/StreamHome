@@ -22,7 +22,7 @@ from services.logger import logger
 from services.languages import language_label, normalize_language_tag
 from services.media_timing import canonical_audio_filter_chain
 from services.ffmpeg_input import generated_hls_input_options, local_media_input_options, native_media_environment
-from services.media_source import ResolvedMediaSource, clear_cloud_object_cache, playback_source_fingerprint, resolve_media_source
+from services.media_source import ResolvedMediaSource, clear_cloud_object_cache, cloud_read_enabled, playback_source_fingerprint, resolve_media_source, resolve_related_source
 from services.rclone import rclone_service
 from services.state import register_process, unregister_process
 from lifecycle.coordination import (
@@ -31,7 +31,8 @@ from lifecycle.coordination import (
     run_cancellation_safe_thread,
     runtime_work,
 )
-from lifecycle.media_work import MediaRecoveryRequired, media_ownership, require_resolved_media, supervised_output
+from lifecycle.media_work import MediaRecoveryRequired, media_ownership, require_resolved_media, settle, supervised_output
+from services.storage_capacity import StorageCapacityError, storage_capacity
 
 
 STANDARD_HEIGHTS = (1080, 720, 480, 360, 240, 144)
@@ -123,10 +124,127 @@ class PlaybackPrepService:
         self._last_touch_at: dict[str, float] = {}
         self._active_cache_leases: dict[str, float] = {}
         self._cloud_spool_locks: dict[str, asyncio.Lock] = {}
+        self._run_cache_roots: dict[str, tuple[str, str]] = {}
         self._update_quiesced = False
 
     def initialize_storage(self) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def protect_run(self, run_id: str, media_id: str, fingerprint: str) -> None:
+        """An open player, including explicit Pause, has no short cache TTL."""
+        if fingerprint:
+            self._run_cache_roots[run_id] = (str(media_id), fingerprint)
+
+    def release_run(self, run_id: str) -> None:
+        self._run_cache_roots.pop(run_id, None)
+
+    async def reconcile_run_protections(self) -> None:
+        from db import engine
+        from models import PlaybackRun
+        from sqlmodel import select
+        from sqlmodel.ext.asyncio.session import AsyncSession
+
+        async with AsyncSession(engine) as db:
+            runs = (await db.exec(select(PlaybackRun).where(PlaybackRun.lifecycle_state == "active"))).all()
+        self._run_cache_roots = {
+            run.id: (str(run.episode_id or run.movie_id), str(run.source_fingerprint))
+            for run in runs if run.source_kind == "catalog" and run.source_fingerprint
+        }
+
+    async def is_media_protected(self, media_id: str) -> bool:
+        return any(owner == media_id for owner, _ in self._run_cache_roots.values()) or any(
+            key.startswith(f"{media_id}:") for key in self.active_jobs
+        )
+
+    def enqueue_cache_miss(self, media_obj: Any, source: ResolvedMediaSource, *, retry: bool = False) -> None:
+        """Queue the approved same-generation exception; HTTP never runs FFmpeg."""
+        from services.storage_inventory import hybrid_policy_active
+
+        if not hybrid_policy_active() or self._update_quiesced:
+            return
+        media = self.snapshot_media(media_obj)
+        fingerprint = str(media.source_fingerprint or "")
+        if not fingerprint or playback_source_fingerprint(source, media.audio_metadata) != fingerprint:
+            return
+        if self.preparation_state(media.id, fingerprint, media) == "ready":
+            return
+        if not retry and self.required_preparation_error(media.id, fingerprint, media):
+            return
+        key = f"{media.id}:{fingerprint}:cache-miss"
+        if key in self.active_jobs:
+            return
+
+        async def prepare_accepted() -> None:
+            try:
+                await self.prepare(media.id, media, source, include_remaining=False, retry_errors=retry, foreground=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                code = getattr(exc, "code", "PREPARATION_FAILED")
+                self._write_preparation_error(media.id, fingerprint, code, "Playback preparation could not start. Retry this title.")
+
+        self._track_job(key, asyncio.create_task(prepare_accepted(), name=f"playback-cache-miss:{media.id}"), FOREGROUND_PRIORITY)
+
+    async def ensure_offline_baseline(self, media_obj: Any, source: ResolvedMediaSource, *, timeout: float = 6 * 3600) -> bool:
+        """Finish verified baseline video/default audio before an offline-ready claim."""
+        media = self.snapshot_media(media_obj)
+        fingerprint = str(media.source_fingerprint or "")
+        if not fingerprint or playback_source_fingerprint(source, media.audio_metadata) != fingerprint:
+            return False
+        baseline = self.baseline_video(media)
+        audios = self.audio_renditions(media)
+        default = next((audio for audio in audios if audio.default), audios[0] if audios else None)
+        names = [baseline.name, *([default.name] if default else [])]
+        await self.prepare(media.id, media, source, include_remaining=False, retry_errors=True, foreground=False)
+        deadline = time.monotonic() + max(1.0, timeout)
+        while time.monotonic() < deadline:
+            if all(self.rendition_complete(media.id, fingerprint, name) for name in names):
+                return True
+            if self.required_preparation_error(media.id, fingerprint, media):
+                return False
+            tasks = [task for key, task in self.active_jobs.items() if key.startswith(f"{media.id}:{fingerprint}:") and not task.done()]
+            if not tasks:
+                return False
+            await asyncio.wait(tasks, timeout=min(1.0, max(0.0, deadline - time.monotonic())))
+        self.cancel_media(media.id, fingerprint)
+        tasks = [task for key, task in self.active_jobs.items() if key.startswith(f"{media.id}:{fingerprint}:")]
+        if tasks:
+            await settle(asyncio.gather(*tasks, return_exceptions=True))
+        return False
+
+    async def cold_recovery_ready(self, media_obj: Any, source: ResolvedMediaSource) -> bool:
+        """Prove the existing full-spool recovery path for this exact generation."""
+        from services.media_analysis import current_duration_analysis, stored_analysis
+
+        analysis = stored_analysis(getattr(media_obj, "analysis_metadata_str", None))
+        fingerprint = str(getattr(media_obj, "source_fingerprint", "") or "")
+        if (not source.available or not current_duration_analysis(analysis)
+                or analysis.get("video_fingerprint") != source.video_fingerprint
+                or analysis.get("source_fingerprint") != fingerprint
+                or playback_source_fingerprint(source, media_obj.audio_metadata or []) != fingerprint
+                or not shutil.which("ffmpeg") or not shutil.which("ffprobe")):
+            return False
+        baseline = self.baseline_video(media_obj)
+        audios = self.audio_renditions(media_obj)
+        default = next((audio for audio in audios if audio.default), audios[0] if audios else None)
+        names = [baseline.name, *([default.name] if default else [])]
+        if not all(self.rendition_complete(str(media_obj.id), fingerprint, name) for name in names):
+            return False
+        try:
+            source_bytes = source.local_path.stat().st_size if source.local_exists else int(source.cloud_size or 0)
+            if source_bytes <= 0:
+                return False
+            peak = source_bytes + sum(self.rendition_capacity_bytes(media_obj, name) for name in names)
+            if default and default.source == "external":
+                external = await self._external_audio_source(source, default, self._external_audio_path(source, default))
+                if external is None:
+                    return False
+                peak += external.local_path.stat().st_size if external.local_exists else int(external.cloud_size or 0)
+            async with runtime_work("playback.cold-recovery-proof", [EffectClass.DB_WRITE]):
+                async with storage_capacity.allocation(f"playback-cold-proof:{media_obj.id}", peak, self.cache_dir, track_materialized=False):
+                    return True
+        except (StorageCapacityError, PlaybackPreparationError, AdmissionClosedError, OSError):
+            return False
 
     @property
     def update_quiesced(self) -> bool:
@@ -679,7 +797,10 @@ class PlaybackPrepService:
             failure = self.rendition_error(media_id, fingerprint, rendition_name)
             if failure:
                 return failure
-        return None
+        required = [baseline.name, *([default_audio.name] if default_audio else [])]
+        return self.preparation_error(media_id, fingerprint) if not all(
+            self.playlist_ready(media_id, fingerprint, name) for name in required
+        ) else None
 
     def preparation_progress(self, media_id: str, fingerprint: str, media_obj: Any) -> dict[str, Any]:
         baseline = self.baseline_video(media_obj)
@@ -1081,7 +1202,7 @@ class PlaybackPrepService:
 
         extension = Path(source.cloud_path).suffix or ".media"
         source_key = hashlib.sha256(source.cloud_path.encode("utf-8")).hexdigest()[:24]
-        spool_path = self.cache_path(media_id, fingerprint) / ".sources" / f"{source_key}{extension}"
+        spool_path = self.cache_path(media_id, fingerprint) / ".sources" / source_key / f"original{extension}"
         lock_key = str(spool_path)
         lock = self._cloud_spool_locks.setdefault(lock_key, asyncio.Lock())
         async with lock:
@@ -1089,7 +1210,34 @@ class PlaybackPrepService:
             if spool_path.is_file() and (expected_size <= 0 or spool_path.stat().st_size == expected_size):
                 return str(spool_path), None
             spool_path.parent.mkdir(parents=True, exist_ok=True)
-            result = await rclone_service.copyto_atomic(source.cloud_path, str(spool_path), timeout=6 * 60 * 60)
+            if expected_size <= 0:
+                raise PlaybackPreparationError("CLOUD_SIZE_INVALID", "A verified source size is required before staging adaptive playback.")
+            try:
+                async with storage_capacity.allocation(f"playback-spool:{media_id}", expected_size, spool_path.parent) as reservation:
+                    copying = asyncio.create_task(rclone_service.copyto_atomic(source.cloud_path, str(spool_path), timeout=6 * 60 * 60))
+                    written = 0
+                    try:
+                        while not copying.done():
+                            await asyncio.wait({copying}, timeout=0.25)
+                            size = await run_cancellation_safe_thread(self._spool_size, spool_path)
+                            if size > expected_size:
+                                raise PlaybackPreparationError("CLOUD_SPOOL_OVERSIZED", "The cloud source exceeded its admitted size.")
+                            written = max(written, size)
+                            await storage_capacity.progress(reservation, written)
+                        result = await copying
+                    finally:
+                        if not copying.done():
+                            copying.cancel()
+                        await settle(asyncio.gather(copying, return_exceptions=True))
+                        # Rclone may create a child .partial beside the named
+                        # atomic destination. Only this locked spool owns them.
+                        def cleanup_parts():
+                            for part in spool_path.parent.glob(f".{spool_path.name}.*"):
+                                if part.is_file() or part.is_symlink():
+                                    part.unlink(missing_ok=True)
+                        await run_cancellation_safe_thread(cleanup_parts)
+            except StorageCapacityError as exc:
+                raise PlaybackPreparationError(exc.code, "Local storage cannot admit the complete source spool for adaptive playback.") from exc
             if not result.ok:
                 raise PlaybackPreparationError(
                     result.error_code or "CLOUD_SPOOL_FAILED",
@@ -1102,6 +1250,21 @@ class PlaybackPrepService:
                     "Google Drive staged an incomplete playback source.",
                 )
         return str(spool_path), None
+
+    @staticmethod
+    def _spool_size(spool_path: Path) -> int:
+        seen: set[tuple[int, int]] = set()
+        total = 0
+        for path in [spool_path, *spool_path.parent.glob(f".{spool_path.name}.*")]:
+            try:
+                info = path.stat()
+                identity = (info.st_dev, info.st_ino)
+                if stat.S_ISREG(info.st_mode) and identity not in seen:
+                    seen.add(identity)
+                    total += info.st_size
+            except FileNotFoundError:
+                continue
+        return total
 
     @asynccontextmanager
     async def _owned_job_input(
@@ -1138,7 +1301,7 @@ class PlaybackPrepService:
                 current_media = self.snapshot_media(item)
             # Cloud identity caches cannot establish which bytes a queued job
             # will download after an earlier publication has completed.
-            if settings.STORAGE_ENGINE == "CLOUD":
+            if cloud_read_enabled():
                 clear_cloud_object_cache()
             source = await resolve_media_source(catalog_path)
             if (not source.available or source.catalog_path != requested_source.catalog_path
@@ -1147,7 +1310,7 @@ class PlaybackPrepService:
             audio = next((track for track in self.audio_renditions(current_media)
                           if track.name == rendition_name), None)
             if audio and audio.source == "external":
-                source = self._external_audio_source(source, audio, self._external_audio_path(source, audio))
+                source = await self._external_audio_source(source, audio, self._external_audio_path(source, audio))
                 if source is None:
                     raise PlaybackPreparationError("MEDIA_SOURCE_MISSING", "The selected audio source is no longer available.")
             if source.local_exists and sys.platform.startswith("linux"):
@@ -1229,15 +1392,26 @@ class PlaybackPrepService:
         self,
         process: asyncio.subprocess.Process,
         target_dir: Path,
+        *,
+        reservation: Optional[str] = None,
+        maximum_bytes: Optional[int] = None,
     ) -> None:
         stall_seconds = max(1, int(settings.PLAYBACK_JOB_STALL_SECONDS))
         last_signature = await run_cancellation_safe_thread(self._output_signature, target_dir)
+        written_peak = last_signature[1]
         last_activity = time.monotonic()
         wait_task = asyncio.create_task(process.wait())
         try:
             while not wait_task.done():
                 await asyncio.wait({wait_task}, timeout=1)
                 signature = await run_cancellation_safe_thread(self._output_signature, target_dir)
+                if maximum_bytes is not None and signature[1] > maximum_bytes:
+                    process.kill()
+                    await wait_task
+                    raise PlaybackPreparationError("STORAGE_RESERVATION_EXCEEDED", "Adaptive output exceeded its admitted storage capacity.")
+                if reservation:
+                    written_peak = max(written_peak, signature[1])
+                    await storage_capacity.progress(reservation, written_peak)
                 if signature != last_signature:
                     last_signature = signature
                     last_activity = time.monotonic()
@@ -1266,6 +1440,17 @@ class PlaybackPrepService:
             if len(tail) > limit:
                 del tail[:-limit]
         return bytes(tail)
+
+    def rendition_capacity_bytes(self, media_obj: Any, rendition_name: str) -> int:
+        """Admit a bounded ceiling, then stop the actual writer on overrun."""
+        import math
+
+        duration = float(getattr(media_obj, "probed_duration", 0.0) or 0.0)
+        if not math.isfinite(duration) or duration <= 0:
+            raise PlaybackPreparationError("MEDIA_DURATION_UNVERIFIED", "Adaptive preparation requires a verified duration.")
+        video = next((item for item in self.video_renditions(media_obj) if item.name == rendition_name), None)
+        rate = video.bandwidth if video else 256_000
+        return max(2 * 1024 * 1024, int(duration * rate / 8 * 1.5) + 2 * 1024 * 1024)
 
     async def _run_ffmpeg_job(
         self,
@@ -1370,6 +1555,10 @@ class PlaybackPrepService:
             cloud_stderr_task: Optional[asyncio.Task[bytes]] = None
             ffmpeg_stderr_task: Optional[asyncio.Task[bytes]] = None
             try:
+                maximum_bytes = self.rendition_capacity_bytes(media_obj, rendition_name)
+                reservation = await capacity.enter_async_context(storage_capacity.allocation(
+                    f"playback-output:{media_id}:{rendition_name}"[:128], maximum_bytes, target_dir
+                ))
                 actual_input, cloud_process, input_descriptors = await capacity.enter_async_context(
                     self._owned_job_input(media_id, fingerprint, rendition_name, source)
                 )
@@ -1401,7 +1590,7 @@ class PlaybackPrepService:
                     pump_task = asyncio.create_task(self._pump_cloud_input(cloud_process, ffmpeg_process))
                     assert cloud_process.stderr is not None
                     cloud_stderr_task = asyncio.create_task(self._read_bounded_stream(cloud_process.stderr))
-                await self._wait_for_ffmpeg_progress(ffmpeg_process, target_dir)
+                await self._wait_for_ffmpeg_progress(ffmpeg_process, target_dir, reservation=reservation, maximum_bytes=maximum_bytes)
                 stderr = await ffmpeg_stderr_task
                 if cloud_process:
                     if pump_task:
@@ -1443,7 +1632,7 @@ class PlaybackPrepService:
                 self._clear_rendition_error(media_id, fingerprint, rendition_name)
                 self.touch(media_id, fingerprint)
                 await self.rebuild_master(media_id, fingerprint, media_obj)
-                await run_cancellation_safe_thread(self.enforce_lru_limits)
+                await self.enforce_lru_limits_admitted()
                 elapsed = max(0.0, time.monotonic() - self.job_started_at.get(job_key, time.monotonic()))
                 logger.info(
                     f"[Playback Prep] Prepared {media_id}/{rendition_name} in {elapsed:.2f}s; "
@@ -1453,7 +1642,7 @@ class PlaybackPrepService:
                 shutil.rmtree(target_dir, ignore_errors=True)
                 await self.rebuild_master(media_id, fingerprint, media_obj)
                 raise
-            except PlaybackPreparationError as exc:
+            except (PlaybackPreparationError, StorageCapacityError) as exc:
                 self._write_preparation_error(media_id, fingerprint, exc.code, str(exc))
                 self._write_rendition_error(media_id, fingerprint, rendition_name, exc.code, str(exc))
                 shutil.rmtree(target_dir, ignore_errors=True)
@@ -1551,18 +1740,19 @@ class PlaybackPrepService:
         if not audio_dir.is_dir():
             return None
         supported = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"}
-        files = sorted(item for item in audio_dir.iterdir() if item.is_file() and item.suffix.lower() in supported)
+        files = sorted(item for item in audio_dir.iterdir() if item.is_file() and not item.is_symlink() and item.suffix.lower() in supported)
         if audio.file_name:
+            if Path(audio.file_name).name != audio.file_name or "\\" in audio.file_name:
+                return None
             exact = audio_dir / audio.file_name
-            if exact.is_file() and exact.suffix.lower() in supported:
-                return exact
+            return exact if exact in files else None
         language_match = next((item for item in files if normalize_language_tag(item.stem) == audio.language), None)
         if language_match:
             return language_match
         return files[audio.stream_index] if audio.source == "external" and 0 <= audio.stream_index < len(files) else None
 
     @staticmethod
-    def _external_audio_source(source: ResolvedMediaSource, audio: AudioRendition, local_path: Optional[Path]) -> Optional[ResolvedMediaSource]:
+    async def _external_audio_source(source: ResolvedMediaSource, audio: AudioRendition, local_path: Optional[Path]) -> Optional[ResolvedMediaSource]:
         if local_path:
             return ResolvedMediaSource(
                 catalog_path=source.catalog_path,
@@ -1576,17 +1766,8 @@ class PlaybackPrepService:
             return None
         if audio.file_name in {".", ".."} or "/" in audio.file_name or "\\" in audio.file_name:
             return None
-        remote_parent = source.cloud_path.rsplit("/", 1)[0]
-        remote_path = f"{remote_parent}/audio/{audio.file_name}"
-        return ResolvedMediaSource(
-            catalog_path=source.catalog_path,
-            relative_path=source.relative_path,
-            local_path=source.local_path.parent / "audio" / audio.file_name,
-            cloud_path=remote_path,
-            local_exists=False,
-            cloud_exists=True,
-            cloud_identity=remote_path,
-        )
+        observed = await resolve_related_source(source, f"audio/{audio.file_name}")
+        return observed if observed.available else None
 
     async def _transcode_audio(
         self,
@@ -1610,10 +1791,11 @@ class PlaybackPrepService:
                 "-ac", "2",
             ]
 
-        external_source = self._external_audio_source(source, rendition, self._external_audio_path(source, rendition))
-        if external_source:
+        # Keep the accepted video as queue authority. _owned_job_input resolves
+        # this track independently only after checking that authority again.
+        if rendition.source == "external":
             arguments = normalized_audio_arguments("0:a:0", rendition.timeline_offset)
-            await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, external_source, arguments, media_obj)
+            await self._run_ffmpeg_job(media_id, fingerprint, rendition.name, source, arguments, media_obj)
             return
         stream_map = (
             f"0:{rendition.stream_index}"
@@ -1905,6 +2087,11 @@ class PlaybackPrepService:
         if self._update_quiesced:
             return
         await self.reconcile_catalog_cache_identities()
+        from services.storage_inventory import hybrid_policy_active
+        if hybrid_policy_active():
+            # Hybrid storage rebuilds only the requested accepted generation;
+            # startup must not spool or regenerate the whole remote library.
+            return
         async with AsyncSession(engine, expire_on_commit=False) as db:
             sessions = (await db.exec(select(PlaybackSession).order_by(PlaybackSession.updated_at.desc()))).all()
             recent_ids = [str(item.episode_id or item.movie_id) for item in sessions]
@@ -1947,7 +2134,60 @@ class PlaybackPrepService:
                     f"{self.sanitize_diagnostics(str(exc), 400)}"
                 )
 
-    def enforce_lru_limits(self) -> None:
+    async def enforce_lru_limits_admitted(self) -> None:
+        """Resolve durable pins and recovery proof before any cache deletion."""
+        from db import engine
+        from models import Episode, Movie, PlaybackRun, StorageKeepLocal
+        from sqlmodel import select
+        from sqlmodel.ext.asyncio.session import AsyncSession
+
+        limit_bytes = int(settings.PLAYBACK_CACHE_GB * 1024 * 1024 * 1024)
+        if limit_bytes <= 0 or not self.cache_dir.is_dir():
+            return
+        def cache_usage():
+            total = 0
+            for path in self.cache_dir.rglob("*"):
+                try:
+                    if path.is_file():
+                        total += path.stat().st_size
+                except FileNotFoundError:
+                    continue
+            return total
+        if await run_cancellation_safe_thread(cache_usage) <= limit_bytes:
+            return
+        for media_dir in list(self.cache_dir.iterdir()):
+            if not media_dir.is_dir():
+                continue
+            media_id = media_dir.name
+            if await self.is_media_protected(media_id):
+                continue
+            if await run_cancellation_safe_thread(cache_usage) <= limit_bytes:
+                return
+            async with media_ownership(media_id):
+                async with AsyncSession(engine, expire_on_commit=False) as db:
+                    item = await db.get(Movie, media_id) or await db.get(Episode, media_id)
+                    pin_owner = item.movie_id if isinstance(item, Episode) else media_id
+                    pins = (await db.exec(select(StorageKeepLocal).where(StorageKeepLocal.enabled == True,
+                        StorageKeepLocal.media_id == pin_owner))).all()
+                    pinned = any(pin.episode_id is None or pin.episode_id == media_id for pin in pins)
+                    active = (await db.exec(select(PlaybackRun).where(PlaybackRun.lifecycle_state == "active",
+                        (PlaybackRun.movie_id == media_id) | (PlaybackRun.episode_id == media_id)))).first()
+                if item is None or pinned or active or await self.is_media_protected(media_id):
+                    continue
+                try:
+                    source = await resolve_media_source(item.video_url, refresh_cloud=True)
+                    if not await self.cold_recovery_ready(item, source):
+                        continue
+                    eligible = {str(path.resolve()) for path in media_dir.iterdir() if path.is_dir()}
+                    await run_cancellation_safe_thread(self.enforce_lru_limits, eligible)
+                except (MediaRecoveryRequired, OSError, ValueError):
+                    continue
+
+    def enforce_lru_limits(self, eligible_roots: Optional[set[str]] = None) -> None:
+        # Synchronous/thread callers have no database/pin authority. They must
+        # carry eligibility from the async domain check; absence fails closed.
+        if eligible_roots is None:
+            return
         limit_bytes = int(settings.PLAYBACK_CACHE_GB * 1024 * 1024 * 1024)
         if limit_bytes <= 0 or not self.cache_dir.exists():
             return
@@ -1963,6 +2203,7 @@ class PlaybackPrepService:
             if expires_at > now
         }
         active_roots.update(self._active_cache_leases)
+        active_roots.update(str(self.cache_path(media_id, fingerprint)) for media_id, fingerprint in self._run_cache_roots.values())
         entries: list[tuple[float, int, Path]] = []
         total = 0
         for media_dir in self.cache_dir.iterdir():
@@ -1980,6 +2221,8 @@ class PlaybackPrepService:
             if total <= limit_bytes:
                 break
             if str(path.resolve()) in active_roots:
+                continue
+            if str(path.resolve()) not in eligible_roots:
                 continue
             shutil.rmtree(path, ignore_errors=True)
             total -= size

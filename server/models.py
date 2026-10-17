@@ -457,6 +457,87 @@ class MediaOperationReceipt(SQLModel, table=True):
     media_id: str = Field(index=True)
     accepted_at: float = Field(default_factory=time.time)
 
+
+class StorageAsset(SQLModel, table=True):
+    """An accepted content generation; paths are locations, never its identity."""
+    id: str = Field(primary_key=True)
+    media_id: str = Field(index=True)
+    episode_id: Optional[str] = Field(default=None, index=True)
+    catalog_path: str = Field(unique=True, index=True)
+    kind: str = Field(default="video", index=True)
+    generation: str
+    size_bytes: int
+    local_identity: str
+    source_fingerprint: Optional[str] = None
+    video_fingerprint: Optional[str] = None
+    remote_path: Optional[str] = None
+    remote_identity: Optional[str] = None
+    target_generation: Optional[str] = None
+    verified_at: Optional[float] = None
+    cold_recovery_ready: bool = False
+    last_used_at: float = Field(default=0.0, index=True)
+    updated_at: float = Field(default_factory=time.time)
+
+
+class StorageReservation(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    owner: str
+    operation_id: Optional[str] = Field(default=None, index=True)
+    scope: str = Field(index=True)
+    filesystem: str = Field(index=True)
+    path: str
+    peak_bytes: int
+    written_bytes: int = 0
+    baseline_bytes: int = 0
+    track_materialized: bool = True
+    state: str = Field(default="active", index=True)
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+
+
+class StorageOperation(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    session_hash: Optional[str] = Field(default=None, index=True)
+    kind: str = Field(index=True)
+    status: str = Field(default="queued", index=True)
+    phase: str = "queued"
+    media_id: Optional[str] = Field(default=None, index=True)
+    title: Optional[str] = None
+    bytes_total: Optional[int] = None
+    bytes_done: Optional[int] = None
+    released_bytes: int = 0
+    error_code: Optional[str] = None
+    message: Optional[str] = None
+    payload: str = "{}"
+    created_at: float = Field(default_factory=time.time, index=True)
+    updated_at: float = Field(default_factory=time.time)
+
+
+class StorageReview(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    kind: str
+    session_hash: str
+    policy_revision: int
+    target_generation: str
+    draft_hash: str
+    payload: str
+    expires_at: float
+    used_by: Optional[str] = None
+
+
+class StorageKeepLocal(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    media_id: str = Field(index=True)
+    episode_id: Optional[str] = Field(default=None, index=True)
+    enabled: bool = True
+    updated_at: float = Field(default_factory=time.time)
+
+
+class StorageMeasurement(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    payload: str
+    measured_at: float
+
 class RecoveryCode(SQLModel, table=True):
     id: str = Field(primary_key=True)
     user_id: int = Field(foreign_key="user.id", index=True)

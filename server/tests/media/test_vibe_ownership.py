@@ -43,6 +43,7 @@ class VibeOwnershipRegression(unittest.IsolatedAsyncioTestCase):
             connection.execute("PRAGMA busy_timeout=200")
 
         self.patches = [patch.object(vibe_analysis, "engine", self.engine),
+                        patch("db.engine", self.engine),
                         patch.object(media_work, "_locks", {})]
         for item in self.patches:
             item.start()
@@ -109,14 +110,13 @@ class VibeOwnershipRegression(unittest.IsolatedAsyncioTestCase):
 
     def paused_metadata_writer(self):
         entered, release = asyncio.Event(), threading.Event()
-        loop = asyncio.get_running_loop()
         original = vibe_analysis._update_metadata_file
 
-        def write(folder, entity):
-            loop.call_soon_threadsafe(entered.set)
-            if not release.wait(5):
+        async def write(folder, entity):
+            entered.set()
+            if not await asyncio.to_thread(release.wait, 5):
                 raise TimeoutError("metadata test barrier was not released")
-            original(folder, entity)
+            await original(folder, entity)
 
         return entered, release, patch.object(vibe_analysis, "_update_metadata_file", write)
 

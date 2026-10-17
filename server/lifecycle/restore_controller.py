@@ -1277,6 +1277,33 @@ def restore_rollback_checkpoint(paths: RestorePaths, journal: Mapping[str, Any])
 def require_no_media_publication_evidence(root: Path) -> None:
     """Never replace DB receipts while media publication recovery remains pending."""
     try:
+        # Accepted placements deliberately outlive the database being restored.
+        # Validate them even when there is no pending publication directory.
+        from .storage_placement import (
+            StoragePlacementRecoveryRequired, validate_placement_manifests,
+        )
+        try:
+            validate_placement_manifests(root)
+        except StoragePlacementRecoveryRequired as exc:
+            raise RestoreRecoveryRequired("accepted storage placements require recovery") from exc
+        database_path = root / "server" / "database.db"
+        if database_path.exists():
+            if database_path.is_symlink() or not database_path.is_file():
+                raise RestoreRecoveryRequired("storage operation evidence is ambiguous")
+            connection = sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True)
+            try:
+                tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if "storageoperation" in tables and connection.execute(
+                    "SELECT 1 FROM storageoperation WHERE kind IN ('offload','cleanup','keep_local') "
+                    "AND (status IN ('queued','running','blocked') OR phase='cleanup_debt') LIMIT 1"
+                ).fetchone():
+                    raise RestoreRecoveryRequired("storage operations must settle before database restore")
+                if "storagereservation" in tables and connection.execute(
+                    "SELECT 1 FROM storagereservation WHERE state='active' LIMIT 1"
+                ).fetchone():
+                    raise RestoreRecoveryRequired("storage reservations must settle before database restore")
+            finally:
+                connection.close()
         operations = resolve_temp_directory(root) / "media-operations"
         if not operations.exists() and not operations.is_symlink():
             return
@@ -1286,7 +1313,7 @@ def require_no_media_publication_evidence(root: Path) -> None:
             raise RestoreRecoveryRequired("media publication recovery must finish before database restore")
     except RestoreError:
         raise
-    except (ConfigurationPathError, OSError) as exc:
+    except (ConfigurationPathError, OSError, sqlite3.Error) as exc:
         raise RestoreRecoveryRequired("media publication evidence cannot be inspected safely") from exc
 
 

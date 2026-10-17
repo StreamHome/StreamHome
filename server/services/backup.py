@@ -5,6 +5,9 @@ import shutil
 import stat
 import tempfile
 import time
+import threading
+import json
+import uuid
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from sqlmodel import select
@@ -28,6 +31,80 @@ from lifecycle.restore_controller import RestoreValidationError, validate_sqlite
 
 BACKUP_FILENAME_RE = backup_manifest.LEGACY_BACKUP_RE
 BACKUP_LOCK = asyncio.Lock()
+
+
+def _backup_owned_bytes(path: Path) -> int:
+    total = 0
+    for candidate in (path, *(Path(str(path) + suffix) for suffix in ('-journal', '-wal', '-shm', '.manifest.json'))):
+        try:
+            total += candidate.stat().st_size
+        except FileNotFoundError:
+            pass
+    return total
+
+
+async def _run_reserved_backup(run_backup, dest_path: Path, source_path: Path) -> None:
+    """Keep admission until the native SQLite writer has actually settled."""
+    from services.storage_inventory import hybrid_policy_active
+    if not hybrid_policy_active():
+        await run_cancellation_safe_thread(run_backup, None)
+        return
+    from services.storage_capacity import storage_capacity, StorageCapacityError
+    from services.storage_common import policy_value
+    # The source can grow while SQLite copies it. Bound this attempt rather than
+    # allowing an unreserved destination to grow indefinitely.
+    headroom = 1024 * 1024
+    data_ceiling = headroom + source_path.stat().st_size
+    wal = Path(str(source_path) + "-wal")
+    if wal.exists():
+        data_ceiling += wal.stat().st_size
+    # SQLite's normalization transaction can journal almost the entire copied
+    # database. Cover the DB, its journal/page overhead and private manifest;
+    # only bytes materialized by this exact snapshot reduce the remaining claim.
+    peak = data_ceiling * 3
+    async with storage_capacity.allocation("backup.snapshot", peak, dest_path) as reservation:
+        stopped = threading.Event()
+        finished = asyncio.Event()
+        page_size = [4096]
+        deadline = time.monotonic() + 3600
+
+        def progress(status: int, remaining: int, total: int) -> None:
+            if (stopped.is_set() or time.monotonic() >= deadline
+                    or total * page_size[0] > data_ceiling or _backup_owned_bytes(dest_path) > peak):
+                raise StorageCapacityError("storage_backup_reservation_exceeded")
+            if shutil.disk_usage(dest_path.parent).free < policy_value(settings)["disk_reserve_bytes"]:
+                raise StorageCapacityError("storage_disk_space_insufficient")
+
+        async def observe() -> None:
+            written = 0
+            while not finished.is_set():
+                if dest_path.exists():
+                    current = _backup_owned_bytes(dest_path)
+                    if current > peak:
+                        stopped.set()
+                        raise StorageCapacityError("storage_backup_reservation_exceeded")
+                    if current > written:
+                        written = current
+                        try:
+                            await storage_capacity.progress(reservation, written)
+                        except BaseException:
+                            stopped.set()
+                            raise
+                try:
+                    await asyncio.wait_for(finished.wait(), timeout=0.1)
+                except TimeoutError:
+                    pass
+
+        # Updating reservation rows from a SQLite backup callback can deadlock
+        # its source snapshot. Observe asynchronously while the native writer
+        # remains cancellation-safe and its callback enforces the peak bound.
+        monitor = asyncio.create_task(observe())
+        try:
+            await run_cancellation_safe_thread(run_backup, (progress, page_size, reservation),
+                                               cancellation_callback=stopped.set)
+        finally:
+            finished.set()
+            await monitor
 
 def get_backup_dir() -> str:
     """Resolve absolute path to server/backup folder."""
@@ -152,7 +229,7 @@ async def _create_admitted_backup() -> str:
 
         active_db_path = str(Path(settings.db_path).resolve())
         logger.info(f"[Backup Service] Starting secure online backup: {active_db_path} -> {dest_path}")
-        def run_backup() -> None:
+        def run_backup(capacity_guard=None) -> None:
             database_created = False
             manifest_created = False
             try:
@@ -171,7 +248,29 @@ async def _create_admitted_backup() -> str:
                 dest_conn = sqlite3.connect(str(dest_path))
                 try:
                     with dest_conn:
-                        src_conn.backup(dest_conn)
+                        if capacity_guard is None:
+                            src_conn.backup(dest_conn)
+                        else:
+                            callback, page_size, reservation = capacity_guard
+                            page_size[0] = src_conn.execute("PRAGMA page_size").fetchone()[0]
+                            src_conn.backup(dest_conn, pages=256, progress=callback)
+                        # Peak admission belongs to the original live writers,
+                        # not a future process restoring this completed snapshot.
+                        # Preserve historical ownership/receipts, but require all
+                        # replayed writers to acquire fresh admission. Canonical
+                        # reservations and pending publication evidence stay intact.
+                        if dest_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='storagereservation'").fetchone():
+                            if capacity_guard is not None:
+                                def check_normalization():
+                                    try:
+                                        callback(0, 0, 0)
+                                        return 0
+                                    except StorageCapacityError:
+                                        return 1
+                                from services.storage_capacity import StorageCapacityError
+                                dest_conn.set_progress_handler(check_normalization, 1000)
+                            dest_conn.execute("UPDATE storagereservation SET state='snapshot', updated_at=? WHERE state='active'", (time.time(),))
+                            dest_conn.set_progress_handler(None, 0)
                 finally:
                     dest_conn.close()
                     src_conn.close()
@@ -214,7 +313,7 @@ async def _create_admitted_backup() -> str:
                     os.close(directory_descriptor)
                 raise
 
-        await run_cancellation_safe_thread(run_backup)
+        await _run_reserved_backup(run_backup, dest_path, Path(active_db_path))
         logger.info(f"[Backup Service] Backup successfully created: {backup_filename}")
         return str(dest_path)
 
@@ -367,6 +466,71 @@ def _prepare_cloud_snapshot(backup_dir: Path) -> Path:
 def _remove_cloud_snapshot(snapshot: Path) -> None:
     shutil.rmtree(snapshot)
 
+
+async def _sync_reserved_snapshot(snapshot: Path, target_remote: str):
+    """Preserve legacy cloud backups without bypassing the folder budget."""
+    from services.storage_inventory import hybrid_policy_active, target_generation
+    if not hybrid_policy_active():
+        return await rclone_service.run("sync", str(snapshot), target_remote,
+                                       "--retries", "3", timeout=3600)
+    from services.storage_capacity import storage_capacity
+    from lifecycle.storage_worker import storage_worker
+    from lifecycle.media_work import settle
+    from models import StorageOperation
+    import db as database
+    generation = target_generation()
+    await storage_worker.measure_cloud()
+    peak = sum(path.stat().st_size for path in snapshot.iterdir())
+    operation = StorageOperation(id=str(uuid.uuid4()), kind="backup_sync", status="running",
+        phase="uploading", bytes_total=peak)
+    reservation = await storage_capacity.reserve("backup.cloud", peak, target_remote,
+        scope="cloud", operation_id=operation.id)
+    operation.payload = json.dumps({"reservation_id": reservation,
+                                    "target_generation": generation})
+
+    async def record():
+        async with AsyncSession(database.engine, expire_on_commit=False) as session:
+            await session.merge(operation)
+            await session.commit()
+
+    try:
+        await record()
+    except BaseException:
+        await settle(storage_capacity.release(reservation))
+        raise
+    try:
+        result = await rclone_service.run("sync", str(snapshot), target_remote,
+                                         "--retries", "3", timeout=3600)
+        if result.ok:
+            result = await rclone_service.run("check", str(snapshot), target_remote,
+                "--one-way", "--download", timeout=3600, hard_output_limit=65536)
+        # A joined failed copy may have written bytes. Only a fresh whole-folder
+        # observation can replace its conservative peak reservation.
+        await storage_worker.measure_cloud()
+        measured = await storage_worker._measurement("cloud")
+        if measured.get("target_generation") == generation and measured.get("used_bytes") is not None:
+            await storage_capacity.release(reservation)
+            operation.status = "completed" if result.ok else "failed"
+            operation.phase = "verified" if result.ok else "failed"
+            operation.error_code = None if result.ok else "storage_backup_sync_failed"
+            operation.bytes_done = peak if result.ok else None
+        else:
+            operation.status, operation.phase = "blocked", "recovery_required"
+            operation.error_code = "storage_cloud_measurement_unknown"
+            from services.rclone import RcloneResult
+            result = RcloneResult(1, error_code=operation.error_code)
+        operation.updated_at = time.time()
+        await record()
+        return result
+    except BaseException:
+        operation.status, operation.phase = "blocked", "recovery_required"
+        operation.error_code = "storage_backup_sync_interrupted"
+        operation.updated_at = time.time()
+        await settle(record())
+        storage_worker.wake()
+        raise
+
+
 async def sync_backups_to_cloud() -> bool:
     """Sync the local backup directory to the cloud backup location using Rclone."""
     if not rclone_service.cloud_write_available():
@@ -386,9 +550,7 @@ async def sync_backups_to_cloud() -> bool:
             snapshot = await run_cancellation_safe_thread(
                 _prepare_cloud_snapshot, backup_dir
             )
-            result = await rclone_service.run(
-                "sync", str(snapshot), target_remote, "--retries", "3", timeout=60 * 60
-            )
+            result = await _sync_reserved_snapshot(snapshot, target_remote)
         except (AdmissionClosedError, ValueError):
             logger.info("[Backup Service] Cloud synchronization deferred by runtime admission or invalid local evidence.")
             return False

@@ -24,7 +24,7 @@ vi.mock("./panels/AccountPanel", () => ({ AccountPanel: () => <h2>Account panel<
 vi.mock("./panels/ApiKeysPanel", () => ({ ApiKeysPanel: () => <h2>API keys panel</h2> }));
 vi.mock("./panels/DownloadsPanel", () => ({ DownloadsPanel: () => <h2>Downloads panel</h2> }));
 vi.mock("./panels/RecommendationsPanel", () => ({ RecommendationsPanel: () => <h2>Recommendations panel</h2> }));
-vi.mock("./panels/StoragePanel", () => ({ StoragePanel: () => <h2>Storage panel</h2> }));
+vi.mock("./panels/StoragePanel", () => ({ StoragePanel: ({ view, onViewChange, retainedDraft, onDraftChange }: { view: string; onViewChange: (view: string) => void; retainedDraft?: { localBudget: string }; onDraftChange: (draft: unknown) => void }) => <><h2>Storage panel</h2><p>Storage view: {view}</p><p>Draft budget: {retainedDraft?.localBudget ?? "clean"}</p><button onClick={() => onViewChange("policy")}>Open storage policy</button><button onClick={() => onViewChange("activity")}>Open storage activity</button><button onClick={() => onDraftChange({ localBudget: "90", localUnit: "GB", cloudBudget: "1", cloudUnit: "TB", offloadEnabled: false, prefetchNextEpisode: false, hevcCompressionMode: "auto", revision: 3 })}>Edit storage draft</button></> }));
 vi.mock("./panels/UpdatesPanel", () => ({ UpdatesPanel: () => <h2>Updates panel</h2> }));
 vi.mock("./panels/ProfileDataPanel", () => ({ ProfileDataPanel: () => <h2>Profile data panel</h2> }));
 
@@ -86,6 +86,22 @@ describe("admin section navigation", () => {
     expect(scrollTo).toHaveBeenCalledWith({ top: 0, left: 0, behavior: "auto" });
     expect(root.scrollTop).toBe(0);
     view.unmount();
+  });
+
+  it("restores storage subpages and visit drafts through browser history", async () => {
+    render(<MemoryRouter initialEntries={["/?profile=1&view=admin&section=storage&storageView=policy"]}><AdminCenter /><HistoryControls /></MemoryRouter>);
+    expect(await screen.findByText("Storage view: policy")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Edit storage draft" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open storage activity" }));
+    expect(await screen.findByText("Storage view: activity")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    await screen.findByRole("heading", { name: "Downloads panel" });
+    fireEvent.click(screen.getByRole("button", { name: "History back" }));
+    expect(await screen.findByText("Storage view: activity")).toBeTruthy();
+    expect(screen.getByText("Draft budget: 90")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "History back" }));
+    expect(await screen.findByText("Storage view: policy")).toBeTruthy();
+    expect(screen.getByText("Draft budget: 90")).toBeTruthy();
   });
 
   it("starts each changed section at the top through buttons, the selector and browser history", async () => {

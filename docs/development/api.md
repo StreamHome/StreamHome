@@ -74,10 +74,41 @@ same-origin `manifest`, `progressive`, `source/{trackId}`, `subtitles/{trackId}`
 Each request revalidates the session/profile/run/source; the run ID is not a bearer
 credential. Ticket URLs remain supported and retain their expiry/revocation rules.
 `rendition_id` on a master selects one verified video variant without dropping its
-alternate audio group. No viewer request starts completed-media preparation.
+alternate audio group. In hybrid storage, viewer entry/status may enqueue bounded,
+deduplicated preparation of a missing cache for the same accepted source generation.
+Changed source media cannot be accepted through this path. Preparation runs in
+owned background jobs with capacity admission.
 
 Progress and Close optionally accept `total_seconds_played` for cumulative,
 idempotent watch-time snapshots. Legacy `duration_watched` remains accepted.
 Close additionally accepts `discard_progress: true` to abandon cancelled work
 without modifying saved profile progress. Default Close still records the final
 confirmed position and watch time.
+
+### Storage administration
+
+All `/api/admin/storage` endpoints require a recently reauthenticated human
+session; integration credentials and browser query state grant no authority.
+
+| Method and suffix | Purpose |
+| --- | --- |
+| `GET /status` | Cached policy, capacity, connection and current operation |
+| `POST /refresh` | Enqueue a measurement with an exact `request_id` |
+| `POST /policy/preview` | Bind the canonical `draft` and `expected_revision` to a review |
+| `PUT /policy` | Accept that exact `review_id`, draft, revision and request identity |
+| `GET /operations/{request_id}` | Reconcile the original request; response contains `operation` |
+| `GET /retention` | Bounded local-retention inventory |
+| `PUT /retention/{id}` | Set `keep_local` using the qualified item `id` |
+| `GET /activity` | Bounded operation history |
+| `POST /cleanup/preview` | Review currently eligible cleanup |
+| `POST /cleanup` | Execute the exact `plan_id` with a request identity |
+
+Retention item IDs distinguish `movie:` from `episode:`; do not substitute a
+series parent's `media_id`. Pagination uses `cursor` and `limit`. Unknown byte
+counts are null. Policy byte budgets are total integer allocations, not file-size
+limits. A saved policy is not evidence of released space. A lost mutation response
+must be reconciled with its original request identity before any retry; even HTTP
+409 `storage_save_outcome_uncertain` means the outcome needs checking.
+
+See [Storage Management](../storage-management.md) for accounting, placement,
+offline readiness and recovery boundaries.

@@ -43,6 +43,15 @@ describe("query-state navigation", () => {
     expect(canonicalAppUrl("?view=admin&section=storage&category=activity")).toBe("/?view=admin&section=storage");
   });
 
+  it("canonicalizes storage subpages only inside the storage section", () => {
+    expect(parseAppQuery("?view=admin&section=storage&storageView=policy")).toMatchObject({ section: "storage", storageView: "policy" });
+    expect(appUrl("1", "admin", { section: "storage", storageView: "activity" })).toBe("/?profile=1&view=admin&section=storage&storageView=activity");
+    expect(canonicalAppUrl("?view=admin&section=storage&storageView=overview")).toBe("/?view=admin&section=storage");
+    expect(canonicalAppUrl("?view=admin&section=storage&storageView=unknown")).toBe("/?view=admin&section=storage");
+    expect(canonicalAppUrl("?view=admin&section=updates&storageView=activity")).toBe("/?view=admin&section=updates");
+    expect(canonicalAppUrl("?view=home&storageView=activity")).toBe("/?view=home");
+  });
+
   it("preserves categories only while moving among catalog views", () => {
     const current = parseAppQuery("?profile=1&view=home&genre=Action");
     expect(preservedCatalogCategory(current, "movies")).toEqual({ genre: "Action" });

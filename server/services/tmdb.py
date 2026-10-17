@@ -583,7 +583,6 @@ class TMDBClient:
                 from lifecycle.media_publication import MediaMutation
                 from pathlib import Path
                 import tempfile
-                import shutil
 
                 tmdb_id = int(item_dict.get("tmdb_id"))
                 media_type = "series" if item_dict.get("type") in ("series", "tv") else "movie"
@@ -643,14 +642,11 @@ class TMDBClient:
                         if existing_payload.get("catalog_source") == "server" or existing_payload.get("video_url"):
                             return movie_id
                     async with MediaMutation(movie_id) as mutation:
-                        from services.media_updates import synchronize_local_asset
+                        from services.media_updates import admitted_local_copy, admitted_json_write
                         for source, name in ((poster_abs, "poster.jpg"), (backdrop_abs, "backdrop.jpg")):
                             if os.path.isfile(source):
                                 destination = Path(folder_abs) / name
-                                mutation.capture_local(str(destination))
-                                destination.parent.mkdir(parents=True, exist_ok=True)
-                                shutil.copy2(source, destination)
-                                synchronize_local_asset(destination)
+                                await admitted_local_copy(Path(source), destination)
                         poster_abs = os.path.join(folder_abs, "poster.jpg")
                         backdrop_abs = os.path.join(folder_abs, "backdrop.jpg")
                         metadata_content = {
@@ -676,9 +672,8 @@ class TMDBClient:
                             "vibe_analysis_version": 1,
                         }
                         metadata_file = os.path.join(metadata_dir, "metadata.json")
-                        from services.media_updates import atomic_json_write
-                        mutation.capture_local(metadata_file)
-                        atomic_json_write(Path(metadata_file), metadata_content)
+                        await mutation.capture_local_asset(metadata_file)
+                        await admitted_json_write(Path(metadata_file), metadata_content)
 
                         local_poster = f"/media/{library_name}/{folder_name}/poster.jpg" if os.path.exists(poster_abs) else (raw_poster_url or "")
                         local_backdrop = f"/media/{library_name}/{folder_name}/backdrop.jpg" if os.path.exists(backdrop_abs) else (raw_backdrop_url or "")

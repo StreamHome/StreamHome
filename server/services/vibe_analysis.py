@@ -21,7 +21,7 @@ from config import settings
 from db import engine
 from models import Episode, Movie
 from services.logger import logger
-from lifecycle.media_work import media_ownership, require_resolved_media
+from lifecycle.media_work import media_ownership, require_resolved_media, settle
 from lifecycle.coordination import (
     AdmissionClosedError,
     EffectClass,
@@ -216,7 +216,7 @@ def _subtitle_candidate(entity: Movie | Episode, folder: Path) -> tuple[Optional
     return None, preferred[0] if preferred else "und"
 
 
-def _update_metadata_file(folder: Path, entity: Movie | Episode) -> None:
+async def _update_metadata_file(folder: Path, entity: Movie | Episode) -> None:
     path = folder / ".metadata" / "metadata.json"
     if not path.is_file():
         return
@@ -231,8 +231,8 @@ def _update_metadata_file(folder: Path, entity: Movie | Episode) -> None:
             "vibe_analysis_version": entity.vibe_analysis_version,
             "vibe_analyzed_at": entity.vibe_analyzed_at,
         })
-        from services.media_updates import atomic_json_write
-        atomic_json_write(path, payload)
+        from services.media_updates import admitted_json_write
+        await admitted_json_write(path, payload)
     except Exception as exc:
         logger.warning(f"[Vibe Analysis] Could not update {path}: {exc}")
 
@@ -353,7 +353,9 @@ class VibeAnalysisManager:
                     series.vibe_analyzed_at = time.time()
                     db.add(series)
             await db.commit()
-            await run_cancellation_safe_thread(_update_metadata_file, folder, entity)
+            _, cancelled = await settle(_update_metadata_file(folder, entity))
+            if cancelled:
+                raise asyncio.CancelledError
             return metrics
 
 
@@ -371,7 +373,7 @@ async def backfill_catalog_vibes(limit: int = 24) -> int:
 
 async def _backfill_catalog_vibes_admitted(limit: int = 24) -> int:
     from services.tmdb import tmdb_client
-    from services.media_updates import atomic_json_write
+    from services.media_updates import admitted_json_write
 
     if not tmdb_client.api_key and not tmdb_client.read_access_token:
         return 0
@@ -407,7 +409,7 @@ async def _backfill_catalog_vibes_admitted(limit: int = 24) -> int:
                     try:
                         payload = json.loads(path.read_text(encoding="utf-8"))
                         payload.update({"crew": movie.crew, "keywords": movie.keywords, "trope_vectors": movie.trope_vectors, "director": movie.director})
-                        atomic_json_write(path, payload)
+                        await admitted_json_write(path, payload)
                     except Exception as error:
                         logger.warning("[Vibe Backfill] Metadata update deferred for %s: %s", media_id, type(error).__name__)
                 changed += 1

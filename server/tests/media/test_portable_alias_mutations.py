@@ -276,14 +276,14 @@ class PortableAliasMutations(unittest.IsolatedAsyncioTestCase):
             for path in self.aliases(directory).values()}
         real_write = media_updates.atomic_json_write
         observed = []
-        def write(path, data):
+        def write(path, data, **kwargs):
             if path in self.aliases().values() and not observed:
                 manifest = next(Path(settings.TEMP_DIR).glob("media-operations/*/operation.json"))
                 self.assertEqual(len(json.loads(manifest.read_text())["entries"]), 4)
                 for original, content in originals.items():
                     self.assertEqual(original.read_bytes(), content)
                 observed.append(path)
-            real_write(path, data)
+            real_write(path, data, **kwargs)
         with patch.object(media_updates, "atomic_json_write", write):
             await self.markers_update()
         self.assertEqual(len(observed), 1)
@@ -471,14 +471,14 @@ class PortableAliasMutations(unittest.IsolatedAsyncioTestCase):
             *self.aliases(self.remote / ".metadata").values(), local, remote]}
         real_write, real_run = media_updates.atomic_json_write, rclone_service.run
         observed, writers = [], []
-        def write(path, data):
+        def write(path, data, **kwargs):
             if path in self.aliases().values() and not observed:
                 manifest = next(Path(settings.TEMP_DIR).glob("media-operations/*/operation.json"))
                 self.assertEqual(len(json.loads(manifest.read_text())["entries"]), 6)
                 for original, content in originals.items():
                     self.assertEqual(original.read_bytes(), content)
                 observed.append(path)
-            real_write(path, data)
+            real_write(path, data, **kwargs)
         async def run(*args, **kwargs):
             if args[0] == "lsjson" and args[1].endswith("/.metadata/metadata_s1_e1.json") and not writers:
                 async def independent_write():

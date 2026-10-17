@@ -2,6 +2,8 @@ export const APP_VIEWS = ["home", "movies", "series", "watchlist", "downloads", 
 export const ADMIN_SECTIONS = ["account", "api-keys", "profiles", "recommendations", "storage", "downloads", "updates"] as const;
 export const ADMIN_DATA_CATEGORIES = ["overview", "history", "watchlist", "recommendations", "cache", "activity"] as const;
 export type AdminDataCategory = (typeof ADMIN_DATA_CATEGORIES)[number];
+export const STORAGE_VIEWS = ["overview", "policy", "activity"] as const;
+export type StorageView = (typeof STORAGE_VIEWS)[number];
 export const CATALOG_VIEWS = ["home", "movies", "series"] as const;
 export const VIRTUAL_CATEGORIES = ["recommended", "all"] as const;
 
@@ -20,6 +22,7 @@ export interface AppQueryState {
   section?: AdminSection;
   adminProfile?: string;
   adminCategory?: AdminDataCategory;
+  storageView?: StorageView;
 }
 
 const viewSet = new Set<string>(APP_VIEWS);
@@ -69,6 +72,8 @@ export function parseAppQuery(input: string | URLSearchParams): AppQueryState {
   if (view === "admin") {
     const section = clean(params.get("section"));
     state.section = section && adminSectionSet.has(section) ? section as AdminSection : "account";
+    const storageView = clean(params.get("storageView"));
+    if (state.section === "storage" && storageView && (STORAGE_VIEWS as readonly string[]).includes(storageView) && storageView !== "overview") state.storageView = storageView as StorageView;
     const adminProfile = clean(params.get("subject"));
     if (adminProfile) state.adminProfile = adminProfile;
     const category = clean(params.get("category"));
@@ -89,6 +94,7 @@ export function appSearch(state: AppQueryState): string {
   if (state.view === "admin") {
     params.set("section", state.section ?? "account");
     if (state.adminProfile) params.set("subject", state.adminProfile);
+    if (state.section === "storage" && state.storageView && state.storageView !== "overview") params.set("storageView", state.storageView);
     if (state.section === "profiles" && state.adminCategory && state.adminCategory !== "overview") params.set("category", state.adminCategory);
   }
   return `?${params.toString()}`;

@@ -28,6 +28,8 @@ beforeEach(() => {
     const method = init.method || "GET"; const body = init.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
     requests.push({ path: input, method, body });
     const replaced = override?.(input, method, body); if (replaced) return replaced;
+    if (input === "/api/admin/storage/status") return json({ policy: { revision: 0, local_budget_bytes: null, cloud_budget_bytes: null, offload_enabled: false, prefetch_next_episode: false, hevc_compression_mode: "auto", disk_reserve_bytes: 0 }, local: { written_bytes: null, reserved_bytes: null, protected_bytes: null, free_bytes: null, disk_reserve_bytes: 0, categories: [], measured_at: null, stale: false, error_code: null }, cloud: { configured, reachable: null, health_state: "unknown", folder_name: null, used_bytes: null, account_total_bytes: null, account_free_bytes: null, measured_at: null, stale: false, error_code: null }, offload: { state: "paused", reason: null }, capabilities: { offload: true, keep_local: true, cleanup: true }, operation: null });
+    if (input === "/api/admin/storage/retention") return json({ items: [], next_cursor: null });
     if (input === "/api/system/settings") return json({ ...settings, driveConfigured: configured });
     if (input === `${root}/setup`) return json(setupFor(current, configured));
     if (input === `${root}/jobs` && method === "POST") { current = sampleJob(); return json({ jobId: current.id, authorizationUrl: "https://accounts.google.com/o/oauth2/v2/auth?state=synthetic", expiresAt: current.expiresAt }); }
@@ -58,8 +60,12 @@ function card() { return render(<DriveSetupCard settings={null} onSettingsRefres
 describe("Admin Drive actual-client protocol", () => {
   it("connects, chooses, verifies and saves without submitting storage or HEVC preferences", async () => {
     render(<StoragePanel />);
+    await screen.findByRole("spinbutton", { name: "Total local budget" });
+    fireEvent.click(screen.getByRole("link", { name: "Policy" }));
     const hevc = await screen.findByRole("combobox", { name: "HEVC compression" });
     fireEvent.click(hevc); fireEvent.click(screen.getByRole("option", { name: "Disabled" }));
+    fireEvent.click(screen.getByRole("link", { name: "Overview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Connect Google Drive" }));
     await connect();
     expect(screen.getByLabelText("Client secret").getAttribute("value")).toBe("");
     expect(popup.location.href).toContain("https://accounts.google.com/");
@@ -73,8 +79,10 @@ describe("Admin Drive actual-client protocol", () => {
     expect((screen.getByRole("button", { name: "Save connection" }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(checkbox); fireEvent.click(screen.getByRole("button", { name: "Save connection" }));
     await screen.findByText("Connection saved");
-    expect(hevc.textContent).toBe("Disabled");
-    expect(screen.getByRole("combobox", { name: "Storage engine" }).textContent).toBe("Local server storage");
+    fireEvent.click(screen.getByRole("link", { name: "Policy" }));
+    expect(screen.getByRole("combobox", { name: "HEVC compression" }).textContent).toBe("Disabled");
+    expect(screen.getByText("Local storage always stays active.")).toBeTruthy();
+    expect(requests.filter(item => item.path.startsWith("/api/admin/storage/policy") && item.method !== "GET")).toHaveLength(0);
     expect(requests.filter(item => item.path === "/api/system/settings" && item.method === "POST")).toHaveLength(0);
     expect(requests.filter(item => item.path.endsWith("/save"))).toHaveLength(1);
   });
@@ -153,7 +161,7 @@ describe("Admin Drive actual-client protocol", () => {
     current = sampleJob(); let reject = true;
     override = (path, method) => reject && path.endsWith("/test") && method === "POST" ? json({ detail: { code: "reauthentication_required", message: "Confirm identity" } }, 403) : undefined;
     card(); fireEvent.click(await screen.findByRole("checkbox", { name: /Allow StreamHome/ })); fireEvent.click(screen.getByRole("button", { name: "Verify folder" }));
-    await screen.findByRole("dialog", { name: "Confirm your identity" }); reject = false;
+    await screen.findByRole("dialog", { name: "Confirm your identity" }, { timeout: 5000 }); reject = false;
     fireEvent.click(screen.getByRole("button", { name: "Authorize Drive" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(requests.filter(item => item.path.endsWith("/test"))).toHaveLength(1);

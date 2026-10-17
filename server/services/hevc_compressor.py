@@ -15,7 +15,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import config_dir, settings
 from db import engine
-from models import Episode, Movie, PlaybackSession
+from models import Episode, Movie, PlaybackSession, PlaybackRun
 from lifecycle.media_work import media_ownership, settle, stop_process, accepted_commit, supervised_output
 from lifecycle.media_publication import MediaMutation, current_mutation
 from services.ffmpeg_input import local_media_input_options, native_media_environment
@@ -27,6 +27,7 @@ from services.audio_extractor import audio_languages, primary_embedded_audio_ind
 from services.media_source import MediaSourceError, resolve_media_source
 from services.state import register_process, unregister_process
 from lifecycle.coordination import AdmissionClosedError, EffectClass, WorkLease, runtime_work
+from services.storage_capacity import storage_capacity
 
 
 class HEVCActivityInterrupted(RuntimeError):
@@ -89,12 +90,16 @@ class HEVCCompressorWorker:
         deferred = getattr(self, "deferred_candidates", {})
         now = time.monotonic()
         async with AsyncSession(engine) as db:
+            open_runs = (await db.exec(select(PlaybackRun).where(PlaybackRun.lifecycle_state == "active"))).all()
+            protected = {str(run.episode_id or run.movie_id) for run in open_runs}
             for model in (Movie, Episode):
                 query = select(model).where(model.hevc_compressed == False, model.video_url.startswith("/media/"))
                 if model is Movie:
                     query = query.where(Movie.availability == "available")
                 candidates = (await db.exec(query.order_by(model.id))).all()
                 for item in candidates:
+                    if str(item.id) in protected:
+                        continue
                     if deferred.get(item.id, 0) > now:
                         continue
                     source = await resolve_media_source(item.video_url, check_cloud=False)
@@ -271,7 +276,7 @@ class HEVCCompressorWorker:
                     return False
         return True
 
-    async def _supervise_transcode(self, process, output: Path, original_size: int, lease: WorkLease) -> int:
+    async def _supervise_transcode(self, process, output: Path, original_size: int, lease: WorkLease, reservation: Optional[str] = None) -> int:
         """Stop an ineligible child before relinquishing process/media ownership."""
         async def watch_runtime():
             next_idle_check = 0.0
@@ -280,6 +285,8 @@ class HEVCCompressorWorker:
                     raise HEVCActivityInterrupted("Maintenance requested optimization cancellation")
                 if shutil.disk_usage(output.parent).free <= self.STORAGE_SAFETY_MARGIN_BYTES:
                     raise ValueError("HEVC output reached the media storage safety floor")
+                if reservation and output.is_file():
+                    await storage_capacity.progress(reservation, output.stat().st_size)
                 now = time.monotonic()
                 if now >= next_idle_check:
                     if not await self._is_server_idle():
@@ -319,6 +326,7 @@ class HEVCCompressorWorker:
             mutation = None
             active_lease: Optional[WorkLease] = None
             activity_cooldown = False
+            reservation = None
             try:
                 await asyncio.sleep(60.0)
                 mode = getattr(settings, "HEVC_COMPRESSION_MODE", "auto")
@@ -371,6 +379,7 @@ class HEVCCompressorWorker:
                 temporary_file = file_path.with_name(f".{file_path.stem}.hevc-part{file_path.suffix}")
                 temporary_file.unlink(missing_ok=True)
                 original_size = file_path.stat().st_size
+                reservation = await storage_capacity.reserve(f"hevc:{item_id}", original_size - 1, temporary_file)
                 command = [
                     ffmpeg_path,
                     "-y",
@@ -422,7 +431,7 @@ class HEVCCompressorWorker:
                 register_process(process_key, self.active_process)
 
                 try:
-                    return_code = await self._supervise_transcode(self.active_process, temporary_file, original_size, active_lease)
+                    return_code = await self._supervise_transcode(self.active_process, temporary_file, original_size, active_lease, reservation)
                 finally:
                     if self.active_process is not None and self.active_process.returncode is None:
                         await settle(stop_process(self.active_process))
@@ -444,9 +453,7 @@ class HEVCCompressorWorker:
 
                 mutation = MediaMutation(item_id)
                 await mutation.__aenter__()
-                _, cancelled = await settle(asyncio.to_thread(mutation.capture_local, str(file_path)))
-                if cancelled:
-                    raise asyncio.CancelledError
+                await mutation.capture_local_asset(str(file_path))
                 os.replace(temporary_file, file_path)
                 from services.media_updates import synchronize_local_asset
                 synchronize_local_asset(file_path)
@@ -481,6 +488,8 @@ class HEVCCompressorWorker:
                         await ownership.__aexit__(None, None, None)
                     if work_scope is not None:
                         await work_scope.__aexit__(None, None, None)
+                    if reservation is not None:
+                        await settle(storage_capacity.release(reservation))
             if activity_cooldown:
                 # Backoff owns neither a child, a media lock nor a writer lease.
                 await asyncio.sleep(5 * 60)

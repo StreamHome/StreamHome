@@ -183,6 +183,10 @@ class Settings:
     # Library Optimization System
     HEVC_COMPRESSION_MODE: str = os.getenv("HEVC_COMPRESSION_MODE", "auto")
 
+    # The protected settings document is the sole hybrid-policy authority.
+    # An absent policy deliberately preserves legacy ingestion behavior.
+    STORAGE_POLICY: Optional[dict] = None
+
     # Ingestion Notification Settings
     VIDEO_SENDER_API_URL: Optional[str] = os.getenv("VIDEO_SENDER_API_URL", None)
 
@@ -204,6 +208,7 @@ class Settings:
                     self.UPDATE_MAINTENANCE_START = str(data.get("update_maintenance_start", self.UPDATE_MAINTENANCE_START)).strip()
                     self.UPDATE_MAINTENANCE_END = str(data.get("update_maintenance_end", self.UPDATE_MAINTENANCE_END)).strip()
                     self.HEVC_COMPRESSION_MODE = data.get("hevc_compression_mode", self.HEVC_COMPRESSION_MODE)
+                    self.STORAGE_POLICY = data.get("storage_policy")
                     self.SESSION_LIFETIME_DAYS = max(1, min(365, int(data.get("session_lifetime_days", self.SESSION_LIFETIME_DAYS))))
                     self.JWT_EXPIRATION_MINUTES = 60 * 24 * self.SESSION_LIFETIME_DAYS
             except Exception as e:
@@ -215,9 +220,17 @@ class Settings:
 
     def _save_to_json_locked(self):
         json_path = os.path.join(config_dir, "settings.json")
-        temporary = f"{json_path}.{secrets.token_hex(8)}.tmp"
-        with open(temporary, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({
+        # Preserve fields published by other settings owners (including Drive
+        # publication), and make both replacement and its directory durable.
+        data = {}
+        if os.path.exists(json_path):
+            if os.path.islink(json_path):
+                raise OSError("refusing a symlinked settings document")
+            with open(json_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                raise ValueError("invalid settings document")
+        data.update({
                 "storage_engine": self.STORAGE_ENGINE,
                 "rclone_remote_path": self.RCLONE_REMOTE_PATH,
                 "public_url": self.PUBLIC_URL,
@@ -230,12 +243,10 @@ class Settings:
                 "update_maintenance_start": self.UPDATE_MAINTENANCE_START,
                 "update_maintenance_end": self.UPDATE_MAINTENANCE_END,
                 "hevc_compression_mode": self.HEVC_COMPRESSION_MODE,
-                "session_lifetime_days": self.SESSION_LIFETIME_DAYS
-            }, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temporary, json_path)
+                "session_lifetime_days": self.SESSION_LIFETIME_DAYS,
+                "storage_policy": self.STORAGE_POLICY,
+            })
+        _private_atomic_replace(json_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
     def get_system_profile(self) -> dict:
         profile_path = os.path.join(config_dir, "system_profile.json")

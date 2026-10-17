@@ -17,6 +17,22 @@ from lifecycle.media_work import settle, MediaRecoveryRequired
 current_mutation: ContextVar["MediaMutation | None"] = ContextVar("media_mutation", default=None)
 
 
+def copy_bounded(source: Path | str, destination: Path | str, maximum_bytes: int):
+    """An admitted local copy cannot grow beyond its measured source ceiling."""
+    written = 0
+    with open(source, "rb") as incoming, open(destination, "wb") as outgoing:
+        while block := incoming.read(1024 * 1024):
+            written += len(block)
+            if written > maximum_bytes:
+                from services.storage_capacity import StorageCapacityError
+                raise StorageCapacityError("storage_reservation_exceeded")
+            outgoing.write(block)
+        outgoing.flush()
+        os.fsync(outgoing.fileno())
+    shutil.copystat(source, destination)
+    return str(destination)
+
+
 async def _read_acceptance_receipt(engine, operation_id: str):
     """Read acceptance independently of a failed committing session."""
     from models import MediaOperationReceipt
@@ -168,6 +184,73 @@ class MediaMutation:
         self.acceptance_pending = False
         self.entered = False
         self.compensated = False
+        self._admitted_local: set[str] = set()
+        self._capacity_reservations: list[str] = []
+        self._admitted_directories: set[str] = set()
+        self._copy_reservations: dict[tuple[str, str], str] = {}
+        self._capture_limits: dict[str, int] = {}
+        self._directory_limits: dict[str, int] = {}
+
+    async def _reserve_copy(self, size: int, path: Path | str, *, scope: str = "local") -> str:
+        from services.storage_capacity import storage_capacity
+        key = (scope, str(path))
+        if key in self._copy_reservations:
+            return self._copy_reservations[key]
+        reservation, cancelled = await settle(storage_capacity.reserve(
+            f"media-mutation:{self.operation_id}", size, path, operation_id=self.operation_id, scope=scope))
+        self._capacity_reservations.append(reservation)
+        self._copy_reservations[key] = reservation
+        if cancelled:
+            raise asyncio.CancelledError
+        return reservation
+
+    async def _download_cloud_copy(self, remote: str, destination: Path, size: int, *, workspace: Path | None = None):
+        from services.rclone import rclone_service
+        from services.storage_capacity import StorageCapacityError, storage_capacity
+        workspace = workspace or self.root / f".copy-{uuid.uuid4().hex}"
+        reservation = await self._reserve_copy(size, workspace)
+        workspace.mkdir(parents=True, exist_ok=True)
+        copying = asyncio.create_task(rclone_service.copyto_atomic(remote, str(workspace / "asset"), timeout=900))
+        try:
+            while not copying.done():
+                await asyncio.wait({copying}, timeout=0.1)
+                written = sum(path.stat().st_size for path in workspace.iterdir() if path.is_file())
+                if written > size:
+                    raise StorageCapacityError("storage_reservation_exceeded")
+                await storage_capacity.progress(reservation, written)
+            result = await copying
+            completed = workspace / "asset"
+            if result.ok and completed.is_file() and completed.stat().st_size == size:
+                os.replace(completed, destination)
+                _sync_directory(destination.parent)
+                return result
+            raise RuntimeError("Could not preserve complete cloud compensation bytes")
+        finally:
+            if not copying.done():
+                copying.cancel()
+            await settle(asyncio.gather(copying, return_exceptions=True))
+            await settle(asyncio.to_thread(shutil.rmtree, workspace))
+            await settle(storage_capacity.release(reservation))
+            self._capacity_reservations.remove(reservation)
+            self._copy_reservations.pop(("local", str(workspace)), None)
+
+    async def capture_local_asset(self, value: str) -> None:
+        """Admit preserved originals and rollback overlap before copying bytes."""
+        from services.storage_capacity import storage_capacity
+        path = _local_path(value)
+        if any(e["kind"] == "local" and e["path"] == str(path) for e in self.entries):
+            return
+        size = path.stat().st_size if path.is_file() else 0
+        backup = self.root / f"asset-{len(self.entries)}"
+        reservation = await self._reserve_copy(size, backup)
+        if size:
+            await self._reserve_copy(size, path.with_name(f".{path.name}.{self.operation_id}.rollback"))
+        self._admitted_local.add(str(path))
+        self._capture_limits[str(path)] = size
+        _, cancelled = await settle(asyncio.to_thread(self.capture_local, value))
+        await storage_capacity.progress(reservation, backup.stat().st_size if backup.is_file() else 0)
+        if cancelled:
+            raise asyncio.CancelledError
 
     def persist(self):
         self.root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -194,6 +277,10 @@ class MediaMutation:
 
     def capture_local(self, value: str):
         path = _local_path(value)
+        from services.storage_inventory import hybrid_policy_active
+        if hybrid_policy_active() and str(path) not in self._admitted_local:
+            from services.storage_capacity import StorageCapacityError
+            raise StorageCapacityError("storage_copy_admission_required")
         if any(e["kind"] == "local" and e["path"] == str(path) for e in self.entries):
             return
         if not self.root.exists():
@@ -203,7 +290,7 @@ class MediaMutation:
         if existed:
             if not path.is_file():
                 raise ValueError("Only regular media assets can be captured")
-            shutil.copy2(path, backup)
+            copy_bounded(path, backup, self._capture_limits.get(str(path), path.stat().st_size))
             with backup.open("rb") as handle:
                 os.fsync(handle.fileno())
         self.entries.append({"kind": "local", "path": str(path), "existed": existed,
@@ -230,7 +317,19 @@ class MediaMutation:
             raise RuntimeError("Could not establish previous cloud asset identity")
         existed = state.ok
         if existed:
-            copied = await rclone_service.copyto_atomic(path, str(backup), timeout=900)
+            from services.storage_inventory import hybrid_policy_active
+            if hybrid_policy_active():
+                payload = json.loads(state.stdout)
+                if isinstance(payload, list):
+                    payload = payload[0]
+                size = int(payload["Size"])
+                if size < 0:
+                    raise ValueError("Cloud compensation size is invalid")
+                await self._reserve_copy(size, self.root / f".verification-{backup.name}")
+                await self._reserve_copy(size, path, scope="cloud")
+                copied = await self._download_cloud_copy(path, backup, size)
+            else:
+                copied = await rclone_service.copyto_atomic(path, str(backup), timeout=900)
             if not copied.ok or not backup.is_file():
                 raise RuntimeError("Could not preserve previous cloud asset")
             with backup.open("rb") as handle:
@@ -285,6 +384,10 @@ class MediaMutation:
     def publish_directory(self, staging: str, destination: str):
         """Use same-filesystem renames; intent precedes the first destructive move."""
         destination = _local_path(destination)
+        from services.storage_inventory import hybrid_policy_active
+        if hybrid_policy_active() and str(destination) not in self._admitted_directories:
+            from services.storage_capacity import StorageCapacityError
+            raise StorageCapacityError("storage_copy_admission_required")
         source = Path(staging).resolve()
         source.relative_to(Path(settings.TEMP_DIR).resolve())
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -299,7 +402,18 @@ class MediaMutation:
         _validate_directory_ownership([*self.entries, entry])
         self.entries.append(entry)
         self.persist()
-        shutil.copytree(source, candidate)
+
+        remaining = self._directory_limits.get(str(destination))
+        def admitted_copy(source_file, destination_file):
+            nonlocal remaining
+            size = Path(source_file).stat().st_size
+            if remaining is not None:
+                if size > remaining:
+                    from services.storage_capacity import StorageCapacityError
+                    raise StorageCapacityError("storage_reservation_exceeded")
+                remaining -= size
+            return copy_bounded(source_file, destination_file, size)
+        shutil.copytree(source, candidate, copy_function=admitted_copy)
         _sync_tree(candidate)
         _sync_directory(candidate.parent)
         entry["phase"] = "prepared"
@@ -313,6 +427,21 @@ class MediaMutation:
         _sync_directory(destination.parent)
         entry["phase"] = "published"
         self.persist()
+
+    async def publish_directory_admitted(self, staging: str, destination: str):
+        """Publication copies have their own device-bound peak admission."""
+        from services.storage_capacity import storage_capacity
+        source = Path(staging).resolve()
+        target = _local_path(destination)
+        size = sum(path.stat().st_size for path in source.rglob("*") if path.is_file())
+        candidate = target.with_name(f".{target.name}.{self.operation_id}.candidate")
+        reservation = await self._reserve_copy(size, candidate)
+        self._admitted_directories.add(str(target))
+        self._directory_limits[str(target)] = size
+        _, cancelled = await settle(asyncio.to_thread(self.publish_directory, staging, destination))
+        await storage_capacity.progress(reservation, size)
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def publish_cloud_directory(self, staging: str, subpath: str):
         from services.rclone import rclone_service
@@ -374,6 +503,13 @@ class MediaMutation:
         _sync_directory(self.root)
         self.root.rmdir()
         _sync_directory(self.root.parent)
+        # Reservations remain durable while compensation/evidence remain. A
+        # successful cleanup also resolves admission from an interrupted owner.
+        if self._capacity_reservations:
+            from services.storage_capacity import storage_capacity
+            for reservation in self._capacity_reservations:
+                await storage_capacity.release(reservation)
+            self._capacity_reservations.clear()
 
     async def compensate(self):
         from services.rclone import rclone_service
@@ -431,7 +567,7 @@ class MediaMutation:
                         path.parent.mkdir(parents=True, exist_ok=True)
                         # Keep backup evidence until the whole compensation succeeds.
                         temporary = path.with_name(f".{path.name}.{self.operation_id}.rollback")
-                        shutil.copy2(backup, temporary)
+                        copy_bounded(backup, temporary, backup.stat().st_size)
                         with temporary.open("rb") as handle:
                             os.fsync(handle.fileno())
                         os.replace(temporary, path)
@@ -448,7 +584,12 @@ class MediaMutation:
                         result = await rclone_service.run("copyto", str(backup), path, timeout=900)
                         if result.ok:
                             verification = self.root / f"verify-{backup.name}"
-                            verified = await rclone_service.copyto_atomic(path, str(verification), timeout=900)
+                            from services.storage_inventory import hybrid_policy_active
+                            if hybrid_policy_active():
+                                verified = await self._download_cloud_copy(path, verification, backup.stat().st_size,
+                                    workspace=self.root / f".verification-{backup.name}")
+                            else:
+                                verified = await rclone_service.copyto_atomic(path, str(verification), timeout=900)
                             def digest(file):
                                 with file.open("rb") as handle:
                                     return hashlib.file_digest(handle, "sha256").hexdigest()
@@ -543,6 +684,12 @@ async def recover_media_operations():
         mutation.compensated = payload.get("phase") == "compensated"
         async with AsyncSession(engine) as db:
             receipt = await db.get(MediaOperationReceipt, mutation.operation_id)
+            from models import StorageReservation
+            from sqlmodel import select
+            reservations = (await db.exec(select(StorageReservation).where(
+                StorageReservation.operation_id == mutation.operation_id, StorageReservation.state == "active"))).all()
+            mutation._capacity_reservations = [row.id for row in reservations]
+            mutation._copy_reservations = {(row.scope, row.path): row.id for row in reservations}
         if receipt is None and not mutation.compensated:
             await mutation.compensate()
         elif receipt is not None and receipt.media_id != mutation.media_id:

@@ -41,6 +41,8 @@ class PlaybackContractRegression(unittest.TestCase):
         cls.temp_directory = tempfile.mkdtemp(prefix="streamhome-playback-contract-")
         cls.database_path = os.path.join(cls.temp_directory, "contract.db")
         cls.engine = create_async_engine(f"sqlite+aiosqlite:///{cls.database_path}")
+        cls.capacity_engine_patch = patch("db.engine", cls.engine)
+        cls.capacity_engine_patch.start()
         cls.media_directory = Path(settings.MEDIA_DIR) / "Movies" / f"PlaybackContract_{uuid.uuid4().hex}"
         cls.media_directory.mkdir(parents=True, exist_ok=True)
         cls.media_file = cls.media_directory / "contract.mp4"
@@ -158,6 +160,7 @@ class PlaybackContractRegression(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        cls.capacity_engine_patch.stop()
         asyncio.run(cls.engine.dispose())
         shutil.rmtree(cls.temp_directory, ignore_errors=True)
         shutil.rmtree(cls.media_directory, ignore_errors=True)

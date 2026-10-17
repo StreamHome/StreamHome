@@ -89,6 +89,7 @@ from routes.update import router as update_router
 from routes.lifecycle import router as lifecycle_router
 from routes.setup import router as setup_router
 from routes.admin_drive import router as admin_drive_router
+from routes.admin_storage import router as admin_storage_router
 from routes.playback import router as playback_router
 from routes.admin_profiles import router as admin_profiles_router
 from routes.media_updates import router as media_updates_router
@@ -114,10 +115,13 @@ async def playback_run_reaper():
                     expired_runs = result.all()
                     if expired_runs:
                         logger.info(f"[Lifespan Reaper] Found {len(expired_runs)} inactive playback runs. Marking as expired.")
+                        expired_ids = [run.id for run in expired_runs]
                         for run in expired_runs:
                             run.lifecycle_state = "expired"
                             db.add(run)
                         await db.commit()
+                        for run_id in expired_ids:
+                            playback_prep_service.release_run(run_id)
         except AdmissionClosedError:
             continue
         except asyncio.CancelledError:
@@ -353,6 +357,11 @@ async def _optional_playback_baselines() -> None:
 
 
 async def _stop_runtime_workers(runtime: _WorkerRuntime) -> None:
+    from lifecycle.storage_worker import storage_worker
+
+    # A storage worker must settle source mutations before playback protections
+    # and the other producer services are retired.
+    await storage_worker.stop()
     runtime.update_stop.set()
     runtime.recommendation_stop.set()
     for task in runtime.tasks:
@@ -387,6 +396,10 @@ async def _start_runtime_workers(runtime: _WorkerRuntime) -> None:
     if runtime.started:
         return
     try:
+        from lifecycle.storage_worker import storage_worker
+
+        await playback_prep_service.reconcile_run_protections()
+        await storage_worker.start()
         queue_manager.start()
         from services.tmdb import tmdb_client
 
@@ -408,6 +421,16 @@ async def _start_runtime_workers(runtime: _WorkerRuntime) -> None:
     except BaseException:
         await _stop_runtime_workers(runtime)
         raise
+
+
+async def _recover_storage_placements() -> None:
+    """Recover accepted locations without hashing the local library at startup."""
+    from lifecycle.coordination import run_cancellation_safe_thread
+    from lifecycle.storage_placement import validate_placement_manifests
+    from services.storage_inventory import storage_inventory
+
+    await run_cancellation_safe_thread(validate_placement_manifests, Path(settings.BASE_DIR))
+    await storage_inventory.reconcile_accepted_placements()
 
 
 def _normal_recovery_steps() -> tuple[MandatoryRecoveryStep, ...]:
@@ -432,6 +455,7 @@ def _normal_recovery_steps() -> tuple[MandatoryRecoveryStep, ...]:
         ),
         MandatoryRecoveryStep("tmdb_configuration", _report_tmdb_configuration),
         MandatoryRecoveryStep("drive_setup", _recover_drive_setup),
+        MandatoryRecoveryStep("storage_placements", _recover_storage_placements),
         MandatoryRecoveryStep("interrupted_ingestion", _recover_interrupted_ingestion),
         MandatoryRecoveryStep("default_profile", _seed_default_profile),
         MandatoryRecoveryStep(
@@ -858,6 +882,7 @@ class RuntimeWriteCoordinationMiddleware(BaseHTTPMiddleware):
         effects = {EffectClass.DB_WRITE}
         if path.startswith(("/api/setup", "/api/system/drive/")) or path in {
             "/api/system/settings",
+            "/api/admin/storage/policy",
             "/api/update/policy",
         }:
             effects.add(EffectClass.CONFIG_WRITE)
@@ -935,6 +960,7 @@ app.include_router(update_router, prefix="/api/update", tags=["update"])
 app.include_router(lifecycle_router, prefix="/api/lifecycle", tags=["lifecycle"])
 app.include_router(setup_router)
 app.include_router(admin_drive_router)
+app.include_router(admin_storage_router)
 app.include_router(admin_profiles_router)
 
 from fastapi.responses import FileResponse, StreamingResponse
@@ -1684,6 +1710,11 @@ async def save_system_settings(req: SystemSettingsRequest, session = Depends(req
 
 
 async def _save_system_settings_locked(req: SystemSettingsRequest):
+    if isinstance(getattr(settings, "STORAGE_POLICY", None), dict):
+        raise HTTPException(status_code=409, detail={
+            "code": "storage_policy_managed",
+            "message": "Storage is managed by the Storage workspace. Review and save the current policy there.",
+        })
     if req.storage_engine not in ["LOCAL", "CLOUD"]:
         raise HTTPException(status_code=400, detail="Invalid storage engine value. Must be LOCAL or CLOUD.")
 

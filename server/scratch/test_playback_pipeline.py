@@ -1063,7 +1063,7 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 (newest / "segment.m4s").write_bytes(b"n" * 24)
                 os.utime(oldest, (1, 1))
                 os.utime(newest, (2, 2))
-                service.enforce_lru_limits()
+                service.enforce_lru_limits({str(root.resolve()) for root in service.cache_dir.glob("*/*") if root.is_dir()})
                 self.assertFalse(oldest.exists())
                 self.assertTrue(newest.exists())
             finally:
