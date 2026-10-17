@@ -68,3 +68,21 @@ def operation_value(row) -> dict:
         'id', 'kind', 'status', 'phase', 'media_id', 'title', 'bytes_total',
         'bytes_done', 'released_bytes', 'error_code', 'message'
     )} | {'created_at': utc(row.created_at), 'updated_at': utc(row.updated_at)}
+
+
+CLEANUP_RETENTION_VERSION = 1
+
+
+def validate_cleanup_retention(plan: dict) -> None:
+    """Reject the whole obsolete/mixed plan before any file can be released."""
+    if not isinstance(plan, dict) or type(plan.get('retention_version')) is not int or plan['retention_version'] != CLEANUP_RETENTION_VERSION:
+        raise StorageError('storage_cleanup_plan_expired', 'Storage protection changed. Review cleanup again.')
+    candidates = plan.get('candidates')
+    if not isinstance(candidates, list) or len(candidates) > 25:
+        raise StorageError('storage_cleanup_plan_expired')
+    for item in candidates:
+        if not isinstance(item, dict) or item.get('kind') != 'verified_duplicate':
+            raise StorageError('storage_retained_data_protected', 'Caches and subtitles are retained and cannot be released by cleanup.')
+        if (not isinstance(item.get('asset_id'), str) or not isinstance(item.get('generation'), str)
+                or type(item.get('bytes')) is not int or item['bytes'] < 0):
+            raise StorageError('storage_cleanup_plan_expired')

@@ -69,6 +69,26 @@ describe("storage workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "Review changes" }));
     await waitFor(() => expect(api.previewStoragePolicy).toHaveBeenCalledWith(expect.objectContaining({ localBudgetBytes: saved, cloudBudgetBytes: 1e12, prefetchNextEpisode: true }), 3));
   });
+  it("explains retained capacity and never offers cache clearing", async () => {
+    vi.mocked(api.getStorageStatus).mockResolvedValue({ ...status, local: { ...status.local, retainedBytes: 12 * 1024 ** 3 }, offload: { state: "blocked", reason: "storage_retained_data_blocks_capacity" } });
+    render(<StoragePanel />);
+    const local = await screen.findByRole("region", { name: "Local storage" });
+    expect(within(local).getByText("Retained files")).toBeTruthy();
+    expect(within(local).getByText("12 GiB")).toBeTruthy();
+    expect(screen.getByText(/No eligible video or audio can be released/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("link", { name: "Policy" }));
+    expect(screen.queryByText("Clear idle playback cache")).toBeNull();
+    expect(screen.getByText(/Caches and subtitles remain protected on this server and in Drive/)).toBeTruthy();
+  });
+  it("shows a protected cleanup blocker and cannot run an empty release", async () => {
+    vi.mocked(api.previewStorageCleanup).mockResolvedValue({ planId: "retained-plan", expiresAt: "2099-01-01T00:00:00Z", estimatedReleaseBytes: 0, steps: [], blocker: "storage_no_releasable_media" });
+    render(<StoragePanel />);
+    fireEvent.click(await screen.findByRole("button", { name: "Review cleanup" }));
+    const review = await screen.findByRole("region", { name: "Cleanup review" });
+    expect(within(review).getByRole("alert").textContent).toContain("Caches and subtitles remain protected");
+    expect((within(review).getByRole("button", { name: "Run cleanup" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(api.runStorageCleanup).not.toHaveBeenCalled();
+  });
   it("retains an immutable review through section visits without saving it", async () => {
     render(<Visit />); await openReview();
     fireEvent.click(screen.getByRole("button", { name: "Change section" }));

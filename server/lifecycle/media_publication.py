@@ -13,6 +13,7 @@ from pathlib import Path
 
 from config import settings
 from lifecycle.media_work import settle, MediaRecoveryRequired
+from lifecycle.storage_retention import is_protected_path, retain_existing_tree
 
 current_mutation: ContextVar["MediaMutation | None"] = ContextVar("media_mutation", default=None)
 
@@ -60,6 +61,26 @@ def _sync_tree(root: Path):
             finally:
                 os.close(fd)
         _sync_directory(Path(directory))
+
+
+def _retained_files(root: Path):
+    """Reject ambiguous links before making a replacement tree."""
+    if not root.exists():
+        return []
+    result = []
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise MediaRecoveryRequired("Media replacement contains an ambiguous symbolic link")
+        if path.is_file() and is_protected_path(path.relative_to(root)):
+            result.append(path)
+    return result
+
+
+def _same_bytes(left: Path, right: Path) -> bool:
+    if left.stat().st_size != right.stat().st_size:
+        return False
+    with left.open("rb") as first, right.open("rb") as second:
+        return hashlib.file_digest(first, "sha256").digest() == hashlib.file_digest(second, "sha256").digest()
 
 
 def _local_path(value: str) -> Path:
@@ -155,6 +176,17 @@ def validate_operation_manifest(path: Path) -> dict:
             backup = path.parent / entry["backup"]
             if backup.is_symlink() or (backup.exists() and not backup.is_file()):
                 raise ValueError("Unsafe media asset backup")
+            if "retained_cloud" in entry:
+                retained = entry["retained_cloud"]
+                expected = (f"{settings.RCLONE_REMOTE_PATH.rstrip('/')}/.streamhome-retained/"
+                    f"{payload['operation_id']}/{entry['backup']}/{entry['path'].rsplit('/', 1)[-1]}")
+                if (kind != "cloud" or entry["existed"] or not is_protected_path(entry["path"])
+                        or not isinstance(retained, dict) or retained.get("path") != expected
+                        or not re.fullmatch(r"[0-9a-f]{64}", str(retained.get("sha256", "")))
+                        or retained.get("phase") not in {"prepared", "verified"}
+                        or type(retained.get("size")) is not int or retained["size"] < 0):
+                    raise ValueError("Invalid protected cloud retention evidence")
+                _cloud_path(retained["path"])
         else:
             if entry.get("phase") not in {"building", "prepared", "preserved", "published"} or not isinstance(entry.get("candidate"), str):
                 raise ValueError("Invalid media directory recovery phase")
@@ -390,6 +422,11 @@ class MediaMutation:
             raise StorageCapacityError("storage_copy_admission_required")
         source = Path(staging).resolve()
         source.relative_to(Path(settings.TEMP_DIR).resolve())
+        retained = _retained_files(destination)
+        for original in retained:
+            incoming = source / original.relative_to(destination)
+            if incoming.exists() and (not incoming.is_file() or incoming.is_symlink() or not _same_bytes(original, incoming)):
+                raise MediaRecoveryRequired("A protected media file conflicts with its replacement")
         destination.parent.mkdir(parents=True, exist_ok=True)
         candidate = destination.with_name(f".{destination.name}.{self.operation_id}.candidate")
         backup = destination.with_name(f".{destination.name}.{self.operation_id}.previous")
@@ -414,6 +451,11 @@ class MediaMutation:
                 remaining -= size
             return copy_bounded(source_file, destination_file, size)
         shutil.copytree(source, candidate, copy_function=admitted_copy)
+        for original in retained:
+            preserved = candidate / original.relative_to(destination)
+            if not preserved.exists():
+                preserved.parent.mkdir(parents=True, exist_ok=True)
+                admitted_copy(original, preserved)
         _sync_tree(candidate)
         _sync_directory(candidate.parent)
         entry["phase"] = "prepared"
@@ -434,6 +476,8 @@ class MediaMutation:
         source = Path(staging).resolve()
         target = _local_path(destination)
         size = sum(path.stat().st_size for path in source.rglob("*") if path.is_file())
+        size += sum(path.stat().st_size for path in _retained_files(target)
+                    if not (source / path.relative_to(target)).exists())
         candidate = target.with_name(f".{target.name}.{self.operation_id}.candidate")
         reservation = await self._reserve_copy(size, candidate)
         self._admitted_directories.add(str(target))
@@ -454,7 +498,7 @@ class MediaMutation:
         _validate_directory_ownership([*self.entries, entry])
         self.entries.append(entry)
         self.persist()
-        for arguments in (("sync", staging, remote_staging), ("check", staging, remote_staging, "--one-way")):
+        for arguments in (("copy", staging, remote_staging), ("check", staging, remote_staging, "--one-way")):
             result = await rclone_service.run(*arguments, timeout=6 * 3600)
             if not result.ok:
                 raise RuntimeError("Cloud candidate verification failed")
@@ -467,14 +511,161 @@ class MediaMutation:
             checked = await rclone_service.run("check", target, backup, timeout=3600)
             if not copied.ok or not checked.ok:
                 raise RuntimeError("Could not preserve the previous cloud tree")
+        # Check protected collisions before any target write. A preserved subtitle
+        # cannot silently disagree with the candidate catalog's sidecar claim.
+        await self._check_protected_cloud_collisions(remote_staging, target)
         entry["phase"] = "preserved"
         self.persist()
-        result = await rclone_service.run("sync", remote_staging, target, timeout=6 * 3600)
-        checked = await rclone_service.run("check", remote_staging, target, timeout=3600)
-        if not result.ok or not checked.ok:
-            raise RuntimeError("Cloud publication failed verification")
+        await self._copy_cloud_tree_preserving(remote_staging, target)
         entry["phase"] = "published"
         self.persist()
+
+    async def _cloud_files(self, remote: str) -> list[str]:
+        from services.rclone import rclone_service
+        result = await rclone_service.run("lsjson", remote, "--recursive", "--files-only",
+            timeout=300, output_limit=None, hard_output_limit=8 * 1024 * 1024)
+        if not result.ok:
+            if result.error_code == "drive_not_found":
+                return []
+            raise MediaRecoveryRequired("Cloud retention inventory is unavailable")
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, list) or len(payload) > 20000:
+            raise MediaRecoveryRequired("Cloud retention inventory exceeds its bounded manifest")
+        files = []
+        for item in payload:
+            name = item.get("Path") if isinstance(item, dict) else None
+            if (not isinstance(name, str) or not name or name.startswith("/")
+                    or ".." in name.split("/") or any(char in name for char in "\r\n\\\x00")):
+                raise MediaRecoveryRequired("Cloud retention inventory contains an unsafe path")
+            files.append(name)
+        return files
+
+    def _cloud_file_list(self, names: list[str]) -> Path:
+        path = self.root / f"retention-files-{uuid.uuid4().hex}"
+        with path.open("x", encoding="utf-8") as handle:
+            handle.write("".join(name + "\n" for name in names))
+            handle.flush()
+            os.fsync(handle.fileno())
+        _sync_directory(path.parent)
+        return path
+
+    async def _check_protected_cloud_collisions(self, source: str, target: str,
+            *, independent_children: frozenset[str] = frozenset()):
+        from services.rclone import rclone_service
+        incoming = set(await self._cloud_files(source))
+        existing = set(await self._cloud_files(target))
+        collisions = sorted(name for name in incoming & existing
+                            if is_protected_path(name) and name not in independent_children)
+        if collisions:
+            manifest = self._cloud_file_list(collisions)
+            result = await rclone_service.run("check", source, target, "--one-way",
+                "--download", "--files-from-raw", str(manifest), timeout=3600)
+            if not result.ok:
+                raise MediaRecoveryRequired("A protected cloud file conflicts with its replacement")
+
+    async def _copy_cloud_tree_preserving(self, source: str, target: str,
+            *, independent_children: frozenset[str] = frozenset()):
+        """Add sidecars without replacement; overwrite only catalog-owned sources.
+
+        Copy never removes destination-only data. The exact manifest also keeps
+        videos nested in a cache directory outside the overwrite set.
+        """
+        from services.rclone import rclone_service
+        files = [name for name in await self._cloud_files(source) if name not in independent_children]
+        if not files:
+            return
+        # During replay, independently captured children restore their original
+        # bytes after the containing tree. Replaying an intermediate tree over
+        # an already restored child would violate that temporal ownership.
+        selected = ("--files-from-raw", str(self._cloud_file_list(files))) if independent_children else ()
+        added = await rclone_service.run("copy", source, target, "--ignore-existing", *selected, timeout=6 * 3600)
+        if not added.ok:
+            raise RuntimeError("Cloud publication additive copy failed")
+        mutable = sorted(name for name in files if not is_protected_path(name))
+        if mutable:
+            manifest = self._cloud_file_list(mutable)
+            result = await rclone_service.run("copy", source, target, "--ignore-times",
+                "--files-from-raw", str(manifest), timeout=6 * 3600)
+            if not result.ok:
+                raise RuntimeError("Cloud publication replacement failed")
+        checked = await rclone_service.run("check", source, target, "--one-way", *selected, timeout=3600)
+        if not checked.ok:
+            raise RuntimeError("Cloud publication failed verification")
+
+    async def _cloud_digest(self, path: str) -> str | None:
+        """Stream a strong hash even for providers without a native checksum."""
+        from services.rclone import rclone_service
+        result = await rclone_service.run("hashsum", "sha256", path, "--download",
+            timeout=3600, output_limit=None, hard_output_limit=8192)
+        if not result.ok:
+            if result.error_code == "drive_not_found":
+                return None
+            raise MediaRecoveryRequired("Protected cloud bytes could not be verified")
+        lines = result.stdout.splitlines()
+        if not lines:
+            return None
+        if len(lines) != 1 or not re.match(r"^[0-9a-f]{64}  .+$", lines[0]):
+            raise MediaRecoveryRequired("Protected cloud identity is ambiguous")
+        return lines[0][:64]
+
+    async def _retain_created_cloud_asset(self, entry: dict):
+        """Journal, verify and retire one unaccepted protected generation.
+
+        A durable verified archive permits retry after delete acknowledgment loss;
+        a changed visible generation or archive never authorizes another delete.
+        """
+        from services.rclone import rclone_service
+        path = _cloud_path(entry["path"])
+        retained = entry.get("retained_cloud")
+        if retained is None:
+            digest = await self._cloud_digest(path)
+            if digest is None:
+                return
+            stat = await rclone_service.run("lsjson", path, "--stat", timeout=60)
+            if not stat.ok:
+                raise MediaRecoveryRequired("Protected cloud identity is unavailable")
+            payload = json.loads(stat.stdout)
+            if isinstance(payload, list) and len(payload) == 1:
+                payload = payload[0]
+            size = payload.get("Size") if isinstance(payload, dict) else None
+            if type(size) is not int or size < 0 or payload.get("IsDir") is True:
+                raise MediaRecoveryRequired("Protected cloud identity is ambiguous")
+            basename = path.rsplit("/", 1)[-1]
+            if any(char in basename for char in "\r\n\\\x00"):
+                raise MediaRecoveryRequired("Protected cloud path is unsafe")
+            retained = {"path": f"{settings.RCLONE_REMOTE_PATH.rstrip('/')}/.streamhome-retained/"
+                f"{self.operation_id}/{entry['backup']}/{basename}",
+                "sha256": digest, "size": size, "phase": "prepared"}
+            entry["retained_cloud"] = retained
+            self.persist()
+        archived = _cloud_path(retained["path"])
+        expected = retained["sha256"]
+        visible = await self._cloud_digest(path)
+        if visible is not None and visible != expected:
+            raise MediaRecoveryRequired("Protected cloud generation changed during retention")
+        archive_digest = await self._cloud_digest(archived)
+        from services.storage_inventory import hybrid_policy_active
+        reservation = (await self._reserve_copy(retained["size"], archived, scope="cloud")
+                       if hybrid_policy_active() else None)
+        if archive_digest != expected:
+            if retained["phase"] == "verified" or visible is None:
+                raise MediaRecoveryRequired("Verified protected cloud archive changed")
+            copied = await rclone_service.run("copyto", path, archived, "--ignore-times", timeout=3600)
+            if not copied.ok or await self._cloud_digest(archived) != expected:
+                raise MediaRecoveryRequired("Protected cloud archive could not be verified")
+        if reservation is not None:
+            from services.storage_capacity import storage_capacity
+            _, cancelled = await settle(storage_capacity.progress(reservation, retained["size"]))
+            if cancelled:
+                raise asyncio.CancelledError
+        retained["phase"] = "verified"
+        self.persist()
+        if visible is not None:
+            if await self._cloud_digest(path) != expected:
+                raise MediaRecoveryRequired("Protected cloud generation changed before retirement")
+            deleted = await rclone_service.run("deletefile", path, timeout=60)
+            if not deleted.ok and deleted.error_code != "drive_not_found":
+                raise MediaRecoveryRequired("Protected cloud retirement acknowledgment is pending")
 
     async def cleanup(self):
         from services.rclone import rclone_service
@@ -483,13 +674,14 @@ class MediaMutation:
                 for name in ("backup", "candidate"):
                     path = _local_path(entry[name])
                     if path.exists():
-                        shutil.rmtree(path)
-                        _sync_directory(path.parent)
+                        # Includes legacy/ambiguous generations and any sidecars
+                        # created by a rejected candidate. Never recurse-delete.
+                        retain_existing_tree(path)
             elif entry["kind"] == "cloud_directory":
-                for name in ("backup", "candidate"):
-                    result = await rclone_service.run("purge", _cloud_path(entry[name]), timeout=3600)
-                    if not result.ok and result.error_code != "drive_not_found":
-                        raise RuntimeError("Cloud publication cleanup remains pending")
+                # These uniquely named trees are durable retained generations.
+                # A recursive provider purge cannot prove that its descendants
+                # contain no accepted or ambiguous cache/sidecar bytes.
+                continue
         # Retain the manifest until every backup has been removed. Its durable
         # compensated phase permits a retry after partial cleanup.
         for child in self.root.iterdir():
@@ -531,7 +723,7 @@ class MediaMutation:
                     if entry["existed"]:
                         if backup.exists():
                             if path.exists():
-                                shutil.rmtree(path)
+                                retain_existing_tree(path)
                             os.replace(backup, path)
                             _sync_directory(path.parent)
                         elif entry["phase"] not in {"building", "prepared"}:
@@ -539,22 +731,37 @@ class MediaMutation:
                             if identity != entry.get("original_identity"):
                                 raise RuntimeError("Previous directory evidence is missing")
                     elif path.exists():
-                        shutil.rmtree(path)
-                        _sync_directory(path.parent)
+                        retain_existing_tree(path)
                     continue
                 if entry["kind"] == "cloud_directory":
                     path = _cloud_path(entry["path"])
                     if entry.get("phase") == "building":
                         continue
                     if entry["existed"]:
-                        result = await rclone_service.run("sync", _cloud_path(entry["backup"]), path, timeout=6 * 3600)
-                        checked = await rclone_service.run("check", _cloud_path(entry["backup"]), path, timeout=3600)
-                        if not result.ok or not checked.ok:
-                            raise RuntimeError("Cloud directory compensation failed")
+                        backup_remote = _cloud_path(entry["backup"])
+                        independent = frozenset(child["path"][len(path.rstrip("/")) + 1:]
+                            for child in self.entries
+                            if child["kind"] == "cloud" and child.get("directory_owner") is None
+                            and _contains_asset(entry, "cloud", child["path"]))
+                        await self._check_protected_cloud_collisions(backup_remote, path,
+                            independent_children=independent)
+                        await self._copy_cloud_tree_preserving(backup_remote, path,
+                            independent_children=independent)
                     else:
-                        result = await rclone_service.run("purge", path, timeout=3600)
-                        if not result.ok and result.error_code != "drive_not_found":
-                            raise RuntimeError("Cloud directory compensation failed")
+                        # Remove only proven current-job source/catalog objects;
+                        # sidecars and caches survive even rejected publication.
+                        candidate = _cloud_path(entry["candidate"])
+                        for name in await self._cloud_files(candidate):
+                            if is_protected_path(name):
+                                continue
+                            manifest = self._cloud_file_list([name])
+                            checked = await rclone_service.run("check", candidate, path,
+                                "--one-way", "--download", "--files-from-raw", str(manifest), timeout=3600)
+                            if not checked.ok:
+                                raise MediaRecoveryRequired("Cloud rollback object ownership is ambiguous")
+                            result = await rclone_service.run("deletefile", f"{path}/{name}", timeout=60)
+                            if not result.ok and result.error_code != "drive_not_found":
+                                raise RuntimeError("Cloud directory compensation failed")
                     continue
                 backup = self.root / entry["backup"]
                 if backup.parent != self.root or not entry["backup"].startswith("asset-"):
@@ -573,7 +780,10 @@ class MediaMutation:
                         os.replace(temporary, path)
                         _sync_directory(path.parent)
                     else:
-                        path.unlink(missing_ok=True)
+                        if path.exists() and is_protected_path(path):
+                            retain_existing_tree(path)
+                        else:
+                            path.unlink(missing_ok=True)
                         if path.parent.exists():
                             _sync_directory(path.parent)
                 elif entry["kind"] == "cloud":
@@ -599,6 +809,9 @@ class MediaMutation:
                             if not matches:
                                 raise RuntimeError("Cloud compensation could not be verified")
                     else:
+                        if is_protected_path(path):
+                            await self._retain_created_cloud_asset(entry)
+                            continue
                         result = await rclone_service.run("deletefile", path, timeout=60)
                     if not result.ok and result.error_code != "drive_not_found":
                         raise RuntimeError("Cloud compensation failed")

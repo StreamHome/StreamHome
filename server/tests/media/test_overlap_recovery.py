@@ -101,7 +101,11 @@ class OverlapRecovery(unittest.IsolatedAsyncioTestCase):
         for directory, sentinel in ((self.target, "original"), (self.staging, "candidate")):
             (directory / ".metadata").mkdir(parents=True)
             (directory / "film.mp4").write_bytes(sentinel.encode())
-            (directory / "subtitle_en.vtt").write_bytes((sentinel + " subtitle").encode())
+            if directory == self.target:
+                # Re-ingestion retains the original sidecar. A conflicting
+                # candidate now correctly stops before publication; this suite
+                # exercises temporal ownership after publication has begun.
+                (directory / "subtitle_en.vtt").write_bytes((sentinel + " subtitle").encode())
             (directory / ".metadata/metadata.json").write_text(json.dumps({"sentinel": sentinel}))
         self.original = tree_bytes(self.target)
 

@@ -20,7 +20,8 @@ from lifecycle.media_work import media_ownership, require_resolved_media, settle
 from lifecycle.storage_placement import validate_placement_manifests
 from models import (Episode, Movie, PlaybackRun, StorageAsset, StorageKeepLocal,
                     StorageMeasurement, StorageOperation, StorageReview)
-from services.storage_common import StorageError, digest, policy_value
+from services.storage_common import StorageError, digest, policy_value, CLEANUP_RETENTION_VERSION, validate_cleanup_retention
+from lifecycle.storage_retention import is_protected_path
 from services.storage_capacity import storage_capacity
 from services.storage_inventory import (accepted_placement, adopt_asset, cloud_read_enabled, file_identity,
     persist_placement, storage_inventory, target_generation, _hash_file)
@@ -273,7 +274,7 @@ class StorageWorker:
                 if candidate is None:
                     # Durable blocked state reports why the target cannot be
                     # met; a changed inventory/protection can reopen planning.
-                    await self._save_measurement('offload_cycle', {'active': True, 'blocker': 'no_safe_candidates', 'measured_at': local.get('measured_at')})
+                    await self._save_measurement('offload_cycle', {'active': True, 'blocker': 'storage_retained_data_blocks_capacity', 'measured_at': local.get('measured_at')})
                     return
                 row = StorageOperation(id=str(uuid.uuid4()), kind='offload', media_id=candidate.media_id,
                     bytes_total=candidate.size_bytes, payload=json.dumps({'asset_id': candidate.id,
@@ -320,6 +321,8 @@ class StorageWorker:
         eligible, identities = 0, set()
         for asset in assets:
             path = local_path_for(asset.catalog_path)
+            if asset.kind not in {'video', 'audio'} or is_protected_path(path):
+                continue
             if not path.is_file() or await media_protection_reason(asset.media_id, asset.episode_id):
                 continue
             media = await self._media(asset)
@@ -328,6 +331,9 @@ class StorageWorker:
             if not media or not direct_recovery_proven(media) or file_identity(path) != asset.local_identity:
                 continue
             info = path.stat()
+            # Removing one alias cannot free bytes retained by another path.
+            if info.st_nlink > 1:
+                continue
             identity = (info.st_dev, info.st_ino)
             if identity not in identities:
                 identities.add(identity)
@@ -449,7 +455,9 @@ class StorageWorker:
                     and_(StorageAsset.last_used_at == cursor['last_used_at'], StorageAsset.id > cursor['id'])))
             assets = (await db.exec(query.limit(200))).all()
         for asset in assets:
-            if not local_path_for(asset.catalog_path).is_file():
+            if asset.kind not in {'video', 'audio'} or is_protected_path(local_path_for(asset.catalog_path)):
+                continue
+            if not local_path_for(asset.catalog_path).is_file() or local_path_for(asset.catalog_path).stat().st_nlink > 1:
                 continue
             if filesystem is not None and str(local_path_for(asset.catalog_path).stat().st_dev) != filesystem:
                 continue
@@ -473,32 +481,25 @@ class StorageWorker:
 
     async def cleanup_plan(self):
         from services.media_source import local_path_for
-        from services.playback_prep import playback_prep_service
         candidates = []
         async with AsyncSession(database.engine, expire_on_commit=False) as db:
             assets = (await db.exec(select(StorageAsset).order_by(StorageAsset.last_used_at).limit(200))).all()
-        # Only source-bound, proven rebuildable cache roots are eligible. An
-        # unrecognized/sole playable HLS cache is retained.
         for asset in assets:
-            if asset.kind != 'video' or await media_protection_reason(asset.media_id, asset.episode_id):
+            path = local_path_for(asset.catalog_path)
+            if asset.kind not in {'video', 'audio'} or is_protected_path(path):
+                continue
+            if await media_protection_reason(asset.media_id, asset.episode_id):
                 continue
             media = await self._media(asset)
             if not media or not await self.recovery_proven(media, asset):
                 continue
-            root = playback_prep_service.cache_path(str(media.id), media.source_fingerprint or '')
-            if root.is_dir() and not root.is_symlink():
-                size, identity = await run_cancellation_safe_thread(self._tree_identity, root)
-                if size:
-                    candidates.append({'kind': 'unused_cache', 'asset_id': asset.id,
-                        'generation': asset.generation, 'bytes': size, 'identity': identity,
-                        'filesystem': str(root.stat().st_dev)})
             placement = accepted_placement(asset.catalog_path)
-            if placement and local_path_for(asset.catalog_path).is_file():
+            if placement and path.is_file() and path.stat().st_nlink == 1:
                 candidates.append({'kind': 'verified_duplicate', 'asset_id': asset.id,
                     'generation': asset.generation, 'bytes': asset.size_bytes, 'identity': asset.local_identity,
-                    'filesystem': str(local_path_for(asset.catalog_path).stat().st_dev)})
-        candidates.sort(key=lambda value: 0 if value['kind'] == 'unused_cache' else 1)
-        return {'candidates': candidates[:25], 'blocker': None if candidates else 'no_safe_candidates'}
+                    'filesystem': str(path.stat().st_dev)})
+        return {'retention_version': CLEANUP_RETENTION_VERSION, 'candidates': candidates[:25],
+                'blocker': None if candidates else 'storage_no_releasable_media'}
 
     @staticmethod
     def _tree_identity(root):
@@ -517,39 +518,25 @@ class StorageWorker:
 
     async def execute_cleanup(self, operation):
         from services.media_source import local_path_for
-        from services.playback_prep import playback_prep_service
         payload = json.loads(operation.payload)
+        plan = payload.get('plan')
+        validate_cleanup_retention(plan)
         if payload['revision'] != policy_value(settings)['revision'] or payload['target_generation'] != target_generation():
             raise StorageError('storage_cleanup_plan_expired')
-        released = 0
-        for item in payload['plan']['candidates']:
-            async with AsyncSession(database.engine, expire_on_commit=False) as db:
+        # Preflight every asset before executing even the first release. Legacy
+        # jobs and a mixed protected plan must never partially consume data.
+        assets = []
+        async with AsyncSession(database.engine, expire_on_commit=False) as db:
+            for item in plan['candidates']:
                 asset = await db.get(StorageAsset, item['asset_id'])
-            if not asset or asset.generation != item['generation']:
-                raise StorageError('storage_source_changed')
-            if item['kind'] == 'verified_duplicate':
-                # Re-check remote contents, not just an old receipt, before
-                # consuming the local original.
-                await self._verified_release(operation, asset, payload['revision'])
-                released = operation.released_bytes
-                continue
-            async with media_ownership(asset.media_id, *([asset.episode_id] if asset.episode_id else [])):
-                if await media_protection_reason(asset.media_id, asset.episode_id):
-                    raise StorageError('storage_media_protected')
-                media = await self._media(asset)
-                if not media or not await self.recovery_proven(media, asset):
-                    raise StorageError('storage_cold_recovery_unproven')
-                root = playback_prep_service.cache_path(str(media.id), media.source_fingerprint or '')
-                size, identity = await run_cancellation_safe_thread(self._tree_identity, root)
-                if identity != item['identity'] or size != item['bytes']:
-                    raise StorageError('storage_cleanup_plan_expired')
-                await self._set(operation, phase='releasing_cache')
-                await run_cancellation_safe_thread(shutil.rmtree, root)
-                if root.exists():
-                    raise StorageError('storage_cleanup_incomplete')
-                released += size
-                await self._set(operation, released_bytes=released)
-        await self._set(operation, status='completed', phase='completed', released_bytes=released)
+                if not asset or asset.generation != item['generation']:
+                    raise StorageError('storage_source_changed')
+                if asset.kind not in {'video', 'audio'} or is_protected_path(local_path_for(asset.catalog_path)):
+                    raise StorageError('storage_retained_data_protected', 'Caches and subtitles cannot be released by cleanup.')
+                assets.append(asset)
+        for asset in assets:
+            await self._verified_release(operation, asset, payload['revision'])
+        await self._set(operation, status='completed', phase='completed')
         await self.measure_local()
 
     async def _verify_remote(self, asset, remote):
@@ -595,6 +582,8 @@ class StorageWorker:
         if (not asset or asset.generation != payload['generation'] or policy['revision'] != payload['revision']
             or target_generation() != payload['target_generation'] or not policy['offload_enabled']):
             raise StorageError('storage_policy_changed')
+        if asset.kind not in {'video', 'audio'} or is_protected_path(local_path_for(asset.catalog_path)):
+            raise StorageError('storage_retained_data_protected', 'Caches and subtitles cannot be offloaded or released.')
         if await media_protection_reason(asset.media_id, asset.episode_id):
             raise StorageError('storage_media_protected')
         media = await self._media(asset)
@@ -657,8 +646,12 @@ class StorageWorker:
     async def _verified_release(self, operation, asset, revision):
         from services.media_source import local_path_for
         path = local_path_for(asset.catalog_path)
+        if asset.kind not in {'video', 'audio'} or is_protected_path(path):
+            raise StorageError('storage_retained_data_protected', 'Caches and subtitles cannot be released.')
         if not path.exists():
             return
+        if path.stat().st_nlink > 1:
+            raise StorageError('storage_retained_data_protected', 'A retained alias shares this source; no space can be released.')
         placement = accepted_placement(asset.catalog_path)
         if not placement or placement['generation'] != asset.generation:
             raise StorageError('storage_placement_unaccepted')
@@ -688,6 +681,8 @@ class StorageWorker:
                 'local_identity': identity, 'previous_released_bytes': operation.released_bytes}
             await self._set(operation, phase='releasing_local_copy', payload=json.dumps(payload))
             def unlink():
+                if path.stat().st_nlink > 1:
+                    raise StorageError('storage_retained_data_protected', 'A retained alias shares this source.')
                 from config import SETTINGS_WRITE_LOCK
                 with SETTINGS_WRITE_LOCK:
                     current = policy_value(settings)

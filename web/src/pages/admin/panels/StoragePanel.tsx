@@ -33,6 +33,11 @@ const humanize = (s: string) => { const text = s.replace(/_/g, " "); return text
 const kindLabel = (value: string) => ({ refresh: "Storage measurement", policy: "Policy update", policy_save: "Policy update", keep_local: "Keep local", cleanup: "Local cleanup", offload: "Cloud offloading", prefetch: "Next episode preparation", backup_sync: "Backup copy" }[value] ?? "Storage operation");
 const phaseLabel = (value: string) => ({ queued: "Waiting to start", starting: "Starting", measuring_local: "Measuring local usage", measuring_cloud: "Measuring Drive usage", reconciling_assets: "Checking stored copies", measured: "Usage measurement finished", saved: "Policy saved", uploading: "Uploading to Drive", downloading: "Downloading to this server", verifying: "Verifying the stored copy", releasing_cache: "Clearing idle playback cache", releasing_local_copy: "Releasing verified local copies", preparing_playback: "Preparing playback files", ready_offline: "Ready offline on this server", protection_removed: "Keep local protection removed", retained_local_copy: "Local copy retained", cleanup_debt: "Temporary cleanup pending", completed: "Finished", failed: "Operation could not finish", blocked: "Waiting for an issue to be resolved", interrupted: "Interrupted; retained data needs checking", recovery_required: "Recovery needs attention", reconciled: "Stored copies checked" }[value] ?? "Progress is being checked");
 const errorExplanation = (value: string | null) => ({
+  storage_retained_data_protected: "Caches and subtitles are retained. Review a new media-only cleanup plan.",
+  storage_retained_data_blocks_capacity: "No eligible video or audio can be released. Caches and subtitles are retained; new work needs more available space.",
+  storage_no_releasable_media: "No verified media copies can be released. Caches and subtitles remain protected.",
+  storage_cleanup_plan_expired: "Storage protection or the reviewed files changed. Review cleanup again.",
+  no_safe_candidates: "No media can currently be released without violating data protection.",
   storage_inventory_unreadable: "Some managed files could not be read. Check the server's storage access permissions.",
   storage_inventory_limit: "The file inventory exceeded the measurement limit. Usage is incomplete.",
   storage_filesystem_unavailable: "The server storage filesystem is unavailable.",
@@ -459,7 +464,7 @@ export function StoragePanel({ retainedDraft, onDraftChange, view: controlledVie
     <div className="ss-ruleline"><span className="ss-state">{draft.offloadEnabled !== status.policy.offloadEnabled ? "Pending save" : humanize(status.offload.state)}</span><span className="ss-rulepill">Start at <em>90%</em></span><span className="ss-rulepill">Free down to <em>80%</em></span></div>
     {status.offload.reason && <p className="ss-help">{errorExplanation(status.offload.reason)}</p>}
     {!status.capabilities.offload && <p className="ss-help">Automatic offloading is unavailable on this server.</p>}
-    {[ ["Clear idle playback cache", "Remove temporary playback data that can be prepared again."], ["Release cloud-backed local copies", "Only after the matching Drive copy is confirmed available."], ["Offload least recently used media", "Upload video and separate audio, verify the copy, then release local space."] ].map(([title, description], i) => <div className="ss-step" key={title}><span>{i + 1}</span><div><strong>{title}</strong><p>{description}</p></div></div>)}
+    {[ ["Release cloud-backed local copies", "Only after the matching Drive copy is confirmed available."], ["Offload least recently used media", "Upload video and separate audio, verify the copy, then release local space."] ].map(([title, description], i) => <div className="ss-step" key={title}><span>{i + 1}</span><div><strong>{title}</strong><p>{description}</p></div></div>)}
     <div className="ss-connection"><h3>Always protected</h3><p className="ss-help">Active playback · Keep local items · Subtitles · Artwork · Database</p>
       <label className="ss-check"><input type="checkbox" checked={draft.prefetchNextEpisode} disabled={blocked} onChange={e => edit({ prefetchNextEpisode: e.target.checked })} /><span>Prepare the next episode<small>One episode ahead, only when the local budget allows.</small></span></label>
     </div>
@@ -501,9 +506,9 @@ export function StoragePanel({ retainedDraft, onDraftChange, view: controlledVie
         <div className="ss-sheetfooter"><Button variant="secondary" disabled={blocked} onClick={() => edit({})}>Back to editing</Button><Button className="ss-button ss-primary" disabled={!reviewValid || mutationBlocked} onClick={() => void perform("policy")}>Save changes</Button></div>
       </section>}
       {cleanup && view === "overview" && <section className="ss-sheet" aria-label="Cleanup review">
-        <h2 ref={reviewHeading} tabIndex={-1}>Review cleanup</h2><p className="ss-help">Estimated release: {formatStorageBytes(cleanup.estimatedReleaseBytes)}. Playback and kept items stay protected.</p>
+        <h2 ref={reviewHeading} tabIndex={-1}>Review cleanup</h2><p className="ss-help">Estimated release: {formatStorageBytes(cleanup.estimatedReleaseBytes)}. Playback, kept items, caches and subtitles stay protected.</p>
         {cleanup.steps.map((step, i) => <div className="ss-reviewrow" key={i}><span>{humanize(step.kind)}</span><strong>{formatStorageBytes(step.bytes)}</strong></div>)}
-        {cleanup.blocker && <p className="ss-error" role="alert">{humanize(cleanup.blocker)}</p>}
+        {cleanup.blocker && <p className="ss-error" role="alert">{errorExplanation(cleanup.blocker)}</p>}
         <div className="ss-sheetfooter"><Button variant="secondary" onClick={() => setCleanup(null)}>Cancel</Button><Button disabled={mutationBlocked || Boolean(cleanup.blocker) || Date.parse(cleanup.expiresAt) <= Date.now()} onClick={() => void perform("cleanup")}>Run cleanup</Button></div>
       </section>}
       {view === "overview" && <>
@@ -518,6 +523,8 @@ export function StoragePanel({ retainedDraft, onDraftChange, view: controlledVie
             <ul className="ss-legend" aria-label="Usage distribution legend">{meterCategories.map((category, i) => <li key={category.key}><span className={category.key === "reserved" ? "ss-segreserved" : segmentClass(i)} aria-hidden="true" />{category.label} · {formatStorageBytes(category.bytes)}</li>)}</ul>
             <div className="ss-meterlabel"><span>{formatStorageBytes(status.local.writtenBytes)} on disk · {formatStorageBytes(status.local.reservedBytes)} reserved</span><button ref={breakdownTrigger} className="ss-link" type="button" aria-expanded={breakdown} onClick={() => breakdown ? closeBreakdown() : setBreakdown(true)}>View breakdown</button></div>
             <div className="ss-hardware"><div><span>Local budget</span><strong>{status.policy.localBudgetBytes === null ? "Not set" : formatStorageBytes(status.policy.localBudgetBytes)}</strong></div><div><span>Free on server disk</span><strong>{formatStorageBytes(status.local.freeBytes)}</strong></div><div><span>Minimum disk reserve</span><strong>{formatStorageBytes(status.local.diskReserveBytes)}</strong></div></div>
+            <div className="ss-detailrow"><span>Retained files</span><strong>{formatStorageBytes(status.local.retainedBytes ?? null)}</strong></div>
+            <p className="ss-help">Caches, subtitles, artwork and unclassified files are retained and included in disk usage. Capacity pressure pauses new work instead of deleting them.</p>
             <Measurement label="Local" value={status.local} />
             <button className="ss-link" type="button" onClick={() => changeView("policy")}>Edit local budget →</button>
           </Panel>
@@ -529,6 +536,7 @@ export function StoragePanel({ retainedDraft, onDraftChange, view: controlledVie
               <p className="ss-help">{status.cloud.folderName || "Configured folder"}</p>
             </> : <p className="ss-muted ss-small">Add a Drive folder to make automatic offloading available.</p>}
             <div className="ss-hardware"><div><span>Cloud folder budget</span><strong>{status.policy.cloudBudgetBytes === null ? "Not set" : formatStorageBytes(status.policy.cloudBudgetBytes)}</strong></div><div><span>Free in Google account</span><strong>{formatStorageBytes(status.cloud.accountFreeBytes)}</strong></div><div><span>Account capacity</span><strong>{formatStorageBytes(status.cloud.accountTotalBytes)}</strong></div></div>
+            <p className="ss-help">Existing Drive caches and subtitles are retained and included in folder usage. Local copies are not automatically mirrored to Drive.</p>
             <Measurement label="Drive" value={status.cloud} />
             <button className="ss-link" type="button" onClick={() => changeView("policy")}>Edit cloud budget →</button>
             <div className="ss-connection"><button className="ss-link" type="button" onClick={() => setConnection(!connection)} aria-expanded={connection}>{connection ? "Hide connection details" : status.cloud.configured ? "Connection details" : "Connect Google Drive"}</button></div>
@@ -572,7 +580,7 @@ export function StoragePanel({ retainedDraft, onDraftChange, view: controlledVie
         </Panel>
       </>}
       {view === "policy" && <>
-        <Panel title="Total storage budgets"><div className="ss-formgrid ss-budgetside">{budgetField("local")}{budgetField("cloud")}</div></Panel>
+        <Panel title="Total storage budgets"><p className="ss-help">Caches and subtitles remain protected on this server and in Drive. Only eligible video and audio originals can be offloaded. If retained files fill the budget, new work waits for capacity.</p><div className="ss-formgrid ss-budgetside">{budgetField("local")}{budgetField("cloud")}</div></Panel>
         {offload()}
         <Panel title="Media processing">
           <p className="ss-muted ss-small">Compression is managed separately from storage placement.</p>

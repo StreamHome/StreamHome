@@ -18,6 +18,7 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings, _private_atomic_replace
+from lifecycle.storage_retention import is_protected_path
 import db as database
 from lifecycle.coordination import EffectClass, run_cancellation_safe_thread, runtime_work
 from models import Episode, Movie, PlaybackRun, StorageAsset, StorageMeasurement
@@ -271,6 +272,7 @@ def scan_managed(*, max_files: int = MAX_INVENTORY_FILES, include_entries: bool 
     """Bounded scan counts hardlinks/overlapping roots once; separate copies twice."""
     seen: set[tuple[int, int]] = set()
     categories: dict[str, int] = {}
+    retained_sizes: dict[tuple[int, int], int] = {}
     filesystems: dict[str, int] = {}
     count = 0
     complete = True
@@ -307,11 +309,14 @@ def scan_managed(*, max_files: int = MAX_INVENTORY_FILES, include_entries: bool 
                 if not stat.S_ISREG(info.st_mode):
                     continue
                 identity = (info.st_dev, info.st_ino)
+                inode_sizes.setdefault(identity, info.st_size)
                 if include_entries:
                     # Aliases carry the same first-observed size used by the
                     # global sum even if a native writer grows between stats.
                     inode_sizes.setdefault(identity, info.st_size)
                     entries.append((os.path.abspath(path), info.st_dev, info.st_ino, inode_sizes[identity]))
+                if is_protected_path(path):
+                    retained_sizes.setdefault(identity, inode_sizes[identity])
                 if identity in seen:
                     continue
                 seen.add(identity)
@@ -325,6 +330,7 @@ def scan_managed(*, max_files: int = MAX_INVENTORY_FILES, include_entries: bool 
             break
     result = {'written_bytes': sum(categories.values()) if complete else None,
             'observed_bytes': sum(categories.values()), 'categories': categories,
+            'retained_bytes': sum(retained_sizes.values()) if complete else None,
             'filesystems': filesystems, 'complete': complete, 'error_code': error,
             'measured_at': time.time()}
     if include_entries:

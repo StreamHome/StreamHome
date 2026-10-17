@@ -20,6 +20,11 @@ describe("storage API normalization and review binding", () => {
     expect(result.local.refresh).toEqual({ state: "error", phase: null, lastAttemptAt: refresh.last_attempt_at, lastSuccessAt: refresh.last_success_at, nextAttemptAt: refresh.next_attempt_at, errorCode: refresh.error_code });
     expect(() => normalizeStorageStatus({ ...wire, local: { ...wire.local, refresh: { ...refresh, state: "success" } } })).toThrow(ApiError);
   });
+  it("normalizes retained bytes without treating an unknown sample as zero", () => {
+    expect(normalizeStorageStatus(wire).local.retainedBytes).toBeNull();
+    expect(normalizeStorageStatus({ ...wire, local: { ...wire.local, retained_bytes: 1024 } }).local.retainedBytes).toBe(1024);
+    expect(() => normalizeStorageStatus({ ...wire, local: { ...wire.local, retained_bytes: -1 } })).toThrow(ApiError);
+  });
   it("passes caller cancellation to every observation endpoint", async () => {
     const controller = new AbortController();
     fetcher.mockResolvedValueOnce(json(wire)).mockResolvedValueOnce(json({ operation })).mockResolvedValueOnce(json({ items: [], next_cursor: null })).mockResolvedValueOnce(json({ items: [], next_cursor: null }));

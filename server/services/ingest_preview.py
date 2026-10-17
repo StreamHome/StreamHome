@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
@@ -44,7 +43,9 @@ class IngestPreviewService:
 
     def prepare(self, task_id: str, duration_seconds: float) -> Path:
         target = self.task_path(task_id)
-        shutil.rmtree(target, ignore_errors=True)
+        # Stable task URLs must never acquire bytes from another preview.
+        if target.exists() and any(target.iterdir()):
+            raise IngestPreviewError("A retained preview already exists for this task. Start a new task to prepare another preview.")
         target.mkdir(parents=True, exist_ok=True)
         self._write_state(
             task_id,
@@ -152,21 +153,12 @@ class IngestPreviewService:
             pass
 
     def remove(self, task_id: str) -> None:
-        shutil.rmtree(self.task_path(task_id), ignore_errors=True)
+        """Compatibility hook: accepted and ambiguous previews remain retained."""
+        self.task_path(task_id)
 
     def cleanup_expired(self, *, exclude: Optional[set[str]] = None) -> None:
-        excluded = exclude or set()
-        cutoff = time.time() - PREVIEW_RETENTION_SECONDS
-        if not self.root.is_dir():
-            return
-        for candidate in self.root.iterdir():
-            if not candidate.is_dir() or candidate.name in excluded:
-                continue
-            try:
-                if candidate.stat().st_mtime < cutoff:
-                    shutil.rmtree(candidate, ignore_errors=True)
-            except OSError:
-                continue
+        """Age is not permission to delete preview cache or subtitle copies."""
+        return
 
     def _state_path(self, task_id: str) -> Path:
         return self.task_path(task_id) / "state.json"

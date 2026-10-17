@@ -1777,6 +1777,59 @@ async def serve_ingest_preview_asset(
         raise
 
 
+def retained_master_playlist(content: str, media_id: str, fingerprint: str) -> str:
+    """Retain historical bytes without advertising unavailable generations."""
+    def child_ready(uri: str, prefix: str) -> bool:
+        parts = PurePosixPath(uri).parts
+        return (len(parts) == 2 and parts[0].startswith(prefix) and parts[1] == "playlist.m3u8"
+                and playback_prep_service.retained_asset_available(media_id, fingerprint, uri)
+                and playback_prep_service.playlist_ready(media_id, fingerprint, parts[0]))
+
+    lines = content.splitlines()
+    audio_groups = set()
+    media_lines = set()
+    for line in lines:
+        if not line.startswith("#EXT-X-MEDIA:"):
+            continue
+        uri = re.search(r'URI="([^"\n]+)"', line)
+        group = re.search(r'GROUP-ID="([^"\n]+)"', line)
+        if 'TYPE=AUDIO' in line and uri and group and child_ready(uri.group(1), "audio_"):
+            audio_groups.add(group.group(1))
+            media_lines.add(line)
+    selected = []
+    index = 0
+    videos = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            uri = lines[index + 1].strip() if index + 1 < len(lines) else ""
+            audio = re.search(r'AUDIO="([^"\n]+)"', line)
+            if child_ready(uri, "video_") and (audio is None or audio.group(1) in audio_groups):
+                selected.extend([line, uri])
+                videos += 1
+            index += 2
+            continue
+        if not line.startswith("#EXT-X-MEDIA:") or line in media_lines:
+            selected.append(line)
+        index += 1
+    if not videos:
+        raise playback_error(status.HTTP_425_TOO_EARLY, "PLAYBACK_PREPARING", "The adaptive stream is still preparing.")
+    return "\n".join(selected) + "\n"
+
+
+def protect_master_renditions(content: str, payload: dict, media_id: str) -> None:
+    """Bind only the canonical renditions this response actually advertises."""
+    for line in content.splitlines():
+        if line.startswith("#EXT-X-MEDIA:"):
+            match = re.search(r'URI="([^"\n]+)"', line)
+            uri = match.group(1) if match else ""
+        else:
+            uri = line.strip() if line.strip() and not line.startswith("#") else ""
+        parts = PurePosixPath(uri).parts
+        if len(parts) == 2 and parts[1] == "playlist.m3u8":
+            playback_prep_service.protect_rendition(str(payload["run_id"]), media_id, str(payload["fingerprint"]), parts[0])
+
+
 @router.get("/manifest/{media_id}")
 async def serve_master_manifest(
     media_id: str,
@@ -1794,11 +1847,11 @@ async def serve_master_manifest(
         raise playback_error(status.HTTP_425_TOO_EARLY, "PLAYBACK_PREPARING", "The adaptive stream is still preparing.")
     lease = playback_response_lease("playback.hls-manifest", disposable_cache=True)
     try:
-        playback_prep_service.touch(media_id, str(payload["fingerprint"]))
-        raw_content = master_path.read_text(encoding="utf-8")
+        raw_content = retained_master_playlist(master_path.read_text(encoding="utf-8"), media_id, str(payload["fingerprint"]))
         if isinstance(rendition_id, str):
             allowed = {item.id for item in rendition_contract(media_obj, media_id, str(payload["fingerprint"]))}
-            if rendition_id not in allowed:
+            advertised = {line.strip() for line in raw_content.splitlines() if line.strip() and not line.startswith("#")}
+            if rendition_id not in allowed or f"{rendition_id}/playlist.m3u8" not in advertised:
                 raise playback_error(404, "RENDITION_NOT_READY", "The selected quality is not available.")
             lines = raw_content.splitlines()
             selected_lines = []
@@ -1815,6 +1868,8 @@ async def serve_master_manifest(
                     index += 1
             raw_content = "\n".join(selected_lines) + "\n"
         content = rewrite_hls_playlist(raw_content, media_id, ticket, PurePosixPath())
+        protect_master_renditions(raw_content, payload, media_id)
+        playback_prep_service.touch(media_id, str(payload["fingerprint"]))
         return LeaseBoundPlaybackResponse(
             PlainTextResponse(content, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"}),
             lease,
@@ -1834,17 +1889,24 @@ async def serve_hls_asset(
     payload, _, _ = await validate_playback_ticket(ticket, media_id, db)
     cache_root = playback_prep_service.cache_path(media_id, str(payload["fingerprint"]))
     target = safe_hls_file(cache_root, path)
-    if not target.is_file():
+    if not target.is_file() or not playback_prep_service.retained_asset_available(media_id, str(payload["fingerprint"]), path):
         raise playback_error(status.HTTP_404_NOT_FOUND, "HLS_ASSET_NOT_READY", "The requested playback rendition is not ready.")
     lease = playback_response_lease("playback.hls-asset", disposable_cache=True)
     try:
-        playback_prep_service.touch(media_id, str(payload["fingerprint"]))
         if target.suffix.lower() == ".m3u8":
-            content = rewrite_hls_playlist(target.read_text(encoding="utf-8"), media_id, ticket, PurePosixPath(path).parent)
+            raw_content = target.read_text(encoding="utf-8")
+            if PurePosixPath(path).name == "master.m3u8" and len(PurePosixPath(path).parts) == 1:
+                raw_content = retained_master_playlist(raw_content, media_id, str(payload["fingerprint"]))
+                protect_master_renditions(raw_content, payload, media_id)
+            content = rewrite_hls_playlist(raw_content, media_id, ticket, PurePosixPath(path).parent)
             response = PlainTextResponse(content, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
         else:
             media_type = "video/iso.segment" if target.suffix.lower() == ".m4s" else "video/mp4"
             response = FileResponse(target, media_type=media_type, headers={"Cache-Control": "private, max-age=900"})
+        parts = PurePosixPath(path).parts
+        if len(parts) >= 2:
+            playback_prep_service.protect_rendition(str(payload["run_id"]), media_id, str(payload["fingerprint"]), parts[0])
+        playback_prep_service.touch(media_id, str(payload["fingerprint"]))
         return LeaseBoundPlaybackResponse(response, lease)
     except Exception:
         lease.release()

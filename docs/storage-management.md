@@ -3,7 +3,8 @@
 The Storage workspace keeps local storage active and optionally offloads eligible
 video and separate audio files to Google Drive. Connecting Drive and enabling
 offloading are separate actions. Subtitles, artwork, catalog metadata and the
-database stay local.
+database stay local. Existing cache and subtitle copies are retained on both
+the server and Drive; this does not automatically replicate local caches to Drive.
 
 Open **Admin Center → Storage & HEVC**. The existing admin navigation remains at
 the top. The workspace has three views:
@@ -80,15 +81,23 @@ remaining capacity reserved for ongoing work both count toward admission.
 
 The maintenance order is:
 
-1. Remove eligible idle, rebuildable playback caches.
-2. Release eligible local copies already backed by a verified cloud generation.
-3. Upload eligible cold video or separate audio, verify the exact content, record
+1. Release eligible video or audio originals already backed by a verified cloud generation.
+2. Upload eligible cold video or separate audio, verify the exact content, record
    durable acceptance, then remove the matching local copy.
 
 Playback, explicit local retention, ongoing processing and unresolved recovery
 take precedence. A paused playback run remains protected. Provider failures,
 changed sources and insufficient capacity block work; they do not authorize
 removing an original. Pausing offloading leaves existing cloud media readable.
+
+Caches, subtitles, artwork and unclassified files are never automatic eviction or
+age-based cleanup targets, including retained older generations. They remain part
+of total storage usage. A full budget or insufficient free disk space blocks new
+writers rather than deleting retained files. The legacy `PLAYBACK_CACHE_GB` value
+no longer authorizes cache eviction; total admission budgets and the physical disk
+reserve remain authoritative. Existing cleanup reviews from before this protection
+must be reviewed again. Explicitly authorized subtitle removal remains a separate
+media-edit operation.
 
 ## Playback and Keep local
 
@@ -112,7 +121,8 @@ is limited to one episode ahead and remains subject to capacity and protections.
 
 **Review cleanup** presents a bounded plan. Confirming it rechecks source
 generations, current protections, policy and Drive target before releasing space.
-Estimates and released bytes are separate values. Existing unrelated Drive files
+Estimates and released bytes are separate values. Caches and subtitles are excluded
+from cleanup. Existing unrelated Drive files
 are counted but are not cleanup targets.
 
 Accepted cloud placements have permanent recovery metadata under

@@ -21,7 +21,7 @@ from lifecycle.media_work import media_ownership
 from models import (Episode, Movie, StorageAsset, StorageKeepLocal, StorageMeasurement,
                     StorageOperation, StorageReservation, StorageReview)
 from services.storage_common import (DRAFT_FIELDS, StorageError, canonical_draft, digest,
-                                     operation_value, policy_value, request_id, utc)
+                                     operation_value, policy_value, request_id, utc, validate_cleanup_retention)
 from services.storage_inventory import cloud_read_enabled, target_generation
 
 StoragePolicyError = StorageError
@@ -100,7 +100,7 @@ class StoragePolicyService:
         return {
             'policy': policy,
             'local': {'written_bytes': local.get('written_bytes'), 'reserved_bytes': await storage_capacity.remaining(observe=False),
-                'protected_bytes': local.get('protected_bytes'), 'free_bytes': free,
+                'protected_bytes': local.get('protected_bytes'), 'retained_bytes': local.get('retained_bytes'), 'free_bytes': free,
                 'disk_reserve_bytes': policy['disk_reserve_bytes'],
                 'categories': [{'key': key, 'label': key.replace('_', ' ').title(), 'bytes': amount}
                                for key, amount in local.get('categories', {}).items()],
@@ -142,7 +142,7 @@ class StoragePolicyService:
             await db.commit()
         effects = ['Saving settings records the policy; media movement is reported separately in Activity.']
         if canonical['offload_enabled']:
-            effects += ['Unused caches are considered first, then verified duplicates, then recoverable cold video and audio.',
+            effects += ['Caches and subtitles are retained. Only verified video and audio copies may be released.',
                         'Capacity and playback protections are checked again before each operation.']
         else:
             effects += ['New automatic transfers are paused. Existing Google Drive media remains readable.']
@@ -452,7 +452,9 @@ class StoragePolicyService:
                     or plan.expires_at <= time.time() or plan.policy_revision != policy_value(settings)['revision']
                     or plan.target_generation != target_generation() or plan.used_by):
                     raise StorageError('storage_cleanup_plan_expired')
-                payload = {'plan_id': plan_id, 'plan': json.loads(plan.payload), 'revision': plan.policy_revision,
+                canonical_plan = json.loads(plan.payload)
+                validate_cleanup_retention(canonical_plan)
+                payload = {'plan_id': plan_id, 'plan': canonical_plan, 'revision': plan.policy_revision,
                            'target_generation': plan.target_generation}
                 plan.used_by = operation_id
                 operation = StorageOperation(id=operation_id, session_hash=session_hash, kind='cleanup',

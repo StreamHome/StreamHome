@@ -22,7 +22,7 @@ from config import settings
 import db as database
 from lifecycle.storage_placement import StoragePlacementRecoveryRequired, validate_placement_manifests
 from lifecycle.storage_worker import StorageWorker
-from models import Movie, PlaybackRun, StorageAsset, StorageKeepLocal, StorageMeasurement, StorageOperation, StorageReservation
+from models import Movie, PlaybackRun, StorageAsset, StorageKeepLocal, StorageMeasurement, StorageOperation, StorageReservation, StorageReview
 from services.storage_capacity import StorageCapacity
 from services.storage_common import DISK_RESERVE_BYTES, StorageError, digest
 from services.storage_inventory import (accepted_identity, accepted_placement, adopt_asset,
@@ -643,6 +643,117 @@ class HybridStorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await offline_ready(row, 'movie'))
             audio.write_bytes(b'a-different-audio-generation')
             self.assertFalse(await offline_ready(row, 'movie'))
+
+
+    async def test_retention_excludes_cache_and_subtitles_from_cleanup(self):
+        row, asset, video = await self.movie()
+        await self.accept(row, asset, video)
+        from services.playback_prep import playback_prep_service
+        cache = self.temporary / 'playback_cache' / row.id / 'abcd'
+        cache.mkdir(parents=True)
+        segment = cache / 'segment.m4s'
+        segment.write_bytes(b'accepted-cache')
+        subtitle = video.parent / 'subtitle_en.vtt'
+        subtitle.write_bytes(b'WEBVTT\nretained subtitles')
+        with patch.object(playback_prep_service, 'cache_dir', self.temporary / 'playback_cache'), patch.object(self.worker, 'recovery_proven', AsyncMock(return_value=True)):
+            plan = await self.worker.cleanup_plan()
+        self.assertEqual(plan['retention_version'], 1)
+        self.assertTrue(plan['candidates'])
+        self.assertTrue(all(item['kind'] == 'verified_duplicate' for item in plan['candidates']))
+        self.assertEqual(segment.read_bytes(), b'accepted-cache')
+        self.assertEqual(subtitle.read_bytes(), b'WEBVTT\nretained subtitles')
+
+    async def test_mixed_cleanup_plan_rejected_before_first_release(self):
+        row, asset, video = await self.movie()
+        await self.accept(row, asset, video)
+        plan = {'retention_version': 1, 'candidates': [
+            {'kind': 'verified_duplicate', 'asset_id': asset.id, 'generation': asset.generation, 'bytes': asset.size_bytes},
+            {'kind': 'unused_cache', 'asset_id': asset.id, 'generation': asset.generation, 'bytes': 10}]}
+        operation = StorageOperation(id=str(uuid.uuid4()), kind='cleanup', payload=json.dumps({'plan': plan, 'revision': 0, 'target_generation': target_generation()}))
+        with patch.object(self.worker, '_verified_release', AsyncMock()) as release:
+            with self.assertRaisesRegex(StorageError, 'Caches and subtitles'):
+                await self.worker.execute_cleanup(operation)
+            release.assert_not_awaited()
+        self.assertTrue(video.is_file())
+
+    async def test_old_cleanup_review_rejected_without_consuming_receipt(self):
+        plan_id, operation_id = str(uuid.uuid4()), str(uuid.uuid4())
+        from services.storage_policy_service import _session
+        review = StorageReview(id=plan_id, kind='cleanup', session_hash=_session('human'), policy_revision=0,
+            target_generation=target_generation(), draft_hash='old-plan', payload=json.dumps({'candidates': []}), expires_at=time.time() + 300)
+        async with AsyncSession(self.engine) as db:
+            db.add(review)
+            await db.commit()
+        with self.assertRaisesRegex(StorageError, 'protection changed'):
+            await self.service.cleanup_execute('human', plan_id, operation_id)
+        async with AsyncSession(self.engine) as db:
+            self.assertIsNone(await db.get(StorageOperation, operation_id))
+            self.assertIsNone((await db.get(StorageReview, plan_id)).used_by)
+
+    async def test_old_queued_cache_cleanup_is_blocked_with_zero_release(self):
+        cache = self.temporary / 'playback_cache' / 'legacy'
+        cache.mkdir(parents=True)
+        segment = cache / 'segment.m4s'
+        segment.write_bytes(b'existing cached segment')
+        operation = StorageOperation(id=str(uuid.uuid4()), kind='cleanup', payload=json.dumps({'plan': {'candidates': [{'kind': 'unused_cache'}]}, 'revision': 0, 'target_generation': target_generation()}))
+        async with AsyncSession(self.engine, expire_on_commit=False) as db:
+            db.add(operation)
+            await db.commit()
+        await self.worker.tick()
+        async with AsyncSession(self.engine, expire_on_commit=False) as db:
+            observed = await db.get(StorageOperation, operation.id)
+            self.assertEqual(observed.status, 'blocked')
+            self.assertEqual(observed.released_bytes, 0)
+            self.assertEqual(observed.error_code, 'storage_cleanup_plan_expired')
+        self.assertEqual(segment.read_bytes(), b'existing cached segment')
+
+    async def test_direct_release_guards_misclassified_subtitle(self):
+        row, asset, video = await self.movie()
+        subtitle = video.parent / 'subtitle_en.vtt'
+        subtitle.write_bytes(b'WEBVTT\nretained')
+        asset.catalog_path = row.video_url.rsplit('/', 1)[0] + '/subtitle_en.vtt'
+        asset.kind = 'video'
+        operation = StorageOperation(id=str(uuid.uuid4()), kind='cleanup')
+        with patch.object(self.worker, '_verify_remote', AsyncMock()) as verify:
+            with self.assertRaises(StorageError) as raised:
+                await self.worker._verified_release(operation, asset, 0)
+            self.assertEqual(raised.exception.code, 'storage_retained_data_protected')
+            verify.assert_not_awaited()
+        self.assertEqual(subtitle.read_bytes(), b'WEBVTT\nretained')
+
+    async def test_retained_hardlink_is_counted_once_and_not_releasable_floor(self):
+        row, asset, video = await self.movie(content=b'v' * 37)
+        cache = self.temporary / 'playback_cache' / 'legacy'
+        cache.mkdir(parents=True)
+        os.link(video, cache / 'original.mp4')
+        subtitle = video.parent / 'subtitle_en.vtt'
+        subtitle.write_bytes(b'WEBVTT\nkeep')
+        with patch('services.storage_inventory.managed_roots', return_value=[('media', self.media), ('temporary', self.temporary)]):
+            sample = scan_managed()
+        self.assertGreaterEqual(sample['retained_bytes'], video.stat().st_size + subtitle.stat().st_size)
+        self.assertEqual(sample['written_bytes'], video.stat().st_size + subtitle.stat().st_size)
+        with patch('lifecycle.storage_worker.direct_recovery_proven', return_value=True):
+            floor = await self.worker.protected_floor(sample)
+        self.assertEqual(floor, sample['written_bytes'])
+        with patch.object(self.worker, '_verify_remote', AsyncMock()) as verify:
+            with self.assertRaises(StorageError) as raised:
+                await self.worker._verified_release(StorageOperation(id=str(uuid.uuid4()), kind='cleanup'), asset, 0)
+            self.assertEqual(raised.exception.code, 'storage_retained_data_protected')
+            verify.assert_not_awaited()
+        self.assertTrue(video.is_file())
+
+    async def test_full_budget_blocks_writer_without_evicting_retained_data(self):
+        cache = self.temporary / 'playback_cache'
+        cache.mkdir()
+        segment = cache / 'segment.m4s'
+        segment.write_bytes(b'v' * 100)
+        sample = scan_managed()
+        settings.STORAGE_POLICY = {'revision': 1, 'offload_enabled': False, 'local_budget_bytes': sample['written_bytes'], 'cloud_budget_bytes': None}
+        from services.storage_capacity import StorageCapacityError
+        with self.assertRaises(StorageCapacityError) as raised:
+            await self.capacity.reserve('new-work', 1, self.temporary / 'new-output')
+        self.assertEqual(raised.exception.code, 'storage_local_budget_exceeded')
+        self.assertEqual(segment.read_bytes(), b'v' * 100)
 
 
 if __name__ == '__main__':

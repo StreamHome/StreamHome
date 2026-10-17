@@ -97,7 +97,7 @@ class CloudPublicationRegression(unittest.IsolatedAsyncioTestCase):
                 movie.source_fingerprint = "accepted-fingerprint"
                 await mutation.commit(db)
         self.assertEqual((self.target / "film.mp4").read_bytes(), b"candidate-new-cloud-video")
-        self.assertFalse((self.target / "subtitle_en.vtt").exists())
+        self.assertEqual((self.target / "subtitle_en.vtt").read_bytes(), b"WEBVTT\nOriginal subtitle")
         self.assertEqual(json.loads((self.target / ".metadata/metadata.json").read_text())["sentinel"], "accepted-new")
         self.assertEqual(list((Path(settings.TEMP_DIR) / "media-operations").glob("*/operation.json")), [])
         self.assertFalse(any(key.startswith("rclone:") for key in ACTIVE_PROCESSES))
@@ -119,7 +119,7 @@ class CloudPublicationRegression(unittest.IsolatedAsyncioTestCase):
 
         async def run(*arguments, **kwargs):
             result = await real_run(*arguments, **kwargs)
-            if arguments[0] == "sync" and ".streamhome-ingestion/" in arguments[1]:
+            if arguments[0] == "copy" and ".streamhome-ingestion/" in arguments[1] and "--files-from-raw" in arguments:
                 entered.set()
                 await asyncio.Event().wait()
             return result
@@ -143,7 +143,7 @@ class CloudPublicationRegression(unittest.IsolatedAsyncioTestCase):
 
         async def run(*arguments, **kwargs):
             result = await real_run(*arguments, **kwargs)
-            if arguments[0] == "sync" and ".streamhome-ingestion/" in arguments[1]:
+            if arguments[0] == "copy" and ".streamhome-ingestion/" in arguments[1] and "--files-from-raw" in arguments:
                 (self.target / "film.mp4").write_bytes(b"partial-publication")
                 return RcloneResult(1, error_code="rclone_failed")
             return result
@@ -157,7 +157,7 @@ class CloudPublicationRegression(unittest.IsolatedAsyncioTestCase):
         real_run = rclone_service.run
 
         async def run(*arguments, **kwargs):
-            if arguments[0] == "sync" and ".streamhome-replacement-backups/" in arguments[1]:
+            if arguments[0] == "copy" and ".streamhome-replacement-backups/" in arguments[1]:
                 return RcloneResult(1, error_code="rclone_failed")
             return await real_run(*arguments, **kwargs)
 

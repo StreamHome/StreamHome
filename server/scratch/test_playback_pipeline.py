@@ -1049,8 +1049,8 @@ class PlaybackPipelineRegression(unittest.TestCase):
             interrupted_file = service.cache_dir / "orphan.tmp"
             interrupted_file.write_bytes(b"partial")
             service.recover_interrupted_outputs()
-            self.assertFalse(interrupted_dir.exists())
-            self.assertFalse(interrupted_file.exists())
+            self.assertEqual((interrupted_dir / "partial.m4s").read_bytes(), b"partial")
+            self.assertEqual(interrupted_file.read_bytes(), b"partial")
 
             old_limit = settings.PLAYBACK_CACHE_GB
             try:
@@ -1064,8 +1064,8 @@ class PlaybackPipelineRegression(unittest.TestCase):
                 os.utime(oldest, (1, 1))
                 os.utime(newest, (2, 2))
                 service.enforce_lru_limits({str(root.resolve()) for root in service.cache_dir.glob("*/*") if root.is_dir()})
-                self.assertFalse(oldest.exists())
-                self.assertTrue(newest.exists())
+                self.assertEqual((oldest / "segment.m4s").read_bytes(), b"o" * 24)
+                self.assertEqual((newest / "segment.m4s").read_bytes(), b"n" * 24)
             finally:
                 settings.PLAYBACK_CACHE_GB = old_limit
 

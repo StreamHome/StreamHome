@@ -290,7 +290,7 @@ class HybridPlaybackTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((await db.exec(select(StorageReservation).where(StorageReservation.state == "active"))).all())
         self.assertFalse(list(self.temp.glob("media-operations/*/operation.json")))
 
-    async def test_long_paused_open_run_protects_cache_beyond_short_lease(self):
+    async def test_cache_is_retained_after_open_run_and_short_lease_end(self):
         with patch.object(settings, "PLAYBACK_CACHE_GB", 1 / 1024**3):
             protected = self.service.cache_path("m_hybrid", "abcd")
             obsolete = self.service.cache_path("m_other", "beef")
@@ -301,10 +301,11 @@ class HybridPlaybackTests(unittest.IsolatedAsyncioTestCase):
             self.service._active_cache_leases[str(protected)] = time.monotonic() - 600
             self.service.enforce_lru_limits({str(protected), str(obsolete)})
             self.assertTrue(protected.is_dir())
-            self.assertFalse(obsolete.exists())
+            self.assertEqual((obsolete / "segment.m4s").read_bytes(), b"segment" * 100)
             self.service.release_run("open-paused-run")
             self.service.enforce_lru_limits({str(protected), str(obsolete)})
-            self.assertFalse(protected.exists())
+            self.assertEqual((protected / "segment.m4s").read_bytes(), b"segment" * 100)
+            self.assertEqual((obsolete / "segment.m4s").read_bytes(), b"segment" * 100)
 
     async def test_cold_cache_budget_failure_is_terminal_until_explicit_retry(self):
         self.video.write_bytes(b"accepted-local-video")

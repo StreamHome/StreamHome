@@ -43,6 +43,7 @@ from services.audio_extractor import (apply_primary_audio_language, extract_audi
     audio_languages, primary_embedded_audio_index, retained_primary_audio_language)
 from lifecycle.media_work import MediaRecoveryRequired, media_ownership, settle
 from lifecycle.media_publication import MediaMutation
+from lifecycle.storage_retention import is_protected_path, retain_existing_tree
 from lifecycle.coordination import (
     AdmissionClosedError,
     EffectClass,
@@ -211,7 +212,16 @@ def _recovery_metadata_files(root: str, files: List[str]) -> List[str]:
 def _recovery_metadata_inventory(media_dir: str, accepted_sources: Optional[Dict[tuple, str]] = None,
     *, ambiguous_sources: Optional[Dict[tuple, set[str]]] = None) -> List[tuple[str, List[str]]]:
     """Select canonicals before any alias can author reconstructed DB state."""
-    inventory = [(root, files) for root, _, files in os.walk(media_dir) if os.path.basename(root) == ".metadata"]
+    inventory = []
+    for root, directories, files in os.walk(media_dir):
+        # Retention is physical preservation, never catalog acceptance. Retired
+        # portable metadata must not resurrect an obsolete/rejected generation.
+        directories[:] = [name for name in directories
+            if ".retained-" not in name
+            and name not in {".streamhome-ingestion", ".streamhome-replacement-backups", ".streamhome-retained"}
+            and not re.fullmatch(r"\..+\.[0-9a-f]{32}\.(?:candidate|previous)", name)]
+        if os.path.basename(root) == ".metadata":
+            inventory.append((root, files))
     accepted_sources = accepted_sources or {}
     canonicals = {}
     source_owners = {}
@@ -664,6 +674,24 @@ class DownloadQueueManager:
         return size
 
     @staticmethod
+    def _retain_staging_sidecars(root: Path) -> None:
+        """Discard only this job's plain source copies, retaining sidecars/cache.
+
+        The caller owns this exact task workspace and has settled publication
+        and all writers. Existing/ambiguous generations never reach this path.
+        """
+        paths = list(root.rglob("*"))
+        if root.is_symlink() or any(path.is_symlink() for path in paths):
+            raise ValueError("Ambiguous ingestion workspace must be retained")
+        for path in paths:
+            if path.is_file() and not is_protected_path(path.relative_to(root)):
+                path.unlink()
+        if any(path.is_file() for path in root.rglob("*")):
+            retain_existing_tree(root)
+        else:
+            shutil.rmtree(root)
+
+    @staticmethod
     def _assert_directory_within(path: str, root: str, label: str) -> Path:
         candidate = Path(path).resolve()
         expected_root = Path(root).resolve()
@@ -717,6 +745,11 @@ class DownloadQueueManager:
                     from services.state import remove_task_metrics
                     remove_task_metrics(task_id)
                     return
+
+                # A retry is a new writer. It cannot reuse or clean up an older
+                # workspace whose completed cache/sidecar ownership is unknown.
+                if staging_task_root.exists():
+                    await run_cancellation_safe_thread(retain_existing_tree, staging_task_root)
                 
                 tmdb_id = task.tmdb_id
                 media_type = task.media_type
@@ -1130,8 +1163,8 @@ class DownloadQueueManager:
                     f"[Queue Manager] Vibe analysis scheduling failed for {analysis_id}: "
                     f"{type(analysis_error).__name__}"
                 )
-            if uploaded_to_cloud and os.path.exists(local_dir):
-                shutil.rmtree(local_dir)
+            # The settled workspace cleanup below keeps local subtitles,
+            # artwork and caches even when the accepted source lives on Drive.
                     
         except IngestionTaskError as err:
             logger.error(f"[Queue Manager] Task {task_id} failed: {err.failure.display}")
@@ -1165,7 +1198,7 @@ class DownloadQueueManager:
             if recovery_pending:
                 created_artifacts.clear()
             for artifact in created_artifacts:
-                if os.path.exists(artifact):
+                if os.path.exists(artifact) and not is_protected_path(artifact):
                     try:
                         os.remove(artifact)
                     except OSError:
@@ -1174,7 +1207,7 @@ class DownloadQueueManager:
                 self._remove_empty_parents(os.path.dirname(output_abs_path))
             if staging_task_root.exists() and not recovery_pending:
                 try:
-                    await run_cancellation_safe_thread(shutil.rmtree, staging_task_root)
+                    await run_cancellation_safe_thread(self._retain_staging_sidecars, staging_task_root)
                 except OSError as staging_cleanup_error:
                     logger.warning(
                         f"[Queue Manager] Could not remove staging directory for task {task_id}: "
@@ -1888,12 +1921,31 @@ class DownloadQueueManager:
 
             cloud_inventory: Optional[set[str]] = None
             if cloud_read_enabled() and rclone_service.executable():
+                retained_exclusions = (
+                    "--exclude", "/.streamhome-ingestion/**",
+                    "--exclude", "/.streamhome-replacement-backups/**",
+                    "--exclude", "/.streamhome-retained/**",
+                    "--exclude", "**/*.retained-*/**",
+                    "--exclude", "**/.*.candidate/**",
+                    "--exclude", "**/.*.previous/**",
+                )
                 metadata_sync = await rclone_service.run(
                     "copy",
                     settings.RCLONE_REMOTE_PATH,
                     media_dir,
+                    *retained_exclusions,
                     "--include",
                     "**/.metadata/*.json",
+                    timeout=30 * 60,
+                )
+                # Cached local artwork survives provider refresh. Canonical
+                # portable catalog documents above retain their separate writer.
+                artwork_sync = await rclone_service.run(
+                    "copy",
+                    settings.RCLONE_REMOTE_PATH,
+                    media_dir,
+                    *retained_exclusions,
+                    "--ignore-existing",
                     "--include",
                     "**/poster.jpg",
                     "--include",
@@ -1907,6 +1959,9 @@ class DownloadQueueManager:
                         f"[Queue Manager Recovery] Cloud metadata sync failed: "
                         f"{metadata_sync.error_code or 'rclone_failed'}"
                     )
+                if not artwork_sync.ok:
+                    logger.warning("[Queue Manager Recovery] Cloud artwork copy failed: %s",
+                        artwork_sync.error_code or "rclone_failed")
                 inventory_result = await rclone_service.run(
                     "lsf",
                     settings.RCLONE_REMOTE_PATH,
