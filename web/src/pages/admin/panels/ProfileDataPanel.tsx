@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { formatStorageBytes } from "../../../utils/format";
 import { useLocation, useNavigate } from "react-router-dom";
 import { appUrl, parseAppQuery, type AdminDataCategory } from "../../../navigation/queryState";
 import { getAdminProfileData } from "../../../api/adminProfiles";
@@ -212,7 +213,7 @@ function Cache({ data }: { data: AdminProfileData }) {
       <Metric label="Linked to profile" value={String(cache.total)} detail="Through recommendations or activity" />
       <Metric label="Shared TMDB cache" value={String(cache.sharedCacheTotal)} detail="Server-wide metadata records" />
       <Metric label="Unreferenced here" value={String(cache.unreferencedSharedTotal)} detail="May be used by other profiles" />
-      <Metric label="Disk footprint" value={formatBytes(cache.items.reduce((total, item) => total + item.files.totalSizeBytes, 0))} detail="Linked artwork and metadata shown here" />
+      <Metric label="Disk footprint" value={formatStorageBytes(cache.items.reduce((total, item) => total + item.files.totalSizeBytes, 0))} detail="Linked artwork and metadata shown here" />
     </div>
     <GlassPane className="profile-data-card profile-data-cache-note" spotlight={false}>
       <header><p>SHARED OWNERSHIP</p><h2>Shared catalog artwork and metadata</h2><span>Other profiles can use these records too. Removing a profile keeps this shared artwork and metadata. This view shows why each title is linked to the selected profile.</span></header>
@@ -225,7 +226,7 @@ function Cache({ data }: { data: AdminProfileData }) {
         <td>{item.files.poster.storedOnDisk ? "On disk" : "Remote or missing"}</td>
         <td>{item.files.backdrop.storedOnDisk ? "On disk" : "Remote or missing"}</td>
         <td>{item.files.metadata.storedOnDisk ? "On disk" : "Missing"}</td>
-        <td>{formatBytes(item.files.totalSizeBytes)}</td>
+        <td>{formatStorageBytes(item.files.totalSizeBytes)}</td>
       </tr>)}
     </DataTable>
     {!cache.items.length && <Empty label="No shared TMDB cache entries are currently associated with this profile." />}
@@ -295,13 +296,6 @@ function formatDuration(seconds: number) {
   if (hours) return `${hours}h ${minutes}m`;
   if (minutes) return `${minutes}m`;
   return `${value}s`;
-}
-
-function formatBytes(bytes: number) {
-  if (!bytes) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-  return `${(bytes / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
 }
 
 function percent(value: number) {

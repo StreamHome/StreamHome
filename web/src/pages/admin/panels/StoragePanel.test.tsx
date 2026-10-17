@@ -11,9 +11,9 @@ vi.mock("../../../api/storage", async original => ({ ...await original<typeof im
 vi.mock("../../../api/system", () => ({ getSettings: vi.fn(), testGoogleDrive: vi.fn() }));
 vi.mock("./DriveSetupCard", () => ({ DriveSetupCard: ({ onSettingsRefresh }: { onSettingsRefresh: () => void }) => <section aria-label="Existing Drive setup"><button onClick={onSettingsRefresh}>Test connection</button></section> }));
 vi.mock("../SudoModal", () => ({ SudoModal: ({ isOpen, onSuccess }: { isOpen: boolean; onSuccess: () => void }) => isOpen ? <button onClick={onSuccess}>Authorize action</button> : null }));
-const status: StorageStatus = { policy: { revision: 3, localBudgetBytes: 80e9, cloudBudgetBytes: 1e12, offloadEnabled: false, prefetchNextEpisode: false, hevcCompressionMode: "auto", diskReserveBytes: 8e9 }, local: { writtenBytes: 40e9, reservedBytes: 2e9, protectedBytes: 10e9, freeBytes: 140e9, diskReserveBytes: 8e9, categories: [{ key: "media", label: "Video and audio", bytes: 40e9 }], measuredAt: "2026-10-17T00:00:00Z", stale: false, errorCode: null }, cloud: { configured: true, reachable: true, healthState: "healthy", folderName: "Selected folder", usedBytes: 100e9, accountTotalBytes: 2e12, accountFreeBytes: 1.4e12, measuredAt: "2026-10-17T00:00:00Z", stale: false, errorCode: null }, offload: { state: "paused", reason: null }, capabilities: { offload: true, keepLocal: true, cleanup: true }, operation: null };
+const status: StorageStatus = { policy: { revision: 3, localBudgetBytes: (80 * 1024 ** 3), cloudBudgetBytes: (1 * 1024 ** 4), offloadEnabled: false, prefetchNextEpisode: false, hevcCompressionMode: "auto", diskReserveBytes: (8 * 1024 ** 3) }, local: { writtenBytes: (40 * 1024 ** 3), reservedBytes: (2 * 1024 ** 3), protectedBytes: (10 * 1024 ** 3), freeBytes: (140 * 1024 ** 3), diskReserveBytes: (8 * 1024 ** 3), categories: [{ key: "media", label: "Video and audio", bytes: (40 * 1024 ** 3) }], measuredAt: "2026-10-17T00:00:00Z", stale: false, errorCode: null }, cloud: { configured: true, reachable: true, healthState: "healthy", folderName: "Selected folder", usedBytes: (100 * 1024 ** 3), accountTotalBytes: (2 * 1024 ** 4), accountFreeBytes: (1.4 * 1024 ** 4), measuredAt: "2026-10-17T00:00:00Z", stale: false, errorCode: null }, offload: { state: "paused", reason: null }, capabilities: { offload: true, keepLocal: true, cleanup: true }, operation: null };
 const operation: StorageOperation = { id: "receipt", kind: "policy", status: "completed", phase: "saved", createdAt: "2026-10-17T00:00:00Z", updatedAt: "2026-10-17T00:00:00Z", mediaId: null, title: null, bytesTotal: null, bytesDone: null, releasedBytes: 0, errorCode: null, message: null };
-const reviewFor = (draft: api.StoragePolicyDraft): StorageReview => Object.freeze({ reviewId: "exact-review", policyRevision: 3, expiresAt: "2099-01-01T00:00:00Z", draft: Object.freeze({ ...draft }), changes: [{ field: "local_budget_bytes", before: 80e9, after: draft.localBudgetBytes }], effects: ["No files are released by saving this policy."] });
+const reviewFor = (draft: api.StoragePolicyDraft): StorageReview => Object.freeze({ reviewId: "exact-review", policyRevision: 3, expiresAt: "2099-01-01T00:00:00Z", draft: Object.freeze({ ...draft }), changes: [{ field: "local_budget_bytes", before: (80 * 1024 ** 3), after: draft.localBudgetBytes }], effects: ["No files are released by saving this policy."] });
 function Visit() { const [shown, setShown] = useState(true); const [draft, setDraft] = useState<StorageDraft>(); return <><button onClick={() => setShown(!shown)}>Change section</button><div hidden={!shown}><StoragePanel active={shown} retainedDraft={draft} onDraftChange={setDraft} /></div></>; }
 async function editBudget(value = "90") {
   if (!screen.queryByRole("spinbutton", { name: "Total local budget" })) fireEvent.click(await screen.findByRole("link", { name: "Policy" }));
@@ -24,15 +24,15 @@ const flush = async () => { await act(async () => { for (let i = 0; i < 15; i++)
 const advance = async (ms: number) => { await act(async () => { vi.advanceTimersByTime(ms); for (let i = 0; i < 15; i++) await Promise.resolve(); }); };
 const visibility = (state: "visible" | "hidden") => { Object.defineProperty(document, "visibilityState", { configurable: true, value: state }); fireEvent(document, new Event("visibilitychange")); };
 afterEach(() => { vi.useRealTimers(); Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" }); });
-beforeEach(() => { vi.clearAllMocks(); vi.mocked(api.getStorageStatus).mockResolvedValue(structuredClone(status)); vi.mocked(getSettings).mockResolvedValue({ storageEngine: "LOCAL", hevcCompressionMode: "auto", driveConfigured: true, driveReachable: true, rcloneRemotePath: "fixture:" }); vi.mocked(api.getStorageRetention).mockResolvedValue({ items: [], nextCursor: null }); vi.mocked(api.getStorageActivity).mockResolvedValue({ items: [], nextCursor: null }); vi.mocked(api.previewStoragePolicy).mockImplementation(async d => reviewFor(d)); vi.mocked(api.saveStoragePolicy).mockResolvedValue({ policy: { ...status.policy, localBudgetBytes: 90e9, revision: 4 }, operation }); });
+beforeEach(() => { vi.clearAllMocks(); vi.mocked(api.getStorageStatus).mockResolvedValue(structuredClone(status)); vi.mocked(getSettings).mockResolvedValue({ storageEngine: "LOCAL", hevcCompressionMode: "auto", driveConfigured: true, driveReachable: true, rcloneRemotePath: "fixture:" }); vi.mocked(api.getStorageRetention).mockResolvedValue({ items: [], nextCursor: null }); vi.mocked(api.getStorageActivity).mockResolvedValue({ items: [], nextCursor: null }); vi.mocked(api.previewStoragePolicy).mockImplementation(async d => reviewFor(d)); vi.mocked(api.saveStoragePolicy).mockResolvedValue({ policy: { ...status.policy, localBudgetBytes: (90 * 1024 ** 3), revision: 4 }, operation }); });
 
 describe("storage workspace", () => {
   it("shows measured totals, read-only summaries and direct Policy links", async () => {
     render(<StoragePanel />);
     const local = await screen.findByRole("region", { name: "Local storage" });
-    expect(within(local).getByText("42 GB")).toBeTruthy();
-    expect(within(local).getByText("140 GB")).toBeTruthy();
-    expect(within(local).getByRole("list", { name: "Usage distribution legend" }).textContent).toContain("Reserved · 2 GB");
+    expect(within(local).getByText("42 GiB")).toBeTruthy();
+    expect(within(local).getByText("140 GiB")).toBeTruthy();
+    expect(within(local).getByRole("list", { name: "Usage distribution legend" }).textContent).toContain("Reserved · 2 GiB");
     expect(screen.queryByRole("spinbutton")).toBeNull();
     expect(screen.queryByRole("switch")).toBeNull();
     for (const name of ["Refresh usage", "Check connection", "Check status", "Refresh activity", "Discard changes", "Review changes"]) expect(screen.queryByRole("button", { name })).toBeNull();
@@ -44,6 +44,31 @@ describe("storage workspace", () => {
     expect(screen.getByRole("combobox", { name: "HEVC compression" })).toBeTruthy();
     await flush();
   });
+  it("shows the provider's exact 2 TiB quota and binary budget options", async () => {
+    render(<StoragePanel />);
+    const cloud = await screen.findByRole("region", { name: "Google Drive storage" });
+    expect(within(cloud).getByText("2 TiB")).toBeTruthy();
+    fireEvent.click(screen.getByRole("link", { name: "Policy" }));
+    expect(screen.getByRole("combobox", { name: "Total local budget unit" }).textContent).toContain("GiB");
+    expect(screen.getByRole("combobox", { name: "Total cloud budget unit" }).textContent).toContain("TiB");
+    fireEvent.click(screen.getByRole("combobox", { name: "Total local budget unit" }));
+    fireEvent.click(screen.getByRole("option", { name: "TiB" }));
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Total local budget" }), { target: { value: "0.5" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review changes" }));
+    await waitFor(() => expect(api.previewStoragePolicy).toHaveBeenCalledWith(expect.objectContaining({ localBudgetBytes: 512 * 1024 ** 3, cloudBudgetBytes: 1024 ** 4 }), 3));
+    expect(screen.getByRole("region", { name: "Review storage changes" }).textContent).toContain("512 GiB");
+  });
+  it.each([80e9, 1024 ** 4, Number.MAX_SAFE_INTEGER])("preserves a saved byte budget (%s) through an unrelated policy edit", async saved => {
+    vi.mocked(api.getStorageStatus).mockResolvedValue({ ...status, policy: { ...status.policy, localBudgetBytes: saved, cloudBudgetBytes: 1e12 } });
+    render(<StoragePanel view="policy" />);
+    const input = await screen.findByRole("spinbutton", { name: "Total local budget" });
+    const multiplier = saved === 1024 ** 4 ? 1024 ** 4 : 1024 ** 3;
+    expect(Number((input as HTMLInputElement).value) * multiplier).toBe(saved);
+    expect(screen.queryByRole("button", { name: "Review changes" })).toBeNull();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Prepare the next episode/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Review changes" }));
+    await waitFor(() => expect(api.previewStoragePolicy).toHaveBeenCalledWith(expect.objectContaining({ localBudgetBytes: saved, cloudBudgetBytes: 1e12, prefetchNextEpisode: true }), 3));
+  });
   it("retains an immutable review through section visits without saving it", async () => {
     render(<Visit />); await openReview();
     fireEvent.click(screen.getByRole("button", { name: "Change section" }));
@@ -51,7 +76,7 @@ describe("storage workspace", () => {
     expect((screen.getByRole("spinbutton", { name: "Total local budget" }) as HTMLInputElement).value).toBe("90");
     expect(api.saveStoragePolicy).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
-    await waitFor(() => expect(api.saveStoragePolicy).toHaveBeenCalledWith(expect.objectContaining({ reviewId: "exact-review", policyRevision: 3, draft: expect.objectContaining({ localBudgetBytes: 90e9 }) }), expect.any(String)));
+    await waitFor(() => expect(api.saveStoragePolicy).toHaveBeenCalledWith(expect.objectContaining({ reviewId: "exact-review", policyRevision: 3, draft: expect.objectContaining({ localBudgetBytes: (90 * 1024 ** 3) }) }), expect.any(String)));
   });
   it("validates budgets and invalidates reviews on editing", async () => {
     render(<StoragePanel />); await openReview(); await editBudget("1");
@@ -59,7 +84,7 @@ describe("storage workspace", () => {
     const input = screen.getByRole("spinbutton", { name: "Total local budget" });
     expect(input.getAttribute("aria-invalid")).toBe("true");
     expect(input.getAttribute("aria-describedby")).toContain("storage-local-error");
-    expect(screen.getByText("Protected data needs at least 10 GB.")).toBeTruthy();
+    expect(screen.getByText("Protected data needs at least 10 GiB.")).toBeTruthy();
     expect((screen.getByRole("button", { name: "Review changes" }) as HTMLButtonElement).disabled).toBe(true);
     await editBudget("90");
     fireEvent.click(screen.getByRole("switch", { name: "Automatic offloading" }));
@@ -81,7 +106,7 @@ describe("storage workspace", () => {
     vi.mocked(api.getStorageStatus).mockResolvedValue({ ...status, local: { ...status.local, refresh: { state: "running", phase: "scanning_local", lastAttemptAt: "2026-10-17T00:00:00Z", lastSuccessAt: status.local.measuredAt, nextAttemptAt: null, errorCode: null } } });
     render(<StoragePanel />); await flush();
     expect(screen.getByText("Measuring local usage…")).toBeTruthy();
-    expect(screen.getByText("42 GB")).toBeTruthy();
+    expect(screen.getByText("42 GiB")).toBeTruthy();
     await advance(3000); expect(api.getStorageStatus).toHaveBeenCalledTimes(2);
     expect(api.refreshStorage).not.toHaveBeenCalled();
   });
@@ -94,8 +119,8 @@ describe("storage workspace", () => {
     visibility("hidden"); expect(signal.aborted).toBe(true);
     await advance(30000); expect(api.getStorageStatus).toHaveBeenCalledTimes(1);
     visibility("visible"); await flush(); expect(api.getStorageStatus).toHaveBeenCalledTimes(2);
-    await act(async () => finish({ ...status, local: { ...status.local, writtenBytes: 999e9 } }));
-    expect(within(screen.getByRole("region", { name: "Local storage" })).getByText("42 GB")).toBeTruthy();
+    await act(async () => finish({ ...status, local: { ...status.local, writtenBytes: (999 * 1024 ** 3) } }));
+    expect(within(screen.getByRole("region", { name: "Local storage" })).getByText("42 GiB")).toBeTruthy();
     fireEvent(window, new Event("focus")); await flush(); expect(api.getStorageStatus).toHaveBeenCalledTimes(3);
     const lastSignal = vi.mocked(api.getStorageStatus).mock.calls[2][0]!.signal!;
     mounted.unmount(); expect(lastSignal.aborted).toBe(false);
@@ -131,7 +156,7 @@ describe("storage workspace", () => {
   });
   it("refreshes server status without overwriting dirty drafts or exact reviews", async () => {
     render(<StoragePanel />); await openReview();
-    vi.mocked(api.getStorageStatus).mockResolvedValue({ ...status, local: { ...status.local, writtenBytes: 50e9 } });
+    vi.mocked(api.getStorageStatus).mockResolvedValue({ ...status, local: { ...status.local, writtenBytes: (50 * 1024 ** 3) } });
     fireEvent(window, new Event("focus")); await flush();
     expect((screen.getByRole("spinbutton", { name: "Total local budget" }) as HTMLInputElement).value).toBe("90");
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
@@ -161,7 +186,7 @@ describe("storage workspace", () => {
     expect(screen.queryByText("Loading storage…")).toBeNull();
     expect(screen.queryByText("Operation awaiting confirmation")).toBeNull();
     expect(screen.getByText(/Policy accepted. Waiting for the saved settings/)).toBeTruthy();
-    vi.mocked(api.getStorageStatus).mockResolvedValue({ ...status, policy: { ...status.policy, revision: 4, localBudgetBytes: 90e9 } });
+    vi.mocked(api.getStorageStatus).mockResolvedValue({ ...status, policy: { ...status.policy, revision: 4, localBudgetBytes: (90 * 1024 ** 3) } });
     await advance(3000);
     expect((screen.getByRole("spinbutton", { name: "Total local budget" }) as HTMLInputElement).disabled).toBe(false);
     expect(api.saveStoragePolicy).toHaveBeenCalledTimes(1);
@@ -184,7 +209,7 @@ describe("storage workspace", () => {
     expect(screen.getByText("Operation awaiting confirmation")).toBeTruthy();
   });
   it("distinguishes accepted background work from uncertainty and allows policy editing", async () => {
-    const item: api.RetentionItem = { id: "one", mediaId: "tv_8", title: "Actual title", kind: "episode", localState: "cloud", bytes: 4e9, kept: false, offlineReady: false, protectedReason: null, operationId: null };
+    const item: api.RetentionItem = { id: "one", mediaId: "tv_8", title: "Actual title", kind: "episode", localState: "cloud", bytes: (4 * 1024 ** 3), kept: false, offlineReady: false, protectedReason: null, operationId: null };
     vi.mocked(api.getStorageRetention).mockResolvedValue({ items: [item], nextCursor: null });
     vi.mocked(api.getStorageOperation).mockResolvedValue({ ...operation, status: "queued" });
     vi.mocked(api.setStorageKeep).mockResolvedValue({ item: { ...item, kept: true, localState: "preparing" }, operation: { ...operation, status: "queued" } });
@@ -235,7 +260,7 @@ describe("storage workspace", () => {
     expect(deeper.items).toHaveLength(3);
   });
   it("refreshes loaded older retention rows through accepted background completion", async () => {
-    const item: api.RetentionItem = { id: "old-item", mediaId: "tv_8", title: "Older episode", kind: "episode", localState: "cloud", bytes: 4e9, kept: false, offlineReady: false, protectedReason: null, operationId: null };
+    const item: api.RetentionItem = { id: "old-item", mediaId: "tv_8", title: "Older episode", kind: "episode", localState: "cloud", bytes: (4 * 1024 ** 3), kept: false, offlineReady: false, protectedReason: null, operationId: null };
     let ready = false;
     vi.mocked(api.getStorageRetention).mockImplementation(async cursor => cursor === "older" ? { items: [{ ...item, kept: ready, offlineReady: ready, localState: ready ? "both" : "cloud" }], nextCursor: null } : { items: [], nextCursor: "older" });
     vi.mocked(api.setStorageKeep).mockResolvedValue({ item: { ...item, kept: true, localState: "preparing" }, operation: { ...operation, status: "queued" } });
@@ -254,7 +279,7 @@ describe("storage workspace", () => {
     expect(within(local).getByText("Some managed files could not be read. Check the server's storage access permissions.")).toBeTruthy();
     expect(within(local).getByText("No successful measurement is available yet. Automatic checks continue.")).toBeTruthy();
     expect(within(local).queryByText(/Last successful values are retained/)).toBeNull();
-    expect(formatStorageBytes(335002)).toBe("335 KB");
+    expect(formatStorageBytes(335002)).toBe("327.2 KiB");
   });
   it("uses product labels for measurement activity rather than raw kind and phase values", async () => {
     vi.mocked(api.getStorageActivity).mockResolvedValue({ items: [{ ...operation, kind: "refresh", phase: "measured" }], nextCursor: null });
@@ -266,7 +291,7 @@ describe("storage workspace", () => {
   it("shows separate last-good measurement errors while preserving values", async () => {
     vi.mocked(api.getStorageStatus).mockResolvedValue({ ...status, local: { ...status.local, stale: true, errorCode: "local_measurement_failed" }, cloud: { ...status.cloud, stale: true, errorCode: "provider_unavailable" } });
     render(<StoragePanel />); await screen.findByRole("region", { name: "Local storage" });
-    expect(screen.getByText("42 GB")).toBeTruthy();
+    expect(screen.getByText("42 GiB")).toBeTruthy();
     expect(screen.getAllByText("Last successful values are retained. Automatic checks continue.")).toHaveLength(2);
     expect(screen.getByText("Local usage could not be measured.")).toBeTruthy();
     expect(screen.getByText("Google Drive could not be reached.")).toBeTruthy();

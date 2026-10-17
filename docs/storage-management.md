@@ -14,6 +14,10 @@ the top. The workspace has three views:
 | Policy | Total budgets, automatic offloading, placement rules, next-episode preparation and HEVC settings |
 | Activity | Accepted operations, progress, released bytes and blocked work |
 
+Capacity and file sizes use binary units: 1 KiB = 1024 bytes, 1 MiB = 1024 KiB,
+1 GiB = 1024 MiB and 1 TiB = 1024 GiB. Budget inputs use GiB or TiB. Previously
+saved budgets retain their exact byte values when displayed in these units.
+
 ## Set total budgets
 
 The local budget covers application-managed media, playback caches, temporary

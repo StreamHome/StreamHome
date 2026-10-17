@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { formatStorageBytes } from "../utils/format";
 import {
   activateDrive,
   cancelDriveJob,
@@ -41,11 +42,7 @@ function errorMessage(error: unknown) {
 
 function formatBytes(value?: number) {
   if (typeof value !== "number" || !Number.isFinite(value)) return "Unavailable";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let amount = value;
-  let index = 0;
-  while (amount >= 1024 && index < units.length - 1) { amount /= 1024; index += 1; }
-  return `${amount.toFixed(index > 1 ? 1 : 0)} ${units[index]}`;
+  return formatStorageBytes(value);
 }
 
 export function SetupPage() {

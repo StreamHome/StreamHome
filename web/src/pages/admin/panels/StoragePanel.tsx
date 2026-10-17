@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { formatStorageBytes } from "../../../utils/format";
 import * as storage from "../../../api/storage";
 import { ApiError } from "../../../api/client";
 import { getSettings } from "../../../api/system";
@@ -13,16 +14,16 @@ import { DriveSetupCard } from "./DriveSetupCard";
 import "./StorageWorkspace.css";
 import { useStorageAutoRead } from "./useStorageAutoRead";
 
-type Unit = "GB" | "TB";
+type Unit = "GiB" | "TiB";
 type Pending = { requestId: string; operationId?: string; kind: "policy" | "retention" | "cleanup" };
 export interface StorageDraft {
   localBudget: string; localUnit: Unit; cloudBudget: string; cloudUnit: Unit;
   offloadEnabled: boolean; prefetchNextEpisode: boolean; hevcCompressionMode: storage.StoragePolicyDraft["hevcCompressionMode"];
   revision: number; review?: storage.StorageReview; pending?: Pending;
 }
-const factor = (unit: Unit) => unit === "TB" ? 1e12 : 1e9;
-export const formatStorageBytes = (bytes: number | null) => bytes === null ? "Not measured" : bytes >= 1e12 ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(bytes / 1e12)} TB` : bytes >= 1e9 ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(bytes / 1e9)} GB` : bytes >= 1e6 ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(bytes / 1e6)} MB` : bytes >= 1e3 ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(bytes / 1e3)} KB` : `${new Intl.NumberFormat().format(bytes)} B`;
-const budgetInput = (bytes: number | null) => bytes === null ? { value: "", unit: "GB" as Unit } : bytes >= 1e12 && bytes % 1e12 === 0 ? { value: String(bytes / 1e12), unit: "TB" as Unit } : { value: String(bytes / 1e9), unit: "GB" as Unit };
+const factor = (unit: Unit) => unit === "TiB" ? 1024 ** 4 : 1024 ** 3;
+export { formatStorageBytes } from "../../../utils/format";
+const budgetInput = (bytes: number | null) => bytes === null ? { value: "", unit: "GiB" as Unit } : bytes >= 1024 ** 4 && bytes % (1024 ** 4) === 0 ? { value: String(bytes / 1024 ** 4), unit: "TiB" as Unit } : { value: String(bytes / 1024 ** 3), unit: "GiB" as Unit };
 const initialDraft = (p: storage.StoragePolicy): StorageDraft => { const l = budgetInput(p.localBudgetBytes), c = budgetInput(p.cloudBudgetBytes); return { localBudget: l.value, localUnit: l.unit, cloudBudget: c.value, cloudUnit: c.unit, offloadEnabled: p.offloadEnabled, prefetchNextEpisode: p.prefetchNextEpisode, hevcCompressionMode: p.hevcCompressionMode, revision: p.revision }; };
 const bytes = (value: string, unit: Unit) => value.trim() === "" ? null : Math.round(Number(value) * factor(unit));
 const policyDraft = (d: StorageDraft): storage.StoragePolicyDraft => ({ localBudgetBytes: bytes(d.localBudget, d.localUnit), cloudBudgetBytes: bytes(d.cloudBudget, d.cloudUnit), offloadEnabled: d.offloadEnabled, prefetchNextEpisode: d.prefetchNextEpisode, hevcCompressionMode: d.hevcCompressionMode });
@@ -432,16 +433,16 @@ export function StoragePanel({ retainedDraft, onDraftChange, view: controlledVie
     return <div className="ss-budgets">
       <label className="ss-label" htmlFor={`storage-${kind}-budget`}>{label}</label>
       <div className="ss-inputrow">
-        <input id={`storage-${kind}-budget`} type="number" inputMode="decimal" min="0.000000001" step="any"
+        <input id={`storage-${kind}-budget`} type="number" inputMode="decimal" min={1 / factor(local ? draft.localUnit : draft.cloudUnit)} step="any"
           value={local ? draft.localBudget : draft.cloudBudget} placeholder="Not set" disabled={blocked}
           aria-invalid={Boolean(validation[kind])} aria-describedby={`storage-${kind}-help storage-${kind}-error`}
           onChange={e => edit(local ? { localBudget: e.target.value } : { cloudBudget: e.target.value })} />
         <AdminSelect label={`${label} unit`} value={local ? draft.localUnit : draft.cloudUnit} disabled={blocked}
-          options={[{ value: "GB", label: "GB" }, { value: "TB", label: "TB" }]}
+          options={[{ value: "GiB", label: "GiB" }, { value: "TiB", label: "TiB" }]}
           onChange={value => edit(local ? { localUnit: value as Unit } : { cloudUnit: value as Unit })} />
       </div>
       <p className="ss-help" id={`storage-${kind}-help`}>
-        {local ? "Includes media, cache, temporary files and essential data." : "Applies to the selected folder, including existing files."} Leave unset to keep the current allocation unrestricted.
+        {local ? "Includes media, cache, temporary files and essential data." : "Applies to the selected folder, including existing files."} Leave unset to keep the current allocation unrestricted. Binary units: 1 GiB = 1024 MiB; 1 TiB = 1024 GiB.
       </p>
       <p id={`storage-${kind}-error`} className="ss-error" role={validation[kind] ? "alert" : undefined}>{validation[kind]}</p>
     </div>;

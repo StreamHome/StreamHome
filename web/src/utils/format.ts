@@ -12,12 +12,22 @@ export function formatDuration(seconds: number | string): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+/** Binary storage units; APIs and saved policies continue to use raw bytes. */
+export function formatStorageBytes(bytes: number | null | undefined, maximumFractionDigits?: number): string {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return "Not measured";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+  let amount = bytes;
+  let index = 0;
+  while (amount >= 1024 && index < units.length - 1) {
+    amount /= 1024;
+    index += 1;
+  }
+  const precision = maximumFractionDigits ?? (index >= 3 ? 2 : index > 0 ? 1 : 0);
+  return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: precision }).format(amount)} ${units[index]}`;
+}
+
 export function formatFileSize(bytes: number): string {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+  return formatStorageBytes(bytes, 1);
 }
 
 export function formatTimeAgo(isoString: string): string {
