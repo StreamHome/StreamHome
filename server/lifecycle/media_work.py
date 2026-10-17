@@ -59,6 +59,8 @@ async def media_ownership(*media_ids: str):
     finally:
         for lock in reversed(acquired):
             lock.release()
+        from lifecycle.storage_measurements import invalidate_storage_measurements
+        invalidate_storage_measurements()
 
 
 async def settle(awaitable: Awaitable[T]) -> tuple[T, bool]:

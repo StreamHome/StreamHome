@@ -84,11 +84,29 @@ def _remaining_from_sample(rows, measured: dict, *, scope: str = 'local', filesy
 class StorageCapacity:
     def __init__(self):
         self._locks = weakref.WeakKeyDictionary()
+        self._cloud_locks = weakref.WeakKeyDictionary()
 
     @property
     def lock(self):
         loop = asyncio.get_running_loop()
         return self._locks.setdefault(loop, asyncio.Lock())
+
+    @property
+    def cloud_lock(self):
+        # Cloud provider observations must serialize with cloud accounting, but
+        # must never occupy the local filesystem admission lock over network I/O.
+        loop = asyncio.get_running_loop()
+        return self._cloud_locks.setdefault(loop, asyncio.Lock())
+
+    def lock_for(self, scope: str):
+        return self.cloud_lock if scope == 'cloud' else self.lock
+
+    async def _reservation_scope(self, identifier: str) -> str:
+        # A reservation's scope is immutable. Discover it before entering the
+        # independent accounting lock, then re-read the row under that lock.
+        async with AsyncSession(database.engine, expire_on_commit=False) as db:
+            row = await db.get(StorageReservation, identifier)
+            return row.scope if row else 'local'
 
     async def _pressure(self, db, policy, owner, additional, filesystem, code, path):
         if not policy['offload_enabled']:
@@ -125,7 +143,7 @@ class StorageCapacity:
             raise StorageCapacityError('storage_invalid_reservation', status_code=422)
         if scope not in {'local', 'cloud'} or not owner or len(owner) > 128:
             raise StorageCapacityError('storage_invalid_reservation', status_code=422)
-        async with self.lock:
+        async with self.lock_for(scope):
             policy = policy_value(settings)
             if scope == 'local':
                 from services.storage_inventory import storage_inventory
@@ -140,7 +158,7 @@ class StorageCapacity:
                 async with AsyncSession(database.engine, expire_on_commit=False) as db:
                     row = await db.get(StorageMeasurement, 'cloud')
                     measured = json.loads(row.payload) if row else {}
-                if not row or time.time() - row.measured_at > 60 or measured.get('used_bytes') is None:
+                if not row or time.time() - row.measured_at > 60 or measured.get('used_bytes') is None or measured.get('capacity_valid') is False:
                     raise StorageCapacityError('storage_cloud_measurement_unknown')
                 if measured.get('target_generation') != filesystem:
                     raise StorageCapacityError('storage_target_changed')
@@ -186,7 +204,8 @@ class StorageCapacity:
                 return identifier
 
     async def progress(self, reservation_id: str, written_bytes: int) -> None:
-        async with self.lock:
+        scope = await self._reservation_scope(reservation_id)
+        async with self.lock_for(scope):
             async with AsyncSession(database.engine, expire_on_commit=False) as db:
                 row = await db.get(StorageReservation, reservation_id)
                 if row is None or row.state != 'active':
@@ -210,20 +229,27 @@ class StorageCapacity:
                 await db.commit()
 
     async def release(self, reservation_id: str) -> None:
-        async with self.lock:
+        scope = await self._reservation_scope(reservation_id)
+        async with self.lock_for(scope):
             async with AsyncSession(database.engine, expire_on_commit=False) as db:
                 row = await db.get(StorageReservation, reservation_id)
                 if row and row.state == 'active':
                     row.state, row.updated_at = 'released', time.time()
                     db.add(row)
                     await db.commit()
+        from lifecycle.storage_measurements import invalidate_storage_measurements
+        invalidate_storage_measurements(local=scope == 'local', cloud=scope == 'cloud')
 
     async def remaining(self, scope: str = 'local', *, observe: bool = True) -> int:
-        async with self.lock:
+        if not observe:
+            # An atomic DB read is enough for display. Never queue a GET behind
+            # admission scans or a provider timeout.
+            async with AsyncSession(database.engine, expire_on_commit=False) as db:
+                rows = (await db.exec(select(StorageReservation).where(StorageReservation.state == 'active', StorageReservation.scope == scope))).all()
+            return sum(max(0, row.peak_bytes - row.written_bytes) for row in rows)
+        async with self.lock_for(scope):
             async with AsyncSession(database.engine, expire_on_commit=False) as db:
                 rows = (await db.exec(select(StorageReservation).where(StorageReservation.state == 'active'))).all()
-            if not observe:
-                return sum(max(0, row.peak_bytes - row.written_bytes) for row in rows if row.scope == scope)
             if scope == 'local':
                 from services.storage_inventory import storage_inventory
                 measured = await storage_inventory.local_measurement(include_entries=True)

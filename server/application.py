@@ -399,7 +399,7 @@ async def _start_runtime_workers(runtime: _WorkerRuntime) -> None:
         from lifecycle.storage_worker import storage_worker
 
         await playback_prep_service.reconcile_run_protections()
-        await storage_worker.start()
+        await storage_worker.start(measurements=False)
         queue_manager.start()
         from services.tmdb import tmdb_client
 
@@ -563,6 +563,8 @@ async def _promote_committed_update(
             and current.generation == STARTUP_CONTEXT.generation
         ):
             get_runtime_coordinator().release_fence(completion_fence)
+            from lifecycle.storage_worker import storage_worker
+            await storage_worker.measurements.start()
             if state.MAINTENANCE_REASON == "StreamHome is completing guarded startup verification.":
                 state.MAINTENANCE_MODE = False
                 state.MAINTENANCE_REASON = ""
@@ -646,6 +648,8 @@ async def _promote_committed_restore(
             and current.generation == STARTUP_CONTEXT.generation
         ):
             get_runtime_coordinator().release_fence(completion_fence)
+            from lifecycle.storage_worker import storage_worker
+            await storage_worker.measurements.start()
             if state.MAINTENANCE_REASON == "StreamHome is completing guarded startup verification.":
                 state.MAINTENANCE_MODE = False
                 state.MAINTENANCE_REASON = ""
@@ -691,6 +695,8 @@ async def _complete_normal_startup(runtime: _WorkerRuntime) -> None:
         return
     STARTUP_READINESS.mark_workers_started()
     STARTUP_READINESS.mark_general_ready()
+    from lifecycle.storage_worker import storage_worker
+    await storage_worker.measurements.start()
     runtime.tasks.append(
         asyncio.create_task(_optional_playback_baselines(), name="playback-baselines")
     )

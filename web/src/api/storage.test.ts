@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "./client";
-import { getStorageStatus, normalizeStorageStatus, normalizeStorageReview, saveStoragePolicy, setStorageKeep, getStorageOperation } from "./storage";
+import { getStorageStatus, normalizeStorageStatus, normalizeStorageReview, saveStoragePolicy, setStorageKeep, getStorageOperation, getStorageActivity, getStorageRetention } from "./storage";
 const draft = { local_budget_bytes: 60e9, cloud_budget_bytes: 2e12, offload_enabled: false, prefetch_next_episode: false, hevc_compression_mode: "auto" };
 const policy = { ...draft, revision: 8, disk_reserve_bytes: 8e9 };
 const wire = { policy, local: { written_bytes: null, reserved_bytes: 0, protected_bytes: null, free_bytes: null, disk_reserve_bytes: 8e9, categories: [], measured_at: null, stale: true, error_code: "measurement_unavailable" }, cloud: { configured: true, reachable: null, health_state: "unknown", folder_name: "Folder", used_bytes: null, account_total_bytes: null, account_free_bytes: null, measured_at: null, stale: true, error_code: null }, offload: { state: "paused", reason: null }, capabilities: { offload: true, keep_local: true, cleanup: false }, operation: null };
@@ -12,6 +12,26 @@ afterEach(() => vi.unstubAllGlobals());
 describe("storage API normalization and review binding", () => {
   it("keeps unknown usage null and normalizes separate folder, disk and account measures", async () => {
     fetcher.mockResolvedValue(json(wire)); const result = await getStorageStatus(); expect(result.local.writtenBytes).toBeNull(); expect(result.local.reservedBytes).toBe(0); expect(result.cloud.usedBytes).toBeNull(); expect(result.cloud.accountFreeBytes).toBeNull(); expect(result.capabilities.cleanup).toBe(false); expect(fetcher.mock.calls[0][0]).toBe("/api/admin/storage/status");
+  });
+  it("normalizes optional refresh state without changing successful measurement timestamps", () => {
+    const refresh = { state: "error", phase: null, last_attempt_at: "2026-10-17T12:00:00Z", last_success_at: "2026-10-17T11:00:00Z", next_attempt_at: "2026-10-17T12:01:00Z", error_code: "measurement_unavailable" };
+    const result = normalizeStorageStatus({ ...wire, local: { ...wire.local, measured_at: refresh.last_success_at, refresh } });
+    expect(result.local.measuredAt).toBe(refresh.last_success_at);
+    expect(result.local.refresh).toEqual({ state: "error", phase: null, lastAttemptAt: refresh.last_attempt_at, lastSuccessAt: refresh.last_success_at, nextAttemptAt: refresh.next_attempt_at, errorCode: refresh.error_code });
+    expect(() => normalizeStorageStatus({ ...wire, local: { ...wire.local, refresh: { ...refresh, state: "success" } } })).toThrow(ApiError);
+  });
+  it("passes caller cancellation to every observation endpoint", async () => {
+    const controller = new AbortController();
+    fetcher.mockResolvedValueOnce(json(wire)).mockResolvedValueOnce(json({ operation })).mockResolvedValueOnce(json({ items: [], next_cursor: null })).mockResolvedValueOnce(json({ items: [], next_cursor: null }));
+    await getStorageStatus({ signal: controller.signal });
+    await getStorageOperation("original-id", { signal: controller.signal });
+    await getStorageRetention(undefined, { signal: controller.signal });
+    await getStorageActivity(undefined, { signal: controller.signal });
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(fetcher.mock.calls.every(call => call[1].method === "GET" && call[1].signal instanceof AbortSignal)).toBe(true);
+    controller.abort();
+    await expect(getStorageStatus({ signal: controller.signal })).rejects.toMatchObject({ code: "request_cancelled" });
+    expect(fetcher).toHaveBeenCalledTimes(4);
   });
   it.each(["written_bytes", "reserved_bytes", "free_bytes"])("rejects invalid %s instead of rendering false capacity", field => {
     expect(() => normalizeStorageStatus({ ...wire, local: { ...wire.local, [field]: -1 } })).toThrow(ApiError);

@@ -589,6 +589,8 @@ async def save_job(job_id: str, session: AuthSession = Depends(require_recent_re
         await _finish(db, job, status="saved", active_session_key=None, error_code=None,
                       progress="Google Drive connection saved. Storage mode is unchanged.")
     rclone_service.cleanup_job(job.id)
+    from lifecycle.storage_measurements import invalidate_storage_measurements
+    invalidate_storage_measurements(cloud=True)
     return {"valid": True, "remotePath": remote_path, "job": _response(job)}
 
 

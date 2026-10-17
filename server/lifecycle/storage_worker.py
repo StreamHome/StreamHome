@@ -115,11 +115,13 @@ class StorageWorker:
         self.event = asyncio.Event()
         self.stopping = False
         self.last_automatic = 0.0
+        from lifecycle.storage_measurements import StorageMeasurements
+        self.measurements = StorageMeasurements(self)
 
     def wake(self):
         self.event.set()
 
-    async def start(self):
+    async def start(self, *, measurements: bool = True):
         if self.task and not self.task.done():
             return
         validate_placement_manifests(Path(settings.BASE_DIR), media_dir=Path(settings.MEDIA_DIR))
@@ -137,11 +139,14 @@ class StorageWorker:
                 row.updated_at = time.time()
                 db.add(row)
             await db.commit()
+        if measurements:
+            await self.measurements.start()
         self.task = asyncio.create_task(self._run(), name='storage-maintenance-worker')
         self.wake()
 
     async def stop(self):
         self.stopping = True
+        await self.measurements.stop()
         self.wake()
         if self.task:
             self.task.cancel()
@@ -188,7 +193,13 @@ class StorageWorker:
                     EffectClass.DURABLE_MEDIA_WRITE, EffectClass.DISPOSABLE_CACHE_WRITE, EffectClass.CLOUD_WRITE]):
                     await self._set(operation, status='running', phase='starting')
                     if operation.kind == 'refresh':
-                        await self.measure()
+                        await self._set(operation, phase='measuring_local')
+                        await self.measure_local()
+                        if cloud_read_enabled():
+                            await self._set(operation, phase='measuring_cloud')
+                            await self.measure_cloud()
+                        await self._set(operation, phase='reconciling_assets')
+                        await storage_inventory.reconcile_catalog()
                         await self._set(operation, status='completed', phase='measured')
                         async with AsyncSession(database.engine, expire_on_commit=False) as db:
                             aliases = (await db.exec(select(StorageOperation).where(StorageOperation.kind == 'refresh',
@@ -278,20 +289,24 @@ class StorageWorker:
             return json.loads(row.payload) if row else {}
 
     async def measure(self):
-        await storage_inventory.reconcile_catalog()
-        local = await storage_inventory.local_measurement()
-        async with AsyncSession(database.engine, expire_on_commit=False) as db:
-            assets = (await db.exec(select(StorageAsset))).all()
-        eligible = 0
-        from services.media_source import local_path_for
-        for asset in assets:
-            if asset.kind in {'video', 'audio'} and asset.cold_recovery_ready and not await media_protection_reason(asset.media_id, asset.episode_id):
-                if local_path_for(asset.catalog_path).is_file():
-                    eligible += asset.size_bytes
-        local['protected_bytes'] = max(0, local['written_bytes'] - eligible) if local['written_bytes'] is not None else None
-        await self._save_measurement('local', local)
+        # Dashboard metrics are available before expensive asset adoption hashes.
+        await self.measure_local()
         if cloud_read_enabled():
             await self.measure_cloud()
+        await storage_inventory.reconcile_catalog()
+
+    async def measure_local(self):
+        await self.measurements.measure('local', fresh=True)
+
+    async def _measure_local(self):
+        local = await storage_inventory.local_measurement()
+        if local.get('written_bytes') is None:
+            raise StorageError(local.get('error_code') or 'storage_measurement_unknown')
+        local['protected_bytes'] = await self.protected_floor(measured=local)
+        from services.storage_capacity import filesystem_for
+        _, existing = filesystem_for(settings.MEDIA_DIR)
+        local['free_bytes'] = (await run_cancellation_safe_thread(shutil.disk_usage, existing)).free
+        await self._save_measurement('local', local)
 
     async def protected_floor(self, measured=None):
         """Fresh conservative protected floor, without provider or write I/O."""
@@ -325,18 +340,43 @@ class StorageWorker:
             await db.commit()
 
     async def measure_cloud(self):
-        async with storage_capacity.lock:
-            await self._measure_cloud_locked()
+        await self.measurements.measure('cloud', fresh=True)
+
+    async def _measure_cloud(self):
+        # Provider I/O serializes cloud accounting only. Local admission and
+        # cached dashboard reads never wait for a cloud network timeout.
+        async with storage_capacity.cloud_lock:
+            try:
+                await self._measure_cloud_locked()
+            except BaseException:
+                # A failed new observation cannot leave an earlier dashboard
+                # value eligible for admission, even within its 60-second TTL.
+                await settle(self._invalidate_cloud_capacity())
+                raise
+
+    async def _invalidate_cloud_capacity(self):
+        async with AsyncSession(database.engine, expire_on_commit=False) as db:
+            row = await db.get(StorageMeasurement, 'cloud')
+            if row:
+                value = json.loads(row.payload)
+                value['capacity_valid'] = False
+                row.payload = json.dumps(value)
+                db.add(row)
+                await db.commit()
 
     async def _measure_cloud_locked(self):
         from services.rclone import rclone_service
         # size is aggregated by Rclone without returning an unbounded listing.
         remote = settings.RCLONE_REMOTE_PATH
         generation = target_generation()
+        self.measurements.phase('cloud', 'measuring_folder')
         size = await rclone_service.run('size', remote, '--json', timeout=60, hard_output_limit=65536)
+        if not size.ok:
+            raise StorageError(size.error_code or 'storage_cloud_measurement_failed')
+        self.measurements.phase('cloud', 'measuring_account')
         about = await rclone_service.run('about', remote.split(':', 1)[0] + ':', '--json', timeout=30, hard_output_limit=65536)
         value = {'target_generation': generation, 'used_bytes': None, 'account_total_bytes': None,
-                 'account_free_bytes': None, 'reachable': bool(size.ok), 'error_code': size.error_code}
+                 'account_free_bytes': None, 'reachable': bool(size.ok), 'error_code': size.error_code, 'capacity_valid': True}
         try:
             if size.ok:
                 result = json.loads(size.stdout)
@@ -355,6 +395,8 @@ class StorageWorker:
             value['error_code'] = 'storage_cloud_measurement_invalid'
         if target_generation() != generation:
             raise StorageError('storage_target_changed')
+        if value['used_bytes'] is None or value['error_code']:
+            raise StorageError(value['error_code'] or 'storage_cloud_measurement_invalid')
         await self._save_measurement('cloud', value)
 
     async def schedule_prefetch(self):
@@ -508,7 +550,7 @@ class StorageWorker:
                 released += size
                 await self._set(operation, released_bytes=released)
         await self._set(operation, status='completed', phase='completed', released_bytes=released)
-        await self._save_measurement('local', await storage_inventory.local_measurement())
+        await self.measure_local()
 
     async def _verify_remote(self, asset, remote):
         from services.media_source import local_path_for, cloud_object_info

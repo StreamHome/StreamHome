@@ -89,6 +89,9 @@ export function AdminCenter() {
           <div><p>{section === "profiles" ? "INSPECTING PROFILE" : "EDITING PROFILE"}</p><span>{section === "profiles" ? "Inspect this profile’s records without entering or unlocking it." : "Edit this profile’s recommendation settings. Your viewing profile stays unchanged."}</span></div>
           <div className="admin-subject-control"><AdminSelect label="Selected profile" value={subjectProfile.id} onChange={selectSubject} options={profiles.map((item) => ({ value: item.id, label: item.name }))} /><small className="admin-subject-role">{subjectProfile.id === "1" ? "Administrator profile" : "Standard profile"}</small></div>
         </div>}
+        <div hidden={section !== "storage"}>
+          <StoragePanel active={section === "storage"} retainedDraft={storageDraft} onDraftChange={setStorageDraft} view={query.storageView ?? "overview"} onViewChange={selectStorageView} />
+        </div>
         <AnimatePresence mode="wait" initial={false}>
           <motion.div className="admin-content__transition" key={section} variants={CONTENT_REVEAL} initial="hidden" animate="shown" exit="exit" onAnimationComplete={(animation) => {
             if (animation !== "shown") return;
@@ -101,7 +104,6 @@ export function AdminCenter() {
             {section === "api-keys" && <ApiKeysPanel />}
             {section === "profiles" && <ProfileDataPanel profileId={subjectProfile.id} />}
             {section === "recommendations" && <RecommendationsPanel profileId={subjectProfile.id} draft={genreDrafts[subjectProfile.id]} onDraftChange={(draft) => setGenreDrafts((previous) => ({ ...previous, [subjectProfile.id]: draft }))} />}
-            {section === "storage" && <StoragePanel retainedDraft={storageDraft} onDraftChange={setStorageDraft} view={query.storageView ?? "overview"} onViewChange={selectStorageView} />}
             {section === "downloads" && <DownloadsPanel />}
             {section === "updates" && <UpdatesPanel />}
           </motion.div>

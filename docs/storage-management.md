@@ -10,8 +10,8 @@ the top. The workspace has three views:
 
 | View | Purpose |
 | --- | --- |
-| Overview | Local and Drive capacity, total budgets, connection, local retention and cleanup |
-| Policy | Automatic offloading, placement rules, next-episode preparation and HEVC settings |
+| Overview | Local and Drive capacity, budget summaries, connection, local retention and cleanup |
+| Policy | Total budgets, automatic offloading, placement rules, next-episode preparation and HEVC settings |
 | Activity | Accepted operations, progress, released bytes and blocked work |
 
 ## Set total budgets
@@ -31,14 +31,42 @@ and temporary upload copies. The Google account's available quota is a separate
 limit. A configured budget does not reserve space at Google or increase account
 capacity. Unknown or stale measurements cannot authorize an upload.
 
-Budgets start unset. Enter the desired values and units, select **Review changes**,
+Budgets start unset. Open **Policy**, enter the desired values and units, select **Review changes**,
 then save the exact reviewed draft. The server checks the policy revision and
 Drive target again. Saving a policy does not mean that files have moved or space
 has been released. Use **Activity** to inspect the actual outcome.
 
-**Refresh usage** requests a measurement. Displayed stale values remain labelled
-as last known measurements. If a mutation response is lost, use **Check status**;
-it checks the original request rather than repeating the change.
+## Automatic measurements and status
+
+Storage measurements run in the background even when automatic offloading is
+paused. Local usage is measured after startup and approximately once a minute;
+the configured Drive folder and account quota are checked approximately every
+five minutes. Completed storage work requests a coalesced update. Slow or failed
+checks do not create overlapping scans or a new job for every open browser tab.
+
+The page displays the latest available values immediately and automatically reads
+new status while visible. It checks more frequently during active work, pauses
+browser polling while hidden, and checks again when you return. Ordinary usage
+measurement counts file sizes; content verification remains a separate requirement
+before accepting transfers or releasing local originals.
+
+Each storage target reports its own last successful measurement and current check
+state. A failed check preserves the previous successful values with their age and
+an explanation. A target that has never been measured is shown as unknown, rather
+than empty or full. Measurements do not lock unrelated policy fields. A budget
+summary without a configured limit is labelled unrestricted; a usage distribution
+is not presented as a percentage of a nonexistent limit.
+
+Accepted background work is tracked automatically. If a mutation response is lost,
+the page checks the original request identity without repeating the change. An
+unresolved outcome remains visible and conflicting actions stay protected. Expired
+admin authorization pauses protected reads until you confirm your identity;
+background polling does not extend authorization. Policy drafts remain intact
+while measurements update. Saving policy, granting Drive access, verifying a folder
+with a temporary file, and confirming cleanup remain explicit actions.
+
+Dashboard measurements do not replace the stricter fresh capacity, generation and
+protection checks required before storage work is admitted.
 
 ## Automatic placement
 

@@ -60,8 +60,9 @@ function card() { return render(<DriveSetupCard settings={null} onSettingsRefres
 describe("Admin Drive actual-client protocol", () => {
   it("connects, chooses, verifies and saves without submitting storage or HEVC preferences", async () => {
     render(<StoragePanel />);
-    await screen.findByRole("spinbutton", { name: "Total local budget" });
+    await screen.findByRole("region", { name: "Local storage" });
     fireEvent.click(screen.getByRole("link", { name: "Policy" }));
+    await screen.findByRole("spinbutton", { name: "Total local budget" });
     const hevc = await screen.findByRole("combobox", { name: "HEVC compression" });
     fireEvent.click(hevc); fireEvent.click(screen.getByRole("option", { name: "Disabled" }));
     fireEvent.click(screen.getByRole("link", { name: "Overview" }));

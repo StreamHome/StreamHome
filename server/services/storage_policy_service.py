@@ -69,7 +69,7 @@ class StoragePolicyService:
 
     async def status(self) -> dict:
         from services.rclone import rclone_service
-        from services.storage_capacity import storage_capacity, filesystem_for
+        from services.storage_capacity import storage_capacity
         local, measured_at = await self._measurement('local')
         cloud, cloud_at = await self._measurement('cloud')
         configured = cloud_read_enabled()
@@ -79,12 +79,8 @@ class StoragePolicyService:
         reachable = cloud.get('reachable')
         if health['state'] in {'unauthorized', 'unreachable', 'unavailable', 'permission_denied'}:
             reachable = False
-        free = None
-        try:
-            _, existing = filesystem_for(settings.MEDIA_DIR)
-            free = (await run_cancellation_safe_thread(shutil.disk_usage, existing)).free
-        except (OSError, StorageError):
-            pass
+        from lifecycle.storage_worker import storage_worker
+        free = local.get('free_bytes')
         policy = policy_value(settings)
         reason = None
         if policy['offload_enabled']:
@@ -109,13 +105,15 @@ class StoragePolicyService:
                 'categories': [{'key': key, 'label': key.replace('_', ' ').title(), 'bytes': amount}
                                for key, amount in local.get('categories', {}).items()],
                 'measured_at': utc(measured_at), 'stale': measured_at is None or time.time() - measured_at > 300,
-                'error_code': local.get('error_code')},
+                'error_code': local.get('error_code'),
+                'refresh': storage_worker.measurements.snapshot('local', last_success=measured_at)},
             'cloud': {'configured': configured, 'reachable': reachable,
                 'health_state': str(health['state']), 'folder_name': settings.RCLONE_REMOTE_PATH.split(':', 1)[-1] if configured else None,
                 'used_bytes': cloud.get('used_bytes'), 'account_total_bytes': cloud.get('account_total_bytes'),
                 'account_free_bytes': cloud.get('account_free_bytes'), 'measured_at': utc(cloud_at),
                 'stale': cloud_at is None or time.time() - cloud_at > 300,
-                'error_code': cloud.get('error_code')},
+                'error_code': cloud.get('error_code'),
+                'refresh': storage_worker.measurements.snapshot('cloud', configured=configured, last_success=cloud_at)},
             'offload': {'state': 'paused' if not policy['offload_enabled'] else ('blocked' if reason else ('working' if active and active.kind == 'offload' else 'monitoring')),
                         'reason': reason},
             'capabilities': {'offload': True, 'keep_local': True, 'cleanup': True},
@@ -207,7 +205,9 @@ class StoragePolicyService:
             from services.storage_capacity import storage_capacity, _remaining_from_sample
             # Serialize final admission against every new storage writer. The
             # database read closes before filesystem/protection/settings I/O.
-            async with storage_capacity.lock:
+            # Acquire cloud first: waiting for provider work never blocks local
+            # writers. Final policy acceptance then fences both admission scopes.
+            async with storage_capacity.cloud_lock, storage_capacity.lock:
                 if canonical['local_budget_bytes'] is not None:
                     from lifecycle.storage_worker import storage_worker
                     from services.storage_inventory import storage_inventory
