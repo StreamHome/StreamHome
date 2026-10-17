@@ -1,6 +1,6 @@
 # Playback
 
-StreamHome uses a direct-media, verified-asset playback model. Pressing Play never starts completed-title transcoding. Completed ingestion schedules adaptive preparation after its catalog transaction commits, and startup recovery warms existing titles in bounded order with recently watched media first. The server creates one authenticated playback run, returns every currently playable URL and track, and lets the browser begin from the protected source or a verified adaptive stream immediately.
+StreamHome uses a direct-media, verified-asset playback model. Completed ingestion schedules adaptive preparation after its catalog transaction commits, and startup recovery normally warms existing titles. With hybrid storage enabled, viewer entry or status may also enqueue bounded, deduplicated background preparation of a missing cache for the same accepted source generation. This path cannot accept changed media or run FFmpeg inline in an HTTP handler. The server creates one authenticated playback run and returns currently playable URLs and tracks; an incompatible source waits for verified adaptive assets.
 
 ## Playback descriptor
 
@@ -14,7 +14,7 @@ StreamHome uses a direct-media, verified-asset playback model. Pressing Play nev
 - the server-probed duration and saved profile position; and
 - a stable same-origin `streamBaseUrl`, the legacy playback ticket, progress sequence, and next-episode identity.
 
-Completed media is playback-ready when its original is measured as directly compatible or verified adaptive assets exist. An incompatible original waits for background preparation. Optional readiness refreshes never start generation or replace a healthy mounted transport. Missing HLS qualities are omitted instead of being shown as preparing or on demand.
+Completed media is playback-ready when its original is measured as directly compatible or verified adaptive assets exist. An incompatible original waits for background preparation. Hybrid cache-miss preparation remains bound to the accepted generation and shared capacity admission, including a complete source spool where required. Readiness refreshes preserve a healthy mounted transport. Missing HLS qualities are omitted until verified and streamable.
 
 ## Direct video delivery
 
@@ -26,7 +26,7 @@ The video element uses eager browser preloading. Local media is read directly fr
 
 If a protected HLS cache already contains a valid master, initialization fragments, playlists, and media fragments, the descriptor includes `/api/playback/manifest/{mediaId}`. A video rendition becomes ready only after FFprobe opens its completed playlist and confirms its stream. Adaptive audio is always rebased to zero before one server-owned relative offset is applied, then normalized to AAC-LC, 48 kHz, stereo with asynchronous timestamp repair. FFprobe must confirm that exact contract, structural audio/video starts must remain within 100 ms, their ends must remain within 250 ms, and FFmpeg must decode the complete audio playlist before publication. The 100 ms structural allowance accommodates frame-quantized container starts; deterministic decoded content markers enforce the 80 ms semantic synchronization boundary. Current verification markers are `.verified-v2` for video and `.verified-audio-v5` for audio. Older caches require background rebuilding before activation; a marker alone is never upgraded. AAC alignment uses decoded content origins, after codec priming and edit-list trimming, rather than a negative preroll packet. Signed HLS timestamps prevent the muxer from independently shifting video and audio. The player uses hls.js or native HLS to select only verified variants.
 
-Quality clicks change the active ready HLS level. Native HLS selects a verified master variant with `rendition_id`, retaining its alternate audio group and the confirmed position/Play intent. They never call a preparation endpoint and never start FFmpeg. If no ready HLS master exists, the source plays directly and unavailable qualities are not displayed.
+Quality clicks change the active ready HLS level. Native HLS selects a verified master variant with `rendition_id`, retaining its alternate audio group and the confirmed position/Play intent. Under hybrid storage, a request for a missing rendition may prioritize its owned background preparation, but it is not advertised as ready. If no ready HLS master exists, a compatible source can play directly while an incompatible source waits. Unavailable qualities are not displayed.
 
 The adaptive forward-buffer target is 30 seconds with a bounded 60-second ceiling. Startup begins in automatic quality with a conservative bandwidth estimate. A saved manual level is restored only after at least eight seconds are buffered and measured bandwidth has 35 percent headroom; a viewer's explicit quality click still switches immediately.
 
