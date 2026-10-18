@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import hashlib
 import json
 import sys
@@ -117,6 +118,132 @@ class AdminDriveTests(unittest.IsolatedAsyncioTestCase):
     async def read(self, job_id):
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
             return await db.get(AdminDriveJob, job_id)
+
+    async def test_finish_refreshes_expiring_and_nonexpiring_sqlite_sessions(self):
+        for expiring in (True, False):
+            with self.subTest(expire_on_commit=expiring):
+                job = await self.add_job(status="saving", operation="save", generation=3,
+                                         operation_owner=drive._PROCESS_OWNER,
+                                         state_hash=__import__('uuid').uuid4().hex)
+                key = (job.id, 3)
+                drive._ACTIVE_OPERATIONS[key] = asyncio.current_task()
+                async with AsyncSession(self.engine, expire_on_commit=expiring) as db:
+                    row = await db.get(AdminDriveJob, job.id)
+                    returned = await drive._finish(db, row, status="saved", active_session_key=None)
+                    self.assertIs(returned, row)
+                    self.assertEqual((row.id, row.status, row.generation), (job.id, "saved", 3))
+                    self.assertIsNone(row.operation)
+                    self.assertIsNone(row.operation_owner)
+                    self.assertNotIn(key, drive._ACTIVE_OPERATIONS)
+                self.assertEqual((await self.read(job.id)).status, "saved")
+
+    async def test_finish_preserves_stale_generation_and_saved_idempotency(self):
+        from sqlalchemy import update
+        for expiring in (True, False):
+            for saved_winner in (False, True):
+                with self.subTest(expire_on_commit=expiring, saved_winner=saved_winner):
+                    job = await self.add_job(status="saving", operation="save", generation=3,
+                                             operation_owner=drive._PROCESS_OWNER, active_session_key=None,
+                                             state_hash=__import__('uuid').uuid4().hex)
+                    key = (job.id, 3)
+                    drive._ACTIVE_OPERATIONS[key] = asyncio.current_task()
+                    async with AsyncSession(self.engine, expire_on_commit=expiring) as db:
+                        row = await db.get(AdminDriveJob, job.id)
+                        async with AsyncSession(self.engine, expire_on_commit=False) as competitor:
+                            await competitor.execute(update(AdminDriveJob).where(AdminDriveJob.id == job.id).values(
+                                generation=4, status="saved" if saved_winner else "ready", operation=None,
+                                operation_owner=None, progress="Winning generation retained"))
+                            await competitor.commit()
+                        if saved_winner:
+                            self.assertIs(await drive._finish(db, row, status="saved"), row)
+                        else:
+                            with self.assertRaises(HTTPException) as raised:
+                                await drive._finish(db, row, status="saved")
+                            self.assertEqual(raised.exception.detail["code"], "drive_job_changed")
+                        self.assertEqual(row.generation, 4)
+                        self.assertEqual(row.progress, "Winning generation retained")
+                        self.assertNotIn(key, drive._ACTIVE_OPERATIONS)
+
+    async def test_finish_commit_errors_preserve_exception_and_cleanup_after_expiry(self):
+        for expiring in (True, False):
+            for committed in (False, True):
+                for cancelled in (False, True):
+                    with self.subTest(expire_on_commit=expiring, committed=committed, cancelled=cancelled):
+                        job = await self.add_job(status="saving", operation="save", generation=3,
+                                                 operation_owner=drive._PROCESS_OWNER, active_session_key=None,
+                                                 state_hash=__import__('uuid').uuid4().hex)
+                        key = (job.id, 3)
+                        drive._ACTIVE_OPERATIONS[key] = asyncio.current_task()
+                        failure = asyncio.CancelledError("synthetic cancellation") if cancelled else RuntimeError("synthetic commit failure")
+                        async with AsyncSession(self.engine, expire_on_commit=expiring) as db:
+                            row = await db.get(AdminDriveJob, job.id)
+                            original_commit = db.commit
+                            async def fail_commit():
+                                if committed:
+                                    await original_commit()
+                                else:
+                                    await db.rollback()
+                                raise failure
+                            with patch.object(db, "commit", side_effect=fail_commit):
+                                with self.assertRaises(type(failure)) as raised:
+                                    await drive._finish(db, row, status="saved", active_session_key=None)
+                            self.assertIs(raised.exception, failure)
+                            self.assertNotIn(key, drive._ACTIVE_OPERATIONS)
+                        current = await self.read(job.id)
+                        self.assertEqual(current.status, "saved" if committed else "saving")
+                        self.assertEqual(current.operation, None if committed else "save")
+
+    async def test_startup_recovers_multiple_jobs_with_default_expiration(self):
+        # Execute the actual startup helper in a narrow namespace, avoiding the
+        # unrelated application bootstrap/import side effects in this unit test.
+        source = Path(__file__).resolve().parents[1] / "application.py"
+        tree = ast.parse(source.read_text())
+        helper = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
+                      and node.name == "_recover_drive_setup")
+        namespace = dict(AsyncSession=AsyncSession, engine=self.engine, select=select,
+                         DriveSetupJob=DriveSetupJob, time=time, rclone_service=self.service)
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), str(source), "exec"), namespace)
+        jobs = [await self.add_job(status="exchanging_code", operation="oauth", operation_owner="old-process",
+                                   generation=number, active_session_key=None,
+                                   state_hash=__import__('uuid').uuid4().hex) for number in (2, 3)]
+        # The startup helper uses AsyncSession's default expire_on_commit=True.
+        await namespace["_recover_drive_setup"]()
+        await namespace["_recover_drive_setup"]()
+        for job in jobs:
+            current = await self.read(job.id)
+            self.assertEqual(current.status, "failed")
+            self.assertEqual(current.error_code, "drive_operation_interrupted")
+            self.assertIsNone(current.operation)
+
+    async def test_receipt_recovery_after_lost_commit_ack_in_expiring_session(self):
+        job = await self.add_job(status="saving", operation="save", operation_owner="old-process", generation=5)
+        candidate = await self.encrypt(None)
+        await asyncio.to_thread(drive._publish, root=self.root, job_id=job.id, generation=5,
+                                encrypted_config=candidate, remote_name="streamhome-drive",
+                                remote_path="streamhome-drive:StreamHome", audience="external",
+                                publishing_status="production")
+        before = self.service.config_path.read_bytes()
+        key = (job.id, 5)
+        drive._ACTIVE_OPERATIONS[key] = asyncio.current_task()
+        async with AsyncSession(self.engine) as db:
+            row = await db.get(AdminDriveJob, job.id)
+            original_commit = db.commit
+            async def lose_ack():
+                await original_commit()
+                raise RuntimeError("synthetic lost commit acknowledgement")
+            with patch.object(db, "commit", side_effect=lose_ack):
+                with self.assertRaisesRegex(RuntimeError, "lost commit acknowledgement"):
+                    await drive._reconcile(db, row)
+            self.assertNotIn(key, drive._ACTIVE_OPERATIONS)
+        async with AsyncSession(self.engine) as db:
+            row = await db.get(AdminDriveJob, job.id)
+            await drive._reconcile(db, row)
+            self.assertEqual(row.status, "saved")
+            self.assertIsNone(row.active_session_key)
+            self.assertIsNone(row.operation)
+        self.assertEqual(self.service.config_path.read_bytes(), before)
+        self.assertEqual(self.service._encrypted_candidate.await_count, 0)
+        self.assertFalse(self.service.job_dir(job.id).exists())
 
     async def test_authentication_reauth_and_machine_isolation(self):
         self.client.cookies.clear()

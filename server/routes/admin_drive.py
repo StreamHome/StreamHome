@@ -108,19 +108,22 @@ def _operation_running(job: AdminDriveJob) -> bool:
 
 
 async def _finish(db: AsyncSession, job: AdminDriveJob, **values: Any) -> AdminDriveJob:
-    operation, generation = job.operation, job.generation
+    # Commit (including an acknowledged commit whose response is lost) and
+    # rollback can expire every ORM attribute. Cleanup must never trigger an
+    # implicit synchronous reload or mask the original transaction exception.
+    job_id, operation, generation, owner = job.id, job.operation, job.generation, job.operation_owner
     values.setdefault("operation", None)
     values.setdefault("operation_owner", None)
     try:
         result = await db.execute(update(AdminDriveJob).where(
-            AdminDriveJob.id == job.id,
+            AdminDriveJob.id == job_id,
             AdminDriveJob.generation == generation,
             AdminDriveJob.operation == operation,
-            AdminDriveJob.operation_owner == job.operation_owner,
+            AdminDriveJob.operation_owner == owner,
         ).values(updated_at=time.time(), **values))
         await db.commit()
     finally:
-        _ACTIVE_OPERATIONS.pop((job.id, generation), None)
+        _ACTIVE_OPERATIONS.pop((job_id, generation), None)
     if result.rowcount != 1:
         await db.refresh(job)
         if values.get("status") == "saved" and job.status == "saved":
@@ -604,5 +607,10 @@ def _publish(**kwargs) -> dict:
 
 
 async def recover_jobs(db: AsyncSession) -> None:
-    for job in (await db.exec(select(AdminDriveJob).where(AdminDriveJob.status.notin_(list(_TERMINAL))))).all():
-        await _reconcile(db, job)
+    # Reconciliation may commit and expire all loaded rows, not just its own
+    # job. Snapshot scalar identities, then explicitly load each next job.
+    job_ids = (await db.exec(select(AdminDriveJob.id).where(AdminDriveJob.status.notin_(list(_TERMINAL))))).all()
+    for job_id in job_ids:
+        job = await db.get(AdminDriveJob, job_id)
+        if job is not None:
+            await _reconcile(db, job)
