@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import time
 import unittest
+from contextlib import AsyncExitStack
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -29,14 +31,19 @@ from tests.media import test_cloud_publication as cloud_fixture
 
 
 class CloudAnalysisIdentity(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+    async def asyncSetUp(self, *, cleanup_owner=None):
+        cleanup_owner = cleanup_owner if cleanup_owner is not None else self
+        self.resources = AsyncExitStack()
+        cleanup_owner.addAsyncCleanup(self.resources.aclose)
         self.fixture = cloud_fixture.CloudPublicationRegression(methodName="test_real_rclone_candidate_check_publish_and_acceptance")
-        await self.fixture.asyncSetUp()
+        await self.fixture.asyncSetUp(cleanup_owner=SimpleNamespace(addAsyncCleanup=self.resources.push_async_callback))
         self.engine = self.fixture.engine
         self.service = PlaybackPrepService()
-        self.enterContext(patch.object(playback, "playback_prep_service", self.service))
-        self.enterContext(patch.object(self.service, "prepare", AsyncMock()))
-        self.enterContext(patch.object(playback, "_cloud_audio_probe_times", {}))
+        self.resources.push_async_callback(self.service.quiesce_for_update, timeout=10)
+        self.resources.enter_context(patch.object(playback, "playback_prep_service", self.service))
+        self.resources.enter_context(patch.object(self.service, "prepare", AsyncMock()))
+        self.resources.enter_context(patch.object(playback, "_cloud_audio_probe_times", {}))
+        self.resources.callback(clear_cloud_object_cache)
         self.remote = self.fixture.target / "film.mp4"
         self.metadata = self.fixture.target / ".metadata" / "metadata.json"
         self.make_video()
@@ -71,13 +78,11 @@ class CloudAnalysisIdentity(unittest.IsolatedAsyncioTestCase):
         app.dependency_overrides[get_session] = sessions
         app.dependency_overrides[get_current_user] = lambda: self.user
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://cloud-analysis.test")
+        self.resources.push_async_callback(self.client.aclose)
         clear_cloud_object_cache()
 
     async def asyncTearDown(self):
-        await self.client.aclose()
-        await self.service.quiesce_for_update(timeout=10)
-        clear_cloud_object_cache()
-        await self.fixture.asyncTearDown()
+        await self.resources.aclose()
 
     def make_video(self, *, duration=1, multiple=False):
         command = [shutil.which("ffmpeg"), "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c=red:s=320x180:r=4:d={duration}"]
@@ -316,3 +321,43 @@ class CloudAnalysisIdentity(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.source_fingerprint, old.source_fingerprint)
         self.assertEqual(current.analysis_metadata_str, old.analysis_metadata_str)
         self.assertEqual(self.metadata.read_bytes(), portable)
+
+
+class ReusedCloudFixtureCleanup(unittest.IsolatedAsyncioTestCase):
+    async def assert_failed_setup_restores_resources(self, *, fail_analysis):
+        original_settings = {name: getattr(settings, name) for name in
+            ("MEDIA_DIR", "TEMP_DIR", "RCLONE_REMOTE_PATH", "STORAGE_ENGINE")}
+        original_engine = cloud_fixture.db_module.engine
+        original_queue_engine = cloud_fixture.queue.engine
+        original_config = rclone_service.config_path
+        original_service = playback.playback_prep_service
+        original_probe_times = playback._cloud_audio_probe_times
+        original_reservations = {name: getattr(cloud_fixture.queue.DownloadQueueManager, name) for name in
+            ("MINIMUM_TASK_RESERVATION_BYTES", "STORAGE_SAFETY_MARGIN_BYTES", "ESTIMATED_MEDIA_BYTES_PER_SECOND")}
+        fixture = CloudAnalysisIdentity() if fail_analysis else cloud_fixture.CloudPublicationRegression()
+        target = patch.object(CloudAnalysisIdentity, "make_video", side_effect=RuntimeError("injected setup failure")) if fail_analysis else \
+            patch.object(cloud_fixture.SQLModel.metadata, "create_all", side_effect=RuntimeError("injected setup failure"))
+        async with AsyncExitStack() as resources:
+            owner = SimpleNamespace(addAsyncCleanup=resources.push_async_callback)
+            with target, self.assertRaisesRegex(RuntimeError, "injected setup failure"):
+                await fixture.asyncSetUp(cleanup_owner=owner)
+        nested = fixture.fixture if fail_analysis else fixture
+        self.assertFalse(nested.root.exists())
+        self.assertEqual({name: getattr(settings, name) for name in original_settings}, original_settings)
+        self.assertIs(cloud_fixture.db_module.engine, original_engine)
+        self.assertIs(cloud_fixture.queue.engine, original_queue_engine)
+        self.assertIs(rclone_service.config_path, original_config)
+        self.assertIs(playback.playback_prep_service, original_service)
+        self.assertIs(playback._cloud_audio_probe_times, original_probe_times)
+        self.assertEqual({name: getattr(cloud_fixture.queue.DownloadQueueManager, name) for name in original_reservations}, original_reservations)
+        if fail_analysis:
+            self.assertTrue(fixture.service.update_quiesced)
+            self.assertFalse(fixture.service.active_jobs)
+        # Cleanup remains safe when the normal teardown also requests it.
+        await fixture.asyncTearDown()
+
+    async def test_nested_publication_setup_failure_restores_resources(self):
+        await self.assert_failed_setup_restores_resources(fail_analysis=False)
+
+    async def test_analysis_setup_failure_restores_resources_and_service_aliases(self):
+        await self.assert_failed_setup_restores_resources(fail_analysis=True)

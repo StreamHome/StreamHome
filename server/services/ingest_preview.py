@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
@@ -40,6 +41,17 @@ class IngestPreviewService:
     def fingerprint(self, task_id: str) -> str:
         self.task_path(task_id)
         return hashlib.sha256(f"streamhome-ingest-preview:{task_id}".encode("utf-8")).hexdigest()[:32]
+
+    def next_generation(self, task_id: str, current_preview_id: Optional[str] = None) -> str:
+        """Never reuse a writing generation, including after process restart.
+
+        The first empty task directory is the legacy generation: runs created
+        before the first writer can already be bound to that identity.
+        """
+        target = self.task_path(task_id)
+        if current_preview_id is None and not (target.exists() and any(target.iterdir())):
+            return task_id
+        return str(uuid.uuid4())
 
     def prepare(self, task_id: str, duration_seconds: float) -> Path:
         target = self.task_path(task_id)

@@ -466,7 +466,7 @@ async def _delete_download_admitted(task_id: str):
         task = await db.get(DownloadTask, task_id)
         if not task:
             return {"status": "success", "message": f"Task {task_id} was already removed.", "processKilled": process_killed}
-        ingest_preview_service.mark_error(task_id, "PREVIEW_CANCELLED", "The download and its play-while-downloading preview were cancelled.")
+        ingest_preview_service.mark_error(task.current_preview_id or task_id, "PREVIEW_CANCELLED", "The download and its play-while-downloading preview were cancelled.")
         if task.media_type == "movie":
             movie = await db.get(Movie, f"m_{task.tmdb_id}")
             if movie and movie.preview_task_id == task_id:

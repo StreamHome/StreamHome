@@ -357,7 +357,13 @@ class PrimaryLanguageRefresh(unittest.IsolatedAsyncioTestCase):
 
     async def test_actual_cloud_refresh_preserves_legacy_primary_and_independent_external_identity(self):
         fixture = cloud_fixture.CloudAnalysisIdentity()
-        await fixture.asyncSetUp()
+        original_service = playback.playback_prep_service
+        original_probe_times = playback._cloud_audio_probe_times
+        # Manually reused TestCases do not get unittest's automatic cleanup pass.
+        # Register restoration assertions first so they run after helper cleanup.
+        self.addCleanup(lambda: self.assertIs(playback.playback_prep_service, original_service))
+        self.addCleanup(lambda: self.assertIs(playback._cloud_audio_probe_times, original_probe_times))
+        await fixture.asyncSetUp(cleanup_owner=self)
         self.addAsyncCleanup(fixture.asyncTearDown)
         measured = await make_media(fixture.remote)
         await make_external(fixture.remote)

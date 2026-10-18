@@ -17,6 +17,7 @@ from services.ffmpeg_input import ffmpeg_network_input_options, is_http_media_so
 from services.controlled_source import controlled_media_input
 from services.ingestion_security import UnsafeIngestionSource, source_request_failure
 from services.ingest_preview import ingest_preview_service
+from lifecycle.ingestion_attempts import require_drained_writer
 from services.media_timing import canonical_audio_filter_chain
 from lifecycle.coordination import run_cancellation_safe_thread
 from lifecycle.media_work import settle
@@ -112,7 +113,7 @@ async def download_and_cache_metadata_image(image_url: str, dest_path: str) -> O
         
     return image_url
 
-def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float, preview_enabled: bool = False) -> tuple[bool, str]:
+def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float, preview_enabled: bool = False, preview_id: Optional[str] = None) -> tuple[bool, str]:
     """Runs FFmpeg synchronously in a dedicated background thread, immune to asyncio loop resets."""
     stderr_lines = []
     process: subprocess.Popen[bytes] | None = None
@@ -173,7 +174,7 @@ def _run_ffmpeg_sync(task_id: str, cmd: list, duration_secs: float, preview_enab
                     if preview_enabled:
                         try:
                             ingest_preview_service.update_progress(
-                                task_id,
+                                preview_id or task_id,
                                 processed_seconds=current_time,
                                 speed_multiplier=speed_val_mult,
                                 duration_seconds=duration_secs,
@@ -254,8 +255,11 @@ async def download_and_merge(
     client_address: str = "",
     audio_headers: Optional[Dict[str, str]] = None,
     attempt: int = 1,
+    preview_id: Optional[str] = None,
 ) -> tuple[bool, Optional[IngestionFailure]]:
     """Give FFmpeg only scoped local inputs whose upstream fetches are pinned."""
+    require_drained_writer(task_id)
+    preview_id = preview_id or ingest_preview_service.next_generation(task_id)
     candidate = _ingestion_candidate_path(output_path, task_id)
     relays = []
     native_results = []
@@ -277,6 +281,7 @@ async def download_and_merge(
             success, failure = await _download_and_merge_controlled(
                 task_id, selected_video, selected_audio, {}, output_path, duration_secs,
                 video_source_type, audio_source_type, preview_enabled, audio_timeline_offset,
+                preview_id=preview_id,
                 source_failed=lambda: any(relay.failure is not None for relay in relays),
                 native_result_callback=lambda diagnostics, preview: native_results.append((diagnostics, preview)),
             )
@@ -285,7 +290,7 @@ async def download_and_merge(
         if success:
             os.replace(candidate, os.path.abspath(output_path))
             if native_results and native_results[-1][1]:
-                ingest_preview_service.mark_complete(task_id)
+                ingest_preview_service.mark_complete(preview_id)
             logger.info(f"[FFmpeg Service] Transfer validated for task {task_id}; final publication is pending.")
             update_task_metrics(task_id, 99.0, speed="Verifying media", eta="00:00:00")
         return success, failure
@@ -316,9 +321,12 @@ async def _download_and_merge_controlled(
     audio_timeline_offset: float = 0.0,
     source_failed=None,
     native_result_callback=None,
+    preview_id: Optional[str] = None,
 ) -> tuple[bool, Optional[IngestionFailure]]:
     """Download video/audio streams, merge losslessly, inject headers, track progress."""
     
+    require_drained_writer(task_id)
+    preview_id = preview_id or ingest_preview_service.next_generation(task_id)
     abs_output_path = os.path.abspath(output_path)
     os.makedirs(os.path.dirname(abs_output_path), exist_ok=True)
     
@@ -349,7 +357,7 @@ async def _download_and_merge_controlled(
             os.remove(temp_output_path)
     except OSError:
         pass
-    preview_dir = ingest_preview_service.prepare(task_id, duration_secs) if preview_enabled else None
+    preview_dir = ingest_preview_service.prepare(preview_id, duration_secs) if preview_enabled else None
 
     def build_command(include_preview: bool) -> list[str]:
         command = list(input_cmd)
@@ -424,13 +432,15 @@ async def _download_and_merge_controlled(
             build_command(preview_enabled),
             duration_secs,
             preview_enabled,
+            preview_id=preview_id,
             cancellation_callback=lambda: _cancel_registered_process(task_id),
         )
         preview_succeeded = bool(preview_enabled and success)
 
         if not success and preview_enabled and not (source_failed and source_failed()):
+            require_drained_writer(task_id)
             preview_failure = classify_failure(diagnostics, "PREVIEW_FAILED")
-            ingest_preview_service.mark_error(task_id, preview_failure.code, preview_failure.message)
+            ingest_preview_service.mark_error(preview_id, preview_failure.code, preview_failure.message)
             if os.path.exists(temp_output_path):
                 os.remove(temp_output_path)
             logger.warning(f"[FFmpeg Service] Preview branch failed for {task_id}; retrying ingestion without play-while-downloading output.")

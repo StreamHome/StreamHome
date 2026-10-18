@@ -15,6 +15,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from db import engine
 from models import DownloadTask, Movie, Episode
 from services.ffmpeg import download_and_merge, download_and_cache_metadata_image
+from lifecycle.ingestion_attempts import require_drained_writer
 from services.tmdb import tmdb_client
 from config import settings
 from services.logger import logger
@@ -737,6 +738,8 @@ class DownloadQueueManager:
         capacity_reservations: list[str] = []
         capacity_monitor = None
         capacity_failure = None
+        preview_id: Optional[str] = None
+        workspace_admitted = False
         try:
             async with AsyncSession(engine) as db:
                 task = await db.get(DownloadTask, task_id)
@@ -746,6 +749,8 @@ class DownloadQueueManager:
                     remove_task_metrics(task_id)
                     return
 
+                require_drained_writer(task_id)
+                workspace_admitted = True
                 # A retry is a new writer. It cannot reuse or clean up an older
                 # workspace whose completed cache/sidecar ownership is unknown.
                 if staging_task_root.exists():
@@ -1018,17 +1023,33 @@ class DownloadQueueManager:
                 
                 await validate_url(video_url, client_address=validation_client)
                 await validate_url(audio_url, client_address=validation_client)
+                require_drained_writer(task_id)
+                async with AsyncSession(engine, expire_on_commit=False) as preview_db:
+                    preview_task = await preview_db.get(DownloadTask, task_id)
+                    if preview_task is None:
+                        raise RuntimeError("The ingestion task disappeared before attempt allocation.")
+                    preview_id = ingest_preview_service.next_generation(task_id, preview_task.current_preview_id)
+                    preview_task.current_preview_id = preview_id
+                    preview_db.add(preview_task)
+                    await preview_db.commit()
                 success, failure = await download_and_merge(
                     task_id=task_id, video_url=video_url, audio_url=audio_url,
                     headers=headers, audio_headers=audio_headers, output_path=output_abs_path, duration_secs=duration_secs,
-                    attempt=attempt,
+                    attempt=attempt, preview_id=preview_id,
                     video_source_type=video_source_type, audio_source_type=audio_source_type,
                     audio_timeline_offset=float(probe_res.get("audio_timeline_offset") or 0.0),
                     client_address=validation_client,
                 )
                 
+                async with AsyncSession(engine) as preview_db:
+                    current_task = await preview_db.get(DownloadTask, task_id)
+                    if current_task is None or current_task.current_preview_id != preview_id:
+                        raise RuntimeError("The ingestion attempt was superseded before completion.")
                 if success:
                     break
+                ingest_preview_service.mark_error(
+                    preview_id, (failure or last_failure).code, (failure or last_failure).message,
+                )
                 
                 last_failure = failure or last_failure
                 logger.warning(f"[Queue Manager] Ingestion attempt {attempt}/{max_retries} failed for task {task_id}: {last_failure.display}")
@@ -1071,6 +1092,8 @@ class DownloadQueueManager:
                 task = await db.get(DownloadTask, task_id)
                 if not task:
                     return
+                if task.current_preview_id != preview_id:
+                    raise RuntimeError("The ingestion attempt was superseded before publication.")
                 await self._catalog_media(
                     db, tmdb_id, media_type, season, episode, meta, output_rel_path,
                     extracted_languages, language, subtitles_list, quality, task.skip_markers,
@@ -1138,6 +1161,8 @@ class DownloadQueueManager:
                 task = await db.get(DownloadTask, task_id)
                 if not task:
                     raise RuntimeError("Publication task disappeared before acceptance")
+                if task.current_preview_id != preview_id:
+                    raise RuntimeError("The ingestion attempt was superseded before acceptance.")
                 if show_data is not None:
                     await db.merge(Movie.model_validate(show_data))
                 finalized_media = await db.merge(model.model_validate(candidate_data))
@@ -1168,19 +1193,20 @@ class DownloadQueueManager:
                     
         except IngestionTaskError as err:
             logger.error(f"[Queue Manager] Task {task_id} failed: {err.failure.display}")
-            await self._record_task_failure(task_id, err.failure, submitted_video_url)
+            await self._record_task_failure(task_id, err.failure, submitted_video_url, preview_id=preview_id)
         except asyncio.CancelledError:
             if capacity_failure is not None:
-                await self._record_task_failure(task_id, capacity_failure, submitted_video_url)
+                await self._record_task_failure(task_id, capacity_failure, submitted_video_url, preview_id=preview_id)
             elif task_id not in self.cancelled_tasks:
-                await self._record_task_failure(task_id, IngestionFailure("INGESTION_INTERRUPTED", "The task was interrupted by server shutdown."), submitted_video_url)
+                await self._record_task_failure(task_id, IngestionFailure("INGESTION_INTERRUPTED", "The task was interrupted by server shutdown."), submitted_video_url, preview_id=preview_id)
             if capacity_failure is None:
                 raise
         except Exception as err:
             diagnostics_path = write_task_diagnostics(task_id, "queue exception", traceback.format_exc())
             failure = IngestionFailure("QUEUE_INTERNAL_ERROR", f"The queue encountered {type(err).__name__}.", False, diagnostics_path)
             logger.error(f"[Queue Manager] Task {task_id} failed: {failure.display}")
-            await self._record_task_failure(task_id, failure, submitted_video_url)
+            if workspace_admitted:
+                await self._record_task_failure(task_id, failure, submitted_video_url, preview_id=preview_id)
                 
         finally:
             if capacity_monitor is not None:
@@ -1205,7 +1231,7 @@ class DownloadQueueManager:
                         pass
             if output_abs_path:
                 self._remove_empty_parents(os.path.dirname(output_abs_path))
-            if staging_task_root.exists() and not recovery_pending:
+            if workspace_admitted and staging_task_root.exists() and not recovery_pending:
                 try:
                     await run_cancellation_safe_thread(self._retain_staging_sidecars, staging_task_root)
                 except OSError as staging_cleanup_error:
@@ -1213,19 +1239,23 @@ class DownloadQueueManager:
                         f"[Queue Manager] Could not remove staging directory for task {task_id}: "
                         f"{type(staging_cleanup_error).__name__}"
                     )
-            self.active_tasks.discard(task_id)
-            self.active_media_keys.pop(task_id, None)
-            self.storage_reservations.pop(task_id, None)
-            from services.state import remove_task_metrics
-            remove_task_metrics(task_id)
+            if workspace_admitted:
+                self.active_tasks.discard(task_id)
+                self.active_media_keys.pop(task_id, None)
+                self.storage_reservations.pop(task_id, None)
+                from services.state import remove_task_metrics
+                remove_task_metrics(task_id)
             for reservation in capacity_reservations:
                 await settle(storage_capacity.release(reservation))
 
-    async def _record_task_failure(self, task_id: str, failure: IngestionFailure, submitted_video_url: str) -> None:
+    async def _record_task_failure(self, task_id: str, failure: IngestionFailure, submitted_video_url: str, *, preview_id: Optional[str] = None) -> None:
         try:
             async with AsyncSession(engine) as db:
                 task = await db.get(DownloadTask, task_id)
                 if not task:
+                    return
+                if preview_id is not None and task.current_preview_id != preview_id:
+                    logger.warning("[Queue Manager] Ignoring failure from an older preview generation for task %s", task_id)
                     return
                 if task.status == "COMPLETED":
                     logger.warning(
@@ -1233,7 +1263,7 @@ class DownloadQueueManager:
                         f"{failure.code}"
                     )
                     return
-                ingest_preview_service.mark_error(task_id, failure.code, failure.message)
+                ingest_preview_service.mark_error(preview_id or task.current_preview_id or task_id, failure.code, failure.message)
                 task.status = "FAILED"
                 task.error_message = failure.display
                 db.add(task)

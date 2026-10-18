@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from contextlib import AsyncExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -30,14 +31,20 @@ from services.state import ACTIVE_PROCESSES
 
 
 class CloudPublicationRegression(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+    async def asyncSetUp(self, *, cleanup_owner=None):
+        cleanup_owner = cleanup_owner if cleanup_owner is not None else self
+        self.resources = AsyncExitStack()
+        cleanup_owner.addAsyncCleanup(self.resources.aclose)
         if not rclone_service.executable():
             self.skipTest("rclone is unavailable")
         for name in ("MINIMUM_TASK_RESERVATION_BYTES", "STORAGE_SAFETY_MARGIN_BYTES", "ESTIMATED_MEDIA_BYTES_PER_SECOND"):
-            self.enterContext(patch.object(queue.DownloadQueueManager, name, 1024**2))
+            self.resources.enter_context(patch.object(queue.DownloadQueueManager, name, 1024**2))
         self.directory = tempfile.TemporaryDirectory(prefix="streamhome-cloud-publication-")
+        self.resources.callback(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.previous = settings.MEDIA_DIR, settings.TEMP_DIR, settings.RCLONE_REMOTE_PATH, settings.STORAGE_ENGINE
+        for name, value in zip(("MEDIA_DIR", "TEMP_DIR", "RCLONE_REMOTE_PATH", "STORAGE_ENGINE"), self.previous):
+            self.resources.callback(setattr, settings, name, value)
         settings.MEDIA_DIR = str(self.root / "media")
         settings.TEMP_DIR = str(self.root / "temp")
         settings.RCLONE_REMOTE_PATH = f"isolated:{self.root / 'remote'}"
@@ -47,12 +54,13 @@ class CloudPublicationRegression(unittest.IsolatedAsyncioTestCase):
         config = self.root / "rclone.conf"
         config.write_text("[isolated]\ntype = local\n", encoding="utf-8")
         self.config_patch = patch.object(rclone_service, "config_path", config)
-        self.config_patch.start()
+        self.resources.enter_context(self.config_patch)
         self.engine = create_async_engine(f"sqlite+aiosqlite:///{self.root / 'cloud.db'}")
+        self.resources.push_async_callback(self.engine.dispose)
         self.engine_patch = patch.object(db_module, "engine", self.engine)
-        self.engine_patch.start()
+        self.resources.enter_context(self.engine_patch)
         self.queue_patch = patch.object(queue, "engine", self.engine)
-        self.queue_patch.start()
+        self.resources.enter_context(self.queue_patch)
         async with self.engine.begin() as connection:
             await connection.run_sync(SQLModel.metadata.create_all)
         self.target = self.root / "remote" / "Movies" / "Film_2026_TMDB_1"
@@ -70,12 +78,7 @@ class CloudPublicationRegression(unittest.IsolatedAsyncioTestCase):
             await db.commit()
 
     async def asyncTearDown(self):
-        self.config_patch.stop()
-        self.engine_patch.stop()
-        self.queue_patch.stop()
-        await self.engine.dispose()
-        settings.MEDIA_DIR, settings.TEMP_DIR, settings.RCLONE_REMOTE_PATH, settings.STORAGE_ENGINE = self.previous
-        self.directory.cleanup()
+        await self.resources.aclose()
 
     async def assert_original(self):
         self.assertEqual((self.target / self.original_filename).read_bytes(), b"healthy-old-cloud-video")
@@ -217,6 +220,11 @@ class CloudPublicationRegression(unittest.IsolatedAsyncioTestCase):
 
         async def download(**kwargs):
             shutil.copy2(fixture, kwargs["output_path"])
+            preview = queue.ingest_preview_service
+            generation = kwargs["preview_id"]
+            preview.prepare(generation, 0.5)
+            preview.playlist_path(generation).write_text("#EXTM3U\n#EXTINF:0.5,\nsegment_0.m4s\n#EXT-X-ENDLIST\n")
+            preview.mark_complete(generation)
             return True, None
 
         entered, release = asyncio.Event(), asyncio.Event()

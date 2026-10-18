@@ -246,6 +246,7 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
         old_hash = hashlib.sha256(target.read_bytes()).hexdigest()
         url = "/media/Movies/Synthetic_2026_TMDB_5001/Synthetic_2026.mp4"
         metrics, relay_owners, attempts, delays = [], [], [], []
+        preview_generations, retained_previews = [], {}
         async with engine.begin() as connection:
             await connection.run_sync(SQLModel.metadata.create_all)
         async with AsyncSession(engine) as session:
@@ -266,7 +267,19 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
         real_download, real_probe, real_sleep = worker.download_and_merge, worker.probe_media_stream, asyncio.sleep
         async def download(**kwargs):
             attempts.append((kwargs["task_id"], kwargs["attempt"]))
-            return await real_download(**kwargs)
+            generation = kwargs["preview_id"]
+            preview_generations.append(generation)
+            for prior, hashes in retained_previews.items():
+                for name, digest in hashes.items():
+                    self.assertEqual(hashlib.sha256((ffmpeg.ingest_preview_service.task_path(prior) / name).read_bytes()).hexdigest(), digest)
+            result = await real_download(**kwargs)
+            root = ffmpeg.ingest_preview_service.task_path(generation)
+            # State records intentionally transition failed -> error at queue handoff;
+            # media, captions and accepted cache bytes must remain immutable.
+            if root.is_dir():
+                retained_previews[generation] = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in root.rglob("*") if path.is_file() and path.name != "state.json"}
+            return result
         async def probe(*args, **kwargs):
             result = await real_probe(*args, **kwargs)
             if kwargs["task_id"] == "queue-transient":
@@ -315,6 +328,9 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
                 async with AsyncSession(engine) as session:
                     task, movie = await session.get(DownloadTask, "queue-transient"), await session.get(Movie, "m_5001")
                     self.assertEqual(task.status, "COMPLETED", task.error_message)
+                    self.assertEqual(task.current_preview_id, preview_generations[-1])
+                    self.assertEqual(len(set(preview_generations)), 2)
+                    self.assertEqual(preview_generations[0], "queue-transient")
                     self.assertEqual(movie.video_url, url)
                     self.assertAlmostEqual(movie.probed_duration, 16, delta=0.1)
                     self.assertNotEqual(movie.source_fingerprint, "accepted-old")
@@ -348,7 +364,7 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
                 response.aiter_bytes = chunks
                 response.aclose = fail_close
             return response
-        def native(task_id, command, duration, preview=False):
+        def native(task_id, command, duration, preview=False, preview_id=None):
             local = command[command.index("-i") + 1]
             self.assertEqual(httpx.get(local, trust_env=False).status_code, 200)
             Path(command[-1]).write_bytes(b"unaccepted candidate")
@@ -399,7 +415,7 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
             closing.set()
             await release.wait()
             await real_close(relay)
-        def native(task_id, command, duration, preview=False):
+        def native(task_id, command, duration, preview=False, preview_id=None):
             local_urls.append(command[command.index("-i") + 1])
             Path(command[-1]).write_bytes(b"unaccepted native candidate")
             return True, "native success before cancellation"
@@ -425,7 +441,7 @@ class HLSContextSourceTests(unittest.IsolatedAsyncioTestCase):
         self.route(self.peers[0], "/direct.mp4", b"synthetic source")
         output = self.root / "fallback.mp4"
         calls = []
-        def native(task_id, command, duration, preview=False):
+        def native(task_id, command, duration, preview=False, preview_id=None):
             calls.append(preview)
             Path(command[-1]).write_bytes(b"complete native candidate")
             return (False, "synthetic preview encoder error") if preview else (True, "native success")

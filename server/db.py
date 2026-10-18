@@ -125,6 +125,8 @@ async def init_db(
                     sync_conn.exec_driver_sql("ALTER TABLE integrationcredential ADD COLUMN token_hint TEXT")
             if "downloadtask" in inspector.get_table_names():
                 columns = [col["name"] for col in inspector.get_columns("downloadtask")]
+                if "current_preview_id" not in columns:
+                    sync_conn.exec_driver_sql("ALTER TABLE downloadtask ADD COLUMN current_preview_id TEXT")
                 if "language" not in columns:
                     logger.info("[Database] Migrating: Adding 'language' column to 'downloadtask' table...")
                     sync_conn.exec_driver_sql("ALTER TABLE downloadtask ADD COLUMN language TEXT")
@@ -334,6 +336,8 @@ async def init_db(
                     sync_conn.exec_driver_sql("ALTER TABLE playbackrun ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'catalog'")
                 if "source_fingerprint" not in playback_run_cols:
                     sync_conn.exec_driver_sql("ALTER TABLE playbackrun ADD COLUMN source_fingerprint TEXT")
+                if "source_preview_id" not in playback_run_cols:
+                    sync_conn.exec_driver_sql("ALTER TABLE playbackrun ADD COLUMN source_preview_id TEXT")
                 if "source_task_id" not in playback_run_cols:
                     sync_conn.exec_driver_sql("ALTER TABLE playbackrun ADD COLUMN source_task_id TEXT")
                 sync_conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_playbackrun_source_task_id ON playbackrun (source_task_id)")

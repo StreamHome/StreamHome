@@ -663,6 +663,7 @@ class PlaybackRun(SQLModel, table=True):
     source_kind: str = Field(default="catalog")
     source_fingerprint: Optional[str] = Field(default=None)
     source_task_id: Optional[str] = Field(default=None, index=True)
+    source_preview_id: Optional[str] = Field(default=None)
     sequence_number: int = Field(default=1)
     lifecycle_state: str = Field(default="active")  # "active", "finished", "expired", "abandoned"
     created_at: float = Field(default_factory=time.time)
@@ -680,6 +681,7 @@ class DownloadTask(SQLModel, table=True):
     episode: Optional[int] = None
     video_url: str
     audio_url: Optional[str] = None
+    current_preview_id: Optional[str] = Field(default=None)
     video_source_type: str = Field(default="auto")
     audio_source_type: str = Field(default="auto")
     headers_str: Optional[str] = Field(default="{}")  # Legacy headers or versioned video/audio sets

@@ -274,6 +274,9 @@ class ActualQueueAcceptanceOutcomes(unittest.IsolatedAsyncioTestCase):
             movie = await session.get(Movie, "m_1")
             receipts = (await session.exec(select(MediaOperationReceipt))).all()
             self.assertEqual(task.status, "COMPLETED", "Late acknowledgment failure must not overwrite durable completion")
+            self.assertNotEqual(task.current_preview_id, "cloud-queue")
+            self.assertEqual(preview.status(task.current_preview_id)["phase"], "ready")
+            self.assertEqual(preview.status(task.current_preview_id)["error_code"], "")
             self.assertEqual(movie.quality, "720p")
             self.assertEqual(len(receipts), 1)
             filename = Path(movie.video_url).name
@@ -308,9 +311,13 @@ class ActualQueueAcceptanceOutcomes(unittest.IsolatedAsyncioTestCase):
         with patch.object(cloud_fixture.queue, "ingest_preview_service", preview):
             await self.fixture.run_queue(cancel_during_commit=True)
         async with AsyncSession(self.fixture.engine) as session:
-            self.assertEqual((await session.get(DownloadTask, "cloud-queue")).status, "COMPLETED")
+            task = await session.get(DownloadTask, "cloud-queue")
+            self.assertEqual(task.status, "COMPLETED")
+            generation = task.current_preview_id
         self.assertEqual(preview.status("cloud-queue")["phase"], "ready")
         self.assertEqual(preview.status("cloud-queue")["error_code"], "")
+        self.assertEqual(preview.status(generation)["phase"], "ready")
+        self.assertEqual(preview.status(generation)["error_code"], "")
 
     async def test_actual_queue_rejected_acceptance_marks_preview_and_task_failed(self):
         preview = self.completed_preview()
@@ -319,8 +326,12 @@ class ActualQueueAcceptanceOutcomes(unittest.IsolatedAsyncioTestCase):
         async with AsyncSession(self.fixture.engine) as session:
             task = await session.get(DownloadTask, "cloud-queue")
             self.assertEqual(task.status, "FAILED")
-        self.assertEqual(preview.status("cloud-queue")["phase"], "error")
-        self.assertEqual(preview.status("cloud-queue")["error_code"], "QUEUE_INTERNAL_ERROR")
+            generation = task.current_preview_id
+        self.assertNotEqual(generation, "cloud-queue")
+        self.assertEqual(preview.status("cloud-queue")["phase"], "ready", "An earlier viewer keeps its retained preview")
+        self.assertEqual(preview.status("cloud-queue")["error_code"], "")
+        self.assertEqual(preview.status(generation)["phase"], "error")
+        self.assertEqual(preview.status(generation)["error_code"], "QUEUE_INTERNAL_ERROR")
         await self.fixture.assert_original()
 
     async def test_actual_same_path_cloud_rejection_immediately_resolves_restored_identity(self):

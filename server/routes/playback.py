@@ -1007,7 +1007,7 @@ async def build_run_response(
     if run.source_kind == "ingest_preview":
         if not run.source_task_id or not run.source_fingerprint:
             raise playback_error(status.HTTP_409_CONFLICT, "PREVIEW_SOURCE_MISSING", "The play-while-downloading source is unavailable.")
-        preview_status = ingest_preview_service.status(run.source_task_id)
+        preview_status = ingest_preview_service.status(run.source_preview_id or run.source_task_id)
         fingerprint = run.source_fingerprint
         failure = (
             PlaybackPreparationFailure(
@@ -1222,7 +1222,7 @@ async def _create_playback_run_locked(req: PlaybackRunRequest, request: Request,
         source = None
     if preview_task:
         source_kind = "ingest_preview"
-        source_fingerprint = ingest_preview_service.fingerprint(preview_task.id)
+        source_fingerprint = ingest_preview_service.fingerprint(preview_task.current_preview_id or preview_task.id)
     else:
         source_kind = "catalog"
         source_fingerprint = str(media_obj.source_fingerprint or source.fingerprint)
@@ -1241,6 +1241,7 @@ async def _create_playback_run_locked(req: PlaybackRunRequest, request: Request,
         source_kind=source_kind,
         source_fingerprint=source_fingerprint,
         source_task_id=preview_task.id if preview_task else None,
+        source_preview_id=preview_task.current_preview_id if preview_task else None,
         sequence_number=1,
         lifecycle_state="active",
         created_at=now,
@@ -1303,7 +1304,8 @@ async def _get_playback_run_locked(run_id: str, request: Request, retry: bool, d
                     raise
                 run.source_kind = "ingest_preview"
                 run.source_task_id = repair_task.id
-                run.source_fingerprint = ingest_preview_service.fingerprint(repair_task.id)
+                run.source_preview_id = repair_task.current_preview_id
+                run.source_fingerprint = ingest_preview_service.fingerprint(repair_task.current_preview_id or repair_task.id)
                 run.updated_at = time.time()
                 async with runtime_work("playback.catalog-repair", [EffectClass.DB_WRITE]):
                     db.add(run)
@@ -1700,10 +1702,10 @@ async def preview_run_from_ticket(
     if run.source_kind != "ingest_preview" or not run.source_task_id:
         raise playback_error(status.HTTP_403_FORBIDDEN, "PREVIEW_TICKET_REQUIRED", "This playback ticket does not permit an ingestion preview.")
     try:
-        ingest_preview_service.task_path(run.source_task_id)
+        ingest_preview_service.task_path(run.source_preview_id or run.source_task_id)
     except IngestPreviewError as exc:
         raise playback_error(status.HTTP_403_FORBIDDEN, "PREVIEW_SOURCE_INVALID", "The ingestion preview source is invalid.") from exc
-    return run, run.source_task_id
+    return run, run.source_preview_id or run.source_task_id
 
 
 @router.get("/preview/{media_id}/playlist.m3u8")

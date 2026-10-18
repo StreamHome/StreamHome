@@ -241,7 +241,7 @@ async def _recover_interrupted_ingestion() -> None:
             task.error_message = "Interrupted by server shutdown/restart."
             db.add(task)
             ingest_preview_service.mark_error(
-                task.id,
+                task.current_preview_id or task.id,
                 "INGESTION_INTERRUPTED",
                 "The download and play-while-downloading preview were interrupted by a server restart.",
             )
