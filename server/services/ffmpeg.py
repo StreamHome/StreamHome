@@ -259,7 +259,8 @@ async def download_and_merge(
 ) -> tuple[bool, Optional[IngestionFailure]]:
     """Give FFmpeg only scoped local inputs whose upstream fetches are pinned."""
     require_drained_writer(task_id)
-    preview_id = preview_id or ingest_preview_service.next_generation(task_id)
+    if preview_enabled and preview_id is None:
+        preview_id = ingest_preview_service.next_generation(task_id)
     candidate = _ingestion_candidate_path(output_path, task_id)
     relays = []
     native_results = []
@@ -326,7 +327,8 @@ async def _download_and_merge_controlled(
     """Download video/audio streams, merge losslessly, inject headers, track progress."""
     
     require_drained_writer(task_id)
-    preview_id = preview_id or ingest_preview_service.next_generation(task_id)
+    if preview_enabled and preview_id is None:
+        preview_id = ingest_preview_service.next_generation(task_id)
     abs_output_path = os.path.abspath(output_path)
     os.makedirs(os.path.dirname(abs_output_path), exist_ok=True)
     
