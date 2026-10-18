@@ -377,7 +377,8 @@ class RecoveryCoordinator:
     def _queue_recovery(self, status: dict[str, Any]) -> bool:
         if self.recovery_queued:
             return False
-        transaction_id = str(status.get("transaction") or self.transaction_id or "legacy")
+        # The public status carries only a shortened reference, never authority.
+        transaction_id = self.transaction_id or "legacy"
         try:
             from lifecycle import state as lifecycle_state
 
