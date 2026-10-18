@@ -60,6 +60,21 @@ class StartShellRecoveryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "true")
 
+    def test_exact_build_is_exported_before_guarded_authorization(self) -> None:
+        expected = subprocess.check_output(
+            ["git", "-C", str(self.repository_root), "rev-parse", "--short=12", "HEAD"], text=True,
+        ).strip()
+        result = self._shell(
+            f"ROOT_DIR={str(self.repository_root)!r}\n"
+            "authorize_lifecycle_startup() {\n"
+            "  python3 -c 'import os; print(os.environ.get(\"STREAMHOME_BUILD_ID\", \"missing\"))'\n"
+            "  exit 0\n"
+            "}\n"
+            "main --update-recovery-complete\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), expected)
+
     def test_failed_recovery_liveness_does_not_mask_startup_failure(self) -> None:
         run_dir = self.temp / ".run"
         run_dir.mkdir()

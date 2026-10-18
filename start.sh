@@ -520,6 +520,8 @@ main() {
     [[ $# -eq 0 ]] || fail "Unknown argument: $1 (use --help for usage)"
 
     select_python
+    STREAMHOME_BUILD_ID="$(git -C "$ROOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || printf 'dev')"
+    export STREAMHOME_BUILD_ID
     [[ "$STARTUP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] \
         && (( STARTUP_TIMEOUT_SECONDS >= 30 && STARTUP_TIMEOUT_SECONDS <= 300 )) \
         || fail "STREAMHOME_STARTUP_TIMEOUT_SECONDS must be between 30 and 300."
@@ -620,7 +622,6 @@ main() {
     fi
     PUBLIC_URL="${PUBLIC_URL%/}"
     validate_public_url "$PUBLIC_URL" || fail "The resolved PUBLIC_URL is invalid: $PUBLIC_URL"
-    STREAMHOME_BUILD_ID="$(git -C "$ROOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || printf 'dev')"
     export WEB_PORT SETUP PUBLIC_URL STREAMHOME_PUBLIC_URL_EXPLICIT STREAMHOME_BUILD_ID TRUSTED_PROXY_CIDRS
 
     acquire_lifecycle_lock
