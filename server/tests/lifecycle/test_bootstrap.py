@@ -180,18 +180,104 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
         run_dir = self.root / ".run"
         run_dir.mkdir(mode=0o700)
         journal = run_dir / "update-state.json"
-        journal.write_text(json.dumps({"transaction_id": transaction}), encoding="utf-8")
+        journal.write_text(json.dumps({"transaction_id": transaction, "target_commit": "a" * 40}), encoding="utf-8")
         environment = self._environment(
             STREAMHOME_LIFECYCLE_STARTUP_MODE="update_verify",
             STREAMHOME_LIFECYCLE_FIRST_ADOPTION="true",
             STREAMHOME_UPDATE_TRANSACTION=transaction,
             STREAMHOME_UPDATE_COMMIT_TOKEN="not-exposed-by-bootstrap-output",
+            STREAMHOME_BUILD_ID="a" * 12,
         )
         accepted = bootstrap.evaluate_startup(self.root, environment, install=False)
         self.assertEqual(accepted.mode, bootstrap.StartupMode.UPDATE_VERIFY)
+        numeric_target = 1 * 10 ** 39
+        journal.write_text(json.dumps({"transaction_id": transaction, "target_commit": numeric_target}), encoding="utf-8")
+        rejected = bootstrap.evaluate_startup(self.root, {**environment, "STREAMHOME_BUILD_ID": str(numeric_target)[:12]}, install=False)
+        self.assertEqual(rejected.mode, bootstrap.StartupMode.FAIL_CLOSED)
         journal.write_text("{", encoding="utf-8")
         rejected = bootstrap.evaluate_startup(self.root, environment, install=False)
         self.assertEqual(rejected.mode, bootstrap.StartupMode.FAIL_CLOSED)
+
+    async def test_first_adoption_completion_requires_exact_durable_receipt(self) -> None:
+        transaction = str(uuid.uuid4())
+        run_dir = self.root / ".run"
+        run_dir.mkdir(mode=0o700)
+        journal = run_dir / "update-state.json"
+        payload = {
+            "transaction_id": transaction, "target_commit": "a" * 40,
+            "current_commit": "a" * 40, "phase": "starting",
+            "lifecycle_generation": None, "lifecycle_phase": None,
+            "runtime_committed": False,
+        }
+        journal.write_text(json.dumps(payload), encoding="utf-8")
+        environment = self._environment(
+            STREAMHOME_LIFECYCLE_STARTUP_MODE="update_verify",
+            STREAMHOME_LIFECYCLE_FIRST_ADOPTION="true",
+            STREAMHOME_UPDATE_TRANSACTION=transaction,
+            STREAMHOME_UPDATE_COMMIT_TOKEN="synthetic-private-token",
+            STREAMHOME_BUILD_ID="a" * 12,
+        )
+        context = bootstrap.evaluate_startup(self.root, environment, install=False)
+        self.assertIsNone(context.generation)
+        self.assertEqual(context.adoption_target_commit, "a" * 40)
+        readiness = bootstrap.StartupReadiness(context)
+
+        async def success():
+            pass
+
+        readiness.record_recovery(await bootstrap.run_mandatory_recovery(
+            context, (bootstrap.MandatoryRecoveryStep("normal", success),)))
+        readiness.mark_workers_started()
+        readiness.mark_general_ready()
+        self.assertFalse(bootstrap.current_readiness_projection(readiness, environment)["generalReady"])
+        payload.update(runtime_committed=True, runtime_committed_at=1.0)
+        journal.write_text(json.dumps(payload), encoding="utf-8")
+        self.assertTrue(bootstrap.guarded_operation_completed(context, environment))
+        self.assertTrue(bootstrap.current_readiness_projection(readiness, environment)["generalReady"])
+        self.assertFalse(state.lifecycle_paths(self.root).state_path.exists())
+        for changes in (
+            {"transaction_id": str(uuid.uuid4())},
+            {"target_commit": "a" * 12 + "b" * 28},
+            {"current_commit": "b" * 40},
+            {"phase": "rolled_back"}, {"phase": "failed"},
+            {"runtime_committed": 1}, {"runtime_committed": False},
+            {"runtime_committed_at": None}, {"runtime_committed_at": True},
+            {"runtime_committed_at": float("inf")}, {"runtime_committed_at": 0},
+            {"lifecycle_generation": 1}, {"lifecycle_phase": "verifying"},
+        ):
+            with self.subTest(changes=changes):
+                journal.write_text(json.dumps({**payload, **changes}), encoding="utf-8")
+                self.assertFalse(bootstrap.guarded_operation_completed(context, environment))
+                self.assertFalse(bootstrap.current_readiness_projection(readiness, environment)["generalReady"])
+        journal.write_text(json.dumps(payload), encoding="utf-8")
+        for raw in (
+            json.dumps(payload).replace('"runtime_committed": true', '"runtime_committed": false, "runtime_committed": true'),
+            json.dumps(payload).replace('"runtime_committed_at": 1.0', '"runtime_committed_at": NaN'),
+            "[]", "{", " " * (64 * 1024 + 1),
+        ):
+            with self.subTest(raw=raw[:80]):
+                journal.write_text(raw, encoding="utf-8")
+                self.assertFalse(bootstrap.guarded_operation_completed(context, environment))
+                self.assertEqual(bootstrap.evaluate_startup(self.root, environment).mode, bootstrap.StartupMode.FAIL_CLOSED)
+        journal.unlink()
+        os.mkfifo(journal)
+        self.assertFalse(bootstrap.guarded_operation_completed(context, environment))
+        self.assertEqual(bootstrap.evaluate_startup(self.root, environment).mode, bootstrap.StartupMode.FAIL_CLOSED)
+        journal.unlink()
+        receipt = run_dir / "receipt.json"
+        receipt.write_text(json.dumps(payload), encoding="utf-8")
+        journal.symlink_to(receipt)
+        self.assertFalse(bootstrap.guarded_operation_completed(context, environment))
+        self.assertEqual(bootstrap.evaluate_startup(self.root, environment).mode, bootstrap.StartupMode.FAIL_CLOSED)
+        journal.unlink()
+        journal.write_text(json.dumps(payload), encoding="utf-8")
+        claimed = self._claim("restore", "restore_controller")
+        self.assertFalse(bootstrap.guarded_operation_completed(context, environment))
+        state.complete_operation_with_credential(
+            self.root, operation_id=claimed.state.active_operation.operation_id,
+            generation=claimed.state.generation, expected_phase="reserved")
+        self.assertFalse(bootstrap.guarded_operation_completed(context, environment))
+        self.assertEqual(bootstrap.evaluate_startup(self.root, environment).mode, bootstrap.StartupMode.FAIL_CLOSED)
 
     async def test_structured_recovery_distinguishes_completion_and_success(self) -> None:
         context = bootstrap.evaluate_startup(self.root, {}, install=False)

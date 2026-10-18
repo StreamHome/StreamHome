@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import unittest
 import uuid
 
@@ -26,7 +27,13 @@ class UpdateShellLifecycleTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def _shell(self, script: str, *, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def _shell(
+        self,
+        script: str,
+        *,
+        environment: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         if environment:
@@ -38,7 +45,82 @@ class UpdateShellLifecycleTests(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
+            timeout=timeout,
         )
+
+    def _committed_runtime_probe(
+        self,
+        payloads: list[dict[str, object]],
+        script: str = "wait_for_committed_runtime \"$TARGET_COMMIT\"",
+    ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+        fixture = self.temp / f"health-fixture-{uuid.uuid4()}"
+        fixture.mkdir()
+        responses = fixture / "responses.json"
+        responses.write_text(json.dumps(payloads), encoding="utf-8")
+        observations = fixture / "observations.jsonl"
+        # Patch only the Python child of the actual shell function. No sockets,
+        # runtime imports or wall-clock waits are used; exhaustion fails promptly
+        # rather than hiding an unexpected infinite polling loop.
+        (fixture / "sitecustomize.py").write_text(
+            textwrap.dedent("""\
+                import json
+                import os
+                import time
+                import urllib.request
+                from pathlib import Path
+
+                responses = json.loads(Path(os.environ['HEALTH_RESPONSES']).read_text())
+                observations = Path(os.environ['HEALTH_OBSERVATIONS'])
+
+                class Response:
+                    status = 200
+                    def __init__(self, payload):
+                        self.payload = payload
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *args):
+                        return False
+                    def read(self):
+                        return json.dumps(self.payload).encode('utf-8')
+
+                class Opener:
+                    def open(self, url, timeout):
+                        if url != 'http://127.0.0.1:8000/api/health/live':
+                            raise SystemExit(89)
+                        if not responses:
+                            raise SystemExit(88)
+                        payload = responses.pop(0)
+                        with observations.open('a') as handle:
+                            handle.write(json.dumps(payload) + '\\n')
+                        return Response(payload)
+
+                urllib.request.build_opener = lambda *args: Opener()
+                time.sleep = lambda seconds: None
+                """),
+            encoding="utf-8",
+        )
+        result = self._shell(
+            f"TARGET_COMMIT={'a' * 40}\n{script}",
+            environment={
+                "PYTHONPATH": str(fixture),
+                "HEALTH_RESPONSES": str(responses),
+                "HEALTH_OBSERVATIONS": str(observations),
+            },
+            timeout=5,
+        )
+        polls = [json.loads(line) for line in observations.read_text().splitlines()]
+        return result, polls
+
+    def _live_payload(self, **changes: object) -> dict[str, object]:
+        return {
+            "status": "live",
+            "buildId": "a" * 12,
+            "recoveryCompleted": True,
+            "recoverySucceeded": True,
+            "workersStarted": False,
+            "errorCode": None,
+            **changes,
+        }
 
     def _git(self, repository: Path, *arguments: str) -> str:
         result = subprocess.run(
@@ -434,6 +516,91 @@ class UpdateShellLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "2 true false true")
+
+    def test_committed_runtime_wait_stops_on_explicit_completed_startup_failure(self) -> None:
+        for code in (
+            "update_lifecycle_identity_missing",
+            "update_completion_fence_failed",
+            "update_completion_drain_timeout",
+            "update_lifecycle_unresolved",
+            "worker_start_failed",
+        ):
+            with self.subTest(code=code):
+                failure = self._live_payload(errorCode=code)
+                result, polls = self._committed_runtime_probe([failure])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(polls, [failure])
+
+    def test_committed_runtime_wait_still_stops_on_mandatory_recovery_failure(self) -> None:
+        failure = self._live_payload(
+            recoverySucceeded=False, errorCode="catalog_recovery_failed"
+        )
+        result, polls = self._committed_runtime_probe([failure])
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(polls, [failure])
+
+    def test_committed_runtime_wait_allows_long_recovery_and_worker_startup_gap(self) -> None:
+        recovering = self._live_payload(
+            recoveryCompleted=False,
+            recoverySucceeded=False,
+            errorCode="update_lifecycle_pending",
+        )
+        starting_workers = self._live_payload()
+        ready = self._live_payload(workersStarted=True)
+        # Exceed the separate 30-poll unavailability limit with valid pending
+        # health. Neither mandatory recovery nor the worker-start gap times out.
+        payloads = [recovering] * 35 + [starting_workers] * 35 + [ready]
+        result, polls = self._committed_runtime_probe(payloads)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(polls, payloads)
+
+    def test_committed_runtime_wait_does_not_classify_foreign_build_error(self) -> None:
+        payloads = [
+            self._live_payload(buildId="b" * 12, errorCode="worker_start_failed"),
+            self._live_payload(workersStarted=True),
+        ]
+        result, polls = self._committed_runtime_probe(payloads)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(polls, payloads)
+
+    def test_committed_runtime_wait_preserves_worker_ready_lifecycle_pending_handoff(self) -> None:
+        ready = self._live_payload(
+            workersStarted=True, errorCode="update_lifecycle_pending"
+        )
+        result, polls = self._committed_runtime_probe([ready])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(polls, [ready])
+
+    def test_explicit_post_commit_startup_failure_preserves_candidate_without_rollback(self) -> None:
+        rollback = self.temp / "post-commit-rollback"
+        journal = self.temp / "post-commit-journal"
+        result, polls = self._committed_runtime_probe(
+            [self._live_payload(errorCode="update_lifecycle_identity_missing")],
+            "\n".join(
+                (
+                    "COMMIT_TOKEN=fixture-token",
+                    "TRANSACTION_ID=fixture-transaction",
+                    "CUTOVER_STARTED=true",
+                    "ACTIVATION_STARTED=true",
+                    "RUNTIME_HEALTHY=false",
+                    "PRESERVE_MAINTENANCE=true",
+                    "installed_release_has_guarded_bootstrap() { return 0; }",
+                    "curl() { printf 200; }",
+                    f'write_state() {{ printf "%s\\n" "$@" >> {shlex_quote(str(journal))}; }}',
+                    f"rollback_release() {{ touch {shlex_quote(str(rollback))}; }}",
+                    "release_lock() { :; }",
+                    'promote_recovered_guarded_runtime "$TARGET_COMMIT"',
+                    "result=$?",
+                    'printf "%s %s %s %s %s %s\\n" "$result" "$NO_ROLLBACK_BOUNDARY" "$CUTOVER_STARTED" "$ACTIVATION_STARTED" "$LIFECYCLE_PRESERVE" "$PRESERVE_RECOVERY_ARTIFACTS"',
+                    "cleanup",
+                )
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1 true false false true true")
+        self.assertEqual(len(polls), 1)
+        self.assertIn("post_commit_recovery_failed", journal.read_text())
+        self.assertFalse(rollback.exists())
 
     def test_post_commit_failure_retains_recovery_without_rollback(self) -> None:
         source = (self.repository_root / "update.sh").read_text(encoding="utf-8")

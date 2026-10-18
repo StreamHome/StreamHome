@@ -10,8 +10,10 @@ import asyncio
 from dataclasses import dataclass
 from enum import Enum
 import json
+import math
 import os
 from pathlib import Path
+import re
 import threading
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 import uuid
@@ -75,6 +77,7 @@ class StartupContext:
     guarded_identity_validated: bool
     allowed_effects: frozenset[str]
     failure_code: str | None = None
+    adoption_target_commit: str | None = None
 
     @property
     def imports_application(self) -> bool:
@@ -151,7 +154,11 @@ def _legacy_first_adoption_context(
     inspected: state.LifecycleState,
     environ: Mapping[str, str],
 ) -> StartupContext | None:
-    if str(environ.get(FIRST_ADOPTION_ENV) or "").lower() != "true":
+    if (
+        str(environ.get(FIRST_ADOPTION_ENV) or "").lower() != "true"
+        or inspected.generation != 0
+        or inspected.active_operation is not None
+    ):
         return None
     transaction = str(environ.get(UPDATE_TRANSACTION_ENV) or "").strip()
     commit_token = str(environ.get(UPDATE_COMMIT_TOKEN_ENV) or "").strip()
@@ -161,17 +168,20 @@ def _legacy_first_adoption_context(
     except (ValueError, AttributeError):
         return None
     journal_path = root / ".run" / "update-state.json"
+    from .update_controller import UpdateControllerError, read_update_journal
+
     try:
-        if journal_path.is_symlink() or journal_path.stat().st_size > 64 * 1024:
-            return None
-        payload = json.loads(journal_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError, TypeError):
+        payload = read_update_journal(journal_path)
+    except UpdateControllerError:
         return None
     if (
         not isinstance(payload, dict)
         or payload.get("transaction_id") != transaction
-        or payload.get("lifecycle_generation") not in {None, ""}
+        or payload.get("lifecycle_generation") not in (None, "")
         or str(payload.get("lifecycle_phase") or "")
+        or not isinstance(payload.get("target_commit"), str)
+        or not re.fullmatch(r"[0-9a-f]{40}", payload["target_commit"])
+        or payload["target_commit"][:12] != environ.get("STREAMHOME_BUILD_ID")
     ):
         return None
     return StartupContext(
@@ -185,6 +195,7 @@ def _legacy_first_adoption_context(
         owner_kind=state.OwnerKind.UPDATER.value,
         guarded_identity_validated=True,
         allowed_effects=frozenset({"db_write"}),
+        adoption_target_commit=payload["target_commit"],
     )
 
 
@@ -331,6 +342,50 @@ def require_current_guarded_authority(
     if not context.guarded or not context.guarded_identity_validated:
         raise StartupAuthorityChangedError("guarded lifecycle authority is unavailable")
     revalidate_startup_context(context, environ)
+
+
+def guarded_operation_completed(
+    context: StartupContext,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Prove completion without manufacturing shared authority for legacy adoption."""
+    from .update_controller import UpdateControllerError, read_update_journal
+
+    try:
+        current = state.inspect_state(context.installation_root)
+        if current.active_operation is not None:
+            return False
+        if context.generation is not None:
+            return current.generation == context.generation
+        if (
+            context.mode is not StartupMode.UPDATE_VERIFY
+            or not context.guarded_identity_validated
+            or context.operation_type != state.OperationType.UPDATE.value
+            or context.owner_kind != state.OwnerKind.UPDATER.value
+            or context.lifecycle_phase is not None
+            or not context.adoption_target_commit
+            or current.generation != 0
+        ):
+            return False
+        require_current_guarded_authority(context, environ)
+        journal = context.installation_root / ".run" / "update-state.json"
+        payload = read_update_journal(journal)
+        committed_at = payload.get("runtime_committed_at")
+        return (
+            payload.get("transaction_id") == context.operation_id
+            and payload.get("target_commit") == context.adoption_target_commit
+            and payload.get("current_commit") == context.adoption_target_commit
+            and payload.get("lifecycle_generation") in (None, "")
+            and not payload.get("lifecycle_phase")
+            and payload.get("phase") in {"starting", "recovering", "succeeded"}
+            and payload.get("runtime_committed") is True
+            and type(committed_at) in {int, float}
+            and math.isfinite(committed_at)
+            and committed_at > 0
+        )
+    except (state.LifecycleError, StartupAuthorityChangedError, UpdateControllerError,
+            OSError, ValueError, TypeError, AttributeError, OverflowError):
+        return False
 
 
 async def run_mandatory_recovery(
@@ -484,14 +539,7 @@ def current_readiness_projection(
         StartupMode.UPDATE_VERIFY,
         StartupMode.RESTORE_VERIFY,
     }:
-        try:
-            current = state.inspect_state(readiness.context.installation_root)
-            lifecycle_completed = (
-                current.active_operation is None
-                and current.generation == readiness.context.generation
-            )
-        except state.LifecycleError:
-            lifecycle_completed = False
+        lifecycle_completed = guarded_operation_completed(readiness.context, environ)
         if not lifecycle_completed:
             projection = dict(projection)
             projection["generalReady"] = False

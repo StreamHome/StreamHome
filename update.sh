@@ -1680,6 +1680,16 @@ while True:
             raise SystemExit(0)
         if live.get("recoveryCompleted") and not live.get("recoverySucceeded"):
             raise SystemExit(2)
+        if (
+            live.get("recoveryCompleted") is True
+            and live.get("workersStarted") is False
+            and isinstance(live.get("errorCode"), str)
+            and live["errorCode"].strip()
+        ):
+            # Recovery can succeed before worker startup or lifecycle completion
+            # fails. An explicit startup error is terminal; recovery still in
+            # progress and the normal gap before worker startup remain unbounded.
+            raise SystemExit(2)
     except Exception:
         unavailable += 1
         if unavailable >= 30:

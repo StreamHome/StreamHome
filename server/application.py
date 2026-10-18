@@ -3,6 +3,7 @@ from lifecycle.bootstrap import (
     ReadinessCapability,
     StartupMode,
     get_startup_readiness,
+    guarded_operation_completed,
     revalidate_startup_context,
     require_startup_context,
     run_mandatory_recovery,
@@ -527,23 +528,29 @@ async def _promote_committed_update(
     if not result.succeeded:
         logger.error(f"[Lifespan Startup] Post-update recovery failed: {result.error_code}")
         return
-    if STARTUP_CONTEXT.operation_id is None or STARTUP_CONTEXT.generation is None:
+    if STARTUP_CONTEXT.operation_id is None:
         STARTUP_READINESS.mark_worker_start_failed("update_lifecycle_identity_missing")
         return
-    try:
-        completion_fence = get_runtime_coordinator().close_admission(
-            list(EffectClass),
-            operation_id=STARTUP_CONTEXT.operation_id,
-            generation=STARTUP_CONTEXT.generation,
-        )
-    except Exception:
-        STARTUP_READINESS.mark_worker_start_failed("update_completion_fence_failed")
-        logger.error("[Lifespan Startup] Update completion fence could not be established.")
-        return
-    drained = await get_runtime_coordinator().drain(completion_fence, timeout=30.0)
-    if not drained.complete:
-        STARTUP_READINESS.mark_worker_start_failed("update_completion_drain_timeout")
-        return
+    completion_fence = None
+    if STARTUP_CONTEXT.generation is None:
+        if not guarded_operation_completed(STARTUP_CONTEXT):
+            STARTUP_READINESS.mark_worker_start_failed("update_adoption_commit_unproven")
+            return
+    else:
+        try:
+            completion_fence = get_runtime_coordinator().close_admission(
+                list(EffectClass),
+                operation_id=STARTUP_CONTEXT.operation_id,
+                generation=STARTUP_CONTEXT.generation,
+            )
+        except Exception:
+            STARTUP_READINESS.mark_worker_start_failed("update_completion_fence_failed")
+            logger.error("[Lifespan Startup] Update completion fence could not be established.")
+            return
+        drained = await get_runtime_coordinator().drain(completion_fence, timeout=30.0)
+        if not drained.complete:
+            STARTUP_READINESS.mark_worker_start_failed("update_completion_drain_timeout")
+            return
     try:
         await _start_runtime_workers(runtime)
     except Exception:
@@ -557,12 +564,9 @@ async def _promote_committed_update(
             current = lifecycle_state.inspect_state(STARTUP_CONTEXT.installation_root)
         except lifecycle_state.LifecycleError:
             current = None
-        if (
-            current is not None
-            and current.active_operation is None
-            and current.generation == STARTUP_CONTEXT.generation
-        ):
-            get_runtime_coordinator().release_fence(completion_fence)
+        if guarded_operation_completed(STARTUP_CONTEXT):
+            if completion_fence is not None:
+                get_runtime_coordinator().release_fence(completion_fence)
             from lifecycle.storage_worker import storage_worker
             await storage_worker.measurements.start()
             if state.MAINTENANCE_REASON == "StreamHome is completing guarded startup verification.":
@@ -571,7 +575,8 @@ async def _promote_committed_update(
             break
         operation = current.active_operation if current is not None else None
         if (
-            operation is None
+            STARTUP_CONTEXT.generation is None
+            or operation is None
             or operation.operation_id != STARTUP_CONTEXT.operation_id
             or current.generation != STARTUP_CONTEXT.generation
             or operation.phase is lifecycle_state.LifecyclePhase.RECOVERY_REQUIRED
@@ -759,18 +764,8 @@ class StartupModeGateMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         readiness = STARTUP_READINESS.projection()
         public_ready = readiness["generalReady"]
-        if public_ready and STARTUP_CONTEXT.mode in {
-            StartupMode.UPDATE_VERIFY,
-            StartupMode.RESTORE_VERIFY,
-        }:
-            try:
-                current = lifecycle_state.inspect_state(STARTUP_CONTEXT.installation_root)
-                public_ready = (
-                    current.active_operation is None
-                    and current.generation == STARTUP_CONTEXT.generation
-                )
-            except lifecycle_state.LifecycleError:
-                public_ready = False
+        if public_ready and STARTUP_CONTEXT.guarded:
+            public_ready = guarded_operation_completed(STARTUP_CONTEXT)
         if public_ready:
             return await call_next(request)
         path = request.url.path
