@@ -61,11 +61,20 @@ class StartShellRecoveryTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "true")
 
     def test_exact_build_is_exported_before_guarded_authorization(self) -> None:
+        repository = self.temp / "installed"
+        repository.mkdir()
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        (repository / "marker").write_text("synthetic installed release\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repository), "add", "marker"], check=True)
+        subprocess.run([
+            "git", "-C", str(repository), "-c", "user.name=StreamHome Test",
+            "-c", "user.email=test@example.invalid", "commit", "-qm", "synthetic release",
+        ], check=True)
         expected = subprocess.check_output(
-            ["git", "-C", str(self.repository_root), "rev-parse", "--short=12", "HEAD"], text=True,
+            ["git", "-C", str(repository), "rev-parse", "--short=12", "HEAD"], text=True,
         ).strip()
         result = self._shell(
-            f"ROOT_DIR={str(self.repository_root)!r}\n"
+            f"ROOT_DIR={str(repository)!r}\n"
             "authorize_lifecycle_startup() {\n"
             "  python3 -c 'import os; print(os.environ.get(\"STREAMHOME_BUILD_ID\", \"missing\"))'\n"
             "  exit 0\n"
