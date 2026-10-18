@@ -12,7 +12,7 @@ files.update(str(f.relative_to(source)) for f in (source/'server/tests').rglob('
 for name in files:
  f=source/name
  if f.suffix not in allowed or name.startswith(('memory-bank/','.agents/','artifacts/')) or not f.is_file() or f.is_symlink():continue
- dest=root/name;dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(f,dest)
+ dest=root/name;dest.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(f,dest)
 (root/'venv').symlink_to(source/'venv',target_is_directory=True)
 (root/'web').mkdir(exist_ok=True)
 (root/'web/node_modules').symlink_to(source/'web/node_modules',target_is_directory=True)
@@ -23,6 +23,7 @@ for name in ('ffmpeg','ffprobe','rclone'):
 # No live environment, credentials, database, runtime state, media or diagnostics copied.
 env={k:v for k,v in os.environ.items() if k in {'PATH','HOME','LANG','LC_ALL','TMPDIR'}}
 (root/'test-home').mkdir()
+(root/'temp').mkdir()
 env['HOME']=str(root/'test-home')
 env.update(PYTHONDONTWRITEBYTECODE='1', PYTHONPATH=str(root/'server'), JWT_SECRET='isolated-test-secret-not-production', SECRET_ENCRYPTION_KEY='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', SETUP='false', STORAGE_ENGINE='LOCAL', STREAMHOME_INSTANCE_ROOT=str(root), PUBLIC_URL='http://localhost:3000')
 command=a.command[1:] if a.command and a.command[0]=='--' else a.command

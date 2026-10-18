@@ -92,8 +92,12 @@ class WriterBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 "services.media_source",
                 ResolvedMediaSource=object,
                 clear_cloud_object_cache=lambda *_args, **_kwargs: None,
+                cloud_read_enabled=lambda: False,
                 playback_source_fingerprint=lambda *args, **kwargs: "a" * 32,
                 resolve_media_source=lambda *args, **kwargs: None,
+                resolve_related_source=mock.AsyncMock(
+                    side_effect=AssertionError("Unexpected related source resolution")
+                ),
             ),
             "services.rclone": module_stub(
                 "services.rclone",
@@ -372,6 +376,11 @@ class WriterBehaviorTests(unittest.IsolatedAsyncioTestCase):
             ),
             "services.rclone": module_stub(
                 "services.rclone", rclone_service=rclone_service
+            ),
+            "services.storage_inventory": module_stub(
+                "services.storage_inventory",
+                hybrid_policy_active=lambda: False,
+                target_generation=lambda: "unused-legacy-backup-target",
             ),
             "sqlmodel": sqlmodel,
             "sqlmodel.ext": sqlmodel_ext,

@@ -59,8 +59,9 @@ describe("skip-marker API normalization", () => {
 
   it("normalizes movie and embedded episode metadata at the same boundary", () => {
     const movie = normalizeMovie({
+      id: "movie",
       skipMarkers: { intro: [{ start: "0", end: "32" }, { start: null, end: 100 }] },
-      episodes: [{ skipMarkers: { recap: [{ start: "1", end: "12" }, { start: false, end: 100 }] } }],
+      episodes: [{ id: "episode", skipMarkers: { recap: [{ start: "1", end: "12" }, { start: false, end: 100 }] } }],
     });
     expect(movie.skipMarkers).toEqual({ intro: [{ start: 0, end: 32 }] });
     expect(movie.episodes?.[0].skipMarkers).toEqual({ recap: [{ start: 1, end: 12 }] });

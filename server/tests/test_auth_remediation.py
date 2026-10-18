@@ -197,7 +197,7 @@ class AuthenticationRemediationRegression(unittest.IsolatedAsyncioTestCase):
 
     async def test_close_is_idempotent_and_keeps_session_authorization(self) -> None:
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
-            progress = playback.PlaybackProgressRequest(sequence_number=1, timestamp=20, duration_watched=1, event="exit")
+            progress = playback.PlaybackCloseRequest(sequence_number=1, timestamp=20, duration_watched=1, event="exit")
             with patch("routes.playback.record_playback_progress", new=AsyncMock(return_value="view")) as record:
                 first = await playback.close_playback_run("run-test", progress, request(self.session), db, self.user)
                 second = await playback.close_playback_run("run-test", progress, request(self.session), db, self.user)
