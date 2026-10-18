@@ -265,7 +265,8 @@ validate_versions
         self.assertIn("transaction_id", update_sh)
         self.assertIn("--controller-silence-seconds", update_sh)
         self.assertIn("--finalize-recovery", update_sh)
-        self.assertIn("recovery_start_failed", update_sh)
+        self.assertIn("record_post_commit_recovery_failure", update_sh)
+        self.assertIn("preserving it fail-closed without automatic rollback", update_sh)
         self.assertIn("update-diagnostics.json", update_sh)
         self.assertIn("update-lock-recovery.lock", update_sh)
         self.assertIn('mv -T -- "$UPDATE_LOCK" "$quarantined_lock"', update_sh)
@@ -734,11 +735,18 @@ validate_versions
 
             helper = (ROOT / "server" / "scratch" / "maintenance_server.py").read_text(encoding="utf-8")
             old_files = {
-                ".gitignore": ".run/\n*.log\nvenv/\nserver/database.db\n",
+                ".gitignore": ".run/\n*.log\nvenv/\nserver/database.db\nweb/node_modules/\nweb/dist/\nhealthy.marker\n",
                 "setup.sh": (
                     "#!/usr/bin/env bash\n"
                     "mkdir -p venv/bin\n"
-                    "printf '#!/usr/bin/env bash\\nexec python3 \"$@\"\\n' > venv/bin/python\n"
+                    "cat > venv/bin/python <<'PYTHON'\n"
+                    "#!/usr/bin/env bash\n"
+                    "if [[ \"${1:-}\" == -m && \"${2:-}\" == pip ]]; then\n"
+                    "    [[ \"${3:-}\" == check ]] || exit 1\n"
+                    "    exit 0\n"
+                    "fi\n"
+                    "exec python3 \"$@\"\n"
+                    "PYTHON\n"
                     "chmod +x venv/bin/python\n"
                 ),
                 "test.sh": "#!/usr/bin/env bash\nexit 0\n",
@@ -747,12 +755,12 @@ validate_versions
                 ".env": f"WEB_PORT={unused_port()}\n",
                 "server/requirements.txt": "",
                 "server/requirements.lock": "",
+                "server/scratch/test_update_system.py": "raise SystemExit(0)\n",
                 "server/scratch/maintenance_server.py": helper,
                 "server/scratch/runtime_control.py": (
                     ROOT / "server" / "scratch" / "runtime_control.py"
                 ).read_text(encoding="utf-8"),
-                "web/node_modules/runtime.txt": "known-working dependencies\n",
-                "web/dist/index.html": "known-working assets\n",
+                "web/package.json": "{}\n",
             }
             for relative, content in old_files.items():
                 target = remote / relative
@@ -773,9 +781,11 @@ validate_versions
                 "connection.commit()\n"
                 "connection.close()\n"
                 "PY\n"
+                "printf 'mutated\\n' > .run/failed-target-started\n"
                 "exit 1\n"
             )
             (remote / "start.sh").write_text(target_start, encoding="utf-8", newline="\n")
+            (remote / "start.sh").chmod(0o755)
             git(["add", "start.sh"], cwd=remote)
             git(["commit", "-m", "broken candidate startup"], cwd=remote)
             target_commit = run(["git", "rev-parse", "HEAD"], cwd=remote).stdout.strip()
@@ -785,6 +795,10 @@ validate_versions
             git(["reset", "--hard", old_commit], cwd=installed)
             prepared = run([bash, str(installed / "setup.sh"), "--no-start"], cwd=installed)
             self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+            (installed / "web" / "node_modules").mkdir()
+            (installed / "web" / "node_modules" / "runtime.txt").write_text("known-working dependencies\n", encoding="utf-8")
+            (installed / "web" / "dist").mkdir()
+            (installed / "web" / "dist" / "index.html").write_text("known-working assets\n", encoding="utf-8")
             (installed / "web" / "dist" / ".streamhome-build").write_text(
                 f"{old_commit[:12]}\n",
                 encoding="utf-8",
@@ -818,11 +832,6 @@ validate_versions
                 "https://github.com/StreamHome/StreamHome.git",
                 remote.as_uri(),
             )
-            controller_source = controller_source.replace(
-                "        ./venv/bin/python -m compileall -q server\n"
-                "        PYTHONPATH=server ./venv/bin/python server/scratch/test_update_system.py\n",
-                "        true\n",
-            )
             controller.write_text(controller_source, encoding="utf-8", newline="\n")
             controller.chmod(0o755)
             environment = os.environ.copy()
@@ -848,6 +857,9 @@ validate_versions
                 result.stdout + result.stderr,
             )
             self.assertEqual(run(["git", "rev-parse", "HEAD"], cwd=installed).stdout.strip(), old_commit)
+            self.assertTrue((installed / "healthy.marker").exists(), result.stdout + result.stderr)
+            self.assertTrue((installed / ".run" / "failed-target-started").exists(), result.stdout + result.stderr)
+            self.assertEqual((installed / ".run" / "failed-target-started").read_text(), "mutated\n")
             self.assertEqual((installed / "healthy.marker").read_text(encoding="utf-8"), "healthy-old\n")
             self.assertEqual(
                 (installed / "web" / "node_modules" / "runtime.txt").read_text(encoding="utf-8"),
@@ -922,8 +934,10 @@ validate_versions
                     cwd=fixture,
                 )
                 self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
-                self.assertIn("earlier StreamHome process", recovered.stdout)
+                self.assertEqual(recovered.stdout, "", "Startup recovery intentionally uses quiet output")
                 owned.wait(timeout=5)
+                with socket.socket() as proof:
+                    proof.bind(("127.0.0.1", owned_port))
             finally:
                 if owned.poll() is None:
                     owned.kill()
@@ -995,6 +1009,7 @@ validate_versions
                 "    [sys.executable, 'listener.py', sys.argv[1]],\n"
                 "    cwd=pathlib.Path(__file__).parent,\n"
                 "    env=os.environ.copy(),\n"
+                "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
                 "    start_new_session=True,\n"
                 ")\n"
                 "pathlib.Path(sys.argv[2]).write_text(str(child.pid), encoding='utf-8')\n",
