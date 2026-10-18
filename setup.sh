@@ -389,7 +389,8 @@ prepare_virtual_environment() {
     local python_fingerprint python_stamp="$SETUP_STATE_DIR/python.fingerprint"
     CURRENT_STEP="Python virtual environment creation"
     if [[ -d "$ROOT_DIR/venv" && ! -x "$ROOT_DIR/venv/bin/python" ]]; then
-        local recovery="$ROOT_DIR/venv.broken.$(date +%Y%m%d%H%M%S)"
+        local recovery
+        recovery="$ROOT_DIR/venv.broken.$(date +%Y%m%d%H%M%S)"
         log "Moving the incomplete virtual environment to $recovery"
         mv "$ROOT_DIR/venv" "$recovery"
     fi
