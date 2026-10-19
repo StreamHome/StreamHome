@@ -1,3 +1,18 @@
+:is(html,body,#root):has(.linear-ember-login) {
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  scrollbar-width: none;
+}
+
+#root:has(> .linear-ember-login) {
+  position: relative;
+  overflow: clip;
+}
+
 .linear-ember-login {
   --login-ember: #ff6b35;
   --login-ember-bright: #ff8a5b;
@@ -6,11 +21,14 @@
   --login-panel: rgba(27,15,11,.82);
   position: relative;
   isolation: isolate;
-  min-height: 100vh;
-  min-height: 100dvh;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
   display: grid;
+  grid-template-columns: minmax(0,1fr);
   place-items: center;
   overflow: hidden;
+  scrollbar-width: none;
   padding: 76px 24px;
   background: var(--login-bg);
   color: #fff8f4;
@@ -18,7 +36,7 @@
 }
 
 .login-ambient,.login-ambient > * { position: absolute; pointer-events: none; }
-.login-ambient { z-index: -2; inset: 0; overflow: hidden; background: radial-gradient(circle at 50% 42%,#26130d 0,#160b08 35%,#0c0605 74%); }
+.login-ambient { z-index: -2; inset: 0; overflow: clip; scrollbar-width: none; background: radial-gradient(circle at 50% 42%,#26130d 0,#160b08 35%,#0c0605 74%); }
 .login-ambient::before { content: ""; position: absolute; inset: 0; opacity: .32; background-image: linear-gradient(rgba(255,126,78,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(255,126,78,.055) 1px,transparent 1px); background-size: 54px 54px; mask-image: radial-gradient(circle at center,#000 8%,transparent 72%); }
 .login-ambient::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg,rgba(5,2,1,.62),transparent 26% 74%,rgba(5,2,1,.62)),linear-gradient(0deg,rgba(5,2,1,.58),transparent 28% 75%,rgba(5,2,1,.42)); }
 .login-ambient > i { width: min(52vw,720px); aspect-ratio: 1; border-radius: 50%; filter: blur(90px); opacity: .18; transform: translate3d(0,0,0); }
@@ -127,8 +145,11 @@
 @keyframes login-ember-drift { from { transform: translate3d(-2%,-1%,0) scale(.94); } to { transform: translate3d(6%,4%,0) scale(1.08); } }
 
 @media (max-width: 560px) {
-  .linear-ember-login { padding: 68px 14px; }
-  .login-server-status { top: 18px; right: 18px; padding: 7px 10px; }
+  /* Block single-finger browser panning while keeping native pinch zoom. */
+  :is(html,body,#root):has(.linear-ember-login), .linear-ember-login { touch-action: pinch-zoom; }
+  :is(html,body,#root):has(.linear-ember-login)::-webkit-scrollbar { width: auto; height: auto; }
+  .linear-ember-login { position: absolute; inset: 0; width: 100%; min-width: 0; padding: clamp(16px,8dvh,68px) 14px; }
+  .login-server-status { display: none; }
   .login-auth-card { border-radius: 2px; padding: 20.9px 20px 24px; }
   .linear-ember-login .brand-logo--login .brand-logo__image { width: 43px; height: 43px; flex-basis: 43px; }
   .login-auth-header > p { margin-top: 23px; }
