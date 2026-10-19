@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -139,8 +140,12 @@ class CatalogAnalysisProvenance(unittest.IsolatedAsyncioTestCase):
         self.stack.enter_context(patch.object(settings, "STORAGE_ENGINE", "LOCAL"))
         Path(settings.TEMP_DIR).mkdir()
         self.engine = create_async_engine(f"sqlite+aiosqlite:///{self.root / 'catalog.db'}")
+        event.listen(self.engine.sync_engine, "connect", db_module.set_sqlite_pragma)
         async with self.engine.begin() as connection:
             await connection.run_sync(SQLModel.metadata.create_all)
+            self.assertEqual((await connection.exec_driver_sql("PRAGMA journal_mode")).scalar_one(), "wal")
+            self.assertEqual((await connection.exec_driver_sql("PRAGMA synchronous")).scalar_one(), 2)
+            self.assertEqual((await connection.exec_driver_sql("PRAGMA busy_timeout")).scalar_one(), 5000)
         self.stack.enter_context(patch.object(db_module, "engine", self.engine))
         self.stack.enter_context(patch.object(queue, "engine", self.engine))
         self.stack.enter_context(patch.object(queue, "download_and_cache_metadata_image", AsyncMock(return_value="")))

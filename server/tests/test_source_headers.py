@@ -12,13 +12,16 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI, HTTPException
 import httpx
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from starlette.requests import Request
 
+import db as db_module
+from config import settings
 from db import get_session
-from models import DownloadAddRequest, DownloadTask, IntegrationCredential, Movie
+from models import DownloadAddRequest, DownloadTask, IntegrationCredential, Movie, StorageReservation
 from routes import queue as api
 from services import queue as worker
 from services.ffmpeg import download_and_merge
@@ -130,7 +133,8 @@ class SourceMediaTests(unittest.TestCase):
                     output=root/'merged.mp4';success,failure=await download_and_merge('source-headers-real',vurl,aurl,VIDEO,str(output),1,
                         audio_headers=AUDIO,preview_enabled=False,client_address='127.0.0.1',video_source_type='hls',audio_source_type='hls')
                     self.assertTrue(success,failure.display if failure else 'unknown');self.assertEqual(_probe_stream_types(output),{'video','audio'})
-                    engine=create_async_engine('sqlite+aiosqlite:///:memory:')
+                    engine=create_async_engine(f'sqlite+aiosqlite:///{root / "source-worker.db"}')
+                    event.listen(engine.sync_engine,'connect',db_module.set_sqlite_pragma)
                     try:
                         async with engine.begin() as c:await c.run_sync(SQLModel.metadata.create_all)
                         async with AsyncSession(engine) as db:
@@ -144,11 +148,23 @@ class SourceMediaTests(unittest.TestCase):
                         async def stop_after_subtitles(**kwargs):
                             captured.update(kwargs);return False,IngestionFailure('SOURCE_ACCESS_DENIED','Synthetic terminal stop',False)
                         with ExitStack() as stack:
+                            (root/'queue-temp').mkdir()
+                            stack.enter_context(patch.object(db_module,'engine',engine))
+                            stack.enter_context(patch.object(settings,'TEMP_DIR',str(root/'queue-temp')))
+                            stack.enter_context(patch.object(settings,'MEDIA_DIR',str(root/'queue-media')))
+                            stack.enter_context(patch.object(settings,'STORAGE_ENGINE','LOCAL'))
                             stack.enter_context(patch.object(worker,'engine',engine));stack.enter_context(patch.object(worker,'probe_media_stream',stub_probe))
                             stack.enter_context(patch.object(worker,'download_and_merge',stop_after_subtitles));stack.enter_context(patch.object(worker,'notify_video_sender',AsyncMock()))
                             stack.enter_context(patch.object(manager,'_reserve_storage',return_value=None));stack.enter_context(patch.object(worker.tmdb_client,'fetch_movie_metadata',AsyncMock(return_value={'title':'Synthetic source headers'})))
                             await manager._process_admitted_task('source-worker')
                         self.assertEqual(captured['headers'],VIDEO);self.assertEqual(captured['audio_headers'],AUDIO);self.assertIn('/tr.vtt',servers[2].seen)
+                        async with AsyncSession(engine) as session:
+                            task=await session.get(DownloadTask,'source-worker')
+                            self.assertEqual(task.status,'FAILED');self.assertIn('SOURCE_ACCESS_DENIED',task.error_message)
+                            reservations=(await session.exec(select(StorageReservation))).all()
+                            self.assertTrue(reservations);self.assertTrue(all(row.state=='released' for row in reservations))
+                            self.assertEqual((await session.execute(text('PRAGMA journal_mode'))).scalar_one(),'wal')
+                            self.assertEqual((await session.execute(text('PRAGMA synchronous'))).scalar_one(),2)
                     finally:await engine.dispose()
                 asyncio.run(run())
                 for server in servers:self.assertTrue(server.seen);self.assertEqual(server.leaks,[])

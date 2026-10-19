@@ -7,20 +7,22 @@ media files and SQLite rows in this module are synthetic.
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import os
 import shutil
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import create_async_engine
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 import db as db_module
 from config import settings
 from lifecycle.media_work import supervised_output
-from models import Movie
+from models import Movie, StorageReservation
 from services.ffmpeg import download_and_merge
 from services.ffmpeg_input import native_media_environment
 from services.media_probe import probe_media_stream
@@ -35,13 +37,26 @@ class NativeMediaPolicyTests(unittest.IsolatedAsyncioTestCase):
     dns = source_fixtures.ControlledSourceTests.dns
 
     async def asyncSetUp(self) -> None:
+        self.resources = AsyncExitStack()
+        self.addAsyncCleanup(self.resources.aclose)
         await source_fixtures.ControlledSourceTests.asyncSetUp(self)
+        self.resources.push_async_callback(source_fixtures.ControlledSourceTests.asyncTearDown, self)
+        self.engine = create_async_engine(f"sqlite+aiosqlite:///{self.root / 'native-policy.db'}")
+        self.resources.push_async_callback(self.engine.dispose)
+        event.listen(self.engine.sync_engine, "connect", db_module.set_sqlite_pragma)
+        async with self.engine.begin() as connection:
+            await connection.run_sync(SQLModel.metadata.create_all)
+        self.resources.enter_context(patch.object(db_module, "engine", self.engine))
+        self.resources.enter_context(patch.object(settings, "MEDIA_DIR", str(self.root / "media")))
+        self.resources.enter_context(patch.object(settings, "TEMP_DIR", str(self.root / "temp")))
+        self.resources.enter_context(patch.object(settings, "STORAGE_ENGINE", "LOCAL"))
+        (self.root / "temp").mkdir()
         self.ffmpeg = shutil.which("ffmpeg")
         if not self.ffmpeg or not shutil.which("ffprobe"):
             self.fail("Installed FFmpeg and FFprobe are required for native policy verification")
 
     async def asyncTearDown(self) -> None:
-        await source_fixtures.ControlledSourceTests.asyncTearDown(self)
+        await self.resources.aclose()
 
     async def fixture(self, name: str, codec: str, *options: str, audio: bool = False) -> Path:
         destination = self.root / name
@@ -139,6 +154,12 @@ class NativeMediaPolicyTests(unittest.IsolatedAsyncioTestCase):
             ), timeout=20)
         self.assertGreater(output.stat().st_size, 0)
         self.assertGreater(audio.stat().st_size, 0)
+        async with AsyncSession(self.engine) as session:
+            reservations = (await session.exec(select(StorageReservation))).all()
+            self.assertTrue(any(row.owner == "media-audio-conversion" for row in reservations))
+            self.assertTrue(all(row.state == "released" for row in reservations))
+            self.assertEqual((await session.execute(text("PRAGMA journal_mode"))).scalar_one(), "wal")
+            self.assertEqual((await session.execute(text("PRAGMA synchronous"))).scalar_one(), 2)
         self.assertTrue(any(headers.get("authorization") == "Bearer synthetic" for _, headers in self.requests))
         self.assertEqual(requests, [])
 
@@ -171,8 +192,9 @@ class NativeMediaPolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_actual_playback_preparation_rejects_downloaded_external_loaders(self) -> None:
         media_root, temp_root = self.root / "media", self.root / "temp"
         media_root.mkdir()
-        temp_root.mkdir()
+        temp_root.mkdir(exist_ok=True)
         engine = create_async_engine(f"sqlite+aiosqlite:///{self.root / 'preparation.db'}")
+        event.listen(engine.sync_engine, "connect", db_module.set_sqlite_pragma)
         async with engine.begin() as connection:
             await connection.run_sync(SQLModel.metadata.create_all)
         resource = self.source_url("neutral-resource.ts")
