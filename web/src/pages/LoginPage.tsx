@@ -10,8 +10,6 @@ import "./login.css";
 
 const REMEMBERED_EMAIL_KEY = "streamhome_remembered_email";
 const REQUEST_TIMEOUT = 12_000;
-const WEB_VERSION = import.meta.env.VITE_APP_VERSION || "0.0.0";
-const BUILD_ID = import.meta.env.VITE_BUILD_ID || "dev";
 type AuthStage = "credentials" | "factor" | "success";
 type FactorMethod = "totp" | "recovery";
 type ServerState = "checking" | "ready" | "busy" | "offline" | "unreachable";
@@ -53,8 +51,6 @@ export function LoginPage() {
   const [inputNotice, setInputNotice] = useState("");
   const [lockedSeconds, setLockedSeconds] = useState(0);
   const [serverState, setServerState] = useState<ServerState>("checking");
-  const [serverBuildId, setServerBuildId] = useState("dev");
-  const [serverVersion, setServerVersion] = useState("—");
   const [serverClockOffset, setServerClockOffset] = useState(0);
   const [totpSeconds, setTotpSeconds] = useState(30);
 
@@ -65,8 +61,6 @@ export function LoginPage() {
     try {
       const health = await getHealth(controller.signal);
       setServerState("ready");
-      setServerVersion(health.version);
-      setServerBuildId(health.buildId || "dev");
       setServerClockOffset(health.serverTime * 1000 - Date.now());
     } catch (requestError) {
       const apiError = requestError instanceof ApiError ? requestError : null;
@@ -168,12 +162,11 @@ export function LoginPage() {
       <AnimatePresence mode="sync" initial={false}>
         {stage === "credentials" ? <motion.form key="credentials" className="login-auth-form" initial={{ opacity: 0, x: reduced ? 0 : -14 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: reduced ? 0 : -14 }} transition={stageTransition} onSubmit={handleLoginSubmit}>
           <div className="login-field" ><label htmlFor="login-email">Email address</label><div className="login-input-shell"><FieldIcon type="email" /><input id="login-email" type="email" autoComplete="username" value={email} onFocus={() => setFocusedField("email")} onBlur={() => setFocusedField("")} onChange={(event) => { setEmail(event.target.value); setError(""); }} placeholder="operator@streamhome.local" required disabled={isLoading} /></div></div>
-          <div className="login-field" data-valid={passwordValid || undefined}><label htmlFor="login-password">Password</label><div className="login-password-field login-input-shell"><FieldIcon type="lock" /><input id="login-password" type={showPassword ? "text" : "password"} autoComplete="current-password" value={password} onFocus={() => setFocusedField("password")} onBlur={() => { setFocusedField(""); setCapsLock(false); }} onKeyUp={(event) => setCapsLock(event.getModifierState("CapsLock"))} onKeyDown={(event) => setCapsLock(event.getModifierState("CapsLock"))} onChange={(event) => { setPassword(event.target.value); setError(""); }} placeholder="Enter your password" required disabled={isLoading} /><button type="button" className="login-password-toggle" aria-label={showPassword ? "Hide password" : "Show password"} aria-pressed={showPassword} onClick={() => setShowPassword((visible) => !visible)} disabled={isLoading}>{showPassword ? "Hide" : "Show"}</button></div>{capsLock && <p className="login-field-notice" role="status">Caps Lock is on</p>}</div>
+          <div className="login-field" data-valid={passwordValid || undefined}><label htmlFor="login-password">Password</label><div className="login-password-field login-input-shell"><FieldIcon type="lock" /><input id="login-password" type={showPassword ? "text" : "password"} autoComplete="current-password" value={password} onFocus={() => setFocusedField("password")} onBlur={() => { setFocusedField(""); setCapsLock(false); }} onKeyUp={(event) => setCapsLock(event.getModifierState("CapsLock"))} onKeyDown={(event) => setCapsLock(event.getModifierState("CapsLock"))} onChange={(event) => { setPassword(event.target.value); setError(""); }} placeholder="Enter your password" required disabled={isLoading} /><button type="button" className="login-password-toggle" aria-label={showPassword ? "Hide password" : "Show password"} aria-pressed={showPassword} onClick={() => setShowPassword((visible) => !visible)} disabled={isLoading}><svg viewBox="0 0 24 24" aria-hidden="true">{showPassword ? <><path d="m3 3 18 18M10.6 10.6a2 2 0 0 0 2.8 2.8M9.9 5.2A11.5 11.5 0 0 1 12 5c5.5 0 9 7 9 7a18 18 0 0 1-2.7 3.7M6.3 6.3C4.2 8.2 3 12 3 12s3.5 7 9 7a9.4 9.4 0 0 0 5.7-2.1" /></> : <><path d="M3 12s3.5-7 9-7 9 7 9 7-3.5 7-9 7-9-7-9-7Z" /><circle cx="12" cy="12" r="3" /></>}</svg></button></div>{capsLock && <p className="login-field-notice" role="status">Caps Lock is on</p>}</div>
           <label className="login-remember"><input type="checkbox" checked={rememberEmail} onChange={(event) => setRememberEmail(event.target.checked)} /><span>Remember email on this device</span></label>
           <button type="submit" className="login-primary-action" disabled={isLoading || !emailValid || !passwordValid || lockedSeconds > 0}><span>{isLoading ? "Please wait…" : lockedSeconds ? "Account temporarily locked" : "Continue"}</span>{!isLoading && !lockedSeconds && <b aria-hidden="true">→</b>}</button>
           <div className="login-feedback"><AnimatePresence initial={false}>{error && <motion.div className="login-error" data-code={errorCode} role="alert" initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}><i /> <span>{error}{lockedSeconds > 0 && ` Try again in ${Math.floor(lockedSeconds / 60)}:${String(lockedSeconds % 60).padStart(2, "0")}.`}</span></motion.div>}</AnimatePresence>
           {progressLabel && <div className="login-progress-label" role="status"><i className="login-button-spinner" />{progressLabel}</div>}</div>
-          <p className="login-keyboard-hint">{isLoading ? "Checking your credentials…" : lockedSeconds > 0 ? "Wait for the sign-in lock to end." : emailValid && passwordValid ? <><kbd>Enter</kbd> to continue</> : "Enter your email and password to continue."}</p>
         </motion.form> : stage === "factor" ? <motion.form key="factor" className="login-totp-stage" initial={{ opacity: 0, x: reduced ? 0 : 14 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: reduced ? 0 : 14 }} transition={stageTransition} onSubmit={submitFactor}>
           {factorMethod === "totp" ? <div className="login-code-layout"><div className="login-totp-inputs" onClick={() => codeInput.current?.focus()} data-focused={focusedField === "code"}><input ref={codeInput} className="login-code-input" type="text" inputMode="numeric" autoComplete="one-time-code" aria-label="Six-digit authenticator code" value={code} onFocus={() => setFocusedField("code")} onBlur={() => setFocusedField("")} onPaste={() => setInputNotice("Code pasted and ready to verify.")} onChange={(event) => { const next = event.target.value.replace(/\D/g, "").slice(0, 6); if (next.length - code.length > 1) setInputNotice("Authenticator autofill received."); setCode(next); setError(""); }} disabled={isLoading} />{Array.from({ length: 6 }, (_, index) => <span key={index} data-filled={Boolean(code[index])}>{code[index] || ""}</span>)}</div><div className="login-code-window"><div className="login-totp-ring" aria-label={`${totpSeconds} seconds remain in the current authenticator window`}><svg viewBox="0 0 44 44"><circle cx="22" cy="22" r="18" /><circle cx="22" cy="22" r="18" style={{ strokeDasharray: circumference, strokeDashoffset: circumference * (1 - totpSeconds / 30) }} /></svg><b>{totpSeconds}</b></div><div><span>Code refreshes in ~{totpSeconds}s</span><small>Estimated code window, not sign-in expiry.</small></div></div></div> : <div className="login-field"><label htmlFor="login-recovery">Recovery code</label><input ref={codeInput} id="login-recovery" className="login-recovery-input" autoComplete="off" aria-describedby="login-recovery-help" value={code} onFocus={() => setFocusedField("code")} onBlur={() => setFocusedField("")} onPaste={() => setInputNotice("Recovery code pasted.")} onChange={(event) => { setCode(event.target.value.toUpperCase().slice(0, 19)); setError(""); }} placeholder="XXXX-XXXX-XXXX-XXXX" disabled={isLoading} /><p id="login-recovery-help" className="login-recovery-help">Use the code saved during setup. Spaces and hyphens are accepted; each code works once.</p></div>}
           <p className="login-input-notice" aria-live="polite">{inputNotice}</p>
@@ -184,7 +177,6 @@ export function LoginPage() {
           <button type="button" className="login-secondary-action" onClick={returnToCredentials} disabled={isLoading}>← Back to sign in</button><p className="login-keyboard-hint">{isLoading ? "Verifying your code…" : <>{lockedSeconds > 0 ? "Wait before trying again" : factorReady ? <><kbd>Enter</kbd> to verify</> : factorMethod === "totp" ? "Enter all six digits to verify" : "Enter a complete recovery code to verify"} · <kbd>Esc</kbd> to go back</>}</p>
         </motion.form> : <motion.div key="success" className="login-success" initial={{ opacity: 0, scale: reduced ? 1 : .9 }} animate={{ opacity: 1, scale: 1 }} transition={stageTransition}><motion.i initial={{ pathLength: 0 }} animate={{ pathLength: 1 }}>✓</motion.i><p>Authentication complete</p><span>{progressLabel}</span></motion.div>}
       </AnimatePresence>
-      <footer className="login-auth-footer"><span><i />Local server account</span><details><summary>Version details</summary><span>{serverBuildId !== "dev" && BUILD_ID !== "dev" && serverBuildId !== BUILD_ID ? `Deployment mismatch · API ${serverBuildId} · Web ${BUILD_ID}` : `Server v${serverVersion} · Web ${WEB_VERSION}${BUILD_ID !== "dev" ? ` · ${BUILD_ID}` : ""}`}</span></details></footer>
     </motion.section>
   </motion.main>;
 }
