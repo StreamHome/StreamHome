@@ -36,6 +36,7 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("restore-recovery-needed")
     commands.add_parser("update-recovery-needed")
     commands.add_parser("update-recovery-required")
+    commands.add_parser("update-journal-settled")
 
     claim = commands.add_parser("claim")
     claim.add_argument("--operation-type", required=True, choices=[item.value for item in state.OperationType])
@@ -96,6 +97,16 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
             "command": "startup-decision",
             **public_startup_projection(context),
         }
+    if arguments.command == "update-journal-settled":
+        from .update_controller import UpdateControllerError, terminal_update_journal_settled
+
+        try:
+            settled = terminal_update_journal_settled(root)
+        except (UpdateControllerError, OSError) as exc:
+            raise state.CorruptStateError("terminal update evidence could not be verified") from exc
+        if not settled:
+            raise state.LifecycleConflictError("update journal still needs recovery")
+        return {"ok": True, "command": "update-journal-settled"}
     if arguments.command == "startup-allowed":
         state.inspect_state(root)
         from .bootstrap import StartupMode, evaluate_startup, public_startup_projection

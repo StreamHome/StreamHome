@@ -1793,7 +1793,7 @@ recovery_staging_is_safe() {
 }
 
 recover_interrupted_release() {
-    local phase current_head recovered_staging web_swapped runtime_committed commit_result
+    local phase current_head recovered_staging web_swapped runtime_committed commit_result settled_result
     RUN_DIR="$ROOT_DIR/.run"
     STATUS_FILE="$RUN_DIR/update-state.json"
     UPDATE_LOG="$ROOT_DIR/update.log"
@@ -1802,7 +1802,15 @@ recover_interrupted_release() {
     MAINTENANCE_PID_FILE="$RUN_DIR/maintenance.pid"
     MAINTENANCE_START_FILE="$RUN_DIR/maintenance.start"
     WEB_PORT="$(read_env "$ROOT_DIR/.env" WEB_PORT 3000)"
-    [[ -f "$STATUS_FILE" ]] || return 10
+    [[ -e "$STATUS_FILE" || -L "$STATUS_FILE" ]] || return 10
+    if lifecycle_cli update-journal-settled >/dev/null 2>&1; then
+        return 10
+    else
+        settled_result=$?
+    fi
+    # Only a strict, known nonterminal journal may enter the legacy recovery
+    # parser. Terminal disagreement, corrupt state and unavailable proof block.
+    [[ "$settled_result" -eq 5 ]] || return 1
     mapfile -t recovery_state < <(python3 - "$STATUS_FILE" <<'PY'
 import json
 import sys

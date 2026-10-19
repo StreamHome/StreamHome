@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import fcntl
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -267,6 +268,95 @@ def read_update_journal(path: Path) -> dict[str, Any]:
     """Strictly decode one authority-sensitive update journal."""
 
     return _read_update_journal(path)
+
+
+def terminal_update_journal_settled(root: Path) -> bool:
+    """Recognize a completed installed release without reacquiring its retired owner.
+
+    False means a known nonterminal phase still needs ordinary recovery. Invalid
+    terminal evidence raises instead of falling through to legacy shell parsing.
+    This probe never changes the checkout, journal or lifecycle authority.
+    """
+    root = state.resolve_installation_root(root)
+    journal_path = root / ".run" / "update-state.json"
+    payload = read_update_journal(journal_path)
+    phase = payload.get("phase")
+    if not isinstance(phase, str) or phase not in {"succeeded", "rolled_back"}:
+        if isinstance(phase, str) and phase in (set(DETAIL_PHASE_TRANSITIONS) | {"idle", "checking", "up_to_date"}):
+            return False
+        raise UpdateControllerConflict("update journal phase is invalid")
+
+    def require(condition: bool) -> None:
+        if not condition:
+            raise UpdateControllerConflict("terminal update evidence is inconsistent")
+
+    def timestamp(value: Any) -> bool:
+        try:
+            return type(value) in {int, float} and math.isfinite(value) and value > 0
+        except OverflowError:
+            return False
+
+    operation_id = payload.get("transaction_id")
+    try:
+        require(isinstance(operation_id, str) and str(uuid.UUID(operation_id)) == operation_id)
+    except (ValueError, AttributeError) as exc:
+        raise UpdateControllerConflict("terminal update identity is invalid") from exc
+    for key in ("current_commit", "target_commit", "previous_commit"):
+        require(isinstance(payload.get(key), str) and COMMIT_RE.fullmatch(payload[key]) is not None)
+    current = payload["current_commit"]
+    require(current in {payload["target_commit"], payload["previous_commit"]})
+    finished = payload.get("finished_at")
+    require(timestamp(finished))
+    committed = payload.get("runtime_committed")
+    committed_at = payload.get("runtime_committed_at")
+    require(type(committed) is bool)
+    if committed:
+        require(timestamp(committed_at) and committed_at <= finished)
+    else:
+        require(committed_at is None)
+    if phase == "succeeded":
+        # Successful recovery may have accepted the previous release after a
+        # precommit rollback; current_commit identifies the accepted runtime.
+        require(committed is True)
+        require(payload.get("error") in (None, "") and payload.get("failed_target") in (None, ""))
+    else:
+        require(current == payload["previous_commit"])
+        require(payload.get("failed_target") == payload["target_commit"])
+
+    authority = state.inspect_state(root)
+    require(authority.active_operation is None)
+    generation = payload.get("lifecycle_generation")
+    lifecycle_phase = payload.get("lifecycle_phase")
+    if generation is None:
+        require(authority.generation == 0 and lifecycle_phase in (None, ""))
+    else:
+        require(type(generation) is int and generation > 0 and generation == authority.generation)
+        require(isinstance(lifecycle_phase, str) and lifecycle_phase in {"reserved", "exclusive", "verifying"})
+        if committed:
+            require(lifecycle_phase == "verifying")
+    lease = state.read_controller_lease(root)
+    if lease is not None:
+        require(lease.operation_id == operation_id and lease.generation == generation)
+        require(not state.controller_lease_is_current(lease))
+    lock_path = state.lifecycle_paths(root).controller_lock_path
+    try:
+        lock_state = lock_path.lstat()
+    except FileNotFoundError:
+        lock_state = None
+    if lock_state is not None:
+        require(stat.S_ISREG(lock_state.st_mode) and not stat.S_IMODE(lock_state.st_mode) & 0o077)
+        require(not hasattr(os, "geteuid") or lock_state.st_uid == os.geteuid())
+        descriptor = os.open(lock_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+        try:
+            opened = os.fstat(descriptor)
+            require((opened.st_dev, opened.st_ino) == (lock_state.st_dev, lock_state.st_ino))
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+    validate_pre_cutover_baseline(root, current)
+    require(read_update_journal(journal_path) == payload and state.inspect_state(root) == authority)
+    return True
 
 
 def pre_cutover_previous_commit(root: Path, payload: Mapping[str, Any], authority: state.LifecycleState) -> str | None:
