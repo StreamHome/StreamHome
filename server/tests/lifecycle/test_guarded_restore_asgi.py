@@ -28,7 +28,9 @@ def available_port():
 
 
 class DisposableRestoreInstallation:
-    def __init__(self):
+    def __init__(self, *, authority_schema_version=1):
+        if authority_schema_version not in {1, 2}:
+            raise ValueError("unsupported disposable authority fixture")
         self.temporary = tempfile.TemporaryDirectory(prefix="streamhome-guarded-restore-")
         self.root = Path(self.temporary.name)
         source = Path(__file__).resolve().parents[2]
@@ -59,6 +61,12 @@ class DisposableRestoreInstallation:
         self.backup = backup_root / "backup_20261013_120000.db"
         self.create_database(self.database, "original")
         self.create_database(self.backup, "candidate", migration=True)
+        if authority_schema_version == 2:
+            # Fixture initialization only; production migration needs separately
+            # qualified target/rollback readers and explicit idle-only adoption.
+            paths = state.lifecycle_paths(self.root)
+            state._ensure_lifecycle_directories(paths)
+            state._write_state_unlocked(paths, state.LifecycleState(2, 0, None))
         self.claim = state.claim_operation_with_credential(self.root, operation_type="restore", owner_kind="restore_controller")
         self.operation_id = self.claim.state.active_operation.operation_id
         identity = restore_controller.prevalidate_candidate(self.root, self.backup.name)

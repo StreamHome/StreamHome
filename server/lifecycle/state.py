@@ -19,7 +19,11 @@ from typing import Any, Callable, Iterator, Mapping
 import uuid
 
 
+# Missing/legacy authority remains version 1. Version 2 is never selected by an
+# ordinary claim: provisioning/adoption must qualify and migrate it separately.
 SCHEMA_VERSION = 1
+MANAGEMENT_SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION, MANAGEMENT_SCHEMA_VERSION})
 MAX_STATE_BYTES = 16 * 1024
 MAX_LEASE_BYTES = 8 * 1024
 CAPABILITY_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
@@ -29,6 +33,7 @@ CAPABILITY_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 class OperationType(str, Enum):
     UPDATE = "update"
     RESTORE = "restore"
+    MANAGEMENT = "management"
 
 
 class LifecyclePhase(str, Enum):
@@ -41,6 +46,14 @@ class LifecyclePhase(str, Enum):
 class OwnerKind(str, Enum):
     UPDATER = "updater"
     RESTORE_CONTROLLER = "restore_controller"
+    MANAGEMENT_CONTROLLER = "management_controller"
+
+
+OPERATION_OWNERS: Mapping[OperationType, OwnerKind] = {
+    OperationType.UPDATE: OwnerKind.UPDATER,
+    OperationType.RESTORE: OwnerKind.RESTORE_CONTROLLER,
+    OperationType.MANAGEMENT: OwnerKind.MANAGEMENT_CONTROLLER,
+}
 
 
 ALLOWED_TRANSITIONS: Mapping[LifecyclePhase, frozenset[LifecyclePhase]] = {
@@ -597,7 +610,7 @@ def _parse_state_payload(payload: Any) -> LifecycleState:
     schema_version = payload["schema_version"]
     if isinstance(schema_version, bool) or not isinstance(schema_version, int):
         raise CorruptStateError("schema_version must be an integer")
-    if schema_version != SCHEMA_VERSION:
+    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
         raise UnsupportedSchemaError("lifecycle state schema is unsupported")
     try:
         generation = _validate_generation(payload["generation"])
@@ -618,6 +631,7 @@ def _parse_state_payload(payload: Any) -> LifecycleState:
         operation_type = _enum_value(OperationType, operation_payload["operation_type"], "operation_type")
         phase = _enum_value(LifecyclePhase, operation_payload["phase"], "phase")
         owner_kind = _enum_value(OwnerKind, operation_payload["owner_kind"], "owner_kind")
+        _validate_schema_operation(schema_version, operation_type, owner_kind)
     except ValueError as exc:
         raise CorruptStateError(str(exc)) from exc
     nonce_hash = operation_payload["owner_nonce_hash"]
@@ -630,6 +644,19 @@ def _parse_state_payload(payload: Any) -> LifecycleState:
         generation,
         ActiveOperation(operation_id, operation_type, phase, owner_kind, nonce_hash),
     )
+
+
+def _validate_schema_operation(
+    schema_version: int, operation_type: OperationType, owner_kind: OwnerKind
+) -> None:
+    if schema_version == SCHEMA_VERSION:
+        if (
+            operation_type is OperationType.MANAGEMENT
+            or owner_kind is OwnerKind.MANAGEMENT_CONTROLLER
+        ):
+            raise UnsupportedSchemaError("management requires lifecycle authority version 2")
+    elif OPERATION_OWNERS[operation_type] is not owner_kind:
+        raise ValueError("operation type and owner kind do not match")
 
 
 def _state_payload(state: LifecycleState) -> dict[str, Any]:
@@ -739,7 +766,9 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _write_state_unlocked(paths: LifecyclePaths, state: LifecycleState) -> None:
-    _atomic_write_json(paths.state_path, _state_payload(state))
+    payload = _state_payload(state)
+    _parse_state_payload(payload)
+    _atomic_write_json(paths.state_path, payload)
 
 
 def _require_expected_operation(
@@ -810,9 +839,10 @@ def claim_operation(
         current = _read_state_unlocked(paths)
         if current.active_operation is not None:
             raise LifecycleConflictError("another lifecycle operation is active")
+        _validate_schema_operation(current.schema_version, selected_type, selected_owner)
         next_generation = current.generation + 1
         claimed = LifecycleState(
-            SCHEMA_VERSION,
+            current.schema_version,
             next_generation,
             ActiveOperation(
                 selected_id,
@@ -929,7 +959,7 @@ def transition_operation(
         if next_value not in ALLOWED_TRANSITIONS[operation.phase]:
             raise LifecycleConflictError("lifecycle phase transition is not allowed")
         updated = LifecycleState(
-            SCHEMA_VERSION,
+            current.schema_version,
             current.generation,
             ActiveOperation(
                 operation.operation_id,
@@ -965,8 +995,9 @@ def transfer_operation_owner(
             expected_phase=expected_phase,
             owner_capability=owner_capability,
         )
+        _validate_schema_operation(current.schema_version, operation.operation_type, next_owner)
         updated = LifecycleState(
-            SCHEMA_VERSION,
+            current.schema_version,
             current.generation + 1,
             ActiveOperation(
                 operation.operation_id,
@@ -1079,7 +1110,7 @@ def complete_operation(
             owner_capability=owner_capability,
             expected_operation_type=expected_operation_type,
         )
-        completed = LifecycleState(SCHEMA_VERSION, current.generation, None)
+        completed = LifecycleState(current.schema_version, current.generation, None)
         _write_state_unlocked(paths, completed)
         return completed
 
@@ -1391,7 +1422,7 @@ def _parse_lease_payload(payload: Any) -> ControllerLease:
     if (
         isinstance(payload["schema_version"], bool)
         or not isinstance(payload["schema_version"], int)
-        or payload["schema_version"] != SCHEMA_VERSION
+        or payload["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS
     ):
         raise UnsupportedSchemaError("controller lease schema is unsupported")
     try:
@@ -1400,13 +1431,15 @@ def _parse_lease_payload(payload: Any) -> ControllerLease:
         owner_kind = _enum_value(OwnerKind, payload["owner_kind"], "owner_kind")
     except ValueError as exc:
         raise CorruptStateError(str(exc)) from exc
+    if payload["schema_version"] == SCHEMA_VERSION and owner_kind is OwnerKind.MANAGEMENT_CONTROLLER:
+        raise UnsupportedSchemaError("management requires controller lease version 2")
     pid = payload["pid"]
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         raise CorruptStateError("controller lease pid is invalid")
     identity = payload["process_start_identity"]
     if not isinstance(identity, str) or not identity.isdigit():
         raise CorruptStateError("controller lease process identity is invalid")
-    return ControllerLease(SCHEMA_VERSION, operation_id, generation, owner_kind, pid, identity)
+    return ControllerLease(payload["schema_version"], operation_id, generation, owner_kind, pid, identity)
 
 
 def read_controller_lease(root: str | os.PathLike[str] | None = None) -> ControllerLease | None:
@@ -1431,6 +1464,16 @@ class ControllerLeaseHandle:
         self.descriptor = descriptor
         self.lease = lease
         self._released = False
+
+    def require_current(self) -> None:
+        """Require this live process's exact persisted controller ownership."""
+        if (
+            self._released
+            or self.lease.pid != os.getpid()
+            or self.lease.process_start_identity != _process_start_identity(os.getpid())
+            or read_controller_lease(self.paths.root) != self.lease
+        ):
+            raise OwnershipError("controller lease is no longer owned by this process")
 
     def release(self) -> None:
         if self._released:
@@ -1486,7 +1529,7 @@ def acquire_controller_lease(
         if operation is None:  # pragma: no cover - protected by validate_operation_owner
             raise LifecycleConflictError("no lifecycle operation is active")
         lease = ControllerLease(
-            SCHEMA_VERSION,
+            state.schema_version,
             operation.operation_id,
             state.generation,
             operation.owner_kind,
@@ -1538,7 +1581,7 @@ def acquire_transferred_controller_lease(
         if operation is None:  # pragma: no cover - transfer guarantees an operation
             raise LifecycleConflictError("no lifecycle operation is active")
         lease = ControllerLease(
-            SCHEMA_VERSION,
+            transferred.state.schema_version,
             operation.operation_id,
             transferred.state.generation,
             operation.owner_kind,

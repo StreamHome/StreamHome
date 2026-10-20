@@ -139,7 +139,7 @@ def parse_operator_action_record(payload: Any) -> OperatorActionRecord:
     if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
         raise RecoveryPlanningError("operator action generation is invalid")
     operation_type = payload["operation_type"]
-    if operation_type not in {item.value for item in state.OperationType}:
+    if operation_type not in {state.OperationType.UPDATE.value, state.OperationType.RESTORE.value}:
         raise RecoveryPlanningError("operator action operation type is invalid")
     action = payload["requested_action"]
     if action not in ACTION_IDENTIFIERS:
@@ -500,6 +500,7 @@ def normalize_interrupted_operator(
         operation = current.active_operation
         if (
             operation is None
+            or operation.operation_type is state.OperationType.MANAGEMENT
             or operation.operation_id != canonical_id
             or current.generation != generation
             or operation.owner_kind is not (
@@ -1017,6 +1018,8 @@ def _durable_recovery_evidence(
 ) -> str:
     """Hash exact private recovery facts without projecting those facts publicly."""
 
+    if operation_type not in {state.OperationType.UPDATE, state.OperationType.RESTORE}:
+        raise RecoveryPlanningConflict("operation recovery protocol is unavailable")
     try:
         if operation_type is state.OperationType.RESTORE:
             paths = restore_controller.restore_paths(root, operation_id)
@@ -1308,6 +1311,8 @@ def _plan_recovery_exact(
         or operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED
     ):
         raise RecoveryPlanningConflict("exact recovery-required lifecycle authority does not match")
+    if operation.operation_type is state.OperationType.MANAGEMENT:
+        raise RecoveryPlanningConflict("management recovery requires its qualified controller")
     controller_status = (
         controller_status_override
         if controller_status_override is not None
@@ -1812,6 +1817,8 @@ def _cleanup_after_resolution(
     controller_generation: int,
     action: str,
 ) -> bool:
+    if operation_type not in {state.OperationType.UPDATE.value, state.OperationType.RESTORE.value}:
+        return False
     try:
         with state.hold_idle_authority(root):
             if _controller_status(root, operation_id, controller_generation) != "inactive":

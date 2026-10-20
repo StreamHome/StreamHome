@@ -17,6 +17,8 @@ from scratch import maintenance_server
 
 
 class UpdateControllerTests(unittest.TestCase):
+    authority_schema_version = 1
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / "StreamHome"
@@ -51,6 +53,10 @@ class UpdateControllerTests(unittest.TestCase):
         self._git("commit", "-m", "target")
         self.target = self._git("rev-parse", "HEAD")
         self._git("checkout", "--detach", self.previous)
+        if self.authority_schema_version == 2:
+            paths = state.lifecycle_paths(self.root)
+            state._ensure_lifecycle_directories(paths)
+            state._write_state_unlocked(paths, state.LifecycleState(2, 0, None))
         self.claimed = state.claim_operation_with_credential(
             self.root,
             operation_type=state.OperationType.UPDATE,

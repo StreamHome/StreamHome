@@ -255,6 +255,14 @@ def evaluate_startup(
             install_startup_context(context)
         return context
 
+    if operation.operation_type is state.OperationType.MANAGEMENT:
+        # Authority readers land before the guarded management application and
+        # recovery protocol. No legacy permit may authorize that missing path.
+        context = _failure_context(resolved_root, "management_startup_unavailable", inspected)
+        if install:
+            install_startup_context(context)
+        return context
+
     try:
         requested = StartupMode(requested_raw)
         generation = int(generation_raw)

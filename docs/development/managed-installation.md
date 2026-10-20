@@ -7,6 +7,10 @@ installation/start/update scripts still use their existing layout. Descriptor
 publication, shared runtime-path integration, systemd supervision and the global
 management command are subsequent increments.
 
+The next increment adds [versioned management authority and bound journal
+persistence](management-protocol.md), without exposing those unfinished commands
+or migrating an installed instance.
+
 ## Descriptor version 1
 
 The protected descriptor is `/etc/streamhome/install.json`. Its complete schema is:

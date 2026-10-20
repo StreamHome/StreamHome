@@ -39,8 +39,9 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("update-journal-settled")
 
     claim = commands.add_parser("claim")
-    claim.add_argument("--operation-type", required=True, choices=[item.value for item in state.OperationType])
-    claim.add_argument("--owner-kind", required=True, choices=[item.value for item in state.OwnerKind])
+    # The legacy controller CLI does not expose unfinished management execution.
+    claim.add_argument("--operation-type", required=True, choices=["update", "restore"])
+    claim.add_argument("--owner-kind", required=True, choices=["updater", "restore_controller"])
     claim.add_argument("--operation-id")
 
     validate_owner = commands.add_parser("validate-owner")
@@ -50,7 +51,7 @@ def _parser() -> argparse.ArgumentParser:
     _add_expected_owner_arguments(complete)
     complete.add_argument(
         "--expected-operation-type",
-        choices=[item.value for item in state.OperationType],
+        choices=["update", "restore"],
     )
 
     transition = commands.add_parser("transition")
@@ -83,6 +84,10 @@ def _success(command: str, lifecycle_state: state.LifecycleState) -> dict[str, A
 
 def _run(arguments: argparse.Namespace) -> dict[str, Any]:
     root = arguments.root
+    if arguments.command in {"transition", "complete"}:
+        operation = state.inspect_state(root).active_operation
+        if operation is not None and operation.operation_type is state.OperationType.MANAGEMENT:
+            raise state.LifecycleConflictError("management execution requires its qualified controller")
     if arguments.command == "inspect":
         return _success("inspect", state.inspect_state(root))
     if arguments.command == "startup-decision":

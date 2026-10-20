@@ -387,7 +387,7 @@ class LifecycleStateTests(unittest.TestCase):
         invalid_cases = (
             (None, '{"schema_version":'),
             (None, '{"schema_version":1,"schema_version":1,"generation":0,"active_operation":null}'),
-            ({"schema_version": 2, "generation": 0, "active_operation": None}, None),
+            ({"schema_version": 3, "generation": 0, "active_operation": None}, None),
             ({"schema_version": 1, "generation": "0", "active_operation": None}, None),
             ({"schema_version": 1, "generation": 0, "active_operation": None, "extra": True}, None),
             ({
@@ -418,7 +418,7 @@ class LifecycleStateTests(unittest.TestCase):
                 self._write_raw_state(payload, text=text)
                 expected = (
                     state.UnsupportedSchemaError
-                    if isinstance(payload, dict) and payload.get("schema_version") == 2
+                    if isinstance(payload, dict) and payload.get("schema_version") == 3
                     else state.CorruptStateError
                 )
                 with self.assertRaises(expected):

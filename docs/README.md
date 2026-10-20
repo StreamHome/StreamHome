@@ -28,6 +28,7 @@ This documentation describes the supported `v0.1.0-alpha.1` Linux server release
 - [Architecture](development/architecture.md)
 - [API Development Notes](development/api.md)
 - [Managed Installation Identity Contract](development/managed-installation.md)
+- [Management Authority and Journal Foundation](development/management-protocol.md)
 
 ## Alpha support contract
 
