@@ -11,6 +11,11 @@ The next increment adds [versioned management authority and bound journal
 persistence](management-protocol.md), without exposing those unfinished commands
 or migrating an installed instance.
 
+Shared [configuration and installer components](configuration-management.md) now
+provide deployment drafts/validation, revision CAS and apply receipts, listener
+preflight, existing-install evidence and isolated release probing. Production
+installer/service/command integration remains in progress.
+
 ## Descriptor version 1
 
 The protected descriptor is `/etc/streamhome/install.json`. Its complete schema is:
