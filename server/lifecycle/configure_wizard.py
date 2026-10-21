@@ -61,7 +61,7 @@ class ConfigurationReview:
 
     @property
     def restart_required(self) -> bool:
-        return self.before.deployment != self.after.deployment
+        return self.before.deployment != self.after.deployment or self.activate_deployment
 
 
 Diagnostics = Callable[[DeploymentConfig], Iterable[str]]
@@ -122,13 +122,23 @@ def show_draft(console: Console, draft: ConfigurationDraft, *, title: str) -> No
 
 def _review(
     console: Console, before: ConfigurationDraft, after: ConfigurationDraft, *,
-    running: bool, diagnostics: Diagnostics,
+    running: bool, diagnostics: Diagnostics, active_deployment: DeploymentConfig | None = None,
 ) -> ConfigurationReview | None:
     if before == after:
+        if running and active_deployment is not None and active_deployment != after.deployment:
+            for message in diagnostics(after.deployment):
+                console.write(message)
+            show_draft(console, replace(before, deployment=active_deployment), title="Currently active configuration:")
+            show_draft(console, after, title="Saved configuration to activate:")
+            if console.confirm("Restart StreamHome to apply this saved deployment?"):
+                return ConfigurationReview(before, after, True)
+            console.write("The saved deployment remains pending.")
+            return None
         console.write("No changes; configuration and services are unchanged.")
         return None
-    for message in diagnostics(after.deployment):
-        console.write(message)
+    if before.deployment != after.deployment:
+        for message in diagnostics(after.deployment):
+            console.write(message)
     show_draft(console, before, title="Current configuration:")
     show_draft(console, after, title="Proposed configuration:")
     deployment_changed = before.deployment != after.deployment
@@ -186,7 +196,7 @@ def configure_wizard(
                 for message in diagnostics(draft.deployment):
                     console.write(message)
             elif choice == "7":
-                return _review(console, current, draft, running=running, diagnostics=diagnostics)
+                return _review(console, current, draft, running=running, diagnostics=diagnostics, active_deployment=active_deployment)
         except BackToMenu:
             console.write("Edit abandoned.")
         except DeploymentConfigError as exc:
@@ -201,10 +211,10 @@ def installation_wizard(
     console.write("StreamHome installs application files in /opt/streamhome, configuration in /etc/streamhome and state in /var/lib/streamhome.")
     config = default_deployment()
     try:
-        port = console.value("Web port (or back)", str(config.web_port), _port)
-        config = patch_deployment(config, {"web_port": port})
         while True:
             try:
+                port = console.value("Web port (or back)", str(config.web_port), _port)
+                config = patch_deployment(config, {"web_port": port})
                 config = _access(console, config, connectors)
                 for message in diagnostics(config):
                     console.write(message)
@@ -236,7 +246,7 @@ def parse_installation_request(payload: Any) -> ConfigurationDraft:
     return ConfigurationDraft(parse_deployment_payload(payload["deployment"]), payload["start_at_boot"])
 
 
-def parse_configuration_request(payload: Any, current: ConfigurationDraft) -> NoninteractiveConfigurationRequest:
+def parse_configuration_request(payload: Any, current: ConfigurationDraft, *, active_deployment: DeploymentConfig | None = None) -> NoninteractiveConfigurationRequest:
     if not isinstance(payload, dict) or set(payload) != {
         "schema_version", "expected_desired_revision", "deployment_patch", "start_at_boot", "apply", "activate_deployment",
     }:
@@ -253,7 +263,7 @@ def parse_configuration_request(payload: Any, current: ConfigurationDraft) -> No
     if payload["apply"] is not True or type(payload["activate_deployment"]) is not bool or type(payload["start_at_boot"]) is not bool:
         raise DeploymentConfigError("Explicit boolean apply, activation and boot intent are required.")
     after = ConfigurationDraft(patch_deployment(current.deployment, payload["deployment_patch"]), payload["start_at_boot"])
-    if payload["activate_deployment"] and after.deployment == current.deployment:
+    if payload["activate_deployment"] and after.deployment == current.deployment and active_deployment in {None, after.deployment}:
         raise DeploymentConfigError("An unchanged deployment cannot request a restart through this edit.")
     return NoninteractiveConfigurationRequest(identity, ConfigurationReview(current, after, payload["activate_deployment"]))
 

@@ -28,7 +28,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from config import settings
 from db import get_session
-from models import AuthChallenge, DriveSetupJob, IntegrationCredential, RecoveryCode, TOTPEnrollment, User
+from models import AuthChallenge, DriveSetupJob, IntegrationCredential, RecoveryCode, SetupFinalization, TOTPEnrollment, User
 from services.integration_auth import integration_token_hash
 from services.logger import logger
 from services.rclone import REMOTE_NAME_RE, RcloneConfigEncryptionError, rclone_service
@@ -111,7 +111,17 @@ def _now() -> int:
 
 
 def setup_required() -> bool:
+    if settings.MANAGED_INSTALLATION:
+        from lifecycle.setup_bootstrap import require_setup_authority
+        return not require_setup_authority().finalized
     return not settings.SETUP_COMPLETE
+
+
+def _setup_completion_lock() -> asyncio.Lock:
+    if settings.MANAGED_INSTALLATION:
+        from lifecycle.setup_bootstrap import require_setup_authority
+        return require_setup_authority().lock
+    return _completion_lock
 
 
 def _bootstrap_code() -> str:
@@ -199,7 +209,7 @@ def require_setup_session(request: Request) -> None:
     if not setup_required():
         raise HTTPException(status_code=409, detail={"code": "setup_complete", "message": "StreamHome is already configured."})
     if not _is_unlocked(request):
-        raise HTTPException(status_code=401, detail={"code": "setup_locked", "message": "Enter the bootstrap code printed by start.sh."})
+        raise HTTPException(status_code=401, detail={"code": "setup_locked", "message": "Run sudo streamhome bootstrap to get a setup code." if settings.MANAGED_INSTALLATION else "Enter the bootstrap code printed by start.sh."})
 
 
 def _hash_value(value: str) -> str:
@@ -390,7 +400,7 @@ def _port_available(port: int) -> bool:
 @router.get("/status")
 async def get_setup_status(request: Request, db: AsyncSession = Depends(get_session)):
     user_count = (await db.execute(select(func.count()).select_from(User))).scalar_one()
-    required = setup_required() or user_count == 0
+    required = setup_required() if settings.MANAGED_INSTALLATION else setup_required() or user_count == 0
     if required and settings.SETUP_COMPLETE:
         settings.SETUP_COMPLETE = False
     unlocked = _is_unlocked(request)
@@ -400,15 +410,16 @@ async def get_setup_status(request: Request, db: AsyncSession = Depends(get_sess
     configured_loopback = configured_host in {"localhost", "127.0.0.1", "::1"}
     public_url_explicit = os.getenv("STREAMHOME_PUBLIC_URL_EXPLICIT", "false").lower() in {"true", "1", "yes"}
     browser_origin = trusted_proxy_origin(request)
-    if required and browser_origin and (configured_loopback or not public_url_explicit):
+    if required and not settings.MANAGED_INSTALLATION and browser_origin and (configured_loopback or not public_url_explicit):
         public_url = browser_origin
     public_url, drive_callback_url = _setup_status_urls(public_url)
     return {
         "required": required,
+        "managedInstallation": settings.MANAGED_INSTALLATION,
         "unlocked": unlocked,
         "webPort": settings.WEB_PORT,
         "serverVersion": settings.APP_VERSION,
-        "mediaPath": str((Path(settings.BASE_DIR) / "server" / "media").resolve()) if unlocked else "",
+        "mediaPath": str(Path(settings.MEDIA_DIR).resolve()) if unlocked else "",
         "databasePath": settings.db_path if unlocked else "",
         "publicUrl": public_url,
         "driveCallbackUrl": drive_callback_url,
@@ -426,8 +437,13 @@ async def unlock_setup(payload: UnlockRequest, request: Request, response: Respo
     if blocked_until > time.time():
         retry = max(1, int(blocked_until - time.time()))
         raise HTTPException(status_code=429, headers={"Retry-After": str(retry)}, detail={"code": "setup_locked_out", "message": "Too many invalid setup attempts.", "retryAfterSeconds": retry})
-    expected = _bootstrap_code()
-    if not expected or not hmac.compare_digest(payload.code.strip(), expected):
+    if settings.MANAGED_INSTALLATION:
+        from lifecycle.setup_bootstrap import require_setup_authority
+        valid_code = await require_setup_authority().consume(payload.code.strip())
+    else:
+        expected = _bootstrap_code()
+        valid_code = bool(expected and hmac.compare_digest(payload.code.strip(), expected))
+    if not valid_code:
         attempts += 1
         _failed_unlocks[ip] = (attempts, time.time() + 300 if attempts >= 5 else 0)
         await fail_rate_limit(db, "setup_unlock", ip, limit=5, window_seconds=300)
@@ -450,7 +466,7 @@ async def readiness(db: AsyncSession = Depends(get_session)):
     checks = []
     for name, command in (("python", shutil.which("python") or shutil.which("python3")), ("node", shutil.which("node")), ("ffmpeg", shutil.which("ffmpeg")), ("ffprobe", shutil.which("ffprobe")), ("rclone", rclone_service.executable())):
         checks.append({"id": name, "ready": bool(command), "detail": command or "Not found"})
-    for name, path in (("database", Path(settings.db_path).parent), ("media", Path(settings.BASE_DIR) / "server" / "media")):
+    for name, path in (("database", Path(settings.db_path).parent), ("media", Path(settings.MEDIA_DIR))):
         path.mkdir(parents=True, exist_ok=True)
         checks.append({"id": name, "ready": os.access(path, os.W_OK), "detail": str(path.resolve())})
     try:
@@ -870,7 +886,7 @@ async def _restart_after_response() -> None:
 
 @router.post("/complete", dependencies=[Depends(require_setup_session)])
 async def complete_setup(payload: CompleteRequest, request: Request, response: Response, db: AsyncSession = Depends(get_session)):
-    async with _completion_lock:
+    async with _setup_completion_lock():
         if not setup_required():
             raise HTTPException(status_code=409, detail={"code": "setup_complete", "message": "StreamHome is already configured."})
         email = payload.email.strip().lower()
@@ -881,9 +897,11 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
             raise HTTPException(status_code=422, detail={"code": "invalid_password", "message": "Use a password between 6 characters and 72 UTF-8 bytes."})
         if payload.web_port < 1 or payload.web_port > 65535:
             raise HTTPException(status_code=422, detail={"code": "invalid_web_port", "message": "Web port must be between 1 and 65535."})
-        if not _port_available(payload.web_port):
+        if not settings.MANAGED_INSTALLATION and not _port_available(payload.web_port):
             raise HTTPException(status_code=409, detail={"code": "web_port_in_use", "message": f"Port {payload.web_port} is already in use."})
         public_url = _normalize_public_url(payload.public_url or settings.PUBLIC_URL)
+        if settings.MANAGED_INSTALLATION and (payload.web_port != settings.WEB_PORT or public_url != settings.PUBLIC_URL):
+            raise HTTPException(status_code=409, detail={"code": "managed_deployment_changed", "message": "Use streamhome configure to change the managed port or public origin, then reload setup."})
         if not payload.tmdb_token.strip():
             raise HTTPException(status_code=422, detail={"code": "tmdb_required", "message": "A validated TMDB token is required."})
         if not _tmdb_validation_is_current(request, payload.tmdb_token, payload.tmdb_validation_token):
@@ -935,6 +953,9 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
             "HEVC_COMPRESSION_MODE": hevc_mode,
         }
         root_updates = {"WEB_PORT": str(payload.web_port), "PUBLIC_URL": public_url, "SETUP": "true"}
+        finalization_id = str(uuid.uuid4()) if settings.MANAGED_INSTALLATION else None
+        if settings.MANAGED_INSTALLATION:
+            root_updates = {"SETUP": "true"}
         staged_files: list[tuple[Path, Path]] = []
         snapshots: dict[Path, Optional[bytes]] = {}
         try:
@@ -971,6 +992,12 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
             db.add(ingestion_credential)
             if totp_enrollment:
                 await db.delete(totp_enrollment)
+            if settings.MANAGED_INSTALLATION:
+                from config import runtime_layout
+                db.add(SetupFinalization(
+                    installation_id=runtime_layout.descriptor.descriptor.installation_id,
+                    finalization_id=finalization_id, finalized_at=time.time(),
+                ))
 
             for target, temporary in staged_files:
                 os.replace(temporary, target)
@@ -991,6 +1018,12 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
             raise HTTPException(status_code=500, detail={"code": "setup_save_failed", "message": message}) from exc
 
         settings.SETUP_COMPLETE = True
+        if settings.MANAGED_INSTALLATION:
+            from lifecycle.setup_bootstrap import SetupAuthorityError, require_setup_authority
+            try:
+                require_setup_authority().finalize_locked(finalization_id)
+            except SetupAuthorityError as exc:
+                raise HTTPException(status_code=503, detail={"code": "setup_finalization_recovery_required", "message": "Account creation committed; restart through the supported control command to reconcile finalization. Do not repeat account creation."}) from exc
         settings.WEB_PORT = payload.web_port
         settings.PUBLIC_URL = public_url
         settings.TMDB_READ_ACCESS_TOKEN = payload.tmdb_token.strip()
@@ -1009,10 +1042,11 @@ async def complete_setup(payload: CompleteRequest, request: Request, response: R
         if drive_job:
             rclone_service.cleanup_job(drive_job.id)
         response.delete_cookie(SETUP_COOKIE, path="/")
-        asyncio.create_task(_restart_after_response())
+        if not settings.MANAGED_INSTALLATION:
+            asyncio.create_task(_restart_after_response())
         return {
             "complete": True,
-            "restartScheduled": os.name != "nt",
+            "restartScheduled": os.name != "nt" and not settings.MANAGED_INSTALLATION,
             "webPort": payload.web_port,
             "recoveryCodes": recovery_codes,
             "ingestionToken": ingestion_token,

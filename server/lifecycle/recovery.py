@@ -26,6 +26,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import uuid
 
 from . import backup_manifest, restore_controller, state, update_controller
+from .layout import layout_for_root
 
 
 ACTION_RECORD_SCHEMA_VERSION = 1
@@ -770,7 +771,7 @@ def _runtime_status(root: Path) -> str:
 
         record_states: list[str] = []
         for service in runtime_control.SERVICE_NAMES:
-            record_path = root / ".run" / f"{service}.runtime.json"
+            record_path = layout_for_root(root).runtime / f"{service}.runtime.json"
             try:
                 record_state = record_path.lstat()
             except FileNotFoundError:
@@ -1047,7 +1048,7 @@ def _durable_recovery_evidence(
                 "rollbackLineage": _evidence_file_identity(paths.operation_dir / "rollback-lineage.json"),
             }
         else:
-            journal_path = root / ".run" / "update-state.json"
+            journal_path = layout_for_root(root).durable_runtime / "update-state.json"
             journal = dict(update_controller.read_update_journal(journal_path))
             raw_journal_generation = journal.get("lifecycle_generation")
             if (
@@ -1091,7 +1092,7 @@ def _durable_recovery_evidence(
                 "journal": journal,
                 "installedCommit": _installed_commit(root),
                 "checkpoint": _evidence_file_identity(
-                    root / ".run" / "pre-update-database.db"
+                    layout_for_root(root).durable_runtime / "pre-update-database.db"
                 ),
                 "permit": _evidence_file_identity(permit_path),
                 "stagingCommit": staging_commit,
@@ -1146,7 +1147,7 @@ def _queued_update_was_not_launched(root: Path, journal: Mapping[str, Any]) -> b
     ):
         return False
     return all(
-        _path_is_absent(root / ".run" / name)
+        _path_is_absent(layout_for_root(root).durable_runtime / name)
         for name in (
             f"update-controller.{operation_id}.sh",
             "pre-update-database.db",
@@ -1184,7 +1185,7 @@ def _update_plan(
     except update_controller.UpdateControllerError:
         return ({"journal": "invalid"}, None, "update_evidence_invalid", [])
 
-    checkpoint = root / ".run" / "pre-update-database.db"
+    checkpoint = layout_for_root(root).durable_runtime / "pre-update-database.db"
     artifacts = {
         "journal": "valid",
         "databaseCheckpoint": _sqlite_status(checkpoint),
@@ -1491,7 +1492,7 @@ def classify_retained_artifacts(
         }
     except restore_controller.RestoreError:
         pass
-    journal_path = installation / ".run" / "update-state.json"
+    journal_path = layout_for_root(installation).durable_runtime / "update-state.json"
     try:
         payload = update_controller.read_update_journal(journal_path)
         terminal = _terminal_update_evidence(payload, canonical_id)
@@ -1555,7 +1556,7 @@ def _verified_update_exit_twelve(
 
     try:
         authority = state.inspect_state(root)
-        journal = update_controller.read_update_journal(root / ".run" / "update-state.json")
+        journal = update_controller.read_update_journal(layout_for_root(root).durable_runtime / "update-state.json")
         if (
             authority.active_operation is not None
             or authority.generation != controller_generation
@@ -1705,7 +1706,7 @@ def _cleanup_update_resolution(
         return False
     # Cleanup can be retried much later than the operator action. Qualify the
     # current mounts containing every deletion target, not the earlier plan's.
-    run_dir = root / ".run"
+    run_dir = layout_for_root(root).durable_runtime
     lifecycle_dir = state.lifecycle_paths(root).lifecycle_dir
     state.qualify_local_filesystem(root, require_private=False, description="installation directory")
     state.qualify_local_filesystem(run_dir, require_private=True, description="update artifact directory")
@@ -1758,12 +1759,12 @@ def _cleanup_update_resolution(
             staging_identity = (qualified_state.st_dev, qualified_state.st_ino)
     paths = [
         permit_path,
-        root / ".run" / f"update-controller.{operation_id}.sh",
-        root / ".run" / f"update-cancel.{operation_id}.requested",
-        root / ".run" / f"update-recovery.{operation_id}.requested",
-        root / ".run" / f"update-recovery.{operation_id[:12]}.requested",
+        layout_for_root(root).durable_runtime / f"update-controller.{operation_id}.sh",
+        layout_for_root(root).durable_runtime / f"update-cancel.{operation_id}.requested",
+        layout_for_root(root).durable_runtime / f"update-recovery.{operation_id}.requested",
+        layout_for_root(root).durable_runtime / f"update-recovery.{operation_id[:12]}.requested",
     ]
-    checkpoint = root / ".run" / "pre-update-database.db"
+    checkpoint = layout_for_root(root).durable_runtime / "pre-update-database.db"
     if action == "safe_abort":
         if not _path_is_absent(checkpoint):
             return False
@@ -1804,7 +1805,7 @@ def _cleanup_update_resolution(
         except OSError:
             return False
     try:
-        _fsync_directory(root / ".run")
+        _fsync_directory(layout_for_root(root).durable_runtime)
         return True
     except OSError:
         return False

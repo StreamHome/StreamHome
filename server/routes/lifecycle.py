@@ -21,6 +21,57 @@ import services.state as service_state
 
 
 router = APIRouter()
+_management_commit_acknowledged = False
+
+
+def management_commit_acknowledged() -> bool:
+    return _management_commit_acknowledged
+
+
+class ManagementCommitRequest(BaseModel):
+    operation_id: str
+    generation: int
+    build_id: str
+    execution_tuple_sha256: str
+
+
+@router.post("/management/commit", include_in_schema=False)
+async def commit_managed_runtime(
+    payload: ManagementCommitRequest, request: Request,
+    capability: str = Header(default="", alias="X-StreamHome-Management-Commit"),
+):
+    """Acknowledge an already durable controller acceptance; never mint one."""
+    global _management_commit_acknowledged
+    from lifecycle.management_journal import ManagementStage, execution_tuple_sha256, validate_active_journal
+    from lifecycle.management_store import inspect_management_journal
+
+    context = require_startup_context()
+    try:
+        peer = ipaddress.ip_address(request.client.host if request.client else "")
+        if (
+            not peer.is_loopback or context.mode is not StartupMode.MANAGEMENT_VERIFY
+            or payload.operation_id != context.operation_id or payload.generation != context.generation
+            or payload.build_id != settings.BUILD_ID
+        ):
+            raise ValueError("The managed runtime identity does not match.")
+        require_current_guarded_authority(context)
+        authority = lifecycle_state.validate_operation_owner(
+            context.installation_root, operation_id=payload.operation_id, generation=payload.generation,
+            expected_phase=lifecycle_state.LifecyclePhase.VERIFYING, owner_capability=capability,
+        )
+        journal = inspect_management_journal(context.installation_root, payload.operation_id)
+        validate_active_journal(journal, authority)
+        if (
+            journal.stage not in {ManagementStage.ACCEPTED, ManagementStage.SUCCEEDED}
+            or journal.acceptance is None
+            or payload.execution_tuple_sha256 != execution_tuple_sha256(journal.candidate)
+            or not _management_commit_acknowledged and not current_readiness_projection(get_startup_readiness())["guardedReady"]
+        ):
+            raise ValueError("Durable acceptance or guarded readiness is missing.")
+    except (ValueError, StartupAuthorityChangedError, lifecycle_state.LifecycleError) as exc:
+        raise HTTPException(status_code=403, detail={"code": "management_commit_forbidden"}) from exc
+    _management_commit_acknowledged = True
+    return {"committed": True, "buildId": settings.BUILD_ID, "recoveryPending": True}
 
 
 class RestoreCommitRequest(BaseModel):

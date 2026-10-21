@@ -316,6 +316,33 @@ class ConfigurationStore:
             raise ConfigurationStoreError("Configuration belongs to another installation.")
         return manifest
 
+    def initialize_provisional(self, root, revision: DeploymentRevision) -> ConfigurationManifest:
+        """First-install publication under provisional identity and idle v2/gen0."""
+        from .installation import InstallationStatus
+        from .layout import layout_for_root
+        layout = layout_for_root(root)
+        if (not layout.managed or layout.descriptor.descriptor.installation_id != self.installation_id
+                or layout.descriptor.descriptor.status is not InstallationStatus.PROVISIONING):
+            raise ConfigurationStoreError("Initial configuration requires the exact provisional installation.")
+        directory, opened = layout.domains.lstat(), os.fstat(self.fd)
+        if (directory.st_dev, directory.st_ino) != (opened.st_dev, opened.st_ino) or not stat.S_ISDIR(directory.st_mode):
+            raise ConfigurationStoreError("Initial configuration targets a different domain directory.")
+        with state.hold_idle_authority(root) as authority:
+            if authority.schema_version != 2 or authority.generation != 0:
+                raise ConfigurationStoreError("Initial configuration cannot replace existing authority.")
+            self.prepare_revision(revision)
+            initial = ConfigurationManifest(self.installation_id, revision.reference, revision.reference, (), (), ())
+            with self._lock():
+                try:
+                    os.stat("manifest.json", dir_fd=self.fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    self._replace("manifest.json", initial.payload(), immutable=True)
+                else:
+                    if self.inspect() != initial:
+                        raise ConfigurationConflictError("Initial configuration already binds a different deployment.")
+                    os.fsync(self.fd)
+            return initial
+
     def read_revision(self, reference: DeploymentReference) -> DeploymentRevision:
         _reference(reference.payload())
         revision = parse_revision(self._read(f"deployment-{reference.revision}.json"))

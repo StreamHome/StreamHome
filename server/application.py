@@ -2,6 +2,7 @@ from lifecycle.bootstrap import (
     MandatoryRecoveryStep,
     ReadinessCapability,
     StartupMode,
+    current_readiness_projection,
     get_startup_readiness,
     guarded_operation_completed,
     revalidate_startup_context,
@@ -138,6 +139,32 @@ class _WorkerRuntime:
         self.started = False
 
 
+async def _settle_managed_runtime() -> None:
+    if not settings.MANAGED_INSTALLATION:
+        return
+    from config import runtime_layout
+    from lifecycle.execution_state import read_active_execution
+    from lifecycle.runtime_admission import RuntimeAdmission, RuntimeAdmissionError, install_runtime_admission
+    record = read_active_execution(STARTUP_CONTEXT.installation_root)
+    if record.execution.application_build_id != settings.BUILD_ID:
+        raise RuntimeError("Managed execution does not match the running build.")
+    admission = RuntimeAdmission(
+        STARTUP_CONTEXT, runtime_layout.descriptor.descriptor.installation_id,
+        os.environ.get("INVOCATION_ID", ""), record.execution,
+    )
+    deadline = time.monotonic() + 30.0
+    while True:
+        try:
+            admission.settle(STARTUP_READINESS)
+            break
+        except RuntimeAdmissionError:
+            current = lifecycle_state.inspect_state(STARTUP_CONTEXT.installation_root)
+            if current.active_operation is not None or current.generation != STARTUP_CONTEXT.generation or time.monotonic() >= deadline:
+                raise
+            await asyncio.sleep(0.1)
+    install_runtime_admission(admission)
+
+
 async def _initialize_configuration(*, allow_mutation: bool) -> None:
     initialize_runtime_configuration(allow_mutation=allow_mutation)
 
@@ -167,6 +194,28 @@ async def _initialize_database(*, guarded: bool) -> None:
 async def _recover_setup_state() -> None:
     async with AsyncSession(engine) as db:
         existing_user = (await db.exec(select(User))).first()
+        if settings.MANAGED_INSTALLATION:
+            from config import runtime_layout
+            from models import SetupFinalization
+            from lifecycle.setup_bootstrap import SetupAuthority, install_setup_authority, recover_committed_finalization
+            descriptor = runtime_layout.descriptor.descriptor
+            receipt = await db.get(SetupFinalization, descriptor.installation_id)
+            recover_committed_finalization(
+                runtime_layout.state, descriptor.installation_id,
+                has_account=existing_user is not None,
+                database_finalization_id=receipt.finalization_id if receipt else None,
+            )
+            authority = SetupAuthority(
+                descriptor.installation_id, os.environ.get("INVOCATION_ID", ""),
+                runtime_layout.state, runtime_layout.runtime,
+            )
+            await authority.reconcile(
+                has_account=existing_user is not None,
+                database_finalization_id=receipt.finalization_id if receipt else None,
+            )
+            settings.SETUP_COMPLETE = authority.finalized
+            install_setup_authority(authority)
+            return
         if not existing_user:
             settings.SETUP_COMPLETE = False
 
@@ -572,6 +621,7 @@ async def _promote_committed_update(
             if state.MAINTENANCE_REASON == "StreamHome is completing guarded startup verification.":
                 state.MAINTENANCE_MODE = False
                 state.MAINTENANCE_REASON = ""
+            await _settle_managed_runtime()
             break
         operation = current.active_operation if current is not None else None
         if (
@@ -658,6 +708,7 @@ async def _promote_committed_restore(
             if state.MAINTENANCE_REASON == "StreamHome is completing guarded startup verification.":
                 state.MAINTENANCE_MODE = False
                 state.MAINTENANCE_REASON = ""
+            await _settle_managed_runtime()
             break
         operation = current.active_operation if current is not None else None
         if (
@@ -702,9 +753,69 @@ async def _complete_normal_startup(runtime: _WorkerRuntime) -> None:
     STARTUP_READINESS.mark_general_ready()
     from lifecycle.storage_worker import storage_worker
     await storage_worker.measurements.start()
+    await _settle_managed_runtime()
     runtime.tasks.append(
         asyncio.create_task(_optional_playback_baselines(), name="playback-baselines")
     )
+
+
+async def _promote_committed_management(runtime: _WorkerRuntime, fence: DrainSnapshot | None) -> None:
+    from routes.lifecycle import management_commit_acknowledged
+    while not management_commit_acknowledged():
+        revalidate_startup_context(STARTUP_CONTEXT)
+        await asyncio.sleep(0.1)
+
+    async def begin_accepted_recovery() -> None:
+        revalidate_startup_context(STARTUP_CONTEXT)
+        if fence is not None:
+            get_runtime_coordinator().release_fence(fence)
+
+    async def verify_authority() -> None:
+        revalidate_startup_context(STARTUP_CONTEXT)
+
+    result = await run_mandatory_recovery(
+        STARTUP_CONTEXT,
+        (MandatoryRecoveryStep("accepted_management_authority", begin_accepted_recovery),)
+        + _normal_recovery_steps()
+        + (MandatoryRecoveryStep("management_authority_final", verify_authority),),
+    )
+    STARTUP_READINESS.record_recovery(result)
+    if not result.succeeded:
+        logger.error("[Lifespan Startup] Accepted management recovery failed.")
+        return
+    completion_fence = get_runtime_coordinator().close_admission(
+        list(EffectClass), operation_id=STARTUP_CONTEXT.operation_id, generation=STARTUP_CONTEXT.generation,
+    )
+    drained = await get_runtime_coordinator().drain(completion_fence, timeout=30.0)
+    if not drained.complete:
+        STARTUP_READINESS.mark_worker_start_failed("management_completion_drain_timeout")
+        return
+    try:
+        await _start_runtime_workers(runtime)
+    except Exception:
+        STARTUP_READINESS.mark_worker_start_failed("management_worker_start_failed")
+        return
+    STARTUP_READINESS.mark_workers_started()
+    STARTUP_READINESS.mark_general_ready()
+    while not guarded_operation_completed(STARTUP_CONTEXT):
+        current = lifecycle_state.inspect_state(STARTUP_CONTEXT.installation_root)
+        operation = current.active_operation
+        if (
+            operation is None or operation.operation_id != STARTUP_CONTEXT.operation_id
+            or current.generation != STARTUP_CONTEXT.generation
+            or operation.phase is lifecycle_state.LifecyclePhase.RECOVERY_REQUIRED
+        ):
+            STARTUP_READINESS.mark_worker_start_failed("management_lifecycle_unresolved")
+            await _stop_runtime_workers(runtime)
+            return
+        await asyncio.sleep(0.1)
+    get_runtime_coordinator().release_fence(completion_fence)
+    from lifecycle.storage_worker import storage_worker
+    await storage_worker.measurements.start()
+    state.MAINTENANCE_MODE = False
+    state.MAINTENANCE_REASON = ""
+    await _settle_managed_runtime()
+    runtime.tasks.append(asyncio.create_task(_optional_playback_baselines(), name="playback-baselines"))
 
 
 @asynccontextmanager
@@ -713,6 +824,7 @@ async def lifespan(app: FastAPI):
     runtime = _WorkerRuntime()
     startup_task: asyncio.Task | None = None
     fence: DrainSnapshot | None = None
+    local_control = None
 
     async def revalidate_authority() -> None:
         nonlocal fence
@@ -746,12 +858,22 @@ async def lifespan(app: FastAPI):
                     _promote_committed_restore(runtime, fence),
                     name="post-restore-startup",
                 )
+            elif STARTUP_CONTEXT.mode is StartupMode.MANAGEMENT_VERIFY:
+                startup_task = asyncio.create_task(
+                    _promote_committed_management(runtime, fence), name="post-management-startup",
+                )
         else:
             logger.error(f"[Lifespan Startup] Guarded recovery failed: {result.error_code}")
 
     try:
+        if settings.MANAGED_INSTALLATION:
+            from lifecycle.backend_control import BackendControl
+            local_control = BackendControl(STARTUP_CONTEXT.installation_root, os.environ.get("INVOCATION_ID", ""))
+            await local_control.start()
         yield
     finally:
+        if local_control is not None:
+            await local_control.close()
         if startup_task is not None:
             startup_task.cancel()
             await asyncio.gather(startup_task, return_exceptions=True)
@@ -764,7 +886,9 @@ class StartupModeGateMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         readiness = STARTUP_READINESS.projection()
         public_ready = readiness["generalReady"]
-        if public_ready and STARTUP_CONTEXT.guarded:
+        if public_ready and settings.MANAGED_INSTALLATION:
+            public_ready = current_readiness_projection(STARTUP_READINESS)["generalReady"]
+        elif public_ready and STARTUP_CONTEXT.guarded:
             public_ready = guarded_operation_completed(STARTUP_CONTEXT)
         if public_ready:
             return await call_next(request)
@@ -773,6 +897,8 @@ class StartupModeGateMiddleware(BaseHTTPMiddleware):
         if STARTUP_CONTEXT.mode is StartupMode.UPDATE_VERIFY and path == "/api/update/commit":
             allowed = True
         if STARTUP_CONTEXT.mode is StartupMode.RESTORE_VERIFY and path == "/api/lifecycle/restore/commit":
+            allowed = True
+        if STARTUP_CONTEXT.mode is StartupMode.MANAGEMENT_VERIFY and path == "/api/lifecycle/management/commit":
             allowed = True
         if allowed:
             return await call_next(request)
@@ -795,6 +921,7 @@ class ActivityTrackingMiddleware(BaseHTTPMiddleware):
             and not request.url.path.startswith("/api/health")
             and request.url.path != "/api/update/commit"
             and request.url.path != "/api/lifecycle/restore/commit"
+            and request.url.path != "/api/lifecycle/management/commit"
             and (
                 bool(state.UPDATE_TRANSACTION_ID)
                 or not request.url.path.startswith("/api/backup/restore/")
@@ -831,6 +958,7 @@ class SetupGateMiddleware(BaseHTTPMiddleware):
             or path.startswith("/api/health")
             or path == "/api/update/commit"
             or path == "/api/lifecycle/restore/commit"
+            or path == "/api/lifecycle/management/commit"
         )
         if not settings.SETUP_COMPLETE and not allowed:
             return JSONResponse(

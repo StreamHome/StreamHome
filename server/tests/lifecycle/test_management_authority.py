@@ -220,7 +220,7 @@ class ManagementAuthorityTests(unittest.TestCase):
                     bootstrap.GENERATION_ENV: str(claimed.state.generation),
                 }, install=False)
                 self.assertEqual(context.mode, bootstrap.StartupMode.FAIL_CLOSED)
-                self.assertEqual(context.failure_code, "management_startup_unavailable")
+                self.assertEqual(context.failure_code, "management_guarded_permit_mismatch" if mode == "management_verify" else "management_startup_unavailable")
                 self.assertFalse(context.guarded_identity_validated)
                 self.assertEqual(context.allowed_effects, frozenset())
 

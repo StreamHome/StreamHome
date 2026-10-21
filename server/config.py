@@ -8,12 +8,15 @@ from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
 from lifecycle.configuration_paths import resolve_temp_directory
+from lifecycle.layout import layout_for_root
 from dotenv import load_dotenv
 
 # Load .env file relative to the config.py location
 config_dir = os.path.dirname(os.path.abspath(__file__))
 base_dir = os.path.abspath(os.path.join(config_dir, ".."))
-root_env_path = os.path.join(base_dir, ".env")
+runtime_layout = layout_for_root(Path(base_dir))
+config_dir = str(runtime_layout.configuration)
+root_env_path = str(runtime_layout.configuration / "runtime.env") if runtime_layout.managed else os.path.join(base_dir, ".env")
 server_env_path = os.path.join(config_dir, ".env")
 SETTINGS_WRITE_LOCK = threading.RLock()
 
@@ -25,10 +28,20 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 
 # Inject local bin/ path into system PATH for discovery of ffmpeg/ffprobe/rclone
 bin_path = os.path.abspath(os.path.join(base_dir, "bin"))
-if bin_path not in os.environ["PATH"]:
-    os.environ["PATH"] = bin_path + os.pathsep + os.environ["PATH"]
+if runtime_layout.managed:
+    from lifecycle.deployment_startup import execution_for_start
+    managed_execution = execution_for_start(runtime_layout)
+    bin_path = str(runtime_layout.application / "runtime/bundles" / managed_execution.runtime_bundle_id / "tools")
+    os.environ["PATH"] = bin_path + os.pathsep + "/usr/bin:/bin"
+else:
+    if bin_path not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = bin_path + os.pathsep + os.environ.get("PATH", "")
 load_dotenv(dotenv_path=root_env_path, override=False)
 load_dotenv(dotenv_path=server_env_path, override=False)
+managed_deployment = None
+if runtime_layout.managed:
+    from lifecycle.deployment_startup import deployment_for_start
+    managed_deployment = deployment_for_start(runtime_layout)
 
 
 def _write_all(fd: int, payload: bytes) -> None:
@@ -116,15 +129,15 @@ class Settings:
     SERVER_ENV_PATH: str = server_env_path
     # Missing configuration must fail closed into the setup gate.
     SETUP_COMPLETE: bool = os.getenv("SETUP", "false").lower() in ("true", "1", "yes")
-    WEB_PORT: int = env_int("WEB_PORT", 3000, 1, 65535)
-    PUBLIC_URL: str = os.getenv("PUBLIC_URL", f"http://localhost:{WEB_PORT}").rstrip("/")
+    WEB_PORT: int = managed_deployment.web_port if managed_deployment else env_int("WEB_PORT", 3000, 1, 65535)
+    PUBLIC_URL: str = managed_deployment.public_origin if managed_deployment else os.getenv("PUBLIC_URL", f"http://localhost:{WEB_PORT}").rstrip("/")
     API_BEARER_TOKEN: str = os.getenv("API_BEARER_TOKEN", "")
-    ALLOWED_ORIGINS: list[str] = [
+    ALLOWED_ORIGINS: list[str] = list(managed_deployment.allowed_origins) if managed_deployment else [
         origin.strip().rstrip("/")
         for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
         if origin.strip()
     ]
-    TRUSTED_PROXY_CIDRS: list[str] = [
+    TRUSTED_PROXY_CIDRS: list[str] = list(managed_deployment.trusted_proxy_cidrs) if managed_deployment else [
         cidr.strip()
         for cidr in os.getenv("TRUSTED_PROXY_CIDRS", "127.0.0.1/32,::1/128").split(",")
         if cidr.strip()
@@ -136,10 +149,13 @@ class Settings:
     ]
     TMDB_API_KEY: str = os.getenv("TMDB_API_KEY", "")
     TMDB_READ_ACCESS_TOKEN: str = os.getenv("TMDB_READ_ACCESS_TOKEN", "")
-    db_path = os.path.abspath(os.path.join(config_dir, "database.db")).replace("\\", "/")
+    CONFIGURATION_DIR: str = config_dir
+    STATE_DIR: str = str(runtime_layout.state)
+    MANAGED_INSTALLATION: bool = runtime_layout.managed
+    db_path = str(runtime_layout.database).replace("\\", "/")
     DATABASE_URL: str = f"sqlite+aiosqlite:///{db_path}"
-    MEDIA_DIR: str = os.path.abspath(os.path.join(config_dir, "media"))
-    TEMP_DIR: str = str(resolve_temp_directory(Path(base_dir), environment=os.environ))
+    MEDIA_DIR: str = str(runtime_layout.state / "media")
+    TEMP_DIR: str = str(runtime_layout.state / "temp") if runtime_layout.managed else str(resolve_temp_directory(Path(base_dir), environment=os.environ))
     PLAYBACK_CACHE_GB: float = max(0.25, min(500.0, float(os.getenv("PLAYBACK_CACHE_GB", "20"))))
     PLAYBACK_TRANSCODE_CONCURRENCY: int = env_int("PLAYBACK_TRANSCODE_CONCURRENCY", 2, 1, 8)
     PLAYBACK_JOB_STALL_SECONDS: int = env_int("PLAYBACK_JOB_STALL_SECONDS", 120, 30, 900)
@@ -198,7 +214,8 @@ class Settings:
                     data = json.load(f)
                     self.STORAGE_ENGINE = data.get("storage_engine", self.STORAGE_ENGINE)
                     self.RCLONE_REMOTE_PATH = data.get("rclone_remote_path", self.RCLONE_REMOTE_PATH)
-                    self.PUBLIC_URL = data.get("public_url", self.PUBLIC_URL)
+                    if not self.MANAGED_INSTALLATION:
+                        self.PUBLIC_URL = data.get("public_url", self.PUBLIC_URL)
                     self.GOOGLE_DRIVE_AUDIENCE = data.get("google_drive_audience", getattr(self, "GOOGLE_DRIVE_AUDIENCE", "external"))
                     self.GOOGLE_DRIVE_PUBLISHING_STATUS = data.get("google_drive_publishing_status", getattr(self, "GOOGLE_DRIVE_PUBLISHING_STATUS", "production"))
                     self.BACKUP_ENABLED = data.get("backup_enabled", self.BACKUP_ENABLED)

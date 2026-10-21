@@ -190,6 +190,8 @@ def restore_paths(root: str | os.PathLike[str], operation_id: str) -> RestorePat
     if canonical_id != operation_id:
         raise ValueError("operation_id must be a canonical UUID")
     lifecycle = state.lifecycle_paths(installation)
+    from .layout import layout_for_root
+    layout = layout_for_root(installation)
     operations = lifecycle.lifecycle_dir / "restore"
     operation_dir = operations / canonical_id
     return RestorePaths(
@@ -200,8 +202,8 @@ def restore_paths(root: str | os.PathLike[str], operation_id: str) -> RestorePat
         journal_lock_path=operation_dir / "journal.lock",
         candidate_path=operation_dir / "candidate.db",
         rollback_path=operation_dir / "rollback.db",
-        database_path=installation / "server" / "database.db",
-        backup_dir=installation / "server" / "backup",
+        database_path=layout.database,
+        backup_dir=layout.backup,
     )
 
 
@@ -1068,7 +1070,8 @@ def prevalidate_candidate(root: str | os.PathLike[str], filename: str) -> Candid
     installation = state.resolve_installation_root(root)
     if not isinstance(filename, str) or not BACKUP_NAME_RE.fullmatch(filename):
         raise RestoreValidationError("restore candidate name is invalid")
-    configured_backup_root = installation / "server" / "backup"
+    from .layout import layout_for_root
+    configured_backup_root = layout_for_root(installation).backup
     if configured_backup_root.is_symlink() or not configured_backup_root.is_dir():
         raise RestoreValidationError("restore backup directory is not trusted")
     backup_root = configured_backup_root.resolve()
@@ -1286,7 +1289,8 @@ def require_no_media_publication_evidence(root: Path) -> None:
             validate_placement_manifests(root)
         except StoragePlacementRecoveryRequired as exc:
             raise RestoreRecoveryRequired("accepted storage placements require recovery") from exc
-        database_path = root / "server" / "database.db"
+        from .layout import layout_for_root
+        database_path = layout_for_root(root).database
         if database_path.exists():
             if database_path.is_symlink() or not database_path.is_file():
                 raise RestoreRecoveryRequired("storage operation evidence is ambiguous")

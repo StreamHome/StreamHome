@@ -11,6 +11,9 @@ import uuid
 
 from lifecycle import configuration_store as store, management_journal as contract, management_store, state
 from lifecycle.deployment_config import default_deployment, patch_deployment
+from lifecycle.pending_deployment import eligible_saved_deployment
+from lifecycle.control.requests import parse_management_request
+from lifecycle.control.rpc import ControlError
 from tests.lifecycle.test_management_journal import _journal_payload
 
 
@@ -116,6 +119,52 @@ class ConfigurationStoreTests(unittest.TestCase):
         self.assertEqual(management_store.inspect_management_journal(self.root, journal.operation_id), journal)
         with self.assertRaises(store.ConfigurationStoreError):
             self.store.promote_active(self.root, journal, lease=self.lease)
+
+    def _saved_pending_review(self):
+        from tests.lifecycle.test_management_requests import request_payload
+        target = self._target()
+        journal = self._operation(target)
+        self._publish(journal, target)
+        saved = replace(journal, stage=contract.ManagementStage.SAVED)
+        management_store.advance_management_journal(self.root, journal, saved, lease=self.lease)
+        state.complete_operation_with_credential(self.root, operation_id=saved.operation_id, generation=saved.generation, expected_phase='reserved')
+        self.lease.release()
+        self.lease = None
+        payload = request_payload()
+        payload.update(installation_id=self.identity, operation_id=saved.operation_id, review_id=saved.review_id,
+            expected_generation=saved.generation - 1, activation_mode='save_only', interruption_approved=False,
+            previous=contract.execution_tuple_payload(saved.previous), candidate=contract.execution_tuple_payload(saved.candidate),
+            expected_desired=self.initial.reference.payload(), deployment=target.settings.payload())
+        return saved, target, parse_management_request(payload)
+
+    def test_pending_start_requires_completed_saved_receipt_and_protected_review(self):
+        journal, target, reviewed = self._saved_pending_review()
+        before = self.store.inspect()
+        with patch('lifecycle.pending_deployment.read_management_request', return_value=reviewed):
+            proof = eligible_saved_deployment(self.root, self.store, state.inspect_state(self.root), journal.previous)
+        self.assertEqual(proof, {'operation_id': journal.operation_id, 'generation': journal.generation, 'request_sha256': reviewed.sha256})
+        self.assertEqual(self.store.inspect(), before)
+        self.assertEqual(before.active, self.initial.reference)
+        self.assertEqual(before.desired, target.reference)
+
+    def test_pending_start_rejects_completed_authority_without_terminal_saved_journal(self):
+        target = self._target()
+        journal = self._operation(target)
+        self._publish(journal, target)
+        state.complete_operation_with_credential(self.root, operation_id=journal.operation_id, generation=journal.generation, expected_phase='reserved')
+        with self.assertRaises(ControlError):
+            eligible_saved_deployment(self.root, self.store, state.inspect_state(self.root), journal.previous)
+
+    def test_pending_start_rejects_missing_or_changed_root_review_and_quarantine(self):
+        journal, target, reviewed = self._saved_pending_review()
+        for replacement in (replace(reviewed, review_id=str(uuid.uuid4())), replace(reviewed, expected_generation=20)):
+            with patch('lifecycle.pending_deployment.read_management_request', return_value=replacement), self.assertRaises(ControlError):
+                eligible_saved_deployment(self.root, self.store, state.inspect_state(self.root), journal.previous)
+        with patch('lifecycle.pending_deployment.read_management_request', side_effect=ControlError('missing')), self.assertRaises(ControlError):
+            eligible_saved_deployment(self.root, self.store, state.inspect_state(self.root), journal.previous)
+        self._fixture_manifest(replace(self.store.inspect(), quarantined=(target.revision,)).payload())
+        with self.assertRaises(ControlError):
+            eligible_saved_deployment(self.root, self.store, state.inspect_state(self.root), journal.previous)
 
     def test_stale_desired_cas_and_changed_journal_are_rejected(self) -> None:
         target = self._target()

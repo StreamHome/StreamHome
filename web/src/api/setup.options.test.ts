@@ -28,3 +28,14 @@ it("rejects an empty successful setup status body", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => new Response("")));
   await expect(getSetupStatus()).rejects.toMatchObject({ code: "invalid_response" });
 });
+
+
+it("normalizes legacy status and validates the managed installation marker", async () => {
+  const status = { required: true, unlocked: false, webPort: 3030, serverVersion: "fixture", mediaPath: "/var/lib/streamhome/media", databasePath: "/var/lib/streamhome/database.db" };
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(status))));
+  expect((await getSetupStatus()).managedInstallation).toBe(false);
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...status, managedInstallation: true }))));
+  expect((await getSetupStatus()).managedInstallation).toBe(true);
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...status, managedInstallation: "true" }))));
+  await expect(getSetupStatus()).rejects.toMatchObject({ code: "invalid_response" });
+});

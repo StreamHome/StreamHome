@@ -17,6 +17,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from config import SETTINGS_WRITE_LOCK, settings
 import db as database
 from lifecycle.coordination import run_cancellation_safe_thread
+from lifecycle.layout import layout_for_root
 from lifecycle.media_work import media_ownership
 from models import (Episode, Movie, StorageAsset, StorageKeepLocal, StorageMeasurement,
                     StorageOperation, StorageReservation, StorageReview)
@@ -158,7 +159,7 @@ class StoragePolicyService:
             raise StorageError('storage_request_conflict')
         # Resolve an acknowledgement lost after atomic replace/directory fsync.
         # Presence in memory alone is never proof of durable settings acceptance.
-        path = Path(settings.BASE_DIR) / 'server/settings.json'
+        path = layout_for_root(Path(settings.BASE_DIR)).configuration / 'settings.json'
         try:
             with SETTINGS_WRITE_LOCK:
                 fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
@@ -257,7 +258,7 @@ class StoragePolicyService:
                             # A directory fsync can fail after replace. Read the
                             # actual file before deciding whether acceptance happened.
                             try:
-                                document = json.loads((Path(settings.BASE_DIR) / 'server/settings.json').read_text())
+                                document = json.loads((layout_for_root(Path(settings.BASE_DIR)).configuration / 'settings.json').read_text())
                                 observed = document.get('storage_policy') or {}
                                 if observed.get('last_operation_id') == operation_id:
                                     settings.STORAGE_POLICY = observed

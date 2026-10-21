@@ -19,6 +19,7 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 import uuid
 
 from . import state
+from .layout import layout_for_root
 
 
 STARTUP_MODE_ENV = "STREAMHOME_LIFECYCLE_STARTUP_MODE"
@@ -34,6 +35,7 @@ class StartupMode(str, Enum):
     NORMAL = "normal"
     UPDATE_VERIFY = "update_verify"
     RESTORE_VERIFY = "restore_verify"
+    MANAGEMENT_VERIFY = "management_verify"
     RECOVERY_ONLY = "recovery_only"
     FAIL_CLOSED = "fail_closed"
 
@@ -85,11 +87,12 @@ class StartupContext:
             StartupMode.NORMAL,
             StartupMode.UPDATE_VERIFY,
             StartupMode.RESTORE_VERIFY,
+            StartupMode.MANAGEMENT_VERIFY,
         }
 
     @property
     def guarded(self) -> bool:
-        return self.mode in {StartupMode.UPDATE_VERIFY, StartupMode.RESTORE_VERIFY}
+        return self.mode in {StartupMode.UPDATE_VERIFY, StartupMode.RESTORE_VERIFY, StartupMode.MANAGEMENT_VERIFY}
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +170,7 @@ def _legacy_first_adoption_context(
             return None
     except (ValueError, AttributeError):
         return None
-    journal_path = root / ".run" / "update-state.json"
+    journal_path = layout_for_root(root).durable_runtime / "update-state.json"
     from .update_controller import UpdateControllerError, read_update_journal
 
     try:
@@ -199,7 +202,7 @@ def _legacy_first_adoption_context(
     )
 
 
-def evaluate_startup(
+def _evaluate_startup(
     root: str | os.PathLike[str] | None = None,
     environ: Mapping[str, str] | None = None,
     *,
@@ -256,9 +259,37 @@ def evaluate_startup(
         return context
 
     if operation.operation_type is state.OperationType.MANAGEMENT:
-        # Authority readers land before the guarded management application and
-        # recovery protocol. No legacy permit may authorize that missing path.
         context = _failure_context(resolved_root, "management_startup_unavailable", inspected)
+        if requested_raw == StartupMode.MANAGEMENT_VERIFY.value:
+            try:
+                from .management_journal import ActivationMode, ManagementStage, execution_tuple_sha256, validate_active_journal
+                from .management_store import inspect_management_journal
+                journal = inspect_management_journal(resolved_root, operation.operation_id)
+                validate_active_journal(journal, inspected)
+                lease = state.read_controller_lease(resolved_root)
+                if (
+                    operation_id != operation.operation_id or generation_raw != str(inspected.generation)
+                    or operation.phase is not state.LifecyclePhase.VERIFYING
+                    or journal.activation_mode is not ActivationMode.CUTOVER
+                    or journal.stage not in {ManagementStage.VERIFYING, ManagementStage.ACCEPTED, ManagementStage.SUCCEEDED}
+                    or selected_environ.get("STREAMHOME_BUILD_ID") != journal.candidate.application_build_id
+                    or selected_environ.get("STREAMHOME_RUNTIME_TUPLE_SHA256") != execution_tuple_sha256(journal.candidate)
+                    or lease is None or not state.controller_lease_is_current(lease)
+                    or lease.operation_id != operation.operation_id or lease.generation != inspected.generation
+                    or lease.owner_kind is not state.OwnerKind.MANAGEMENT_CONTROLLER
+                ):
+                    raise ValueError("Management verification does not match its current owner and candidate.")
+                state.validate_operation_with_credential(
+                    resolved_root, operation_id=operation.operation_id, generation=inspected.generation,
+                    expected_phase=state.LifecyclePhase.VERIFYING,
+                )
+                context = StartupContext(
+                    StartupMode.MANAGEMENT_VERIFY, resolved_root, inspected.schema_version, inspected.generation,
+                    operation.operation_id, operation.operation_type.value, operation.phase.value,
+                    operation.owner_kind.value, True, frozenset({"db_write"}),
+                )
+            except (state.LifecycleError, ValueError, OSError):
+                context = _failure_context(resolved_root, "management_guarded_permit_mismatch", inspected)
         if install:
             install_startup_context(context)
         return context
@@ -328,6 +359,49 @@ def evaluate_startup(
     return context
 
 
+def evaluate_startup(
+    root: str | os.PathLike[str] | None = None, environ: Mapping[str, str] | None = None,
+    *, install: bool = False,
+) -> StartupContext:
+    """Apply managed launch identity checks before application import as well."""
+    context = _evaluate_startup(root, environ, install=False)
+    selected = os.environ if environ is None else environ
+    if context.imports_application:
+        try:
+            from .layout import layout_for_root
+            layout = layout_for_root(context.installation_root)
+            if layout.managed:
+                from .control.processes import RUNTIME_CGROUP, process_cgroup
+                from .control.tickets import require_first_start
+                from .execution_state import read_active_execution
+                from .installation import InstallationStatus
+                from .management_journal import execution_tuple_sha256
+                from .management_store import inspect_management_journal
+                from .runtime_build import file_sha256
+                execution = (
+                    inspect_management_journal(context.installation_root, context.operation_id).candidate
+                    if context.mode is StartupMode.MANAGEMENT_VERIFY
+                    else read_active_execution(context.installation_root).execution
+                )
+                import sys
+                if (
+                    os.geteuid() != layout.descriptor.descriptor.service_uid
+                    or process_cgroup(os.getpid()) != RUNTIME_CGROUP
+                    or selected.get("STREAMHOME_BUILD_ID") != execution.application_build_id
+                    or selected.get("STREAMHOME_RUNTIME_TUPLE_SHA256") != execution_tuple_sha256(execution)
+                    or sys.executable != execution.python_executable
+                    or file_sha256(layout.application / "runtime/bundles" / execution.runtime_bundle_id / "manifest.json") != execution.runtime_manifest_sha256
+                ):
+                    raise ValueError("The managed launch does not match its bound runtime.")
+                if layout.descriptor.descriptor.status is InstallationStatus.PROVISIONING:
+                    require_first_start(layout, execution, selected.get("INVOCATION_ID", ""))
+        except (OSError, ValueError, RuntimeError):
+            context = _failure_context(context.installation_root, "managed_launch_unavailable", state.inspect_state(context.installation_root))
+    if install:
+        install_startup_context(context)
+    return context
+
+
 def revalidate_startup_context(
     context: StartupContext,
     environ: Mapping[str, str] | None = None,
@@ -364,6 +438,14 @@ def guarded_operation_completed(
         if current.active_operation is not None:
             return False
         if context.generation is not None:
+            if context.mode is StartupMode.MANAGEMENT_VERIFY:
+                from .management_journal import ManagementStage
+                from .management_store import inspect_management_journal
+                journal = inspect_management_journal(context.installation_root, context.operation_id)
+                return (
+                    current.generation == context.generation and journal.generation == context.generation
+                    and journal.stage is ManagementStage.SUCCEEDED and journal.acceptance is not None
+                )
             return current.generation == context.generation
         if (
             context.mode is not StartupMode.UPDATE_VERIFY
@@ -376,7 +458,7 @@ def guarded_operation_completed(
         ):
             return False
         require_current_guarded_authority(context, environ)
-        journal = context.installation_root / ".run" / "update-state.json"
+        journal = layout_for_root(context.installation_root).durable_runtime / "update-state.json"
         payload = read_update_journal(journal)
         committed_at = payload.get("runtime_committed_at")
         return (
@@ -543,9 +625,16 @@ def current_readiness_projection(
             projection = dict(projection)
             projection["guardedReady"] = False
             projection["errorCode"] = StartupAuthorityChangedError.code
-    if projection["generalReady"] and readiness.context.mode in {
+    from .runtime_admission import managed_runtime_admitted
+    managed_admitted = managed_runtime_admitted(readiness.context) if projection["generalReady"] else None
+    if projection["generalReady"] and managed_admitted is False:
+        projection = dict(projection)
+        projection["generalReady"] = False
+        projection["errorCode"] = "runtime_not_settled"
+    if projection["generalReady"] and managed_admitted is None and readiness.context.mode in {
         StartupMode.UPDATE_VERIFY,
         StartupMode.RESTORE_VERIFY,
+        StartupMode.MANAGEMENT_VERIFY,
     }:
         lifecycle_completed = guarded_operation_completed(readiness.context, environ)
         if not lifecycle_completed:

@@ -15,7 +15,6 @@ import re
 import socket
 import sys
 
-from . import state
 from .installation import InstallationDescriptor, validate_managed_port
 
 
@@ -50,6 +49,7 @@ def _proc_bytes(path: Path, maximum: int) -> bytes:
 
 
 def _process_matches(owner: OwnedWebListener, installation: InstallationDescriptor) -> bool:
+    from . import state
     if (
         owner.installation_id != installation.installation_id or owner.service_uid != installation.service_uid
         or type(owner.pid) is not int or owner.pid <= 1

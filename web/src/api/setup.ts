@@ -2,6 +2,7 @@ import { ApiError, apiDelete, apiGet, apiPost, type ApiRequestInit } from "./cli
 
 export interface SetupStatus {
   required: boolean;
+  managedInstallation?: boolean;
   unlocked: boolean;
   webPort: number;
   serverVersion: string;
@@ -75,12 +76,13 @@ const setupOptions = { credentials: "same-origin" as const };
 export async function getSetupStatus(options?: ApiRequestInit): Promise<SetupStatus> {
   const value = await apiGet<SetupStatus>("/api/setup/status", { ...options, ...setupOptions });
   if (!value || typeof value.required !== "boolean" || typeof value.unlocked !== "boolean"
+      || (value.managedInstallation != null && typeof value.managedInstallation !== "boolean")
       || !Number.isInteger(value.webPort) || value.webPort < 1 || value.webPort > 65535
       || typeof value.serverVersion !== "string" || typeof value.mediaPath !== "string" || typeof value.databasePath !== "string"
       || [value.publicUrl, value.driveCallbackUrl, value.driveGuideUrl].some((field) => field != null && typeof field !== "string")) {
     throw new ApiError("The server returned an invalid setup status. Try checking again.", 0, "invalid_response");
   }
-  return { ...value, publicUrl: value.publicUrl ?? undefined, driveCallbackUrl: value.driveCallbackUrl ?? undefined, driveGuideUrl: value.driveGuideUrl ?? undefined };
+  return { ...value, managedInstallation: value.managedInstallation ?? false, publicUrl: value.publicUrl ?? undefined, driveCallbackUrl: value.driveCallbackUrl ?? undefined, driveGuideUrl: value.driveGuideUrl ?? undefined };
 }
 export const unlockSetup = (code: string, driveJobId?: string) => apiPost<void>("/api/setup/unlock", { code, drive_job_id: driveJobId || undefined }, setupOptions);
 export async function getSetupReadiness(): Promise<SetupReadiness> {

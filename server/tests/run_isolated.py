@@ -9,6 +9,7 @@ files=set(subprocess.check_output(['git','ls-files'],cwd=source,text=True).split
 files.update(str(f.relative_to(source)) for f in (source/'server').rglob('*.py') if f.relative_to(source/'server').parts[0] not in {'venv','temp','media','logs','.run'} and '__pycache__' not in f.parts)
 files.update(str(f.relative_to(source)) for f in (source/'web').rglob('*') if f.suffix in {'.ts','.tsx','.mjs','.css','.html','.svg','.png','.jpg','.jpeg','.webp','.woff2','.ico'} and not any(part in {'node_modules','dist','test-results','playwright-report'} for part in f.relative_to(source/'web').parts))
 files.update(str(f.relative_to(source)) for f in (source/'server/tests').rglob('*.mjs'))
+files.update(str(f.relative_to(source)) for f in (source/'scripts').rglob('*') if f.suffix in {'.py','.sh'} and f.is_file() and not f.is_symlink())
 for name in files:
  f=source/name
  if f.suffix not in allowed or name.startswith(('memory-bank/','.agents/','artifacts/')) or not f.is_file() or f.is_symlink():continue

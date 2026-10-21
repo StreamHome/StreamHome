@@ -484,7 +484,11 @@ def resolve_installation_root(root: str | os.PathLike[str] | None = None) -> Pat
 
 def lifecycle_paths(root: str | os.PathLike[str] | None = None) -> LifecyclePaths:
     resolved = resolve_installation_root(root)
-    run_dir = resolved / ".run"
+    from .layout import LayoutError, layout_for_root
+    try:
+        run_dir = layout_for_root(resolved).durable_runtime
+    except LayoutError as exc:
+        raise InvalidRootError(str(exc)) from exc
     lifecycle_dir = run_dir / "lifecycle"
     return LifecyclePaths(
         root=resolved,
@@ -734,6 +738,28 @@ def inspect_state(root: str | os.PathLike[str] | None = None) -> LifecycleState:
     return _read_state_unlocked(paths)
 
 
+def initialize_managed_authority(root: Path, *, installation_id: str) -> LifecycleState:
+    """First-install initialization only; existing authority is never migrated here."""
+    from .installation import InstallationStatus
+    from .layout import layout_for_root
+    layout = layout_for_root(root)
+    if (not layout.managed or layout.descriptor.descriptor.installation_id != installation_id
+            or layout.descriptor.descriptor.status is not InstallationStatus.PROVISIONING):
+        raise OwnershipError("authority initialization requires the exact provisional installation")
+    paths = lifecycle_paths(root)
+    qualify_lifecycle_filesystem(root)
+    with _state_lock(paths):
+        if paths.state_path.exists() or paths.state_path.is_symlink():
+            current = _read_state_unlocked(paths)
+            if current.schema_version != MANAGEMENT_SCHEMA_VERSION or current.generation != 0 or current.active_operation is not None:
+                raise LifecycleConflictError("first-install initialization cannot replace existing authority")
+            _fsync_directory(paths.lifecycle_dir)
+            return current
+        initialized = LifecycleState(MANAGEMENT_SCHEMA_VERSION, 0, None)
+        _write_state_unlocked(paths, initialized)
+        return initialized
+
+
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
@@ -829,14 +855,19 @@ def claim_operation(
     owner_kind: OwnerKind | str,
     operation_id: str | None = None,
     owner_capability: str | None = None,
+    expected_generation: int | None = None,
 ) -> ClaimResult:
     paths = lifecycle_paths(root)
     selected_id = _validate_operation_id(operation_id or str(uuid.uuid4()))
     selected_type = _enum_value(OperationType, operation_type, "operation_type")
     selected_owner = _enum_value(OwnerKind, owner_kind, "owner_kind")
     capability = _validate_capability(owner_capability or new_owner_capability())
+    if expected_generation is not None:
+        _validate_generation(expected_generation)
     with _state_lock(paths):
         current = _read_state_unlocked(paths)
+        if expected_generation is not None and current.generation != expected_generation:
+            raise LifecycleConflictError("lifecycle generation changed after review")
         if current.active_operation is not None:
             raise LifecycleConflictError("another lifecycle operation is active")
         _validate_schema_operation(current.schema_version, selected_type, selected_owner)
@@ -1227,6 +1258,7 @@ def claim_operation_with_credential(
     operation_type: OperationType | str,
     owner_kind: OwnerKind | str,
     operation_id: str | None = None,
+    expected_generation: int | None = None,
 ) -> ClaimResult:
     paths = lifecycle_paths(root)
     selected_id = _validate_operation_id(operation_id or str(uuid.uuid4()))
@@ -1239,6 +1271,7 @@ def claim_operation_with_credential(
             owner_kind=owner_kind,
             operation_id=selected_id,
             owner_capability=capability,
+            expected_generation=expected_generation,
         )
     except Exception:
         keep_for_recovery = False
@@ -1539,6 +1572,38 @@ def acquire_controller_lease(
         _atomic_write_json(paths.lease_path, _lease_payload(lease))
         return ControllerLeaseHandle(paths, descriptor, lease)
     except Exception:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+        raise
+
+
+def claim_management_controller(
+    root: str | os.PathLike[str], *, operation_id: str, expected_generation: int,
+) -> tuple[ControllerLeaseHandle, ClaimResult]:
+    """Exclude a still-finishing controller before committing a new claim."""
+    paths = lifecycle_paths(root)
+    _ensure_lifecycle_directories(paths, credentials=True)
+    qualify_lifecycle_filesystem(root)
+    descriptor = _open_locked_file(paths.controller_lock_path, nonblocking=True)
+    try:
+        claim = claim_operation_with_credential(
+            paths.root, operation_type=OperationType.MANAGEMENT,
+            owner_kind=OwnerKind.MANAGEMENT_CONTROLLER, operation_id=operation_id,
+            expected_generation=expected_generation,
+        )
+        with hold_operation_with_credential(
+            paths.root, operation_id=operation_id, generation=claim.state.generation,
+            expected_operation_type=OperationType.MANAGEMENT, expected_phase=LifecyclePhase.RESERVED,
+        ):
+            lease = ControllerLease(
+                claim.state.schema_version, operation_id, claim.state.generation,
+                OwnerKind.MANAGEMENT_CONTROLLER, os.getpid(), _process_start_identity(os.getpid()),
+            )
+            _atomic_write_json(paths.lease_path, _lease_payload(lease))
+        return ControllerLeaseHandle(paths, descriptor, lease), claim
+    except BaseException:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:

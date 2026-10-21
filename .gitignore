@@ -73,3 +73,8 @@ reports.md
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Permanent managed runtime generations and paired web links
+/runtime/
+/web/node_modules
+/web/dist

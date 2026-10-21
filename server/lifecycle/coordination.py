@@ -444,6 +444,9 @@ class RuntimeCoordinator:
     ) -> WorkLease:
         if requested.intersection(self._closed_effects):
             raise AdmissionClosedError("requested runtime effects are closed")
+        from .runtime_admission import registered_runtime_allows_work
+        if not registered_runtime_allows_work():
+            raise AdmissionClosedError("the managed runtime has no current settled admission")
         lease_id = str(uuid.uuid4())
         self._leases[lease_id] = _LeaseRecord(
             lease_id=lease_id,

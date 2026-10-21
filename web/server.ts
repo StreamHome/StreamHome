@@ -4,13 +4,13 @@ import { fileURLToPath } from "url";
 import { readFileSync } from "fs";
 import { createServer as createViteServer } from "vite";
 import { createTrustedProxy } from "./proxySecurity";
+import { webListener } from "./serverRuntime";
 
 
 
 async function startServer() {
   const app = express();
-  const requestedPort = Number.parseInt(process.env.WEB_PORT ?? "3000", 10);
-  const PORT = Number.isInteger(requestedPort) && requestedPort >= 1 && requestedPort <= 65535 ? requestedPort : 3000;
+  const { port: PORT, host: HOST } = webListener(process.env);
   const configuredBuildId = process.env.STREAMHOME_BUILD_ID || "dev";
   const isProd = process.env.NODE_ENV !== "development" || process.argv[1]?.endsWith("server.cjs");
   const distPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "dist");
@@ -93,11 +93,12 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  app.listen(PORT, HOST, () => {
     console.log(`[StreamHome Server] Running at http://localhost:${PORT}`);
   });
 }
 
 startServer().catch((err) => {
   console.error("Failed to start StreamHome full-stack server:", err);
+  process.exitCode = 1;
 });

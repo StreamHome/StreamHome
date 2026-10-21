@@ -29,6 +29,24 @@ beforeEach(() => { vi.resetAllMocks(); sessionStorage.clear(); window.history.re
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe("mounted setup remediation", () => {
+  it("uses the managed endpoint instead of browser checkpoint values and completes without claiming a restart", async () => {
+    vi.mocked(api.getSetupStatus).mockResolvedValue({ ...status, managedInstallation: true, webPort: 3030, publicUrl: "https://managed.example.test" });
+    vi.mocked(api.completeSetup).mockResolvedValue({ ...resultValue, restartScheduled: false, webPort: 3030 });
+    await toReview();
+    expect(screen.getByText("https://managed.example.test")).toBeTruthy();
+    expect(screen.getByText("Port 3030")).toBeTruthy();
+    expect(screen.queryByText(/and restarts StreamHome/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Initialize StreamHome" }));
+    await screen.findByRole("heading", { name: "StreamHome is ready" });
+    expect(api.completeSetup).toHaveBeenCalledWith(expect.objectContaining({ web_port: 3030, public_url: "https://managed.example.test" }));
+  });
+
+  it("shows the managed bootstrap command when setup is locked", async () => {
+    vi.mocked(api.getSetupStatus).mockResolvedValue({ ...status, managedInstallation: true, unlocked: false });
+    render(<SetupPage />);
+    expect(await screen.findByText("sudo streamhome bootstrap")).toBeTruthy();
+  });
+
   it("status pending/error/retry never overwrites the saved checkpoint or silently unlocks", async () => {
     checkpoint(6); const saved = sessionStorage.getItem(SETUP_CHECKPOINT_KEY); const pending = deferred<api.SetupStatus>(); vi.mocked(api.getSetupStatus).mockReturnValueOnce(pending.promise);
     render(<SetupPage />); expect(screen.getByRole("heading", { name: "Checking setup state" })).toBeTruthy(); expect(screen.queryByLabelText("Bootstrap code")).toBeNull();

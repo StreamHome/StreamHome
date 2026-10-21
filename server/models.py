@@ -426,6 +426,12 @@ class User(SQLModel, table=True):
     last_login_ip: Optional[str] = Field(default=None)
     last_login_device: Optional[str] = Field(default=None)
 
+class SetupFinalization(SQLModel, table=True):
+    installation_id: str = Field(primary_key=True)
+    finalization_id: str
+    finalized_at: float
+
+
 class AuthSession(SQLModel, table=True):
     id: str = Field(primary_key=True)
     user_id: int = Field(foreign_key="user.id", index=True)

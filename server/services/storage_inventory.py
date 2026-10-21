@@ -30,7 +30,8 @@ MAX_MANIFEST_BYTES = 128 * 1024
 
 def target_generation() -> str:
     """Credential token rotation does not change the selected Drive target."""
-    receipt = Path(settings.BASE_DIR) / 'server/rclone/.admin-drive-publication.json'
+    from lifecycle.layout import layout_for_root
+    receipt = layout_for_root(Path(settings.BASE_DIR)).configuration / 'rclone/.admin-drive-publication.json'
     identity = None
     try:
         if not receipt.is_symlink() and receipt.stat().st_size <= MAX_MANIFEST_BYTES:
@@ -258,14 +259,16 @@ async def record_usage(media_id: str, episode_id: str | None) -> None:
 
 
 def managed_roots() -> list[tuple[str, Path]]:
-    server = Path(settings.BASE_DIR) / 'server'
+    from lifecycle.layout import layout_for_root
+    layout = layout_for_root(Path(settings.BASE_DIR))
+    server = layout.configuration
     return [('media', Path(settings.MEDIA_DIR)), ('temporary', Path(settings.TEMP_DIR)),
-            ('backup', server / 'backup'), ('recovery', Path(settings.BASE_DIR) / '.run'),
+            ('backup', layout.backup), ('recovery', layout.durable_runtime),
             ('configuration', server / 'rclone'), ('database', Path(settings.db_path)),
             ('database', Path(settings.db_path + '-wal')), ('database', Path(settings.db_path + '-shm')),
             ('database', Path(settings.db_path + '-journal')),
             ('configuration', server / 'settings.json'), ('configuration', server / '.env'),
-            ('configuration', Path(settings.BASE_DIR) / '.env')]
+            ('configuration', Path(settings.ROOT_ENV_PATH))]
 
 
 def scan_managed(*, max_files: int = MAX_INVENTORY_FILES, include_entries: bool = False) -> dict:

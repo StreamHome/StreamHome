@@ -1,406 +1,43 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPOSITORY_URL="https://github.com/StreamHome/StreamHome.git"
-INSTALL_DIR="${STREAMHOME_INSTALL_DIR:-${HOME:-}/StreamHome}"
-INSTALL_REF="${STREAMHOME_REF:-main}"
-NO_START=false
-SKIP_SYSTEM_PACKAGES=false
-INSTALL_PARENT=""
-INSTALL_LOCK=""
-STAGING_DIR=""
-EXISTING_UPDATE_COMPLETE=false
-EXISTING_ALREADY_CURRENT=false
-
-usage() {
+# This frontend always runs unprivileged. The verified Python frontend stages
+# and authenticates an independent publisher package before any custom root code.
+if [[ "${EUID}" -eq 0 ]]; then
+    printf '%s\n' '[StreamHome] Run this installer as your normal user; it requests sudo for verified administrative steps.' >&2
+    exit 2
+fi
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     cat <<'EOF'
-StreamHome bootstrap installer
+StreamHome managed installer
 
-Usage:
-  install.sh [--no-start] [--skip-system-packages] [--help]
+Usage: install.sh [--request FILE]
 
-Options:
-  --no-start             Leave a new/current release stopped; newer existing releases must pass startup health.
-  --skip-system-packages Do not install missing operating-system packages.
-  --help                 Show this help text.
+Supported platform: Ubuntu 24.04 x86_64 with systemd and Python 3.12.3.
+Application: /opt/streamhome; configuration: /etc/streamhome;
+state/media: /var/lib/streamhome. Installation paths are fixed.
 
-Environment overrides:
-  STREAMHOME_INSTALL_DIR Installation directory (default: ~/StreamHome)
-  STREAMHOME_REF         Git branch or tag (default: main)
-
-The installer clones or safely fast-forwards StreamHome, grants executable
-permissions to its shell entry points, and runs setup.sh.
+The interactive wizard reads /dev/tty, including when piped into bash.
+A complete explicit JSON request is required without a controlling terminal.
+An existing installation is inspected and checked; retrying does not reinstall
+or automatically update it. Legacy data is never moved by this installer.
 EOF
-}
-
-log() {
-    printf '\n[StreamHome] %s\n' "$1"
-}
-
-fail() {
-    printf '\n[StreamHome] ERROR: %s\n' "$1" >&2
-    exit 1
-}
-
+    exit 0
+fi
+for executable in /usr/bin/python3 /usr/bin/curl /usr/bin/mktemp /usr/bin/sha256sum; do
+    [[ -x "$executable" ]] || { printf '[StreamHome] Missing bootstrap program: %s\n' "$executable" >&2; exit 2; }
+done
+bootstrap_directory="$(/usr/bin/mktemp -d /tmp/streamhome-bootstrap.XXXXXXXX)"
 cleanup() {
-    if [[ -n "$STAGING_DIR" && -d "$STAGING_DIR" ]]; then
-        case "$STAGING_DIR" in
-            "$INSTALL_PARENT"/.streamhome-install.*)
-                rm -rf -- "$STAGING_DIR"
-                ;;
-        esac
-    fi
-    if [[ -n "$INSTALL_LOCK" && -d "$INSTALL_LOCK" ]]; then
-        rm -f -- "$INSTALL_LOCK/owner.pid"
-        rmdir -- "$INSTALL_LOCK" 2>/dev/null || true
-    fi
+    /usr/bin/rm -f -- "$bootstrap_directory/bootstrap_install.py"
+    /usr/bin/rmdir -- "$bootstrap_directory" 2>/dev/null || true
 }
 trap cleanup EXIT
-
-run_privileged() {
-    if [[ "${EUID}" -eq 0 ]]; then
-        "$@"
-    elif command -v sudo >/dev/null 2>&1; then
-        sudo "$@"
-    else
-        fail "Administrator privileges are required to install Git. Install Git manually and run this command again."
-    fi
+/usr/bin/curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 120 --max-filesize 262144 \
+    https://raw.githubusercontent.com/StreamHome/StreamHome/main/scripts/bootstrap_install.py \
+    --output "$bootstrap_directory/bootstrap_install.py"
+printf '%s  %s\n' 'e034f24121ed89da04a4c508983ab9f4bad1f1645e7b4185731b2151cdd13d9f' "$bootstrap_directory/bootstrap_install.py" | /usr/bin/sha256sum --check --status || {
+    printf '%s\n' '[StreamHome] Bootstrap source verification failed. Retry once the official source/cache is consistent; nothing was elevated.' >&2
+    exit 2
 }
-
-install_git() {
-    command -v git >/dev/null 2>&1 && return 0
-    log "Git is missing; attempting installation"
-    if command -v apt-get >/dev/null 2>&1; then
-        run_privileged apt-get update
-        run_privileged apt-get install -y git ca-certificates
-    elif command -v dnf >/dev/null 2>&1; then
-        run_privileged dnf install -y git ca-certificates
-    elif command -v yum >/dev/null 2>&1; then
-        run_privileged yum install -y git ca-certificates
-    elif command -v pacman >/dev/null 2>&1; then
-        run_privileged pacman -Sy --needed --noconfirm git ca-certificates
-    else
-        fail "Git is required. Install Git with your Linux distribution package manager and retry."
-    fi
-    command -v git >/dev/null 2>&1 || fail "Git installation completed but the git command is still unavailable. Open a new terminal and retry."
-}
-
-valid_remote() {
-    case "${1%/}" in
-        https://github.com/StreamHome/StreamHome|https://github.com/StreamHome/StreamHome.git|git@github.com:StreamHome/StreamHome.git|https://github.com/WaqSea/StreamHome|https://github.com/WaqSea/StreamHome.git|git@github.com:WaqSea/StreamHome.git)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-read_env_value() {
-    local file="$1" key="$2" default_value="$3" value
-    value="$(awk -F= -v key="$key" '
-        {
-            line=$0
-            sub(/^[[:space:]]*export[[:space:]]+/, "", line)
-            candidate=line
-            sub(/=.*/, "", candidate)
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", candidate)
-            if (candidate == key) {
-                sub(/^[^=]*=/, "", line)
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-                print line
-                exit
-            }
-        }
-    ' "$file" 2>/dev/null || true)"
-    value="${value%\"}"
-    value="${value#\"}"
-    value="${value%\'}"
-    value="${value#\'}"
-    printf '%s' "${value:-$default_value}"
-}
-
-verify_existing_update_trust() {
-    local old_commit="$1" target_commit="$2" require_signed raw_signers commit fingerprint trusted
-    local -a trusted_signers=() commits=()
-    require_signed="$(read_env_value "$INSTALL_DIR/.env" UPDATE_REQUIRE_SIGNED_COMMITS __unset__)"
-    if [[ "$require_signed" == "__unset__" ]]; then
-        require_signed="$(read_env_value "$INSTALL_DIR/server/.env" UPDATE_REQUIRE_SIGNED_COMMITS false)"
-    fi
-    require_signed="$(printf '%s' "$require_signed" | tr '[:upper:]' '[:lower:]')"
-    case "$require_signed" in
-        true|1|yes) ;;
-        *) return 0 ;;
-    esac
-    raw_signers="$(read_env_value "$INSTALL_DIR/.env" UPDATE_TRUSTED_SIGNERS __unset__)"
-    if [[ "$raw_signers" == "__unset__" ]]; then
-        raw_signers="$(read_env_value "$INSTALL_DIR/server/.env" UPDATE_TRUSTED_SIGNERS "")"
-    fi
-    IFS=',' read -r -a trusted_signers <<< "$raw_signers"
-    ((${#trusted_signers[@]} > 0)) \
-        || fail "Signed-update policy is enabled, but UPDATE_TRUSTED_SIGNERS is empty."
-    mapfile -t commits < <(git -C "$INSTALL_DIR" rev-list --reverse "$old_commit..$target_commit")
-    ((${#commits[@]} > 0)) || fail "The signed update range is empty."
-    for commit in "${commits[@]}"; do
-        git -C "$INSTALL_DIR" verify-commit "$commit" >/dev/null 2>&1 \
-            || fail "Commit $commit does not have a valid signature."
-        fingerprint="$(git -C "$INSTALL_DIR" show -s --format=%GF "$commit" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
-        [[ -n "$fingerprint" ]] || fail "Commit $commit does not expose a signer fingerprint."
-        trusted=false
-        for signer in "${trusted_signers[@]}"; do
-            signer="$(printf '%s' "$signer" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
-            if [[ -n "$signer" && "$signer" == "$fingerprint" ]]; then
-                trusted=true
-                break
-            fi
-        done
-        [[ "$trusted" == true ]] || fail "Commit $commit is not signed by an approved StreamHome release signer."
-    done
-}
-
-normalize_install_path() {
-    local requested parent name
-    requested="$INSTALL_DIR"
-    [[ -n "$requested" ]] || fail "STREAMHOME_INSTALL_DIR may not be empty."
-    name="$(basename "$requested")"
-    [[ "$name" != "." && "$name" != ".." && "$name" != "/" ]] || fail "Choose a dedicated StreamHome installation directory."
-    parent="$(dirname "$requested")"
-    [[ -d "$parent" ]] || mkdir -p "$parent"
-    INSTALL_PARENT="$(cd "$parent" && pwd -P)"
-    INSTALL_DIR="$INSTALL_PARENT/$name"
-}
-
-acquire_install_lock() {
-    local owner="" lock_age="0"
-    INSTALL_LOCK="${INSTALL_DIR}.install.lock"
-    if mkdir "$INSTALL_LOCK" 2>/dev/null; then
-        printf '%s\n' "$$" > "$INSTALL_LOCK/owner.pid"
-        return 0
-    fi
-    owner="$(cat "$INSTALL_LOCK/owner.pid" 2>/dev/null || true)"
-    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
-        fail "Another StreamHome installation or update is already running for $INSTALL_DIR."
-    fi
-    lock_age="$(python3 - "$INSTALL_LOCK" <<'PY'
-import sys
-import time
-from pathlib import Path
-
-try:
-    print(max(0, int(time.time() - Path(sys.argv[1]).stat().st_mtime)))
-except OSError:
-    print(0)
-PY
-)"
-    if [[ ! "$lock_age" =~ ^[0-9]+$ ]] || (( lock_age < 30 )); then
-        fail "Another StreamHome installation is acquiring the install lock. Retry shortly."
-    fi
-    rm -f -- "$INSTALL_LOCK/owner.pid"
-    rmdir -- "$INSTALL_LOCK" 2>/dev/null || fail "The installation lock is stale but could not be removed: $INSTALL_LOCK"
-    mkdir "$INSTALL_LOCK" || fail "Could not acquire the installation lock: $INSTALL_LOCK"
-    printf '%s\n' "$$" > "$INSTALL_LOCK/owner.pid"
-}
-
-prepare_existing_checkout() {
-    local remote dirty fetched_commit head_commit controller start_after_update
-    remote="$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)"
-    valid_remote "$remote" || fail "The existing directory is not a StreamHome checkout from $REPOSITORY_URL"
-    git -C "$INSTALL_DIR" remote set-url origin "$REPOSITORY_URL"
-    dirty="$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=normal)"
-    [[ -z "$dirty" ]] || fail "The existing StreamHome checkout has local changes. Commit or move them before updating."
-
-    log "Preparing a health-gated update for the existing StreamHome checkout"
-    if [[ "$(git -C "$INSTALL_DIR" rev-parse --is-shallow-repository)" == "true" ]]; then
-        git -C "$INSTALL_DIR" fetch --unshallow origin "$INSTALL_REF"
-    else
-        git -C "$INSTALL_DIR" fetch origin "$INSTALL_REF"
-    fi
-    fetched_commit="$(git -C "$INSTALL_DIR" rev-parse 'FETCH_HEAD^{commit}')"
-    head_commit="$(git -C "$INSTALL_DIR" rev-parse HEAD)"
-    if [[ "$fetched_commit" == "$head_commit" ]]; then
-        log "The existing StreamHome installation is already at the requested release"
-        EXISTING_UPDATE_COMPLETE=true
-        EXISTING_ALREADY_CURRENT=true
-        return 0
-    fi
-    [[ "$NO_START" == false ]] \
-        || fail "--no-start is not supported for existing-installation updates because the target must pass health checks before rollback artifacts are removed."
-    git -C "$INSTALL_DIR" merge-base --is-ancestor "$head_commit" "$fetched_commit" \
-        || fail "The requested update is not a safe fast-forward from the installed release."
-    verify_existing_update_trust "$head_commit" "$fetched_commit"
-
-    STAGING_DIR="$(mktemp -d "$INSTALL_PARENT/.streamhome-install.XXXXXX")"
-    controller="$STAGING_DIR/update-controller.sh"
-    git -C "$INSTALL_DIR" show "$fetched_commit:update.sh" > "$controller"
-    chmod 700 "$controller"
-    start_after_update=true
-    [[ "$NO_START" == true ]] && start_after_update=false
-    log "Running the prepared update controller; StreamHome will stay online until cutover"
-    bash "$controller" --manual-execute \
-        "$fetched_commit" \
-        "$head_commit" \
-        "$INSTALL_REF" \
-        "$start_after_update" \
-        "$INSTALL_DIR"
-    [[ "$(git -C "$INSTALL_DIR" rev-parse HEAD)" == "$fetched_commit" ]] \
-        || fail "The health-gated update did not finish at the requested commit."
-    EXISTING_UPDATE_COMPLETE=true
-}
-
-existing_runtime_ready() {
-    local python_bin="$INSTALL_DIR/venv/bin/python" web_port expected_build
-    [[ -x "$python_bin" ]] || python_bin="$(command -v python3 || true)"
-    [[ -n "$python_bin" ]] || return 1
-    expected_build="$(git -C "$INSTALL_DIR" rev-parse --short=12 HEAD 2>/dev/null || true)"
-    [[ -n "$expected_build" ]] || return 1
-    web_port="$(
-        awk -F= '
-            /^[[:space:]]*WEB_PORT[[:space:]]*=/ {
-                value=$0
-                sub(/^[^=]*=/, "", value)
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-                gsub(/^["'"'"']|["'"'"']$/, "", value)
-                print value
-                exit
-            }
-        ' "$INSTALL_DIR/.env" 2>/dev/null || true
-    )"
-    [[ -n "$web_port" ]] || web_port=3000
-    [[ "$web_port" =~ ^[0-9]+$ ]] || return 1
-    "$python_bin" - "$web_port" "$expected_build" <<'PY'
-import json
-import sys
-import urllib.request
-
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-try:
-    with opener.open("http://127.0.0.1:8000/api/health", timeout=1.5) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-        if (
-            response.status >= 400
-            or payload.get("status") != "ready"
-            or payload.get("buildId") != sys.argv[2]
-        ):
-            raise SystemExit(1)
-    with opener.open(f"http://127.0.0.1:{int(sys.argv[1])}/", timeout=1.5) as response:
-        web_build = str(response.headers.get("X-StreamHome-Web-Build") or "")
-        raise SystemExit(0 if 200 <= response.status < 400 and web_build == sys.argv[2] else 1)
-except Exception:
-    raise SystemExit(1)
-PY
-}
-
-recover_current_installation() {
-    local -a setup_args=(--no-start)
-    [[ "$EXISTING_ALREADY_CURRENT" == true ]] || return 0
-    if [[ "$NO_START" == false ]] && existing_runtime_ready; then
-        log "The existing StreamHome services already match the current release"
-        return 0
-    fi
-    [[ "$SKIP_SYSTEM_PACKAGES" == true ]] && setup_args+=(--skip-system-packages)
-    log "The checkout is current but its prepared runtime is stale or unhealthy; repairing it incrementally"
-    (
-        cd "$INSTALL_DIR"
-        ./setup.sh "${setup_args[@]}"
-    ) || fail "The current checkout could not be prepared. Review the setup error above; existing data was not removed."
-    if [[ "$NO_START" == true ]]; then
-        log "The current StreamHome release was prepared and left stopped by request"
-        return 0
-    fi
-    "$INSTALL_DIR/start.sh" \
-        || fail "The installed release is current, but StreamHome could not be recovered. Review backend.log, frontend.log, update.log, and restart.log."
-    existing_runtime_ready \
-        || fail "StreamHome started without serving the exact current API and web build."
-    log "The current StreamHome release was recovered successfully"
-}
-
-prepare_new_checkout() {
-    local checkout
-    if [[ -d "$INSTALL_DIR" && -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]]; then
-        fail "The installation directory is not empty and is not a StreamHome checkout: $INSTALL_DIR"
-    fi
-
-    STAGING_DIR="$(mktemp -d "$INSTALL_PARENT/.streamhome-install.XXXXXX")"
-    checkout="$STAGING_DIR/checkout"
-    log "Cloning StreamHome into a temporary checkout"
-    git clone --depth 1 --branch "$INSTALL_REF" "$REPOSITORY_URL" "$checkout"
-    [[ -d "$checkout/.git" ]] || fail "The temporary StreamHome checkout is incomplete."
-
-    if [[ -d "$INSTALL_DIR" ]]; then
-        rmdir -- "$INSTALL_DIR" || fail "The installation directory must remain empty during bootstrap: $INSTALL_DIR"
-    fi
-    mv -- "$checkout" "$INSTALL_DIR"
-    rmdir -- "$STAGING_DIR"
-    STAGING_DIR=""
-    log "Installed StreamHome into $INSTALL_DIR"
-}
-
-prepare_checkout() {
-    if [[ -e "$INSTALL_DIR" && ! -d "$INSTALL_DIR" ]]; then
-        fail "The installation path exists and is not a directory: $INSTALL_DIR"
-    fi
-    if [[ -d "$INSTALL_DIR/.git" ]]; then
-        prepare_existing_checkout
-    else
-        prepare_new_checkout
-    fi
-}
-
-main() {
-    local -a setup_args=()
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --no-start)
-                NO_START=true
-                ;;
-            --skip-system-packages)
-                SKIP_SYSTEM_PACKAGES=true
-                ;;
-            --help|-h)
-                usage
-                return 0
-                ;;
-            *)
-                fail "Unknown argument: $1 (use --help for usage)"
-                ;;
-        esac
-        shift
-    done
-
-    [[ -n "${HOME:-}" || -n "${STREAMHOME_INSTALL_DIR:-}" ]] || fail "HOME is unavailable; set STREAMHOME_INSTALL_DIR explicitly."
-    [[ "$(uname -s)" == "Linux" ]] || fail "The alpha server installer supports Linux only."
-    [[ "$INSTALL_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || fail "STREAMHOME_REF contains unsupported characters."
-    [[ "$INSTALL_REF" != *".."* ]] || fail "STREAMHOME_REF may not contain '..'."
-
-    normalize_install_path
-    acquire_install_lock
-    install_git
-    prepare_checkout
-
-    if [[ "$EXISTING_UPDATE_COMPLETE" == true ]]; then
-        recover_current_installation
-        log "Existing StreamHome installation updated successfully"
-        return 0
-    fi
-
-    log "Granting executable permissions"
-    chmod +x \
-        "$INSTALL_DIR/install.sh" \
-        "$INSTALL_DIR/restart.sh" \
-        "$INSTALL_DIR/update.sh" \
-        "$INSTALL_DIR/setup.sh" \
-        "$INSTALL_DIR/start.sh" \
-        "$INSTALL_DIR/stop.sh" \
-        "$INSTALL_DIR/test.sh"
-
-    [[ "$NO_START" == true ]] && setup_args+=(--no-start)
-    [[ "$SKIP_SYSTEM_PACKAGES" == true ]] && setup_args+=(--skip-system-packages)
-
-    log "Starting StreamHome setup"
-    (
-        cd "$INSTALL_DIR"
-        ./setup.sh "${setup_args[@]}"
-    )
-}
-
-main "$@"
+/usr/bin/python3 -I "$bootstrap_directory/bootstrap_install.py" "$@"

@@ -107,9 +107,9 @@ async def _run_reserved_backup(run_backup, dest_path: Path, source_path: Path) -
             await monitor
 
 def get_backup_dir() -> str:
-    """Resolve absolute path to server/backup folder."""
-    config_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(config_dir, "backup")
+    """Use the same canonical layout as config and offline restore."""
+    from lifecycle.layout import layout_for_root
+    return str(layout_for_root(Path(settings.BASE_DIR)).backup)
 
 
 def resolve_backup_file(filename: str, *, must_exist: bool = False) -> Path | None:

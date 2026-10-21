@@ -25,6 +25,7 @@ from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 from . import state
+from .layout import layout_for_root
 
 
 ACK_TIMEOUT_SECONDS = 15.0
@@ -217,7 +218,7 @@ def _update_paths(root: str | os.PathLike[str], operation_id: str, generation: i
         raise ValueError("operation_id must be a canonical UUID")
     if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
         raise ValueError("generation must be positive")
-    run_dir = installation / ".run"
+    run_dir = layout_for_root(installation).durable_runtime
     return (
         run_dir / "update-state.json",
         run_dir / "update-state.lock",
@@ -278,7 +279,7 @@ def terminal_update_journal_settled(root: Path) -> bool:
     This probe never changes the checkout, journal or lifecycle authority.
     """
     root = state.resolve_installation_root(root)
-    journal_path = root / ".run" / "update-state.json"
+    journal_path = layout_for_root(root).durable_runtime / "update-state.json"
     payload = read_update_journal(journal_path)
     phase = payload.get("phase")
     if not isinstance(phase, str) or phase not in {"succeeded", "rolled_back"}:
@@ -373,7 +374,7 @@ def pre_cutover_previous_commit(root: Path, payload: Mapping[str, Any], authorit
             or payload.get("runtime_committed") is not False
             or payload.get("staging_dir") or payload.get("web_artifacts_swapped")
             or payload.get("web_dependencies_swapped") or payload.get("controller_pid")
-            or any((root / ".run" / name).exists() or (root / ".run" / name).is_symlink()
+            or any((layout_for_root(root).durable_runtime / name).exists() or (layout_for_root(root).durable_runtime / name).is_symlink()
                 for name in ("pre-update-database.db", "update-transaction.json"))):
         return None
     lease = state.read_controller_lease(root)
@@ -907,7 +908,7 @@ def _materialize_target_controller(root: Path, operation_id: str, target_commit:
     )
     if result.returncode != 0 or not result.stdout.startswith(b"#!/usr/bin/env bash\n"):
         raise UpdateControllerConflict("validated target update controller is unavailable")
-    destination = root / ".run" / f"update-controller.{operation_id}.sh"
+    destination = layout_for_root(root).durable_runtime / f"update-controller.{operation_id}.sh"
     try:
         destination.unlink()
         _fsync_directory(destination.parent)
@@ -1038,8 +1039,8 @@ def _run_controller(
             if (
                 payload.get("runtime_committed") is True
                 or payload.get("phase") not in {"queued", "preflight", "waiting_for_idle", "failed"}
-                or (root / ".run" / "pre-update-database.db").exists()
-                or (root / ".run" / "pre-update-database.db").is_symlink()
+                or (layout_for_root(root).durable_runtime / "pre-update-database.db").exists()
+                or (layout_for_root(root).durable_runtime / "pre-update-database.db").is_symlink()
             ):
                 raise UpdateControllerConflict("update abort evidence is no longer safe")
             if payload.get("phase") != "failed":
@@ -1420,7 +1421,7 @@ def _recover_identity(root: Path) -> tuple[str, int, str, str, bool, str, str, b
             root, operation.operation_id, current.generation
         )
         raise UpdateControllerConflict("explicit operator recovery cannot be resumed automatically")
-    journal_path = root / ".run" / "update-state.json"
+    journal_path = layout_for_root(root).durable_runtime / "update-state.json"
     try:
         payload = _read_update_journal(journal_path)
     except UpdateControllerError:

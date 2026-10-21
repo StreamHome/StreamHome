@@ -48,9 +48,11 @@ class RcloneService:
 
     def __init__(self) -> None:
         self.root = Path(settings.BASE_DIR)
-        self.config_dir = self.root / "server" / "rclone"
+        from lifecycle.layout import layout_for_root
+        layout = layout_for_root(self.root)
+        self.config_dir = layout.configuration / "rclone"
         self.config_path = self.config_dir / "rclone.conf"
-        self.setup_root = self.root / "server" / "temp" / "rclone-setup"
+        self.setup_root = layout.state / "temp" / "rclone-setup"
         self._semaphore = asyncio.Semaphore(4)
         self._config_lock = asyncio.Lock()
         self._cloud_state = "unknown"
@@ -58,6 +60,12 @@ class RcloneService:
         self._cloud_checked_at: Optional[float] = None
 
     def executable(self) -> Optional[str]:
+        from lifecycle.layout import layout_for_root
+        layout = layout_for_root(self.root)
+        if layout.managed:
+            from config import bin_path
+            candidate = Path(bin_path) / "rclone"
+            return str(candidate) if candidate.is_file() else None
         candidate = self.root / "bin" / ("rclone.exe" if os.name == "nt" else "rclone")
         if candidate.exists():
             return str(candidate)
