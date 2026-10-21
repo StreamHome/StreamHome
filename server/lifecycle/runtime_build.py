@@ -292,7 +292,9 @@ def prepare_runtime(root: Path, *, build_id: str, application_commit: str, stage
     def execute(arguments, **kwargs):
         return run_stage(arguments, checkpoint=checkpoint, **kwargs)
     def retrieve(url, destination, expected):
-        return download(url, destination, expected, checkpoint=checkpoint)
+        from .artifact_cache import cached_artifact
+        return cached_artifact(destination, expected,
+            fetch=lambda temporary: download(url, temporary, expected, checkpoint=checkpoint), checkpoint=checkpoint)
     ids = [str(uuid.uuid4()) for _ in range(4)]
     bundle, python_id, node_id, web_id = ids
     runtime = root / "runtime"

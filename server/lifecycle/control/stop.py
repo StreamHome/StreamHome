@@ -25,9 +25,12 @@ def installation_scopes() -> tuple[str, ...]:
         name = "streamhome-install-" + intent.installation_id + ".scope"
         if fields[0] != name:
             raise ControlError("control_stop_unit_unqualified")
-        observed = systemctl("show", name, "--property=Transient,ControlGroup,Description")
+        observed = systemctl("show", name, "--property=LoadState,Transient,ControlGroup,Description")
         values = dict(field.split("=", 1) for field in observed.splitlines() if "=" in field)
-        if (set(values) != {"Transient", "ControlGroup", "Description"} or values["Transient"] != "yes"
+        if values.get("LoadState") == "not-found":
+            _require_empty(name)
+            continue
+        if (set(values) != {"LoadState", "Transient", "ControlGroup", "Description"} or values["LoadState"] != "loaded" or values["Transient"] != "yes"
                 or values["ControlGroup"] not in {"", "/system.slice/" + name}
                 or values["Description"] != "StreamHome installation " + intent.installation_id):
             raise ControlError("control_stop_unit_unqualified")
@@ -58,11 +61,17 @@ def auxiliary_units() -> tuple[str, ...]:
                 valid = False
         if not valid or len(units) >= 128:
             raise ControlError("control_stop_unit_unqualified")
+        if len(fields) >= 4 and fields[2] in {"inactive", "failed"}:
+            _require_empty(name)
+            continue
         expected = {"FragmentPath": "/etc/systemd/system/streamhome-" + role + "@.service",
             "User": "root" if role == "startup" else "streamhome"}
-        metadata = systemctl("show", name, "--property=FragmentPath,User,ControlGroup")
+        metadata = systemctl("show", name, "--property=LoadState,FragmentPath,User,ControlGroup")
         observed = dict(field.split("=", 1) for field in metadata.splitlines() if "=" in field)
-        if (set(observed) != {*expected, "ControlGroup"}
+        if observed.get("LoadState") == "not-found":
+            _require_empty(name)
+            continue
+        if (set(observed) != {*expected, "LoadState", "ControlGroup"} or observed["LoadState"] != "loaded"
                 or any(observed[key] != value for key, value in expected.items())
                 or observed["ControlGroup"] not in {"", "/system.slice/" + name}):
             raise ControlError("control_stop_unit_unqualified")

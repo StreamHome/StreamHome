@@ -17,7 +17,7 @@ class GlobalStopTests(unittest.TestCase):
                 return '\n'.join(name + ' loaded active running Task fixture' for name in names)
             name = arguments[1]
             role = 'startup' if 'startup@' in name else 'operation'
-            return 'FragmentPath=/etc/systemd/system/streamhome-' + role + '@.service\nUser=' + ('root' if role == 'startup' else 'streamhome') + '\nControlGroup=/system.slice/' + name
+            return 'LoadState=loaded\nFragmentPath=/etc/systemd/system/streamhome-' + role + '@.service\nUser=' + ('root' if role == 'startup' else 'streamhome') + '\nControlGroup=/system.slice/' + name
         with patch.object(stop, 'systemctl', side_effect=ctl) as controller, patch.object(stop, 'installation_scopes', return_value=()):
             self.assertEqual(stop.auxiliary_units(), tuple(sorted(names)))
         self.assertEqual(controller.call_args_list[0].args[0], 'list-units')
@@ -53,12 +53,22 @@ class GlobalStopTests(unittest.TestCase):
     def test_installer_scope_is_bound_to_the_protected_installation_intent(self):
         installation = str(uuid.uuid4())
         name = 'streamhome-install-' + installation + '.scope'
-        metadata = 'Transient=yes\nControlGroup=/system.slice/' + name + '\nDescription=StreamHome installation ' + installation
+        metadata = 'LoadState=loaded\nTransient=yes\nControlGroup=/system.slice/' + name + '\nDescription=StreamHome installation ' + installation
         with patch('lifecycle.control.provisioning.read_intent', return_value=SimpleNamespace(installation_id=installation)), patch.object(stop, 'systemctl', side_effect=[name + ' loaded active running fixture', metadata]):
             self.assertEqual(stop.installation_scopes(), (name,))
         with patch('lifecycle.control.provisioning.read_intent', return_value=SimpleNamespace(installation_id=str(uuid.uuid4()))), patch.object(stop, 'systemctl', return_value=name + ' loaded active running fixture'):
             with self.assertRaisesRegex(ControlError, 'control_stop_unit_unqualified'):
                 stop.installation_scopes()
+
+    def test_collected_units_are_skipped_only_with_empty_cgroup_proof(self):
+        name = 'streamhome-prepare@' + str(uuid.uuid4()) + '.service'
+        with patch.object(stop, 'installation_scopes', return_value=()), patch.object(stop, 'systemctl', side_effect=[name + ' loaded active running fixture', 'LoadState=not-found']), patch.object(stop, '_require_empty') as empty:
+            self.assertEqual(stop.auxiliary_units(), ())
+        empty.assert_called_once_with(name)
+        with patch.object(stop, 'installation_scopes', return_value=()), patch.object(stop, 'systemctl', return_value=name + ' loaded failed failed fixture') as ctl, patch.object(stop, '_require_empty') as empty:
+            self.assertEqual(stop.auxiliary_units(), ())
+        self.assertEqual(ctl.call_count, 1)
+        empty.assert_called_once_with(name)
 
     def test_new_actor_or_remaining_descendant_prevents_false_success(self):
         with patch.object(stop, 'require_root'), patch.object(stop, 'auxiliary_units', side_effect=[(), ('new-actor',)]), patch.object(stop, 'systemctl'):
