@@ -448,10 +448,68 @@ def _finish_registration(intent: ProvisioningIntent) -> None:
         atomic_root_json(Path("/etc/streamhome/install.json"), ready.payload())
 
 
-def resume_install(installation_id: str, *, manifest: dict, manifest_sha256: str) -> int:
+def _require_install_scope(installation_id: str, epoch: str) -> None:
+    identity(installation_id)
+    if not isinstance(epoch, str) or not re.fullmatch(r"[0-9a-f]{64}", epoch):
+        raise ControlError("control_installation_scope_invalid")
+    name = "streamhome-install-" + installation_id + ".scope"
+    if Path("/proc/self/cgroup").read_text().splitlines() != ["0::/system.slice/" + name]:
+        raise ControlError("control_installation_scope_invalid")
+    raw = systemctl("show", name, "--property=ActiveState,Transient,ControlGroup")
+    fields = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+    if fields != {"ActiveState": "active", "Transient": "yes", "ControlGroup": "/system.slice/" + name}:
+        raise ControlError("control_installation_scope_invalid")
+
+
+def _run_install_scope(installation_id: str, epoch: str) -> int:
+    """Give the root first-launch issuer an OS-cancellable lifetime.
+
+    Distro package work finishes before this scope. Once service definitions are
+    published, an inactive/coalesced direct runtime stop also stops the issuer;
+    there is no untracked parent left that can launch after preparation exits.
+    """
+    identity(installation_id)
+    if not isinstance(epoch, str) or not re.fullmatch(r"[0-9a-f]{64}", epoch):
+        raise ControlError("control_installation_scope_invalid")
+    from . import privileged
+    name = "streamhome-install-" + installation_id + ".scope"
+    arguments = ["/usr/bin/systemd-run", "--scope", "--quiet", "--collect", "--slice=system.slice", "--unit=" + name,
+        "--description=StreamHome installation " + installation_id, "--property=StopPropagatedFrom=streamhome.service",
+        "--property=RuntimeMaxSec=7200", "/usr/bin/python3", "-I", "/usr/local/libexec/streamhome/provision",
+        *(["--rescue"] if privileged._RESCUE_MODE else []), "--resume-install-scoped", installation_id, epoch]
+    try:
+        result = subprocess.run(arguments, stdin=subprocess.DEVNULL, cwd="/", env=_OS_ENV, timeout=7230)
+    except BaseException:
+        _stop_install_scope_work(installation_id)
+        raise
+    if result.returncode:
+        _stop_install_scope_work(installation_id)
+        raise ControlError("control_installation_scope_stopped")
+    return 0
+
+
+def _stop_install_scope_work(installation_id: str) -> None:
+    """A cancelled issuer must not abandon its separately owned builder unit."""
+    intent = read_intent()
+    if intent.installation_id != installation_id:
+        raise ControlError("control_installation_review_changed")
+    names = ("streamhome-install-" + installation_id + ".scope",
+             "streamhome-provision@" + intent.operation_id + ".service")
+    targets = tuple(name for name in names if systemctl("show", name, "--property=LoadState", "--value") != "not-found")
+    if targets:
+        systemctl("stop", *targets, timeout=30)
+    from .stop import _require_empty
+    for name in names:
+        _require_empty(name)
+
+
+def resume_install(installation_id: str, *, manifest: dict, manifest_sha256: str, scope_epoch: str | None = None) -> int:
     require_root()
     identity(installation_id)
     require_supported_platform()
+    if scope_epoch is not None:
+        _require_install_scope(installation_id, scope_epoch)
+    handoff = None
     with administrative_lock():
         intent = read_intent()
         if (intent.installation_id != installation_id or intent.control_bundle_id != manifest["bundle_id"]
@@ -466,6 +524,8 @@ def resume_install(installation_id: str, *, manifest: dict, manifest_sha256: str
         expected_stop_epoch = root_stop_epoch() if marker.exists() or marker.is_symlink() else None
         if existing is not None and expected_stop_epoch is None:
             raise ControlError("control_stop_epoch_missing")
+        if scope_epoch is not None and expected_stop_epoch != scope_epoch:
+            raise ControlError("control_operator_stopped")
         progress = Progress(sys.stdout)
         if intent.stage == "intent":
             from .provisioning_mirror import reserve_mirror
@@ -496,40 +556,45 @@ def resume_install(installation_id: str, *, manifest: dict, manifest_sha256: str
                     raise ControlError("control_installation_review_changed")
                 atomic_root_json(marker, stop_record(None), gid=intent.service_gid, mode=0o640)
                 expected_stop_epoch = root_stop_epoch()
+            if scope_epoch is None:
+                handoff = expected_stop_epoch
+        if handoff is None and intent.stage in {"layout_ready", "source_selected", "preparing_application", "application_prepared", "first_start_requested"}:
             _publish_provisional_descriptor(intent)
             result = run_worker(["initial-authority"])
             if result.get("generation") != 0:
                 raise ControlError("control_operation_recovery_required")
-        if intent.stage == "layout_ready":
-            # Source was pinned in the root intent before account/package work.
-            # Explicit resume never re-resolves the advancing public branch.
-            intent = _advance(intent, stage="source_selected")
-        if intent.stage == "source_selected":
-            from .units import unit_files
-            with progress.stage("Registering the protected StreamHome service definitions"):
-                for name, raw in unit_files().items():
-                    parent = root_directory(Path(name).parent, create=True)
-                    os.close(parent)
-                    atomic_root_bytes(Path(name), raw)
-                systemctl("daemon-reload")
-                intent = _advance(intent, stage="preparing_application")
-        if intent.stage == "preparing_application":
-            print("[StreamHome] Preparing private application environments; progress is observed from the owned preparation unit.", flush=True)
-            result = _prepare_application(intent)
-            if (set(result) != {"installation_id", "operation_id", "execution_sha256", "application_commit"}
-                    or result["installation_id"] != intent.installation_id or result["operation_id"] != intent.operation_id
-                    or result["application_commit"] != intent.application_commit):
-                raise ControlError("control_initial_result_invalid")
-            intent = _advance(intent, stage="application_prepared", execution_sha256=result["execution_sha256"])
-        if intent.stage in {"application_prepared", "first_start_requested"}:
-            with progress.stage("Starting and verifying the first StreamHome runtime"):
-                intent = _first_start(intent, expected_stop_epoch=expected_stop_epoch)
+            if intent.stage == "layout_ready":
+                # Source was pinned in the root intent before account/package work.
+                # Explicit resume never re-resolves the advancing public branch.
+                intent = _advance(intent, stage="source_selected")
+            if intent.stage == "source_selected":
+                from .units import unit_files
+                with progress.stage("Registering the protected StreamHome service definitions"):
+                    for name, raw in unit_files().items():
+                        parent = root_directory(Path(name).parent, create=True)
+                        os.close(parent)
+                        atomic_root_bytes(Path(name), raw)
+                    systemctl("daemon-reload")
+                    intent = _advance(intent, stage="preparing_application")
+            if intent.stage == "preparing_application":
+                print("[StreamHome] Preparing private application environments; progress is observed from the owned preparation unit.", flush=True)
+                result = _prepare_application(intent)
+                if (set(result) != {"installation_id", "operation_id", "execution_sha256", "application_commit"}
+                        or result["installation_id"] != intent.installation_id or result["operation_id"] != intent.operation_id
+                        or result["application_commit"] != intent.application_commit):
+                    raise ControlError("control_initial_result_invalid")
+                intent = _advance(intent, stage="application_prepared", execution_sha256=result["execution_sha256"])
+            if intent.stage in {"application_prepared", "first_start_requested"}:
+                with progress.stage("Starting and verifying the first StreamHome runtime"):
+                    intent = _first_start(intent, expected_stop_epoch=expected_stop_epoch)
         if intent.stage == "registered":
             _finish_registration(intent)
             print("StreamHome is registered. Complete the recorded boot-service policy with:", flush=True)
             print("  sudo /usr/local/libexec/streamhome/provision --complete-install " + intent.installation_id, flush=True)
         elif intent.stage == "complete":
             print("StreamHome installation is already complete.")
+    if handoff is not None:
+        return _run_install_scope(installation_id, handoff)
     return 0
 
 

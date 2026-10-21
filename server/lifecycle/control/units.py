@@ -52,6 +52,7 @@ OPERATION_UNIT = """[Unit]
 Description=StreamHome operation %i
 Wants=network-online.target
 After=network-online.target
+StopPropagatedFrom=streamhome.service
 
 [Service]
 Type=exec

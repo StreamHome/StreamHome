@@ -231,12 +231,68 @@ class ProvisioningBoundariesTests(unittest.TestCase):
         real_path = Path
         def paths(value):
             return marker if value == '/etc/streamhome/control/stop-epoch.json' else real_path(value)
-        with patch.object(provisioning, 'require_root'), patch.object(provisioning, 'require_supported_platform'), patch.object(provisioning, 'administrative_lock', return_value=nullcontext()), patch.object(provisioning, 'read_intent', return_value=intent), patch.object(provisioning, 'inspect_installation', return_value=selected), patch.object(provisioning, 'Path', side_effect=paths), patch('lifecycle.control.administration.root_stop_epoch', side_effect=lambda: epoch[0]), patch.object(provisioning, '_ensure_account'), patch('lifecycle.control.provisioning_mirror.publish_mirror'), patch.object(provisioning, '_validate_service_directories'), patch.object(provisioning, '_publish_provisional_descriptor'), patch.object(provisioning, 'run_worker', return_value={'generation': 0}), patch.object(provisioning, '_prepare_application', side_effect=prepare), patch.object(provisioning, '_advance', side_effect=contract.advance_intent), patch.object(provisioning, 'atomic_root_json') as seed, patch.object(provisioning, 'systemctl') as start, patch.object(provisioning.sys, 'stdout', io.StringIO()):
+        with patch.object(provisioning, 'require_root'), patch.object(provisioning, 'require_supported_platform'), patch.object(provisioning, '_require_install_scope'), patch.object(provisioning, 'administrative_lock', return_value=nullcontext()), patch.object(provisioning, 'read_intent', return_value=intent), patch.object(provisioning, 'inspect_installation', return_value=selected), patch.object(provisioning, 'Path', side_effect=paths), patch('lifecycle.control.administration.root_stop_epoch', side_effect=lambda: epoch[0]), patch.object(provisioning, '_ensure_account'), patch('lifecycle.control.provisioning_mirror.publish_mirror'), patch.object(provisioning, '_validate_service_directories'), patch.object(provisioning, '_publish_provisional_descriptor'), patch.object(provisioning, 'run_worker', return_value={'generation': 0}), patch.object(provisioning, '_prepare_application', side_effect=prepare), patch.object(provisioning, '_advance', side_effect=contract.advance_intent), patch.object(provisioning, 'atomic_root_json') as seed, patch.object(provisioning, 'systemctl') as start, patch.object(provisioning.sys, 'stdout', io.StringIO()):
             with self.assertRaisesRegex(ControlError, 'control_operator_stopped'):
                 provisioning.resume_install(intent.installation_id,
-                    manifest={'bundle_id': intent.control_bundle_id}, manifest_sha256=intent.control_manifest_sha256)
+                    manifest={'bundle_id': intent.control_bundle_id}, manifest_sha256=intent.control_manifest_sha256, scope_epoch='d' * 64)
         seed.assert_not_called()
         start.assert_not_called()
+
+    def test_parent_releases_administration_before_scope_and_never_prepares_or_launches(self):
+        intent = prepared_intent()
+        held = []
+        @contextmanager
+        def lock():
+            held.append(True)
+            try:
+                yield
+            finally:
+                held.pop()
+        def handoff(installation, epoch):
+            self.assertFalse(held)
+            self.assertEqual((installation, epoch), (intent.installation_id, 'd' * 64))
+            return 0
+        selected = SimpleNamespace(descriptor=SimpleNamespace(status=provisioning.InstallationStatus.PROVISIONING))
+        marker = SimpleNamespace(exists=lambda: True, is_symlink=lambda: False)
+        real_path = Path
+        def paths(value):
+            return marker if value == '/etc/streamhome/control/stop-epoch.json' else real_path(value)
+        with patch.object(provisioning, 'require_root'), patch.object(provisioning, 'require_supported_platform'), patch.object(provisioning, 'administrative_lock', side_effect=lock), patch.object(provisioning, 'read_intent', return_value=intent), patch.object(provisioning, 'inspect_installation', return_value=selected), patch.object(provisioning, 'Path', side_effect=paths), patch('lifecycle.control.administration.root_stop_epoch', return_value='d' * 64), patch.object(provisioning, '_ensure_account'), patch('lifecycle.control.provisioning_mirror.publish_mirror'), patch.object(provisioning, '_validate_service_directories'), patch.object(provisioning, '_publish_provisional_descriptor') as publish, patch.object(provisioning, 'run_worker') as worker, patch.object(provisioning, '_first_start') as start, patch.object(provisioning, '_run_install_scope', side_effect=handoff) as scope:
+            self.assertEqual(provisioning.resume_install(intent.installation_id, manifest={'bundle_id': intent.control_bundle_id}, manifest_sha256=intent.control_manifest_sha256), 0)
+        scope.assert_called_once()
+        publish.assert_not_called()
+        worker.assert_not_called()
+        start.assert_not_called()
+
+    def test_scoped_issuer_requires_exact_current_kernel_scope(self):
+        installation = str(uuid.uuid4())
+        name = 'streamhome-install-' + installation + '.scope'
+        metadata = 'ActiveState=active\nTransient=yes\nControlGroup=/system.slice/' + name
+        with patch.object(provisioning.Path, 'read_text', return_value='0::/system.slice/' + name + '\n'), patch.object(provisioning, 'systemctl', return_value=metadata):
+            provisioning._require_install_scope(installation, 'd' * 64)
+        with patch.object(provisioning.Path, 'read_text', return_value='0::/user.slice/untracked.scope\n'), patch.object(provisioning, 'systemctl') as ctl:
+            with self.assertRaisesRegex(ControlError, 'control_installation_scope_invalid'):
+                provisioning._require_install_scope(installation, 'd' * 64)
+        ctl.assert_not_called()
+
+    def test_scope_failure_never_relaunches_and_cleans_separate_builder(self):
+        intent = prepared_intent()
+        with patch.object(provisioning.subprocess, 'run', return_value=SimpleNamespace(returncode=143)) as launch, patch.object(provisioning, '_stop_install_scope_work') as cleanup:
+            with self.assertRaisesRegex(ControlError, 'control_installation_scope_stopped'):
+                provisioning._run_install_scope(intent.installation_id, 'd' * 64)
+        arguments = launch.call_args.args[0]
+        self.assertIn('--property=StopPropagatedFrom=streamhome.service', arguments)
+        self.assertIn('--resume-install-scoped', arguments)
+        self.assertNotIn('shell', launch.call_args.kwargs)
+        self.assertEqual(launch.call_count, 1)
+        cleanup.assert_called_once_with(intent.installation_id)
+
+        name = 'streamhome-install-' + intent.installation_id + '.scope'
+        worker = 'streamhome-provision@' + intent.operation_id + '.service'
+        with patch.object(provisioning, 'read_intent', return_value=intent), patch.object(provisioning, 'systemctl', side_effect=['not-found', 'loaded', '']) as ctl, patch('lifecycle.control.stop._require_empty') as empty:
+            provisioning._stop_install_scope_work(intent.installation_id)
+        self.assertEqual(ctl.call_args.args, ('stop', worker))
+        self.assertEqual([call.args[0] for call in empty.call_args_list], [name, worker])
 
     def test_preparation_and_controller_units_are_unprivileged_and_distinct(self):
         files = unit_files()
@@ -249,6 +305,8 @@ class ProvisioningBoundariesTests(unittest.TestCase):
             self.assertIn(f'ExecStart=/usr/local/libexec/streamhome/provision {argument} %i', value)
             self.assertIn('KillMode=control-group', value)
             self.assertIn('Restart=no', value)
+            self.assertIn('StopPropagatedFrom=streamhome.service', value)
+            self.assertNotIn('BindsTo=', value)
         self.assertNotIn('streamhome-provision@', files['/etc/polkit-1/rules.d/49-streamhome-operations.rules'].decode())
 
 

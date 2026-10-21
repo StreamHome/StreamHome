@@ -245,9 +245,11 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
     selected = descriptor()
     if parsed.command == "stop":
         from .administration import record_stop
+        from .stop import stop_units
         unit = unit_snapshot()
         record_stop(unit["InvocationID"] or None)
         if unit["LoadState"] == "not-found" and int(unit["MainPID"]) == 0:
+            stop_units(runtime_registered=False)
             print("Stop intent recorded; the runtime service has not been registered yet.")
             return 0
         if unit["ActiveState"] in {"active", "activating"} and int(unit["MainPID"]) > 0:
@@ -257,7 +259,7 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
                         invocation=unit["InvocationID"], action="stop_notice", arguments={})
             except ControlError:
                 pass  # systemd retains stop custody even if the supervisor crashed.
-        systemctl("stop", "streamhome.service", timeout=60)
+        stop_units(runtime_registered=True)
         print("StreamHome stopped.")
         return 0
     if parsed.command == "start":
@@ -305,6 +307,11 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
                 raise ControlError("control_message_invalid")
             from .provisioning import resume_install
             return resume_install(arguments[1], manifest=manifest, manifest_sha256=manifest_sha256)
+        if arguments and arguments[0] == "--resume-install-scoped":
+            if len(arguments) != 3:
+                raise ControlError("control_message_invalid")
+            from .provisioning import resume_install
+            return resume_install(arguments[1], manifest=manifest, manifest_sha256=manifest_sha256, scope_epoch=arguments[2])
         if arguments and arguments[0] == "--complete-install":
             if len(arguments) != 2:
                 raise ControlError("control_message_invalid")
