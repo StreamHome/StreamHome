@@ -172,6 +172,40 @@ def initial_result(operation_id: str) -> dict:
             "execution_sha256": contract.execution_tuple_sha256(record.execution), "application_commit": intent.application_commit}
 
 
+def initial_retry_check() -> dict:
+    from .processes import require_service_quiescent
+    from .provisioning_contract import intent_sha256
+    layout = layout_for_root(ROOT)
+    selected = layout.descriptor.descriptor
+    intent = parse_intent(read_protected_json(Path(JOURNAL_PATH)))
+    if (os.geteuid() == 0 or os.geteuid() != selected.service_uid or selected.status is not InstallationStatus.PROVISIONING
+            or intent.installation_id != selected.installation_id or intent.stage != "first_start_requested"
+            or intent.start_permit not in {"issued", "consumed"}):
+        raise ControlError("control_start_retry_unavailable")
+    require_service_quiescent()
+    if initial_authority() != {"initialized": True, "generation": 0}:
+        raise ControlError("control_operation_recovery_required")
+    record = read_active_execution(ROOT)
+    _verify_prepared(intent, record)
+    if (record != parse_execution_record(_private_record(layout.state / "preparation/prepared.json"))
+            or intent.execution_sha256 != contract.execution_tuple_sha256(record.execution)):
+        raise ControlError("control_initial_result_changed")
+    verify_links(ROOT, record.execution)
+    directory = os.open(layout.domains, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        with ConfigurationStore(directory, selected.installation_id) as store:
+            manifest = store.inspect()
+            if (manifest.active != manifest.desired or manifest.active.revision != intent.revision_id
+                    or manifest.quarantined or manifest.policy_revisions or manifest.provider_revisions
+                    or store.read_revision(manifest.active).settings.payload() != intent.deployment):
+                raise ControlError("control_initial_result_changed")
+    finally:
+        os.close(directory)
+    require_service_quiescent()
+    return {"installation_id": intent.installation_id, "intent_sha256": intent_sha256(intent),
+            "generation": 0, "execution_sha256": intent.execution_sha256}
+
+
 def initial_progress(operation_id: str) -> dict:
     _review(operation_id)
     path = layout_for_root(ROOT).state / "preparation/progress.json"

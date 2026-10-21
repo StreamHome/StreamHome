@@ -52,7 +52,7 @@ class GlobalStopTests(unittest.TestCase):
 
     def test_installer_scope_is_bound_to_the_protected_installation_intent(self):
         installation = str(uuid.uuid4())
-        name = 'streamhome-install-' + installation + '.scope'
+        name = 'streamhome-install-' + installation + '-' + '2' * 32 + '.scope'
         metadata = 'LoadState=loaded\nTransient=yes\nControlGroup=/system.slice/' + name + '\nDescription=StreamHome installation ' + installation
         with patch('lifecycle.control.provisioning.read_intent', return_value=SimpleNamespace(installation_id=installation)), patch.object(stop, 'systemctl', side_effect=[name + ' loaded active running fixture', metadata]):
             self.assertEqual(stop.installation_scopes(), (name,))

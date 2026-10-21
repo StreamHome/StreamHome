@@ -177,7 +177,7 @@ def inspect_managed() -> dict:
 
 def main(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha256: str) -> int:
     parser = argparse.ArgumentParser(prog="streamhome internal reader")
-    parser.add_argument("action", choices=("inspect", "prepare-request", "bridge-observe", "operation-result", "select-source", "initial-result", "initial-progress", "initial-listener", "initial-authority", "check-listener", "identity", "release-check", "validate-preparation", "runtime-progress", "runtime-result", "prepare-runtime-request"))
+    parser.add_argument("action", choices=("inspect", "prepare-request", "bridge-observe", "operation-result", "select-source", "initial-result", "initial-progress", "initial-listener", "initial-authority", "initial-retry-check", "check-listener", "identity", "release-check", "validate-preparation", "runtime-progress", "runtime-result", "prepare-runtime-request"))
     parser.add_argument("operation_id", nargs="?")
     parsed = parser.parse_args(arguments)
     snapshot = inspect_installation()
@@ -197,6 +197,10 @@ def main(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha256:
     if parsed.action == "initial-authority":
         from .provision_worker import initial_authority
         print(json.dumps(initial_authority(), sort_keys=True))
+        return 0
+    if parsed.action == "initial-retry-check":
+        from .provision_worker import initial_retry_check
+        print(json.dumps(initial_retry_check(), sort_keys=True))
         return 0
     if parsed.action in {"select-source", "initial-result", "initial-progress"}:
         from .provision_worker import initial_progress, initial_result, select_source

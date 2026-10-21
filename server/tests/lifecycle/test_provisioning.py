@@ -186,14 +186,14 @@ class ProvisioningBoundariesTests(unittest.TestCase):
             order.append('permit')
             return contract.advance_intent(previous, **changes)
         def start(*arguments, **kwargs):
-            self.assertEqual(order, ['permit'])
+            self.assertEqual(order, ['permit', 'plan', 'validate'])
             self.assertEqual(arguments, ('start', 'streamhome.service'))
             order.append('start')
             raise ControlError('test_interruption')
-        with patch.object(provisioning, '_advance', side_effect=persist), patch('lifecycle.control.administration.root_stop_epoch', return_value='d' * 64), patch.object(provisioning, 'unit_snapshot', return_value={'ActiveState': 'inactive', 'MainPID': '0'}), patch.object(provisioning, 'systemctl', side_effect=start):
+        with patch.object(provisioning, '_advance', side_effect=persist), patch('lifecycle.control.administration.root_stop_epoch', return_value='d' * 64), patch('lifecycle.control.first_start_plan.publish_start_plan', side_effect=lambda _: order.append('plan')), patch('lifecycle.control.first_start_plan.require_issued_plan', side_effect=lambda *args, **kwargs: order.append('validate')), patch.object(provisioning, 'unit_snapshot', return_value={'ActiveState': 'inactive', 'MainPID': '0'}), patch.object(provisioning, 'systemctl', side_effect=start):
             with self.assertRaises(ControlError):
                 provisioning._first_start(intent,expected_stop_epoch='d'*64)
-        self.assertEqual(order, ['permit', 'start'])
+        self.assertEqual(order, ['permit', 'plan', 'validate', 'start'])
 
     def test_consumed_first_start_never_starts_a_new_or_stopped_invocation(self):
         intent = contract.advance_intent(prepared_intent(), stage='first_start_requested', start_permit='issued',
@@ -266,8 +266,8 @@ class ProvisioningBoundariesTests(unittest.TestCase):
 
     def test_scoped_issuer_requires_exact_current_kernel_scope(self):
         installation = str(uuid.uuid4())
-        name = 'streamhome-install-' + installation + '.scope'
-        metadata = 'ActiveState=active\nTransient=yes\nControlGroup=/system.slice/' + name
+        name = 'streamhome-install-' + installation + '-' + '2' * 32 + '.scope'
+        metadata = 'ActiveState=active\nTransient=yes\nControlGroup=/system.slice/' + name + '\nInvocationID=' + '1' * 32
         with patch.object(provisioning.Path, 'read_text', return_value='0::/system.slice/' + name + '\n'), patch.object(provisioning, 'systemctl', return_value=metadata):
             provisioning._require_install_scope(installation, 'd' * 64)
         with patch.object(provisioning.Path, 'read_text', return_value='0::/user.slice/untracked.scope\n'), patch.object(provisioning, 'systemctl') as ctl:
@@ -285,12 +285,13 @@ class ProvisioningBoundariesTests(unittest.TestCase):
         self.assertIn('--resume-install-scoped', arguments)
         self.assertNotIn('shell', launch.call_args.kwargs)
         self.assertEqual(launch.call_count, 1)
-        cleanup.assert_called_once_with(intent.installation_id)
+        name = next(value[len('--unit='):] for value in arguments if value.startswith('--unit='))
+        cleanup.assert_called_once_with(intent.installation_id, scope_unit=name)
 
-        name = 'streamhome-install-' + intent.installation_id + '.scope'
+        name = 'streamhome-install-' + intent.installation_id + '-' + '2' * 32 + '.scope'
         worker = 'streamhome-provision@' + intent.operation_id + '.service'
-        with patch.object(provisioning, 'read_intent', return_value=intent), patch.object(provisioning, 'systemctl', side_effect=['not-found', 'loaded', '']) as ctl, patch('lifecycle.control.stop._require_empty') as empty:
-            provisioning._stop_install_scope_work(intent.installation_id)
+        with patch.object(provisioning, 'read_intent', return_value=intent), patch.object(provisioning, 'administrative_lock', return_value=nullcontext()), patch.object(provisioning, 'systemctl', side_effect=['not-found', 'loaded', '']) as ctl, patch('lifecycle.control.stop._require_empty') as empty:
+            provisioning._stop_install_scope_work(intent.installation_id, scope_unit=name)
         self.assertEqual(ctl.call_args.args, ('stop', worker))
         self.assertEqual([call.args[0] for call in empty.call_args_list], [name, worker])
 

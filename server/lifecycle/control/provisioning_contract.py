@@ -6,6 +6,8 @@ the unprivileged lifecycle authority after registration.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+import hashlib
+import json
 import re
 from typing import Any
 import uuid
@@ -35,6 +37,16 @@ def identity(value: Any) -> str:
 
 
 @dataclass(frozen=True)
+class StartAttempt:
+    review_id: str
+    previous_intent_sha256: str
+    permit: str
+    invocation: str | None
+    boot_id: str
+    stop_epoch: str
+
+
+@dataclass(frozen=True)
 class ProvisioningIntent:
     installation_id: str
     operation_id: str
@@ -54,22 +66,49 @@ class ProvisioningIntent:
     start_invocation: str | None = None
     start_boot_id: str | None = None
     start_stop_epoch: str | None = None
+    start_attempts: tuple[StartAttempt, ...] = ()
 
     def payload(self) -> dict:
         value = asdict(self)
-        value["schema_version"] = 1
+        value["schema_version"] = 2 if self.start_attempts else 1
+        if not self.start_attempts:
+            value.pop("start_attempts")
+        else:
+            value["start_attempts"] = [asdict(attempt) for attempt in self.start_attempts]
         value["directories"] = {name: {"device": device, "inode": inode} for name, device, inode in self.directories}
         value["mirror_directories"] = {name: {"device": device, "inode": inode} for name, device, inode in self.mirror_directories}
         return value
 
 
 def parse_intent(value: Any) -> ProvisioningIntent:
-    if not isinstance(value, dict) or set(value) != set(ProvisioningIntent.__dataclass_fields__) | {"schema_version"}:
+    if not isinstance(value, dict):
         raise ControlError("control_installation_journal_invalid")
     value = dict(value)
-    version = value.pop("schema_version")
-    if type(version) is not int or version != 1:
+    version = value.pop("schema_version", None)
+    if type(version) is not int or version not in {1, 2}:
         raise ControlError("control_installation_journal_unsupported")
+    expected = set(ProvisioningIntent.__dataclass_fields__)
+    if version == 1:
+        expected.remove("start_attempts")
+    if set(value) != expected:
+        raise ControlError("control_installation_journal_invalid")
+    attempts = value.get("start_attempts", [])
+    if (not isinstance(attempts, list) or len(attempts) > 32 or version == 2 and not attempts):
+        raise ControlError("control_installation_journal_invalid")
+    parsed_attempts = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or set(attempt) != set(StartAttempt.__dataclass_fields__):
+            raise ControlError("control_installation_journal_invalid")
+        identity(attempt["review_id"])
+        identity(attempt["boot_id"])
+        if (not isinstance(attempt["permit"], str) or attempt["permit"] not in {"issued", "consumed"}
+                or any(not isinstance(attempt[key], str) or not _SHA.fullmatch(attempt[key]) for key in ("previous_intent_sha256", "stop_epoch"))
+                or attempt["permit"] == "issued" and attempt["invocation"] is not None
+                or attempt["permit"] == "consumed" and (not isinstance(attempt["invocation"], str)
+                    or not re.fullmatch(r"[0-9a-f]{32}", attempt["invocation"]) or not int(attempt["invocation"], 16))):
+            raise ControlError("control_installation_journal_invalid")
+        parsed_attempts.append(StartAttempt(**attempt))
+    value["start_attempts"] = tuple(parsed_attempts)
     for name in ("installation_id", "operation_id", "revision_id", "control_bundle_id"):
         identity(value[name])
     if (type(value["start_at_boot"]) is not bool or value["stage"] not in STAGES
@@ -101,6 +140,8 @@ def parse_intent(value: Any) -> ProvisioningIntent:
         mirror_bindings.append((name, binding["device"], binding["inode"]))
     value["mirror_directories"] = tuple(sorted(mirror_bindings))
     stage = STAGES.index(value["stage"])
+    if value["start_attempts"] and (stage < STAGES.index("first_start_requested") or value["start_permit"] == "absent"):
+        raise ControlError("control_installation_journal_invalid")
     commit, execution = value["application_commit"], value["execution_sha256"]
     if (commit is not None and (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit))
             or execution is not None and (not isinstance(execution, str) or not _SHA.fullmatch(execution))
@@ -124,13 +165,43 @@ def parse_intent(value: Any) -> ProvisioningIntent:
             raise ControlError("control_installation_journal_invalid")
     if stage >= STAGES.index("registered") and value["start_permit"] != "consumed":
         raise ControlError("control_installation_journal_invalid")
-    return ProvisioningIntent(**value)
+    intent = ProvisioningIntent(**value)
+    if len({attempt.review_id for attempt in intent.start_attempts}) != len(intent.start_attempts):
+        raise ControlError("control_installation_journal_invalid")
+    for index, attempt in enumerate(intent.start_attempts):
+        previous = replace(intent, stage="first_start_requested", start_attempts=intent.start_attempts[:index],
+            start_permit=attempt.permit, start_invocation=attempt.invocation,
+            start_boot_id=attempt.boot_id, start_stop_epoch=attempt.stop_epoch)
+        if intent_sha256(previous) != attempt.previous_intent_sha256:
+            raise ControlError("control_installation_journal_invalid")
+    return intent
+
+
+def intent_sha256(intent: ProvisioningIntent) -> str:
+    return hashlib.sha256(json.dumps(intent.payload(), sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def reviewed_start_attempt(current: ProvisioningIntent, *, review_id: str, boot_id: str, stop_epoch: str) -> ProvisioningIntent:
+    """Describe a distinct explicit attempt; parsing grants no launch authority."""
+    parse_intent(current.payload())
+    identity(review_id)
+    identity(boot_id)
+    if (current.stage != "first_start_requested" or current.start_permit not in {"issued", "consumed"}
+            or not isinstance(stop_epoch, str) or not _SHA.fullmatch(stop_epoch)):
+        raise ControlError("control_start_retry_unavailable")
+    if len(current.start_attempts) >= 32:
+        raise ControlError("control_start_history_full")
+    archived = StartAttempt(review_id, intent_sha256(current), current.start_permit, current.start_invocation,
+        current.start_boot_id, current.start_stop_epoch)
+    candidate = replace(current, start_attempts=(*current.start_attempts, archived), start_permit="issued",
+        start_invocation=None, start_boot_id=boot_id, start_stop_epoch=stop_epoch)
+    return parse_intent(candidate.payload())
 
 
 def advance_intent(current: ProvisioningIntent, **changes) -> ProvisioningIntent:
     candidate = parse_intent(replace(current, **changes).payload())
     immutable = ("installation_id", "operation_id", "revision_id", "service_uid", "service_gid", "deployment",
-                 "start_at_boot", "control_bundle_id", "control_manifest_sha256")
+                 "start_at_boot", "control_bundle_id", "control_manifest_sha256", "start_attempts")
     if any(getattr(current, name) != getattr(candidate, name) for name in immutable):
         raise ControlError("control_installation_review_changed")
     old_stage, next_stage = STAGES.index(current.stage), STAGES.index(candidate.stage)

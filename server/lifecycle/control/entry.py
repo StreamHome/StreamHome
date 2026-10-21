@@ -23,6 +23,24 @@ class EntryError(RuntimeError):
     pass
 
 
+def qualified_support(support: dict) -> tuple[int, ...]:
+    deadlines = {"startup_recovery": 900, "startup_extension": 30, "runtime_drain": 45, "runtime_stop": 60, "controller": 3600}
+    if not isinstance(support, dict) or type(support.get("schema_version")) is not int or support["schema_version"] not in {1, 2}:
+        raise EntryError("The installed control support contract is incompatible.")
+    fields = {"schema_version", "platform", "deadlines_seconds"}
+    if support["schema_version"] == 2:
+        fields.add("provisioning_journal_versions")
+        deadlines["installation"] = 7200
+    versions = [1] if support["schema_version"] == 1 else support.get("provisioning_journal_versions")
+    if (set(support) != fields or support["platform"] != "ubuntu-24.04-x86_64-glibc-python-3.12.3-systemd-cgroup2"
+            or support["deadlines_seconds"] != deadlines
+            or any(type(value) is not int for value in support["deadlines_seconds"].values())
+            or versions != ([1] if support["schema_version"] == 1 else [1, 2])
+            or any(type(value) is not int for value in versions)):
+        raise EntryError("The installed control support contract is incompatible.")
+    return tuple(versions)
+
+
 def _protected(path: Path, *, directory: bool = False):
     metadata = path.lstat()
     if (metadata.st_uid != 0 or metadata.st_mode & 0o7022
@@ -90,14 +108,7 @@ def load_bundle(*, rescue: bool = False) -> tuple[Path, dict, str]:
             or manifest["authority_versions"] != [1, 2] or manifest["control_protocol"] != 1
             or not isinstance(manifest["files"], dict) or not 1 <= len(manifest["files"]) <= 256):
         raise EntryError("The installed control package is incompatible.")
-    support = manifest["support"]
-    deadlines = {"startup_recovery": 900, "startup_extension": 30, "runtime_drain": 45, "runtime_stop": 60, "controller": 3600}
-    if (not isinstance(support, dict) or set(support) != {"schema_version", "platform", "deadlines_seconds"}
-            or type(support["schema_version"]) is not int or support["schema_version"] != 1
-            or support["platform"] != "ubuntu-24.04-x86_64-glibc-python-3.12.3-systemd-cgroup2"
-            or support["deadlines_seconds"] != deadlines
-            or any(type(value) is not int for value in support["deadlines_seconds"].values())):
-        raise EntryError("The installed control support contract is incompatible.")
+    qualified_support(manifest["support"])
     for name, expected in manifest["files"].items():
         relative = PurePosixPath(name)
         if relative.is_absolute() or ".." in relative.parts or len(relative.parts) < 3 or relative.parts[:2] != ("lib", "lifecycle") or relative.suffix != ".py" or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):

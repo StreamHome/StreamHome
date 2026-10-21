@@ -22,8 +22,8 @@ def installation_scopes() -> tuple[str, ...]:
             continue
         from .provisioning import read_intent
         intent = read_intent()
-        name = "streamhome-install-" + intent.installation_id + ".scope"
-        if fields[0] != name:
+        name = fields[0]
+        if not re.fullmatch("streamhome-install-" + re.escape(intent.installation_id) + r"-[0-9a-f]{32}\.scope", name):
             raise ControlError("control_stop_unit_unqualified")
         observed = systemctl("show", name, "--property=LoadState,Transient,ControlGroup,Description")
         values = dict(field.split("=", 1) for field in observed.splitlines() if "=" in field)

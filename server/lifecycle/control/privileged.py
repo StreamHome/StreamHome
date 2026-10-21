@@ -185,7 +185,7 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
     commands.add_parser("stop", help="Stop streamhome.service and close runtime launch admission.")
     configuration = commands.add_parser("configure", help="Review deployment/boot settings and choose activation or save only.")
     configuration.add_argument("--request", type=Path, help="Apply an explicit revision-bound noninteractive JSON request.")
-    repair = commands.add_parser("repair", help="Prepare and review dependency repair for the accepted build.")
+    repair = commands.add_parser("repair", help="Review dependency repair or an interrupted first-start attempt.")
     repair.add_argument("--request", type=Path, help="Explicit noninteractive repair request with current identity and consent.")
     commands.add_parser("help", help="Show this help.")
     for name in ("bootstrap", "setup-code"):
@@ -229,6 +229,11 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
         with administrative_lock():
             return configure(request_path=parsed.request)
     if parsed.command == "repair":
+        require_root()
+        selected = descriptor()
+        if selected.status is InstallationStatus.PROVISIONING:
+            from .first_start_retry import retry_installation
+            return retry_installation(selected.installation_id, manifest=manifest, manifest_sha256=manifest_sha256, request_path=parsed.request)
         from .repair import repair
         from .provisioning import administrative_lock
         with administrative_lock():
@@ -312,6 +317,17 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
                 raise ControlError("control_message_invalid")
             from .provisioning import resume_install
             return resume_install(arguments[1], manifest=manifest, manifest_sha256=manifest_sha256, scope_epoch=arguments[2])
+        if arguments and arguments[0] in {"--retry-first-start", "--retry-first-start-scoped"}:
+            parser = argparse.ArgumentParser(prog=str(CONTROL / "provision") + " " + arguments[0])
+            parser.add_argument("installation_id")
+            if arguments[0] == "--retry-first-start-scoped":
+                parser.add_argument("stop_epoch")
+            parser.add_argument("--request", type=Path)
+            parsed = parser.parse_args(arguments[1:])
+            from .first_start_retry import retry_installation, retry_scoped
+            if arguments[0] == "--retry-first-start-scoped":
+                return retry_scoped(parsed.installation_id, parsed.stop_epoch, manifest=manifest, manifest_sha256=manifest_sha256, request_path=parsed.request)
+            return retry_installation(parsed.installation_id, manifest=manifest, manifest_sha256=manifest_sha256, request_path=parsed.request)
         if arguments and arguments[0] == "--complete-install":
             if len(arguments) != 2:
                 raise ControlError("control_message_invalid")
@@ -365,7 +381,9 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
         print("StreamHome: " + code, file=sys.stderr)
         if code == "control_root_required":
             print("Use sudo streamhome for this administrative command.", file=sys.stderr)
-        if os.geteuid() == 0 and arguments and arguments[0] in {"--install", "--resume-install", "--complete-install"}:
+        if code == "control_stop_before_first_start_retry":
+            print("Use sudo streamhome stop before reviewing a new first-start attempt.", file=sys.stderr)
+        if os.geteuid() == 0 and arguments and arguments[0] in {"--install", "--resume-install", "--complete-install", "--retry-first-start"}:
             try:
                 from .provisioning import report_continuation
                 report_continuation(manifest=manifest, manifest_sha256=manifest_sha256)

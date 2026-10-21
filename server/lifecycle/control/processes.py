@@ -25,6 +25,31 @@ def require_runtime_supervisor() -> None:
         raise ControlError("control_supervisor_forbidden")
 
 
+def require_service_quiescent() -> None:
+    """Prove absence of live service-UID work beyond this independent reader."""
+    if os.geteuid() == 0:
+        raise ControlError("control_worker_forbidden")
+    runtime = Path("/sys/fs/cgroup" + RUNTIME_CGROUP + "/cgroup.procs")
+    try:
+        if runtime.read_text().strip():
+            raise ControlError("control_children_busy")
+    except FileNotFoundError:
+        pass
+    for path in Path("/proc").iterdir():
+        if not path.name.isdigit() or int(path.name) == os.getpid():
+            continue
+        try:
+            if path.stat().st_uid != os.geteuid():
+                continue
+            fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+            if not fields or fields[0] not in {"Z", "X"}:
+                raise ControlError("control_foreign_service_process")
+        except FileNotFoundError:
+            continue
+        except (OSError, IndexError) as exc:
+            raise ControlError("control_quiescence_unproven") from exc
+
+
 def controller_peer(pid: int, operation_id: str) -> None:
     from ..management_journal import _uuid
     _uuid(operation_id, "controller operation")

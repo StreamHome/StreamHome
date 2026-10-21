@@ -80,6 +80,12 @@ def report_continuation(*, manifest: dict, manifest_sha256: str) -> None:
     selected = inspect_installation()
     registered = selected is not None and selected.descriptor.status is InstallationStatus.READY
     command = "--complete-install" if registered or intent.stage == "registered" else "--resume-install"
+    if not registered and intent.stage == "first_start_requested" and intent.start_permit in {"issued", "consumed"}:
+        unit = unit_snapshot()
+        if unit["ActiveState"] in {"inactive", "failed"} and int(unit["MainPID"]) == 0:
+            from .provisioning_contract import intent_sha256
+            command = "--retry-first-start"
+            print("First-start review SHA-256: " + intent_sha256(intent), file=sys.stderr)
     print("Recorded installation stage: " + intent.stage + ". The explicit continuation rechecks ownership and recovery evidence:", file=sys.stderr)
     print("  sudo /usr/local/libexec/streamhome/provision " + command + " " + intent.installation_id, file=sys.stderr)
 
@@ -357,6 +363,8 @@ def before_start() -> int:
             or intent.start_boot_id != Path("/proc/sys/kernel/random/boot_id").read_text().strip()
             or intent.start_stop_epoch != root_stop_epoch()):
         raise ControlError("control_first_start_denied")
+    from .first_start_plan import require_issued_plan
+    require_issued_plan(intent)
     # The administrative parent holds its own lock while systemctl waits for
     # this hook. This child has a separate permit lock and performs a root CAS.
     parent = root_directory(JOURNAL.parent)
@@ -367,6 +375,7 @@ def before_start() -> int:
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o7177 or metadata.st_nlink != 1:
             raise ControlError("control_start_permit_untrusted")
         fcntl.flock(lock, fcntl.LOCK_EX)
+        require_issued_plan(intent)
         intent = _advance(intent, start_permit="consumed", start_invocation=invocation)
         atomic_root_json(Path("/etc/streamhome/control/first-start.json"), {
             "schema_version": 1, "action": "first_start", "installation_id": intent.installation_id,
@@ -391,8 +400,12 @@ def _first_start(intent: ProvisioningIntent, *, expected_stop_epoch: str) -> Pro
     if intent.start_permit == "absent":
         intent = _advance(intent, stage="first_start_requested", start_permit="issued",
                           start_boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip(), start_stop_epoch=expected_stop_epoch)
+        from .first_start_plan import publish_start_plan
+        publish_start_plan(intent)
     unit = unit_snapshot()
     if intent.start_permit == "issued":
+        from .first_start_plan import require_issued_plan
+        require_issued_plan(intent, issuer=True)
         if unit["ActiveState"] not in {"inactive", "failed"} or int(unit["MainPID"]):
             raise ControlError("control_first_start_denied")
         from .notification import STARTUP_RECOVERY_SECONDS
@@ -448,20 +461,25 @@ def _finish_registration(intent: ProvisioningIntent) -> None:
         atomic_root_json(Path("/etc/streamhome/install.json"), ready.payload())
 
 
-def _require_install_scope(installation_id: str, epoch: str) -> None:
+def _require_install_scope(installation_id: str, epoch: str) -> dict:
     identity(installation_id)
     if not isinstance(epoch, str) or not re.fullmatch(r"[0-9a-f]{64}", epoch):
         raise ControlError("control_installation_scope_invalid")
-    name = "streamhome-install-" + installation_id + ".scope"
-    if Path("/proc/self/cgroup").read_text().splitlines() != ["0::/system.slice/" + name]:
+    groups = Path("/proc/self/cgroup").read_text().splitlines()
+    prefix = "0::/system.slice/streamhome-install-" + installation_id + "-"
+    if len(groups) != 1 or not groups[0].startswith(prefix) or not re.fullmatch(r"[0-9a-f]{32}\.scope", groups[0][len(prefix):]):
         raise ControlError("control_installation_scope_invalid")
-    raw = systemctl("show", name, "--property=ActiveState,Transient,ControlGroup")
+    name = groups[0].split("/")[-1]
+    raw = systemctl("show", name, "--property=ActiveState,Transient,ControlGroup,InvocationID")
     fields = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
-    if fields != {"ActiveState": "active", "Transient": "yes", "ControlGroup": "/system.slice/" + name}:
+    invocation = fields.get("InvocationID", "")
+    if (fields != {"ActiveState": "active", "Transient": "yes", "ControlGroup": "/system.slice/" + name, "InvocationID": invocation}
+            or not re.fullmatch(r"[0-9a-f]{32}", invocation) or not int(invocation, 16)):
         raise ControlError("control_installation_scope_invalid")
+    return {"unit": name, "invocation": invocation}
 
 
-def _run_install_scope(installation_id: str, epoch: str) -> int:
+def _run_install_scope(installation_id: str, epoch: str, *, retry: bool = False, request_path: Path | None = None) -> int:
     """Give the root first-launch issuer an OS-cancellable lifetime.
 
     Distro package work finishes before this scope. Once service definitions are
@@ -472,35 +490,47 @@ def _run_install_scope(installation_id: str, epoch: str) -> int:
     if not isinstance(epoch, str) or not re.fullmatch(r"[0-9a-f]{64}", epoch):
         raise ControlError("control_installation_scope_invalid")
     from . import privileged
-    name = "streamhome-install-" + installation_id + ".scope"
+    name = "streamhome-install-" + installation_id + "-" + uuid.uuid4().hex + ".scope"
     arguments = ["/usr/bin/systemd-run", "--scope", "--quiet", "--collect", "--slice=system.slice", "--unit=" + name,
         "--description=StreamHome installation " + installation_id, "--property=StopPropagatedFrom=streamhome.service",
         "--property=RuntimeMaxSec=7200", "/usr/bin/python3", "-I", "/usr/local/libexec/streamhome/provision",
-        *(["--rescue"] if privileged._RESCUE_MODE else []), "--resume-install-scoped", installation_id, epoch]
+        *(["--rescue"] if privileged._RESCUE_MODE else []),
+        "--retry-first-start-scoped" if retry else "--resume-install-scoped", installation_id, epoch,
+        *(["--request", os.path.abspath(request_path)] if retry and request_path is not None else [])]
     try:
         result = subprocess.run(arguments, stdin=subprocess.DEVNULL, cwd="/", env=_OS_ENV, timeout=7230)
     except BaseException:
-        _stop_install_scope_work(installation_id)
+        _stop_install_scope_work(installation_id, scope_unit=name)
         raise
     if result.returncode:
-        _stop_install_scope_work(installation_id)
+        _stop_install_scope_work(installation_id, scope_unit=name)
         raise ControlError("control_installation_scope_stopped")
     return 0
 
 
-def _stop_install_scope_work(installation_id: str) -> None:
+def _stop_install_scope_work(installation_id: str, *, scope_unit: str) -> None:
     """A cancelled issuer must not abandon its separately owned builder unit."""
-    intent = read_intent()
-    if intent.installation_id != installation_id:
-        raise ControlError("control_installation_review_changed")
-    names = ("streamhome-install-" + installation_id + ".scope",
-             "streamhome-provision@" + intent.operation_id + ".service")
-    targets = tuple(name for name in names if systemctl("show", name, "--property=LoadState", "--value") != "not-found")
-    if targets:
-        systemctl("stop", *targets, timeout=30)
+    identity(installation_id)
+    if not re.fullmatch("streamhome-install-" + re.escape(installation_id) + r"-[0-9a-f]{32}\.scope", scope_unit):
+        raise ControlError("control_installation_scope_invalid")
     from .stop import _require_empty
-    for name in names:
-        _require_empty(name)
+    if systemctl("show", scope_unit, "--property=LoadState", "--value") != "not-found":
+        systemctl("stop", scope_unit, timeout=30)
+    _require_empty(scope_unit)
+    try:
+        # A later explicit administrator may already have adopted this intent's
+        # separate builder. Old issuer cleanup cannot stop that owner's work.
+        with administrative_lock():
+            intent = read_intent()
+            if intent.installation_id != installation_id:
+                raise ControlError("control_installation_review_changed")
+            worker = "streamhome-provision@" + intent.operation_id + ".service"
+            if systemctl("show", worker, "--property=LoadState", "--value") != "not-found":
+                systemctl("stop", worker, timeout=30)
+            _require_empty(worker)
+    except ControlError as exc:
+        if exc.code != "control_administrator_busy":
+            raise
 
 
 def resume_install(installation_id: str, *, manifest: dict, manifest_sha256: str, scope_epoch: str | None = None) -> int:

@@ -7,6 +7,7 @@ an unchecked service-controlled parent pathname.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import os
 from pathlib import Path
 import secrets
@@ -61,7 +62,7 @@ def _journal_directory(intent):
         raise
 
 
-def _prefix(previous, candidate):
+def _ordinary_prefix(previous, candidate):
     append_only = {"directories", "mirror_directories", "stage", "application_commit", "execution_sha256",
                    "start_permit", "start_invocation", "start_boot_id", "start_stop_epoch"}
     if any(getattr(previous, name) != getattr(candidate, name) for name in previous.__dataclass_fields__ if name not in append_only):
@@ -77,6 +78,28 @@ def _prefix(previous, candidate):
         if getattr(previous, name) is not None and getattr(previous, name) != getattr(candidate, name):
             return False
     return ("absent", "issued", "consumed").index(previous.start_permit) <= ("absent", "issued", "consumed").index(candidate.start_permit)
+
+
+def _prefix(previous, candidate):
+    try:
+        previous, candidate = parse_intent(previous.payload()), parse_intent(candidate.payload())
+    except ControlError:
+        return False
+    if previous.start_attempts != candidate.start_attempts[:len(previous.start_attempts)]:
+        return False
+    current = previous
+    for index in range(len(previous.start_attempts), len(candidate.start_attempts)):
+        attempt = candidate.start_attempts[index]
+        parent = replace(candidate, stage="first_start_requested", start_attempts=candidate.start_attempts[:index],
+            start_permit=attempt.permit, start_invocation=attempt.invocation,
+            start_boot_id=attempt.boot_id, start_stop_epoch=attempt.stop_epoch)
+        if not _ordinary_prefix(current, parent):
+            return False
+        following = candidate.start_attempts[index + 1] if index + 1 < len(candidate.start_attempts) else None
+        current = replace(parent, start_attempts=candidate.start_attempts[:index + 1], start_permit="issued", start_invocation=None,
+            start_boot_id=following.boot_id if following else candidate.start_boot_id,
+            start_stop_epoch=following.stop_epoch if following else candidate.start_stop_epoch)
+    return _ordinary_prefix(current, candidate)
 
 
 def publish_mirror(intent) -> None:

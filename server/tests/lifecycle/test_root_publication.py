@@ -36,6 +36,18 @@ class RootPublicationBoundaryTests(unittest.TestCase):
                     root_files.atomic_root_json(Path(name), {'schema_version': 1})
                 parent.assert_not_called()
 
+    def test_exact_first_start_review_plan_path_is_writable(self):
+        review = str(uuid.uuid4())
+        accepted = Path('/etc/streamhome/control/first-start-attempts') / (review + '.json')
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(root_files.os, 'geteuid', return_value=0), patch.object(root_files, 'root_directory', side_effect=lambda _: os.open(directory, os.O_RDONLY | os.O_DIRECTORY)), patch.object(root_files.os, 'fchown'):
+                root_files.atomic_root_json(accepted, {'schema_version': 1}, gid=999, mode=0o640)
+            self.assertEqual((Path(directory) / accepted.name).stat().st_mode & 0o777, 0o640)
+        with patch.object(root_files.os, 'geteuid', return_value=0), patch.object(root_files, 'root_directory') as parent:
+            with self.assertRaisesRegex(ControlError, 'control_root_destination_invalid'):
+                root_files.atomic_root_json(accepted.parent / 'unreviewed.json', {'schema_version': 1})
+        parent.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()
