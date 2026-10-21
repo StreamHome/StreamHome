@@ -6,6 +6,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+import uuid
 from unittest.mock import AsyncMock, Mock, patch
 
 from lifecycle.control import notification, startup, supervisor
@@ -17,6 +18,19 @@ from lifecycle.control.requests import parse_management_request
 
 
 class StartupNotificationTests(unittest.TestCase):
+    def test_startup_observer_never_retries_a_quarantined_desired_deployment(self):
+        invocation = '1' * 32
+        active, desired = str(uuid.uuid4()), str(uuid.uuid4())
+        snapshot = {'lifecycle': {'active_operation': None}, 'configuration': {'deployment': {
+            'active': {'revision': active, 'sha256': 'a' * 64}, 'desired': {'revision': desired, 'sha256': 'b' * 64},
+            'quarantined': [desired]}}}
+        selected = SimpleNamespace(status=startup.InstallationStatus.READY)
+        with patch.object(startup, 'require_root'), patch.object(startup.Path, 'read_text', return_value=f'0::/system.slice/streamhome-startup@{invocation}.service\n'), patch.object(startup, 'administrative_lock', return_value=nullcontext()), patch.object(startup, 'descriptor', return_value=selected), patch.object(startup, 'root_stop_epoch', return_value='a' * 64), patch.object(startup, 'wait_supervisor', return_value={}), patch.object(startup, 'run_worker', return_value=snapshot) as worker, patch.object(startup, 'process_snapshot') as processes, patch.object(startup, 'run_operation') as claim:
+            self.assertEqual(startup.activate_pending(invocation), 0)
+        worker.assert_called_once_with(['inspect'], timeout=120)
+        processes.assert_not_called()
+        claim.assert_not_called()
+
     def test_extensions_continue_during_blocked_event_loop_but_expire_without_ready(self):
         values = []
         lock = threading.Lock()

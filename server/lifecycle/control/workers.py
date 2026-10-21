@@ -105,7 +105,8 @@ def bridge_observe(payload: dict) -> dict:
     return {"request_sha256": reviewed.sha256, "generation": journal.generation,
             "stage": journal.stage.value, "os_effect_requested": journal.stage is contract.ManagementStage.PREPARED,
             "previous_boot_enabled": reviewed.previous_boot_enabled, "boot_enabled": reviewed.boot_enabled,
-            "controller_invocation_id": journal.controller_invocation_id, "accepted": journal.acceptance is not None}
+            "controller_invocation_id": journal.controller_invocation_id, "controller_pid": lease.pid,
+            "accepted": journal.acceptance is not None}
 
 
 def operation_result(operation_id: str) -> dict:

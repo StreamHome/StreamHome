@@ -341,6 +341,11 @@ def before_start() -> int:
         raise ControlError("control_unit_hook_forbidden")
     selected = descriptor()
     if selected.status is InstallationStatus.READY:
+        # A direct systemctl start must respect the same administrator exclusion
+        # as the CLI. Release before scheduling the independent observer so its
+        # own lock acquisition cannot race a still-held ExecStartPre lock.
+        with administrative_lock():
+            pass
         from .startup import schedule_pending
         schedule_pending()
         return 0

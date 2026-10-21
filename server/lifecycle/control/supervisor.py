@@ -202,6 +202,10 @@ class Supervisor:
     def _spawn(self, service: str, arguments: list[str], environment: dict[str, str], cwd: Path) -> None:
         token = secrets.token_hex(32)
         environment = {**environment, "STREAMHOME_SERVICE": service, "STREAMHOME_INSTANCE_TOKEN": token}
+        # The signal handler may close admission after the preceding child was
+        # launched. Each child must independently honor that decision.
+        if not self.launches_open:
+            raise ControlError("control_operator_stopped")
         process = subprocess.Popen(arguments, cwd=cwd, env=environment, stdin=subprocess.DEVNULL, start_new_session=True)
         identity = state._process_start_identity(process.pid)
         self.children[service] = Child(process, identity, token)
@@ -234,7 +238,7 @@ class Supervisor:
             try:
                 with ConfigurationStore(descriptor, self.installation) as store:
                     manifest = store.inspect()
-                    if manifest.active != manifest.desired:
+                    if manifest.active != manifest.desired and manifest.desired.revision not in manifest.quarantined:
                         raise ControlError("control_pending_deployment")
             finally:
                 os.close(descriptor)

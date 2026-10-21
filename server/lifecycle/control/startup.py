@@ -75,6 +75,11 @@ def activate_pending(invocation: str) -> int:
             raise ControlError("control_operation_recovery_required")
         if snapshot["configuration"]["deployment"]["active"] == snapshot["configuration"]["deployment"]["desired"]:
             return 0
+        deployment = snapshot['configuration']['deployment']
+        if deployment['desired']['revision'] in deployment['quarantined']:
+            # The accepted active deployment remains usable after canonical
+            # rollback. Failed desired settings are never retried by startup.
+            return 0
         processes = process_snapshot()
         if processes["initial_service_state"] != "running" or processes["supervisor_invocation_id"] != invocation:
             raise ControlError("control_incarnation_changed")

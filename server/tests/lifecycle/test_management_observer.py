@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -44,6 +45,32 @@ class ManagementObserverTests(unittest.TestCase):
         self.assertEqual(result,{'completed':True,'stage':'succeeded'})
         effect.assert_not_called()
         systemctl.assert_not_called()
+
+    def test_deactivating_controller_cannot_request_a_root_effect(self):
+        operation = str(uuid.uuid4())
+        stopping = {'ActiveState': 'deactivating', 'MainPID': '200', 'InvocationID': '1' * 32}
+        ended = {**stopping, 'ActiveState': 'inactive', 'MainPID': '0'}
+        with patch.object(administration, 'require_root'), patch.object(administration, 'publish_request'), patch.object(administration, 'operation_unit', side_effect=[stopping, ended]), patch.object(administration, 'run_worker', return_value={'completed': True, 'stage': 'succeeded'}) as worker, patch.object(administration, '_apply_fixed_boot_effect') as effect, patch.object(administration.time, 'sleep'):
+            administration.run_operation({'operation_id': operation}, start=False)
+        self.assertEqual(worker.call_args_list[0].args, (['operation-result', operation],))
+        self.assertEqual(worker.call_count, 1)
+        effect.assert_not_called()
+
+    def test_stop_or_controller_replacement_during_observation_prevents_boot_effect(self):
+        payload = request_payload()
+        payload['boot_id'] = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        observation = {'request_sha256': administration._sha(payload), 'generation': payload['expected_generation'] + 1,
+            'boot_enabled': payload['boot_enabled'], 'previous_boot_enabled': payload['previous_boot_enabled'],
+            'controller_invocation_id': '1' * 32, 'controller_pid': 200}
+        for changed in ({'ActiveState': 'deactivating', 'MainPID': '200', 'InvocationID': '1' * 32},
+                        {'ActiveState': 'active', 'MainPID': '201', 'InvocationID': '1' * 32},
+                        {'ActiveState': 'active', 'MainPID': '200', 'InvocationID': '2' * 32}):
+            with self.subTest(changed=changed), patch.object(administration, 'descriptor'), patch.object(administration, 'root_stop_epoch', return_value=payload['stop_epoch']), patch.object(administration, 'operation_unit', return_value=changed), patch.object(administration, '_verify_owned_units') as verify, patch.object(administration, 'systemctl') as ctl, patch.object(administration, 'atomic_root_json') as write:
+                with self.assertRaisesRegex(administration.ControlError, 'control_controller_changed'):
+                    administration._apply_fixed_boot_effect(payload, observation)
+            verify.assert_not_called()
+            ctl.assert_not_called()
+            write.assert_not_called()
 
 
 if __name__ == '__main__':

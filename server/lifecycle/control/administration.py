@@ -150,6 +150,11 @@ def _apply_fixed_boot_effect(payload: dict, observation: dict) -> None:
             or observation.get("request_sha256") != _sha(payload) or observation.get("generation") != payload["expected_generation"] + 1
             or observation.get("boot_enabled") is not payload["boot_enabled"] or observation.get("previous_boot_enabled") is not payload["previous_boot_enabled"]):
         raise ControlError("control_os_review_changed")
+    controller = operation_unit(payload["operation_id"])
+    if (controller["ActiveState"] != "active" or int(controller["MainPID"]) <= 0
+            or int(controller["MainPID"]) != observation.get("controller_pid")
+            or controller["InvocationID"] != observation.get("controller_invocation_id")):
+        raise ControlError("control_controller_changed")
     if payload["initial_service_state"] == "running":
         unit = unit_snapshot()
         if (unit["ActiveState"] not in {"active", "activating"} or unit["InvocationID"] != payload["supervisor_invocation_id"]
@@ -193,7 +198,7 @@ def run_operation(payload: dict, *, start: bool = True) -> dict:
     last_stage = None
     while time.monotonic() < deadline:
         unit = operation_unit(operation)
-        if int(unit["MainPID"]) > 0 and unit["InvocationID"]:
+        if unit["ActiveState"] == "active" and int(unit["MainPID"]) > 0 and unit["InvocationID"]:
             try:
                 observation = run_worker(["bridge-observe"], payload={"operation_id": operation, "controller_pid": int(unit["MainPID"]), "controller_invocation_id": unit["InvocationID"]})
             except (ControlError, subprocess.TimeoutExpired):

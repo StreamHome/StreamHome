@@ -25,6 +25,24 @@ from tests.lifecycle.test_management_requests import request_payload
 
 
 class SupervisorWebProcessTests(unittest.TestCase):
+    def test_stop_between_backend_and_web_launch_prevents_second_process(self):
+        instance = managed.Supervisor.__new__(managed.Supervisor)
+        instance.launches_open = True
+        instance.children = {}
+        instance.layout = SimpleNamespace(runtime=Path('/run/streamhome'))
+        process = SimpleNamespace(pid=123)
+
+        def launch_backend(*arguments, **keywords):
+            instance.launches_open = False
+            return process
+
+        with patch.object(managed.subprocess, 'Popen', side_effect=launch_backend) as spawn, patch.object(state, '_process_start_identity', return_value='42'), patch.object(state, '_atomic_write_json'):
+            instance._spawn('backend', ['/usr/bin/python3'], {}, Path('/'))
+            with self.assertRaisesRegex(ControlError, 'control_operator_stopped'):
+                instance._spawn('web', ['/usr/bin/node'], {}, Path('/'))
+        self.assertEqual(spawn.call_count, 1)
+        self.assertEqual(set(instance.children), {'backend'})
+
     def test_changed_operator_stop_epoch_rejects_live_controller(self):
         reviewed=parse_management_request(request_payload())
         generation=reviewed.expected_generation+1
@@ -120,6 +138,35 @@ asyncio.run(main())
 
 
 class SupervisorLaunchAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_quarantine_preserves_idle_active_runtime_without_bypassing_unresolved_authority(self):
+        execution = parse_management_request(request_payload()).previous
+        instance = managed.Supervisor.__new__(managed.Supervisor)
+        instance.installation = str(uuid.uuid4())
+        instance.invocation = '1' * 32
+        instance.sequence = 0
+        instance.control_bundle_id = execution.control_bundle_id
+        instance.control_manifest_sha256 = execution.control_manifest_sha256
+        instance.launches_open = True
+        instance.children = {}
+        instance._spawn = Mock()
+        instance._deployment = Mock(return_value=default_deployment())
+        desired = str(uuid.uuid4())
+        manifest = SimpleNamespace(active=SimpleNamespace(revision=execution.deployment_revision),
+            desired=SimpleNamespace(revision=desired), quarantined=(desired,))
+        descriptor = SimpleNamespace(installation_id=instance.installation, service_uid=os.geteuid(), status=managed.InstallationStatus.READY)
+        with tempfile.TemporaryDirectory() as directory:
+            layout = SimpleNamespace(descriptor=SimpleNamespace(descriptor=descriptor), domains=Path(directory),
+                state=Path('/var/lib/streamhome'), runtime=Path('/run/streamhome'))
+            with patch.object(managed, 'runtime_children', return_value=set()), patch.object(managed, 'layout_for_root', return_value=layout), patch.object(managed, 'verify_runtime'), patch.object(managed, 'verify_links'), patch.object(state, 'inspect_state', return_value=SimpleNamespace(active_operation=None)), patch.object(managed, 'ConfigurationStore') as store:
+                store.return_value.__enter__.return_value.inspect.return_value = manifest
+                await instance.launch(execution)
+            self.assertEqual(instance._spawn.call_count, 2)
+            instance._spawn.reset_mock()
+            with patch.object(managed, 'runtime_children', return_value=set()), patch.object(managed, 'layout_for_root', return_value=layout), patch.object(managed, 'verify_runtime'), patch.object(managed, 'verify_links'), patch.object(state, 'inspect_state', return_value=SimpleNamespace(active_operation=object())):
+                with self.assertRaisesRegex(ControlError, 'control_recovery_required'):
+                    await instance.launch(execution)
+            instance._spawn.assert_not_called()
+
     async def test_controller_is_revalidated_after_verification_before_any_child_spawn(self):
         reviewed=parse_management_request(request_payload())
         journal=contract.ManagementJournal(reviewed.installation_id,reviewed.operation_id,reviewed.expected_generation+1,reviewed.action,reviewed.activation_mode,

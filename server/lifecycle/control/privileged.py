@@ -194,6 +194,8 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
     logs = commands.add_parser("logs", help="Read the StreamHome service journal.")
     logs.add_argument("--follow", action="store_true")
     logs.add_argument("--lines", type=int, default=100)
+    logs.add_argument("--component", choices=("runtime", "operations", "installation", "all"), default="runtime")
+    logs.add_argument("--level", choices=("error", "warning", "info", "debug"), default="debug")
     parsed = parser.parse_args(arguments)
     if parsed.command in {None, "help"}:
         parser.print_help()
@@ -237,10 +239,8 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
     if parsed.command == "logs":
         if not 1 <= parsed.lines <= 1000:
             parser.error("--lines must be from 1 to 1000")
-        arguments = ["/usr/bin/journalctl", "--unit=streamhome.service", "--no-pager", "--lines=" + str(parsed.lines)]
-        if parsed.follow:
-            arguments.append("--follow")
-        os.execve(arguments[0], arguments, _OS_ENV)
+        from .logs import read_logs
+        return read_logs(lines=parsed.lines, follow=parsed.follow, component=parsed.component, level=parsed.level)
     require_root()
     selected = descriptor()
     if parsed.command == "stop":

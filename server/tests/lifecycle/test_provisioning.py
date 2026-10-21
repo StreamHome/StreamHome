@@ -1,5 +1,5 @@
 from copy import deepcopy
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 import json
 import io
@@ -98,6 +98,22 @@ class ProvisioningContractTests(unittest.TestCase):
 
 
 class ProvisioningBoundariesTests(unittest.TestCase):
+    def test_direct_ready_start_checks_administrator_exclusion_before_scheduling_observer(self):
+        order = []
+        @contextmanager
+        def lock():
+            order.append('acquire')
+            yield
+            order.append('release')
+        selected = SimpleNamespace(status=provisioning.InstallationStatus.READY)
+        with patch.object(provisioning, 'require_root'), patch.object(provisioning.Path, 'read_text', return_value='0::/system.slice/streamhome.service\n'), patch.object(provisioning, 'descriptor', return_value=selected), patch.object(provisioning, 'administrative_lock', side_effect=lock), patch('lifecycle.control.startup.schedule_pending', side_effect=lambda: order.append('schedule')):
+            self.assertEqual(provisioning.before_start(), 0)
+        self.assertEqual(order, ['acquire', 'release', 'schedule'])
+        with patch.object(provisioning, 'require_root'), patch.object(provisioning.Path, 'read_text', return_value='0::/system.slice/streamhome.service\n'), patch.object(provisioning, 'descriptor', return_value=selected), patch.object(provisioning, 'administrative_lock', side_effect=ControlError('control_administrator_busy')), patch('lifecycle.control.startup.schedule_pending') as schedule:
+            with self.assertRaisesRegex(ControlError, 'control_administrator_busy'):
+                provisioning.before_start()
+        schedule.assert_not_called()
+
     def test_doctor_reports_actual_settlement_and_nonzero_for_broken_artifacts(self):
         selected=SimpleNamespace(status=provisioning.InstallationStatus.READY,paths=SimpleNamespace(runtime=Path('/run/streamhome')),service_uid=999,installation_id=str(uuid.uuid4()))
         unit={'ActiveState':'active','SubState':'running','UnitFileState':'enabled','InvocationID':'a'*32}
