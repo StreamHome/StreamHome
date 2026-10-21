@@ -143,7 +143,8 @@ class Supervisor:
         contract.validate_active_journal(journal, authority)
         if journal.installation_id != self.installation or journal.supervisor_invocation_id != self.invocation:
             raise ControlError("control_incarnation_changed")
-        reviewed = read_management_request(journal.operation_id)
+        from .recovery_requests import effective_request
+        reviewed = effective_request(journal, original=read_management_request(journal.operation_id))
         if (journal.review_id != reviewed.review_id or journal.generation != reviewed.expected_generation + 1
                 or journal.previous != reviewed.previous or journal.candidate != reviewed.candidate):
             raise ControlError("control_request_changed")
@@ -166,6 +167,18 @@ class Supervisor:
                 return {"stopping": True}
             if not self.launches_open:
                 raise ControlError("control_operator_stopped")
+            if action in {"recover_children", "assert_recovery_stopped"}:
+                from ..management_recovery_store import require_takeover_source
+                journal = self._controller(peer, arguments, phase=state.LifecyclePhase.RECOVERY_REQUIRED)
+                require_takeover_source(ROOT, journal)
+                if action == 'recover_children':
+                    await self.stop_children()
+                    self.execution = journal.candidate if journal.acceptance else journal.previous
+                    self.config = self._deployment(self.execution)
+                    await self.start_maintenance()
+                if self.children or runtime_children():
+                    raise ControlError("control_children_busy")
+                return {"stopped": True, "sequence": self.sequence}
             if action == "stop_children":
                 journal = self._controller(peer, arguments, phase=state.LifecyclePhase.EXCLUSIVE)
                 if journal.stage is not contract.ManagementStage.EXCLUSIVE or journal.acceptance is not None:
@@ -175,9 +188,15 @@ class Supervisor:
                 self.config = self._deployment(journal.previous)
                 await self.start_maintenance()
                 return {"stopped": True, "sequence": self.sequence}
-            if action == "launch_candidate":
+            if action in {"launch_candidate", "launch_recovered"}:
                 journal = self._controller(peer, arguments, phase=state.LifecyclePhase.VERIFYING)
-                if journal.stage is not contract.ManagementStage.VERIFYING or journal.acceptance is not None or self.children:
+                accepted_recovery = False
+                if action == 'launch_recovered':
+                    from ..management_recovery_store import require_takeover_source
+                    require_takeover_source(ROOT, journal)
+                    accepted_recovery = journal.stage is contract.ManagementStage.ACCEPTED and journal.acceptance is not None
+                if (not accepted_recovery and (journal.stage is not contract.ManagementStage.VERIFYING or journal.acceptance is not None)
+                        or self.children):
                     raise ControlError("control_candidate_unavailable")
                 await self.close_maintenance()
                 await self.launch(journal.candidate, journal=journal,

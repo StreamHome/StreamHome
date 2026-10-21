@@ -146,7 +146,7 @@ def read_management_request(operation_id: str) -> ManagementRequest:
 
 
 def read_os_receipt(request: ManagementRequest, generation: int, controller_invocation_id: str) -> dict:
-    payload = read_protected_json(REQUEST_ROOT / request.operation_id / "os-receipt.json")
+    payload = read_protected_json(os_receipt_path(request, generation))
     if (set(payload) != {"schema_version", "request_sha256", "operation_id", "generation", "controller_invocation_id", "boot_enabled", "stage"}
             or type(payload["schema_version"]) is not int or payload["schema_version"] != 1
             or payload["request_sha256"] != request.sha256 or payload["operation_id"] != request.operation_id
@@ -155,3 +155,9 @@ def read_os_receipt(request: ManagementRequest, generation: int, controller_invo
             or payload["boot_enabled"] is not request.boot_enabled or payload["stage"] != "complete"):
         raise ControlError("control_os_receipt_changed")
     return payload
+
+
+def os_receipt_path(request: ManagementRequest, generation: int) -> Path:
+    grant_path = REQUEST_ROOT / request.operation_id / f"recovery-{generation}.json"
+    name = f"os-receipt-{generation}.json" if grant_path.exists() or grant_path.is_symlink() else "os-receipt.json"
+    return REQUEST_ROOT / request.operation_id / name

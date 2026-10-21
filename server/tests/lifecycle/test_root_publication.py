@@ -11,6 +11,20 @@ from lifecycle.control.units import unit_files
 
 
 class RootPublicationBoundaryTests(unittest.TestCase):
+    def test_generation_bound_recovery_files_are_publishable_and_paths_stay_fixed(self):
+        operation, review = str(uuid.uuid4()), str(uuid.uuid4())
+        base = Path('/etc/streamhome/control/operations') / operation
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ('recovery-2.json', 'bridge-2.json', 'os-receipt-2.json', 'recovery-review-' + review + '.json'):
+                with self.subTest(name=name), patch.object(root_files.os, 'geteuid', return_value=0), patch.object(root_files, 'root_directory', side_effect=lambda _: os.open(directory, os.O_RDONLY | os.O_DIRECTORY)), patch.object(root_files.os, 'fchown'):
+                    root_files.atomic_root_json(base / name, {'schema_version': 1}, gid=999, mode=0o640)
+                self.assertEqual((Path(directory) / name).stat().st_mode & 0o777, 0o640)
+        for name in ('recovery-0.json', 'recovery-02.json', 'recovery-../../other.json', 'arbitrary-2.json', 'recovery-review-unbound.json'):
+            with self.subTest(name=name), patch.object(root_files.os, 'geteuid', return_value=0), patch.object(root_files, 'root_directory') as parent:
+                with self.assertRaises(ControlError):
+                    root_files.atomic_root_json(base / name, {})
+                parent.assert_not_called()
+
     def test_every_publisher_owned_unit_can_be_published_through_the_protected_writer(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

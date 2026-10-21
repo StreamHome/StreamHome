@@ -112,6 +112,13 @@ def publish_accepted_execution(
         if current == updated:
             state._fsync_directory(layout.state)
             return current
+        if current.execution == journal.candidate and current.operation_id == journal.operation_id and current.generation < journal.generation:
+            from .management_recovery_store import require_takeover_source
+            source = require_takeover_source(root, journal)
+            if source.acceptance != journal.acceptance or current.generation > source.generation:
+                raise ExecutionStateError("The prior accepted execution has no exact recovery lineage.")
+            state._atomic_write_json(layout.state / "active-runtime.json", updated.payload())
+            return updated
         if current.execution != journal.previous or current.installation_id != journal.installation_id:
             raise ExecutionStateError("Active execution changed after review.")
         state._atomic_write_json(layout.state / "active-runtime.json", updated.payload())

@@ -1,7 +1,8 @@
 """Bound management journal persistence, subordinate to canonical authority.
 
-No production dispatcher uses this store yet. It never migrates authority, starts
-processes, changes configuration, verifies a runtime, accepts or releases a claim.
+It never migrates authority, starts processes, changes configuration, verifies a
+runtime, accepts or releases a claim. Explicit generation takeover has a separate
+retained-intent protocol in management_recovery_store.
 """
 from __future__ import annotations
 

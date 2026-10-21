@@ -12,7 +12,7 @@ from .rpc import ControlError
 
 
 _OPERATION = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
-_JSON_PATH = re.compile(r"/etc/streamhome/(?:install\.json|control/(?:stop-epoch\.json|installation\.json|first-start\.json|administration-owner\.json|first-start-attempts/" + _OPERATION + r"\.json|operations/" + _OPERATION + r"/(?:request|dispatch|os-receipt|bridge)\.json|preparations/" + _OPERATION + r"/request\.json))$")
+_JSON_PATH = re.compile(r"/etc/streamhome/(?:install\.json|control/(?:stop-epoch\.json|installation\.json|first-start\.json|administration-owner\.json|first-start-attempts/" + _OPERATION + r"\.json|operations/" + _OPERATION + r"/(?:(?:request|dispatch|os-receipt|bridge)|(?:recovery|bridge|os-receipt)-[1-9][0-9]{0,18}|recovery-review-" + _OPERATION + r")\.json|preparations/" + _OPERATION + r"/request\.json))$")
 _UNIT_PATHS = frozenset({"/etc/systemd/system/streamhome.service", "/etc/systemd/system/streamhome-operation@.service", "/etc/systemd/system/streamhome-provision@.service", "/etc/systemd/system/streamhome-prepare@.service", "/etc/systemd/system/streamhome-startup@.service", "/etc/polkit-1/rules.d/49-streamhome-operations.rules"})
 
 

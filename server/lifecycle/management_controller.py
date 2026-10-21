@@ -258,8 +258,15 @@ class ManagementController:
 
 
 def main(operation_id: str, *, control_manifest_sha256: str) -> int:
-    reviewed = read_management_request(operation_id)
-    controller = ManagementController(reviewed, control_manifest_sha256=control_manifest_sha256)
+    from .control.recovery_requests import read_grant, recovery_path
+    authority = state.inspect_state(ROOT)
+    next_path = recovery_path(operation_id, max(2, authority.generation + 1))
+    if authority.active_operation is not None and next_path.exists():
+        controller = RecoveredManagementController(read_grant(operation_id, authority.generation + 1),
+            control_manifest_sha256=control_manifest_sha256)
+    else:
+        reviewed = read_management_request(operation_id)
+        controller = ManagementController(reviewed, control_manifest_sha256=control_manifest_sha256)
     def cancel(_signal, _frame):
         controller.cancelled = True
     for value in (signal.SIGTERM, signal.SIGINT):
@@ -274,3 +281,45 @@ def main(operation_id: str, *, control_manifest_sha256: str) -> int:
         return 2
     finally:
         controller.close()
+
+
+class RecoveredManagementController(ManagementController):
+    """Forward continuation after a fresh exact review, on the same supervisor."""
+    def __init__(self, grant: dict, *, control_manifest_sha256: str):
+        from .control.requests import parse_management_request
+        from .control.recovery_requests import parse_grant
+        self.grant = parse_grant(grant)
+        super().__init__(parse_management_request(grant['request']), control_manifest_sha256=control_manifest_sha256)
+
+    def execute(self) -> None:
+        from .management_recovery_store import acquire_recovery_lease, resume_candidate_verification
+        from .runtime_links import recover_management_links
+        self.checkpoint()
+        self.lease, self.claim, self.journal = acquire_recovery_lease(ROOT,
+            operation_id=self.review.operation_id, generation=self.review.expected_generation,
+            evidence_sha256=self.grant['source_evidence_sha256'], review_id=self.grant['recovery_review_id'],
+            action=self.grant['action'], controller_invocation_id=self.invocation, pre_transfer_check=self.checkpoint)
+        if self.journal.action is contract.ManagementAction.CONFIGURE_APPLY:
+            self.store.rebind_apply_receipt(ROOT, self.journal, lease=self.lease)
+        self.wait_os_receipt()
+        if self.rpc('supervisor', 'recover_children').get('stopped') is not True:
+            raise ControlError('control_children_busy')
+        def assert_stopped():
+            if self.rpc('supervisor', 'assert_recovery_stopped').get('stopped') is not True:
+                raise ControlError('control_children_busy')
+        recover_management_links(ROOT, self.journal, lease=self.lease, target='candidate', assert_children_stopped=assert_stopped)
+        self.phase(state.LifecyclePhase.RECOVERY_REQUIRED, state.LifecyclePhase.EXCLUSIVE)
+        self.phase(state.LifecyclePhase.EXCLUSIVE, state.LifecyclePhase.VERIFYING)
+        self.journal = resume_candidate_verification(ROOT, self.journal, lease=self.lease)
+        self.rpc('supervisor', 'launch_recovered')
+        evidence = self.wait_guarded()
+        if self.journal.acceptance is None:
+            digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+            self.advance(contract.ManagementStage.ACCEPTED,
+                acceptance=contract.AcceptanceEvidence(contract.execution_tuple_sha256(self.journal.candidate), digest))
+        publish_accepted_execution(ROOT, self.journal, lease=self.lease)
+        if self.journal.action is contract.ManagementAction.CONFIGURE_APPLY:
+            self.store.promote_active(ROOT, self.journal, lease=self.lease)
+        self.commit_and_wait_recovery()
+        self.advance(contract.ManagementStage.SUCCEEDED)
+        self.complete()

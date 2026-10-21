@@ -362,5 +362,56 @@ class ConfigurationStoreTests(unittest.TestCase):
         self.assertEqual(self.store.inspect().desired, self.initial.reference)
 
 
+    def _recover(self, journal):
+        from lifecycle.management_recovery_store import inspect_recovery, acquire_recovery_lease
+        plan = inspect_recovery(self.root, journal.operation_id, state.inspect_state(self.root).generation)
+        self.lease.release()
+        self.lease, _, recovered = acquire_recovery_lease(self.root, operation_id=journal.operation_id,
+            generation=plan['generation'], evidence_sha256=plan['evidence_sha256'], review_id=str(uuid.uuid4()),
+            action='continue_recovery', controller_invocation_id='2' * 32)
+        return recovered
+
+    def test_recovery_copies_exact_receipt_and_preserves_previous_evidence(self):
+        target = self._target()
+        journal = self._operation(target, mode='cutover')
+        self._publish(journal, target)
+        original = self.store.inspect_apply_receipt(journal.operation_id, journal.generation)
+        before = self.store.inspect()
+        recovered = self._recover(journal)
+        rebound = self.store.rebind_apply_receipt(self.root, recovered, lease=self.lease)
+        self.assertEqual(rebound, replace(original, generation=recovered.generation, journal_identity_sha256=store._journal_identity(recovered)))
+        self.assertEqual(self.store.inspect_apply_receipt(journal.operation_id, journal.generation), original)
+        self.assertEqual(self.store.inspect(), before)
+        self.assertEqual(self.store.rebind_apply_receipt(self.root, recovered, lease=self.lease), rebound)
+
+    def test_two_takeovers_without_receipt_publication_use_retained_original(self):
+        target = self._target()
+        journal = self._operation(target, mode='cutover')
+        self._publish(journal, target)
+        original = self.store.inspect_apply_receipt(journal.operation_id, journal.generation)
+        recovered = self._recover(self._recover(journal))
+        rebound = self.store.rebind_apply_receipt(self.root, recovered, lease=self.lease)
+        self.assertEqual(rebound.generation, 3)
+        self.assertEqual((rebound.expected_desired, rebound.previous_active, rebound.target, rebound.stage),
+                         (original.expected_desired, original.previous_active, original.target, original.stage))
+
+    def test_corrupt_original_receipt_or_foreign_manifest_cannot_be_rebound(self):
+        target = self._target()
+        journal = self._operation(target, mode='cutover')
+        self._publish(journal, target)
+        recovered = self._recover(journal)
+        original = self.directory / f'apply-{journal.operation_id}-{journal.generation}.json'
+        raw = original.read_bytes()
+        original.write_text('{}')
+        with self.assertRaises(store.ConfigurationStoreError):
+            self.store.rebind_apply_receipt(self.root, recovered, lease=self.lease)
+        original.write_bytes(raw)
+        unrelated = self._target(port=5000)
+        self._fixture_manifest(replace(self.store.inspect(), desired=unrelated.reference).payload())
+        with self.assertRaises(store.ConfigurationConflictError):
+            self.store.rebind_apply_receipt(self.root, recovered, lease=self.lease)
+        self.assertFalse((self.directory / f'apply-{recovered.operation_id}-{recovered.generation}.json').exists())
+
+
 if __name__ == "__main__":
     unittest.main()

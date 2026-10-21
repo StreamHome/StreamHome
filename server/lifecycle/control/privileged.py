@@ -187,6 +187,11 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
     configuration.add_argument("--request", type=Path, help="Apply an explicit revision-bound noninteractive JSON request.")
     repair = commands.add_parser("repair", help="Review dependency repair or an interrupted first-start attempt.")
     repair.add_argument("--request", type=Path, help="Explicit noninteractive repair request with current identity and consent.")
+    recovery = commands.add_parser("recover", help="Review continuation of an interrupted management operation.")
+    recovery.add_argument("--operation", required=True, help="The exact unresolved operation UUID.")
+    recovery_input = recovery.add_mutually_exclusive_group()
+    recovery_input.add_argument("--request", type=Path, help="An exact evidence-bound recovery consent request.")
+    recovery_input.add_argument("--review", action="store_true", help="Print the current recovery review without changing the installation.")
     commands.add_parser("help", help="Show this help.")
     for name in ("bootstrap", "setup-code"):
         code = commands.add_parser(name, help="Show or explicitly renew the one-time first-setup code.")
@@ -238,6 +243,12 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
         from .provisioning import administrative_lock
         with administrative_lock():
             return repair(request_path=parsed.request, control_manifest_sha256=manifest_sha256)
+    if parsed.command == "recover":
+        require_root()
+        from .recover import recover
+        from .provisioning import administrative_lock
+        with administrative_lock():
+            return recover(parsed.operation, request_path=parsed.request, control_manifest_sha256=manifest_sha256, review_only=parsed.review)
     if parsed.command in {"bootstrap", "setup-code"}:
         bootstrap_code(renew=parsed.renew)
         return 0

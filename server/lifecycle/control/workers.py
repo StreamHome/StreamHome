@@ -81,11 +81,12 @@ def prepare_management_request(payload: dict, *, control_manifest_sha256: str) -
 def bridge_observe(payload: dict) -> dict:
     from .. import management_journal as contract, management_store
     from .processes import controller_peer
+    from .recovery_requests import effective_request
     from .requests import read_management_request
     if not isinstance(payload, dict) or set(payload) != {"operation_id", "controller_pid", "controller_invocation_id"} or type(payload["controller_pid"]) is not int:
         raise ControlError("control_request_invalid")
-    reviewed = read_management_request(payload["operation_id"])
-    journal = management_store.inspect_management_journal(ROOT, reviewed.operation_id)
+    journal = management_store.inspect_management_journal(ROOT, payload["operation_id"])
+    reviewed = effective_request(journal, original=read_management_request(journal.operation_id))
     authority = state.inspect_state(ROOT)
     lease = state.read_controller_lease(ROOT)
     if (lease is None or not state.controller_lease_is_current(lease) or lease.pid != payload["controller_pid"]
@@ -97,13 +98,15 @@ def bridge_observe(payload: dict) -> dict:
         raise ControlError("control_controller_changed")
     controller_peer(lease.pid, reviewed.operation_id)
     contract.validate_active_journal(journal, authority)
-    if journal.stage is contract.ManagementStage.PREPARED:
+    recovering = journal.generation != read_management_request(journal.operation_id).expected_generation + 1
+    effect_requested = journal.stage is contract.ManagementStage.PREPARED or recovering and journal.stage is contract.ManagementStage.RECOVERY_REQUIRED
+    if effect_requested:
         # Only PREPARED can request a root OS effect. Later observations are
         # progress, and must not wait on the controller's long exclusive
         # runtime verification while it holds the canonical state lock.
         state.validate_operation_with_credential(ROOT, operation_id=journal.operation_id, generation=journal.generation, expected_phase=authority.active_operation.phase)
     return {"request_sha256": reviewed.sha256, "generation": journal.generation,
-            "stage": journal.stage.value, "os_effect_requested": journal.stage is contract.ManagementStage.PREPARED,
+            "stage": journal.stage.value, "os_effect_requested": effect_requested,
             "previous_boot_enabled": reviewed.previous_boot_enabled, "boot_enabled": reviewed.boot_enabled,
             "controller_invocation_id": journal.controller_invocation_id, "controller_pid": lease.pid,
             "accepted": journal.acceptance is not None}
@@ -111,9 +114,9 @@ def bridge_observe(payload: dict) -> dict:
 
 def operation_result(operation_id: str) -> dict:
     from .. import management_journal as contract, management_store
-    from .requests import read_management_request
-    reviewed = read_management_request(operation_id)
+    from .recovery_requests import effective_request
     journal = management_store.inspect_management_journal(ROOT, operation_id)
+    reviewed = effective_request(journal, require_live=False)
     authority = state.inspect_state(ROOT)
     if (journal.review_id != reviewed.review_id or journal.installation_id != reviewed.installation_id
             or journal.previous != reviewed.previous or journal.candidate != reviewed.candidate
@@ -177,7 +180,7 @@ def inspect_managed() -> dict:
 
 def main(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha256: str) -> int:
     parser = argparse.ArgumentParser(prog="streamhome internal reader")
-    parser.add_argument("action", choices=("inspect", "prepare-request", "bridge-observe", "operation-result", "select-source", "initial-result", "initial-progress", "initial-listener", "initial-authority", "initial-retry-check", "check-listener", "identity", "release-check", "validate-preparation", "runtime-progress", "runtime-result", "prepare-runtime-request"))
+    parser.add_argument("action", choices=("inspect", "prepare-request", "bridge-observe", "operation-result", "select-source", "initial-result", "initial-progress", "initial-listener", "initial-authority", "initial-retry-check", "check-listener", "identity", "release-check", "validate-preparation", "runtime-progress", "runtime-result", "prepare-runtime-request", "recovery-review", "prepare-recovery"))
     parser.add_argument("operation_id", nargs="?")
     parsed = parser.parse_args(arguments)
     snapshot = inspect_installation()
@@ -218,6 +221,14 @@ def main(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha256:
         return 0
     if parsed.action == "inspect":
         print(json.dumps(inspect_managed(), sort_keys=True, allow_nan=False))
+        return 0
+    if parsed.action in {"recovery-review", "prepare-recovery"}:
+        from . import recovery_requests
+        from ..configure_wizard import parse_request_json
+        value = (recovery_requests.review(parsed.operation_id, control_manifest_sha256=manifest_sha256)
+                 if parsed.action == "recovery-review" else recovery_requests.prepare(
+                     parse_request_json(sys.stdin.buffer.read(32769)), control_manifest_sha256=manifest_sha256))
+        print(json.dumps(value, sort_keys=True, allow_nan=False))
         return 0
     if parsed.action in {"validate-preparation", "runtime-progress", "runtime-result", "prepare-runtime-request"}:
         from . import runtime_preparation as preparation

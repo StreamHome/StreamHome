@@ -144,7 +144,7 @@ def publish_request(payload: dict) -> None:
     atomic_root_json(path, payload, gid=selected.service_gid, mode=0o640)
 
 
-def _apply_fixed_boot_effect(payload: dict, observation: dict) -> None:
+def _apply_fixed_boot_effect(payload: dict, observation: dict, *, recovery: bool = False) -> None:
     selected = descriptor()
     if (payload["stop_epoch"] != root_stop_epoch() or payload["boot_id"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip()
             or observation.get("request_sha256") != _sha(payload) or observation.get("generation") != payload["expected_generation"] + 1
@@ -161,7 +161,8 @@ def _apply_fixed_boot_effect(payload: dict, observation: dict) -> None:
                 or int(unit["MainPID"]) != payload["supervisor"]["pid"]):
             raise ControlError("control_incarnation_changed")
     _verify_owned_units()
-    path = OPERATIONS / payload["operation_id"] / "bridge.json"
+    suffix = "-" + str(observation["generation"]) if recovery else ""
+    path = OPERATIONS / payload["operation_id"] / ("bridge" + suffix + ".json")
     receipt = {"schema_version": 1, "request_sha256": _sha(payload), "generation": observation["generation"],
                "controller_invocation_id": observation["controller_invocation_id"], "boot_enabled": payload["boot_enabled"], "stage": "applying"}
     if path.exists():
@@ -178,17 +179,43 @@ def _apply_fixed_boot_effect(payload: dict, observation: dict) -> None:
     if _boot_enabled() is not payload["boot_enabled"]:
         raise ControlError("control_os_verification_failed")
     atomic_root_json(path, {**receipt, "stage": "complete"}, mode=0o600)
-    atomic_root_json(OPERATIONS / payload["operation_id"] / "os-receipt.json", {
+    atomic_root_json(OPERATIONS / payload["operation_id"] / ("os-receipt" + suffix + ".json"), {
         "schema_version": 1, "request_sha256": _sha(payload), "operation_id": payload["operation_id"],
         "generation": observation["generation"], "controller_invocation_id": observation["controller_invocation_id"],
         "boot_enabled": payload["boot_enabled"], "stage": "complete",
     }, gid=selected.service_gid, mode=0o640)
 
 
-def run_operation(payload: dict, *, start: bool = True) -> dict:
+def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | None = None) -> dict:
     require_root()
     operation = _identity(payload.get("operation_id"))
-    publish_request(payload)
+    if recovery_grant is None:
+        publish_request(payload)
+    else:
+        generation = payload.get("expected_generation")
+        if (type(generation) is not int or not 1 <= generation < 2**63 - 1
+                or recovery_grant.get("request") != payload):
+            raise ControlError("control_recovery_request_invalid")
+        selected = descriptor()
+        unit = operation_unit(operation)
+        if unit['ActiveState'] not in {'inactive', 'failed'} or int(unit['MainPID']) != 0:
+            raise ControlError('control_controller_busy')
+        from .stop import _require_empty
+        _require_empty(f'streamhome-operation@{operation}.service')
+        retained = OPERATIONS / operation / ('recovery-review-' + _identity(recovery_grant.get('recovery_review_id')) + '.json')
+        if retained.exists() or retained.is_symlink():
+            if read_protected_json(retained) != recovery_grant:
+                raise ControlError('control_recovery_request_changed')
+        else:
+            atomic_root_json(retained, recovery_grant, gid=selected.service_gid, mode=0o640)
+        path = OPERATIONS / operation / f"recovery-{generation + 1}.json"
+        if path.exists() or path.is_symlink():
+            previous = read_protected_json(path)
+            previous_review = _identity(previous.get('recovery_review_id'))
+            previous_retained = OPERATIONS / operation / ('recovery-review-' + previous_review + '.json')
+            if read_protected_json(previous_retained) != previous:
+                raise ControlError('control_recovery_request_changed')
+        atomic_root_json(path, recovery_grant, gid=selected.service_gid, mode=0o640)
     if start:
         # Type=exec acknowledges the executable, not operation completion. This
         # avoids treating a merely queued start job as an exited controller.
@@ -208,7 +235,10 @@ def run_operation(payload: dict, *, start: bool = True) -> dict:
                     last_stage = observation.get("stage")
                     print("[StreamHome] Management: " + str(last_stage), flush=True)
                 if observation.get("os_effect_requested") is True and not effect_done:
-                    _apply_fixed_boot_effect(payload, observation)
+                    if recovery_grant is None:
+                        _apply_fixed_boot_effect(payload, observation)
+                    else:
+                        _apply_fixed_boot_effect(payload, observation, recovery=True)
                     effect_done = True
         if unit["ActiveState"] in {"inactive", "failed"}:
             try:

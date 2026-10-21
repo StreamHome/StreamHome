@@ -414,6 +414,50 @@ class ConfigurationStore:
         parse_apply_receipt(receipt.payload())
         self._replace(f"apply-{receipt.operation_id}-{receipt.generation}.json", receipt.payload())
 
+    def rebind_apply_receipt(self, root, journal, *, lease) -> ConfigurationApplyReceipt:
+        """Copy exact retained inputs to a reviewed recovery generation.
+
+        The old receipt is never edited. Missing or corrupt lineage cannot be
+        replaced by inferring settings from the current manifest.
+        """
+        from .management_recovery_store import require_takeover_source
+        if journal.stage is not management.ManagementStage.RECOVERY_REQUIRED or journal.action is not management.ManagementAction.CONFIGURE_APPLY:
+            raise ConfigurationStoreError("Receipt rebinding requires reviewed configure recovery.")
+        with self._management_lock(root, journal, lease):
+            source = require_takeover_source(root, journal)
+            current = self.inspect()
+            self._require_domains(current, journal)
+            name = f"apply-{journal.operation_id}-{journal.generation}.json"
+            try:
+                os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                receipt = self._receipt_for_journal(journal)
+                os.fsync(self.fd)
+                return receipt
+            for _ in range(128):
+                previous_name = f"apply-{source.operation_id}-{source.generation}.json"
+                try:
+                    os.stat(previous_name, dir_fd=self.fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    source = require_takeover_source(root, source)
+                else:
+                    receipt = self._receipt_for_journal(source)
+                    break
+            else:
+                raise ConfigurationStoreError("The configuration receipt lineage exceeds its review bound.")
+            if (current.active not in {receipt.previous_active, receipt.target}
+                    or current.desired not in {receipt.expected_desired, receipt.target}
+                    or journal.acceptance is None and current.active != receipt.previous_active
+                    or current.active == receipt.target and journal.acceptance is not None and current.desired != receipt.target):
+                raise ConfigurationConflictError("The manifest no longer matches the retained apply receipt.")
+            self.read_revision(current.active)
+            self.read_revision(current.desired)
+            rebound = replace(receipt, generation=journal.generation, journal_identity_sha256=_journal_identity(journal))
+            self._replace(name, rebound.payload(), immutable=True)
+            return rebound
+
     def _intent(self, current, journal, expected, target) -> ConfigurationApplyReceipt:
         name = f"apply-{journal.operation_id}-{journal.generation}.json"
         try:
