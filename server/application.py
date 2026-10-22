@@ -797,9 +797,12 @@ async def _promote_committed_management(runtime: _WorkerRuntime, fence: DrainSna
         return
     STARTUP_READINESS.mark_workers_started()
     STARTUP_READINESS.mark_general_ready()
-    while not guarded_operation_completed(STARTUP_CONTEXT):
+    while True:
         current = lifecycle_state.inspect_state(STARTUP_CONTEXT.installation_root)
         operation = current.active_operation
+        if (operation is None and current.generation == STARTUP_CONTEXT.generation
+                and guarded_operation_completed(STARTUP_CONTEXT)):
+            break
         if (
             operation is None or operation.operation_id != STARTUP_CONTEXT.operation_id
             or current.generation != STARTUP_CONTEXT.generation

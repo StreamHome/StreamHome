@@ -1,9 +1,10 @@
-# Management authority and journal foundation
+# Management authority and journals
 
-This increment adds lifecycle authority version 2, strict management journal
-contracts and operation-bound persistence. It does not expose a management
-controller, configuration activation, systemd integration or a global command.
-Legacy startup, update and restore remain available on their existing format.
+Lifecycle authority version 2 adds strict management journals and operation-bound
+persistence. Managed configuration activation, systemd control, environment
+preparation and [reviewed forward recovery](management-recovery.md) use these
+contracts. Legacy startup, update and restore retain their existing format;
+their managed adapters remain a separate integration requirement.
 
 ## Authority versions
 
@@ -113,9 +114,11 @@ permission to mutate or launch anything.
 ## Canonical-bound persistence
 
 `server/lifecycle/management_store.py` stores `management/<operation-id>/journal.json`
-under the canonical lifecycle directory. That resolver currently retains the
-legacy layout; the managed durable-path integration is still pending. No current
-production dispatcher calls this store.
+under the canonical lifecycle directory. Managed installations resolve it to
+`/var/lib/streamhome/lifecycle`; legacy checkouts retain their existing resolver.
+The UID management controller uses this store for ordinary operation progress.
+Explicit generation takeover uses a separate retained-intent protocol and cannot
+be performed through an ordinary journal update.
 
 Creation and progress require an exact living controller lease and current
 credential under controller-lock-before-state-lock ordering. The journal must
@@ -134,9 +137,9 @@ retains authority and evidence; it cannot acknowledge success or force-clear.
 
 ## Remaining integration gates
 
-Guarded management verification/acceptance, settled runtime admission, explicit
-operator recovery and journal generation rebinding remain unimplemented.
-Configuration/runtime/control changes must not use this foundation until those
-protocols, trusted provisioning, compatible readers and managed path resolution
-are qualified. In particular, this increment does not provide an installer,
-bootstrap code, `streamhome configure`, service control or dependency repair.
+Guarded verification/acceptance, settled admission, protected provisioning,
+configuration activation and same-supervisor forward recovery are implemented
+for the qualified managed runtime. Guarded rollback/safe abort, stopped/replaced
+supervisor recovery, bound environment/control reconstruction and managed
+update/restore integration remain separate incomplete gates. Existing schema
+validators or link-recovery primitives do not make those operations available.

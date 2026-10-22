@@ -36,6 +36,10 @@ class ConfigurationConflictError(ConfigurationStoreError):
     pass
 
 
+class ConfigurationReceiptMissingError(ConfigurationStoreError):
+    pass
+
+
 @dataclass(frozen=True)
 class DeploymentReference:
     revision: str
@@ -414,13 +418,15 @@ class ConfigurationStore:
         parse_apply_receipt(receipt.payload())
         self._replace(f"apply-{receipt.operation_id}-{receipt.generation}.json", receipt.payload())
 
-    def rebind_apply_receipt(self, root, journal, *, lease) -> ConfigurationApplyReceipt:
+    def rebind_apply_receipt(self, root, journal, *, lease, original_generation: int | None = None) -> ConfigurationApplyReceipt:
         """Copy exact retained inputs to a reviewed recovery generation.
 
         The old receipt is never edited. Missing or corrupt lineage cannot be
         replaced by inferring settings from the current manifest.
         """
         from .management_recovery_store import require_takeover_source
+        if original_generation is not None and (type(original_generation) is not int or not 1 <= original_generation < journal.generation):
+            raise ConfigurationStoreError("The original configure generation is invalid.")
         if journal.stage is not management.ManagementStage.RECOVERY_REQUIRED or journal.action is not management.ManagementAction.CONFIGURE_APPLY:
             raise ConfigurationStoreError("Receipt rebinding requires reviewed configure recovery.")
         with self._management_lock(root, journal, lease):
@@ -441,6 +447,10 @@ class ConfigurationStore:
                 try:
                     os.stat(previous_name, dir_fd=self.fd, follow_symlinks=False)
                 except FileNotFoundError:
+                    if source.generation == original_generation:
+                        raise ConfigurationReceiptMissingError("The original configure never published its apply receipt.")
+                    if original_generation is not None and source.generation < original_generation:
+                        raise ConfigurationConflictError("The receipt lineage predates the original configure review.")
                     source = require_takeover_source(root, source)
                 else:
                     receipt = self._receipt_for_journal(source)
@@ -457,6 +467,61 @@ class ConfigurationStore:
             rebound = replace(receipt, generation=journal.generation, journal_identity_sha256=_journal_identity(journal))
             self._replace(name, rebound.payload(), immutable=True)
             return rebound
+
+    def recover_desired(self, root, journal, *, lease, original_generation: int,
+                        expected: DeploymentReference, target: DeploymentRevision) -> ConfigurationManifest:
+        """Finish the original desired-publication intent during forward recovery.
+
+        A missing original receipt permits creation only while both active and
+        desired still equal the reviewed base. An unexplained target already in
+        the manifest cannot be used to manufacture a lost receipt.
+        """
+        from .management_recovery_store import inspect_takeover
+        if (journal.stage is not management.ManagementStage.RECOVERY_REQUIRED
+                or journal.action is not management.ManagementAction.CONFIGURE_APPLY
+                or journal.activation_mode is not management.ActivationMode.CUTOVER
+                or target.installation_id != self.installation_id
+                or target.revision != journal.candidate.deployment_revision):
+            raise ConfigurationStoreError("Desired recovery requires the original cutover configuration.")
+        intent = inspect_takeover(root, journal.operation_id, journal.generation)
+        if intent.action != 'continue_recovery':
+            raise ConfigurationStoreError("The recovery review does not authorize desired publication.")
+        self.prepare_revision(target)
+        missing = False
+        try:
+            self.rebind_apply_receipt(root, journal, lease=lease, original_generation=original_generation)
+        except ConfigurationReceiptMissingError:
+            missing = True
+        with self._management_lock(root, journal, lease):
+            current = self.inspect()
+            self._require_domains(current, journal)
+            if missing:
+                if (journal.acceptance is not None or current.desired != expected
+                        or current.active.revision != journal.previous.deployment_revision):
+                    raise ConfigurationConflictError("A missing receipt cannot explain an already published configuration.")
+                receipt = self._intent(current, journal, expected, target.reference)
+            else:
+                receipt = self._receipt_for_journal(journal)
+            if (receipt.expected_desired != expected or receipt.target != target.reference
+                    or target.revision in current.quarantined
+                    or current.desired not in {expected, target.reference}):
+                raise ConfigurationConflictError("The original configure intent changed during recovery.")
+            if journal.acceptance is not None:
+                if receipt.stage not in {'applying', 'accepted'} or current.desired != target.reference:
+                    raise ConfigurationConflictError("Accepted configure recovery requires its prior desired publication.")
+                os.fsync(self.fd)
+                return current
+            if current.active != receipt.previous_active or receipt.stage not in {'prepared', 'applying'}:
+                raise ConfigurationConflictError("Unaccepted configure recovery cannot change the active revision.")
+            self.read_revision(current.active)
+            self.read_revision(current.desired)
+            if current.desired != target.reference:
+                current = replace(current, desired=target.reference)
+                self._replace('manifest.json', current.payload())
+            else:
+                os.fsync(self.fd)
+            self._write_receipt(replace(receipt, stage='applying'))
+            return current
 
     def _intent(self, current, journal, expected, target) -> ConfigurationApplyReceipt:
         name = f"apply-{journal.operation_id}-{journal.generation}.json"

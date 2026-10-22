@@ -58,6 +58,9 @@ class ManagementRecoveryExecutionTests(unittest.TestCase):
             supervisor_invocation_id=self.source.supervisor_invocation_id)
         value = controller.RecoveredManagementController.__new__(controller.RecoveredManagementController)
         value.review = parse_management_request(reviewed)
+        original_patch = patch.object(controller, 'read_management_request', return_value=replace(value.review, expected_generation=self.source.generation - 1))
+        original_patch.start()
+        self.addCleanup(original_patch.stop)
         value.grant = {'source_evidence_sha256': snapshot['evidence_sha256'], 'recovery_review_id': str(uuid.uuid4()), 'action': 'continue_recovery'}
         value.invocation = '2' * 32
         value.store = self.fixture.store
@@ -120,6 +123,20 @@ class ManagementRecoveryExecutionTests(unittest.TestCase):
         self.assertEqual(execution_state.read_active_execution(self.root).execution, self.source.candidate)
         self.assertEqual(self.fixture.store.inspect().active, self.target.reference)
         self.assertEqual(recovery.inspect_recovery(self.root, value.journal.operation_id, 2)['permitted_actions'], ['continue_recovery'])
+
+    def test_succeeded_journal_before_authority_release_can_be_reviewed_and_completed(self):
+        first = self.make_controller()
+        first.complete = Mock(side_effect=OSError('completion reply gap'))
+        with self.assertRaises(OSError):
+            first.execute()
+        self.assertEqual(first.journal.stage, contract.ManagementStage.SUCCEEDED)
+        acceptance = first.journal.acceptance
+        first.lease.release()
+        second = self.make_controller()
+        second.execute()
+        self.assertEqual(second.journal.acceptance, acceptance)
+        self.assertEqual(execution_state.read_active_execution(self.root).generation, 3)
+        self.assertIsNone(state.inspect_state(self.root).active_operation)
 
 
 if __name__ == '__main__':

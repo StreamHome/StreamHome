@@ -412,6 +412,53 @@ class ConfigurationStoreTests(unittest.TestCase):
             self.store.rebind_apply_receipt(self.root, recovered, lease=self.lease)
         self.assertFalse((self.directory / f'apply-{recovered.operation_id}-{recovered.generation}.json').exists())
 
+    def test_early_configure_recovery_reconstructs_only_original_unpublished_intent(self):
+        target = self._target()
+        journal = self._operation(target, mode='cutover')
+        (self.directory / f'deployment-{target.revision}.json').unlink()
+        recovered = self._recover(journal)
+        updated = self.store.recover_desired(self.root, recovered, lease=self.lease,
+            original_generation=journal.generation, expected=self.initial.reference, target=target)
+        self.assertEqual(updated.active, self.initial.reference)
+        self.assertEqual(updated.desired, target.reference)
+        receipt = self.store.inspect_apply_receipt(journal.operation_id, recovered.generation)
+        self.assertEqual(receipt.stage, 'applying')
+        self.assertFalse((self.directory / f'apply-{journal.operation_id}-{journal.generation}.json').exists())
+        self.assertEqual(self.store.recover_desired(self.root, recovered, lease=self.lease,
+            original_generation=journal.generation, expected=self.initial.reference, target=target), updated)
+
+    def test_prepared_receipt_before_manifest_reply_is_rebound_and_published_once(self):
+        target = self._target()
+        journal = self._operation(target, mode='cutover')
+        write = self.store._replace
+        def fail_manifest(name, payload, **kwargs):
+            if name == 'manifest.json':
+                raise store.ConfigurationStoreError('before manifest fixture')
+            return write(name, payload, **kwargs)
+        with patch.object(self.store, '_replace', side_effect=fail_manifest):
+            with self.assertRaises(store.ConfigurationStoreError):
+                self._publish(journal, target)
+        original = self.store.inspect_apply_receipt(journal.operation_id, journal.generation)
+        self.assertEqual(original.stage, 'prepared')
+        recovered = self._recover(journal)
+        self.store.recover_desired(self.root, recovered, lease=self.lease,
+            original_generation=journal.generation, expected=self.initial.reference, target=target)
+        self.assertEqual(self.store.inspect().desired, target.reference)
+        self.assertEqual(self.store.inspect_apply_receipt(journal.operation_id, journal.generation), original)
+        self.assertEqual(self.store.inspect_apply_receipt(journal.operation_id, recovered.generation).stage, 'applying')
+
+    def test_missing_original_receipt_cannot_be_invented_from_unexplained_desired(self):
+        target = self._target()
+        journal = self._operation(target, mode='cutover')
+        self._fixture_manifest(replace(self.manifest, desired=target.reference).payload())
+        recovered = self._recover(journal)
+        before = self.store.inspect()
+        with self.assertRaises(store.ConfigurationConflictError):
+            self.store.recover_desired(self.root, recovered, lease=self.lease,
+                original_generation=journal.generation, expected=self.initial.reference, target=target)
+        self.assertEqual(self.store.inspect(), before)
+        self.assertFalse((self.directory / f'apply-{journal.operation_id}-{recovered.generation}.json').exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,80 @@
+# Managed operation recovery
+
+Managed installations retain the original operation when configuration activation
+or environment activation is interrupted. A failed command does not authorize a
+reinstall, erase lifecycle state or reverse database writes. Recovery continues
+the recorded application, configuration and runtime tuple after a fresh review.
+
+The currently qualified path is a CUTOVER operation whose original systemd
+supervisor is still running. It supports failure before configuration publication,
+failure during guarded verification, failure after acceptance and a terminal
+`succeeded` journal whose canonical completion was interrupted. Stopped or replaced
+supervisors, save-only/OS-only recovery and operation-bound environment/control
+reconstruction require their separate maintenance protocols. This command refuses
+those unqualified cases.
+
+## Review and continue
+
+Use the exact unresolved operation UUID reported by installation diagnostics:
+
+```bash
+sudo streamhome recover --operation <operation-uuid> --review
+sudo streamhome recover --operation <operation-uuid>
+```
+
+The first command prints current evidence without changing canonical authority,
+configuration or application processes. The second reviews an interruption of the
+owned application children. Empty Enter at its `[Y/n]` prompt means Yes; EOF,
+missing terminal and interrupted input are not consent. A declined review leaves
+the original operation unresolved.
+
+Automation uses `--request FILE` instead of interactive input. The JSON must contain
+exactly `schema_version` (1), `operation_id`, `expected_generation`,
+`expected_evidence_sha256`, `continue_recovery` and `interruption_approved`.
+Obtain the generation and evidence hash from a fresh `--review`. Both consent
+fields must be JSON booleans and true for continuation. Stale evidence is rejected;
+there is no force option or implicit retry loop.
+
+The current CLI exposes forward continuation. Link-recovery helpers and internal
+recovery-plan actions do not expose a guarded rollback or safe-abort command.
+
+## Ownership and durable evidence
+
+Root runs only the authenticated protected control entry. Application state and
+journals are interpreted after dropping to the dedicated service UID. A root grant
+binds the original request, exact operation/generation, fresh review, boot identity,
+stop epoch and a finite monotonic lifetime. Root OS effects require a separate
+receipt from that exact living UID controller; an old receipt cannot grant a new
+generation authority.
+
+Under controller-lock exclusion, recovery rechecks the evidence and persists its
+intent before rotating the generation and owner capability. The source journal,
+unique review and per-generation takeover record remain retained. A subsequent
+review can explain a crash between transfer and journal rebinding. Missing or
+unexplained lineage is an error, rather than permission to infer a new installation.
+
+Configuration receipts are copied into the new generation with the same reviewed
+base and target. If the original operation never published a receipt, recovery may
+create one only while active and desired configuration still match the reviewed
+base. An already changed manifest cannot manufacture evidence for a missing receipt.
+
+Web dependency and build links are reconstructed only from the original bound
+previous/candidate pair and retained receipts, after proving children stopped.
+Referenced environments and recovery evidence remain available. No database,
+media, account or provider rollback is performed.
+
+## Acceptance and completion
+
+An unaccepted candidate must pass guarded verification before acceptance. Existing
+acceptance is preserved byte for byte: recovery cannot relabel another runtime as
+accepted or switch to the previous tuple after acceptance.
+
+The accepted backend performs mandatory recovery before the controller publishes
+its terminal journal and completes canonical authority. The application separately
+observes that exact terminal journal and idle generation before opening ordinary
+traffic. Observing completion between two checks must not be treated as a lifecycle
+failure. A different generation or missing terminal evidence still closes admission.
+
+The qualified native environment is Ubuntu 24.04, x86_64, systemd/cgroup v2 and
+Python 3.12.3. Source tests and disposable native fault injection do not certify
+valuable-data recovery, other distributions or physical power-loss behavior.

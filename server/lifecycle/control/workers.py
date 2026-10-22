@@ -101,9 +101,9 @@ def bridge_observe(payload: dict) -> dict:
     recovering = journal.generation != read_management_request(journal.operation_id).expected_generation + 1
     effect_requested = journal.stage is contract.ManagementStage.PREPARED or recovering and journal.stage is contract.ManagementStage.RECOVERY_REQUIRED
     if effect_requested:
-        # Only PREPARED can request a root OS effect. Later observations are
-        # progress, and must not wait on the controller's long exclusive
-        # runtime verification while it holds the canonical state lock.
+        # Original PREPARED work and an explicitly rebound recovery can request
+        # their own OS receipt. Other observations are progress and cannot wait
+        # on the controller's long exclusive runtime verification lock.
         state.validate_operation_with_credential(ROOT, operation_id=journal.operation_id, generation=journal.generation, expected_phase=authority.active_operation.phase)
     return {"request_sha256": reviewed.sha256, "generation": journal.generation,
             "stage": journal.stage.value, "os_effect_requested": effect_requested,

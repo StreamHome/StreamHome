@@ -79,7 +79,8 @@ def parse_takeover_intent(payload: dict) -> TakeoverIntent:
             or (previous.generation < result.source_generation) != (parent is not None)
             or target.stage is not contract.ManagementStage.RECOVERY_REQUIRED
             or previous.stage in {contract.ManagementStage.SAVED, contract.ManagementStage.OS_COMPLETED,
-                                  contract.ManagementStage.ROLLED_BACK, contract.ManagementStage.SUCCEEDED}
+                                  contract.ManagementStage.ROLLED_BACK}
+            or previous.stage is contract.ManagementStage.SUCCEEDED and previous.acceptance is None
             or result.action in {"rollback", "safe_abort"} and previous.acceptance is not None):
         raise ManagementRecoveryError("The recovery intent does not bind a recoverable generation.")
     before, after = contract.management_journal_payload(previous), contract.management_journal_payload(target)
@@ -172,7 +173,7 @@ def inspect_recovery(root: Path, operation_id: str, generation: int) -> dict:
     if operation.phase is not expected_phase and operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED and not phase_gap:
         raise ManagementRecoveryError("The journal does not explain the canonical phase.")
     if effective.stage in {contract.ManagementStage.SAVED, contract.ManagementStage.OS_COMPLETED,
-                           contract.ManagementStage.ROLLED_BACK, contract.ManagementStage.SUCCEEDED}:
+                           contract.ManagementStage.ROLLED_BACK}:
         raise ManagementRecoveryError("Terminal acknowledgement requires its completion protocol.")
     actions = ["continue_recovery"]
     if effective.acceptance is None:

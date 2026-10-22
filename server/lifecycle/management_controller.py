@@ -300,7 +300,10 @@ class RecoveredManagementController(ManagementController):
             evidence_sha256=self.grant['source_evidence_sha256'], review_id=self.grant['recovery_review_id'],
             action=self.grant['action'], controller_invocation_id=self.invocation, pre_transfer_check=self.checkpoint)
         if self.journal.action is contract.ManagementAction.CONFIGURE_APPLY:
-            self.store.rebind_apply_receipt(ROOT, self.journal, lease=self.lease)
+            original = read_management_request(self.journal.operation_id)
+            self.store.recover_desired(ROOT, self.journal, lease=self.lease,
+                original_generation=original.expected_generation + 1, expected=original.expected_desired,
+                target=DeploymentRevision(self.journal.installation_id, self.journal.candidate.deployment_revision, original.deployment))
         self.wait_os_receipt()
         if self.rpc('supervisor', 'recover_children').get('stopped') is not True:
             raise ControlError('control_children_busy')
