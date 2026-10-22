@@ -114,6 +114,20 @@ permission to mutate or launch anything.
 
 ## Canonical-bound persistence
 
+Previous-runtime recovery uses journal version 2: it retains all version-1 fields
+and adds exactly `recovery_target: "previous"`. Ordinary candidate journals keep
+their version-1 representation and hashes. Both original execution tuples remain
+immutable; a rollback cannot relabel the previous tuple as the candidate.
+
+Only an explicit unaccepted rollback/abort takeover can select the previous
+runtime. Its guarded verification publishes acceptance of that exact previous
+tuple before mandatory recovery or ordinary worker effects. Its terminal stage
+is `rolled_back`. Once either selected runtime is accepted, recovery preserves
+that selection and acceptance; a new generation cannot switch it. A terminal
+previous-runtime journal whose canonical completion failed remains reviewable.
+Bound readers must explicitly declare both management journal formats in support
+contract version 3; an older reader is not presumed compatible.
+
 `server/lifecycle/management_store.py` stores `management/<operation-id>/journal.json`
 under the canonical lifecycle directory. Managed installations resolve it to
 `/var/lib/streamhome/lifecycle`; legacy checkouts retain their existing resolver.

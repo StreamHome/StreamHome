@@ -262,18 +262,20 @@ def _evaluate_startup(
         context = _failure_context(resolved_root, "management_startup_unavailable", inspected)
         if requested_raw == StartupMode.MANAGEMENT_VERIFY.value:
             try:
-                from .management_journal import ActivationMode, ManagementStage, execution_tuple_sha256, validate_active_journal
+                from .management_journal import ActivationMode, ManagementStage, execution_tuple_sha256, selected_execution, validate_active_journal
                 from .management_store import inspect_management_journal
                 journal = inspect_management_journal(resolved_root, operation.operation_id)
                 validate_active_journal(journal, inspected)
+                execution = selected_execution(journal)
+                terminal = ManagementStage.ROLLED_BACK if journal.recovery_target == 'previous' else ManagementStage.SUCCEEDED
                 lease = state.read_controller_lease(resolved_root)
                 if (
                     operation_id != operation.operation_id or generation_raw != str(inspected.generation)
                     or operation.phase is not state.LifecyclePhase.VERIFYING
                     or journal.activation_mode is not ActivationMode.CUTOVER
-                    or journal.stage not in {ManagementStage.VERIFYING, ManagementStage.ACCEPTED, ManagementStage.SUCCEEDED}
-                    or selected_environ.get("STREAMHOME_BUILD_ID") != journal.candidate.application_build_id
-                    or selected_environ.get("STREAMHOME_RUNTIME_TUPLE_SHA256") != execution_tuple_sha256(journal.candidate)
+                    or journal.stage not in {ManagementStage.VERIFYING, ManagementStage.ACCEPTED, terminal}
+                    or selected_environ.get("STREAMHOME_BUILD_ID") != execution.application_build_id
+                    or selected_environ.get("STREAMHOME_RUNTIME_TUPLE_SHA256") != execution_tuple_sha256(execution)
                     or lease is None or not state.controller_lease_is_current(lease)
                     or lease.operation_id != operation.operation_id or lease.generation != inspected.generation
                     or lease.owner_kind is not state.OwnerKind.MANAGEMENT_CONTROLLER
@@ -375,11 +377,11 @@ def evaluate_startup(
                 from .control.tickets import require_first_start
                 from .execution_state import read_active_execution
                 from .installation import InstallationStatus
-                from .management_journal import execution_tuple_sha256
+                from .management_journal import execution_tuple_sha256, selected_execution
                 from .management_store import inspect_management_journal
                 from .runtime_build import file_sha256
                 execution = (
-                    inspect_management_journal(context.installation_root, context.operation_id).candidate
+                    selected_execution(inspect_management_journal(context.installation_root, context.operation_id))
                     if context.mode is StartupMode.MANAGEMENT_VERIFY
                     else read_active_execution(context.installation_root).execution
                 )
@@ -444,7 +446,8 @@ def guarded_operation_completed(
                 journal = inspect_management_journal(context.installation_root, context.operation_id)
                 return (
                     current.generation == context.generation and journal.generation == context.generation
-                    and journal.stage is ManagementStage.SUCCEEDED and journal.acceptance is not None
+                    and journal.stage is (ManagementStage.ROLLED_BACK if journal.recovery_target == 'previous' else ManagementStage.SUCCEEDED)
+                    and journal.acceptance is not None
                 )
             return current.generation == context.generation
         if (

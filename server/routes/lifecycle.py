@@ -42,7 +42,7 @@ async def commit_managed_runtime(
 ):
     """Acknowledge an already durable controller acceptance; never mint one."""
     global _management_commit_acknowledged
-    from lifecycle.management_journal import ManagementStage, execution_tuple_sha256, validate_active_journal
+    from lifecycle.management_journal import ManagementStage, execution_tuple_sha256, selected_execution, validate_active_journal
     from lifecycle.management_store import inspect_management_journal
 
     context = require_startup_context()
@@ -61,10 +61,11 @@ async def commit_managed_runtime(
         )
         journal = inspect_management_journal(context.installation_root, payload.operation_id)
         validate_active_journal(journal, authority)
+        terminal = ManagementStage.ROLLED_BACK if journal.recovery_target == 'previous' else ManagementStage.SUCCEEDED
         if (
-            journal.stage not in {ManagementStage.ACCEPTED, ManagementStage.SUCCEEDED}
+            journal.stage not in {ManagementStage.ACCEPTED, terminal}
             or journal.acceptance is None
-            or payload.execution_tuple_sha256 != execution_tuple_sha256(journal.candidate)
+            or payload.execution_tuple_sha256 != execution_tuple_sha256(selected_execution(journal))
             or not _management_commit_acknowledged and not current_readiness_projection(get_startup_readiness())["guardedReady"]
         ):
             raise ValueError("Durable acceptance or guarded readiness is missing.")

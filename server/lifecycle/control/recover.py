@@ -15,15 +15,18 @@ from .privileged import require_root, run_worker
 from .rpc import ControlError
 
 
-def _consent(path: Path, snapshot: dict) -> bool:
+def _consent(path: Path, snapshot: dict, *, action: str = 'continue_recovery') -> bool:
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     with os.fdopen(descriptor, 'rb') as handle:
         metadata = os.fstat(handle.fileno())
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 32768:
             raise ControlError('control_request_invalid')
         value = parse_request_json(handle.read(32769))
-    if (set(value) != {'schema_version', 'operation_id', 'expected_generation', 'expected_evidence_sha256', 'continue_recovery', 'interruption_approved'}
-            or type(value['schema_version']) is not int or value['schema_version'] != 1
+    fields = {'schema_version', 'operation_id', 'expected_generation', 'expected_evidence_sha256', 'continue_recovery', 'interruption_approved'}
+    if (type(value.get('schema_version')) is not int or value['schema_version'] not in {1, 2}
+            or set(value) != (fields if value['schema_version'] == 1 else fields | {'action'})
+            or value['schema_version'] == 1 and action != 'continue_recovery'
+            or value['schema_version'] == 2 and value['action'] != action
             or type(value['expected_generation']) is not int
             or any(type(value[key]) is not bool for key in ('continue_recovery', 'interruption_approved'))):
         raise ControlError('control_request_invalid')
@@ -52,7 +55,8 @@ def _preserved_processes(snapshot: dict) -> dict:
     return processes
 
 
-def recover(operation_id: str, *, request_path: Path | None, control_manifest_sha256: str, review_only: bool = False) -> int:
+def recover(operation_id: str, *, request_path: Path | None, control_manifest_sha256: str, review_only: bool = False,
+            action: str = 'continue_recovery') -> int:
     require_root()
     _identity(operation_id)
     unit = operation_unit(operation_id)
@@ -62,19 +66,28 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
     _require_empty(f'streamhome-operation@{operation_id}.service')
     epoch = root_stop_epoch()
     snapshot = run_worker(['recovery-review', operation_id], timeout=120)
+    if action not in snapshot['permitted_actions']:
+        raise ControlError('control_recovery_action_unavailable')
     processes = _preserved_processes(snapshot)
     if review_only:
         print(json.dumps(snapshot, sort_keys=True, allow_nan=False))
         return 0
     if request_path is not None:
-        approved = _consent(request_path, snapshot)
+        approved = _consent(request_path, snapshot, action=action)
     else:
         with open_console() as console:
             console.write('StreamHome operation recovery')
             console.write('Operation: ' + operation_id)
             console.write('Generation: ' + str(snapshot['generation']))
             console.write('Recovery review SHA-256: ' + snapshot['evidence_sha256'])
-            if snapshot['activation_mode'] == 'cutover':
+            if action in {'rollback', 'safe_abort'}:
+                console.write('The previous recorded runtime will be started under guarded verification.')
+                console.write('Owned application processes will be interrupted. User database writes are preserved.')
+                console.write('Start at boot: ' + ('enabled' if snapshot['previous_boot_enabled'] else 'disabled'))
+            elif snapshot.get('recovery_target') == 'previous':
+                console.write('The previously selected runtime will continue under guarded verification.')
+                console.write('Owned application processes will be interrupted. The recorded previous-runtime selection is retained.')
+            elif snapshot['activation_mode'] == 'cutover':
                 console.write('The recorded application and configuration will be verified and continued.')
                 console.write('Owned application processes will be interrupted. Accepted changes remain accepted.')
             else:
@@ -91,6 +104,7 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
         raise ControlError('control_recovery_review_stale')
     grant = run_worker(['prepare-recovery'], payload={'operation_id': operation_id,
         'expected_evidence_sha256': snapshot['evidence_sha256'], 'recovery_review_id': str(uuid.uuid4()),
+        'action': action,
         'processes': processes, 'boot_enabled': _boot_enabled(),
         'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'stop_epoch': epoch})
     if (grant['request']['controller_control_manifest_sha256'] != control_manifest_sha256

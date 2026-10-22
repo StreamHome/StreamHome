@@ -117,24 +117,31 @@ class ManagementController:
             return value, dict(response.headers)
 
     def wait_guarded(self) -> dict:
+        execution = contract.selected_execution(self.journal)
+        deployment = self.review.deployment
+        if self.journal.recovery_target == 'previous':
+            manifest = self.store.inspect()
+            if manifest.active.revision != execution.deployment_revision:
+                raise ControlError('control_recovery_execution_changed')
+            deployment = self.store.read_revision(manifest.active).settings
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             self.checkpoint()
             try:
                 health, _ = self.http("/api/health")
                 live, _ = self.http("/api/health/live")
-                if (health.get("readyKind") == "guarded" and health.get("buildId") == self.journal.candidate.application_build_id
+                if (health.get("readyKind") == "guarded" and health.get("buildId") == execution.application_build_id
                         and live.get("mode") == "management_verify" and live.get("workersStarted") is False
                         and live.get("generalReady") is False and live.get("recoverySucceeded") is True):
                     # Check the actual web listener too. The proxy must serve the
                     # same build and guarded backend, on the reviewed port.
                     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                    with opener.open(f"http://127.0.0.1:{self.review.deployment.web_port}/api/health", timeout=2) as response:
+                    with opener.open(f"http://127.0.0.1:{deployment.web_port}/api/health", timeout=2) as response:
                         web = json.loads(response.read(32769))
-                        if response.headers.get("X-StreamHome-Web-Build") != self.journal.candidate.application_build_id or web.get("readyKind") != "guarded" or web.get("buildId") != self.journal.candidate.application_build_id:
+                        if response.headers.get("X-StreamHome-Web-Build") != execution.application_build_id or web.get("readyKind") != "guarded" or web.get("buildId") != execution.application_build_id:
                             raise ControlError("control_web_identity_changed")
-                    return {"backend": live, "web_build_id": self.journal.candidate.application_build_id,
-                            "execution_sha256": contract.execution_tuple_sha256(self.journal.candidate),
+                    return {"backend": live, "web_build_id": execution.application_build_id,
+                            "execution_sha256": contract.execution_tuple_sha256(execution),
                             "supervisor_invocation_id": self.review.supervisor_invocation_id}
             except (OSError, ValueError, urllib.error.URLError):
                 pass
@@ -142,9 +149,10 @@ class ManagementController:
         raise ControlError("control_guarded_start_timeout")
 
     def commit_and_wait_recovery(self) -> None:
+        execution = contract.selected_execution(self.journal)
         payload = {"operation_id": self.journal.operation_id, "generation": self.journal.generation,
-                   "build_id": self.journal.candidate.application_build_id,
-                   "execution_tuple_sha256": contract.execution_tuple_sha256(self.journal.candidate)}
+                   "build_id": execution.application_build_id,
+                   "execution_tuple_sha256": contract.execution_tuple_sha256(execution)}
         deadline = time.monotonic() + 120
         acknowledged = False
         while time.monotonic() < deadline:
@@ -294,6 +302,12 @@ class RecoveredManagementController(ManagementController):
         self.grant = parse_grant(grant)
         super().__init__(parse_management_request(grant['request']), control_manifest_sha256=control_manifest_sha256)
 
+    def checkpoint(self) -> None:
+        super().checkpoint()
+        if self.grant['action'] in {'rollback', 'safe_abort'} or self.journal is not None and self.journal.recovery_target == 'previous':
+            from .control.reader_support import require_previous_reader
+            require_previous_reader(self.review.previous)
+
     def execute(self) -> None:
         from .management_recovery_store import acquire_recovery_lease, resume_candidate_verification
         from .runtime_links import recover_management_links
@@ -304,7 +318,9 @@ class RecoveredManagementController(ManagementController):
             action=self.grant['action'], controller_invocation_id=self.invocation, pre_transfer_check=self.checkpoint)
         if self.journal.action is contract.ManagementAction.CONFIGURE_APPLY:
             original = read_management_request(self.journal.operation_id)
-            self.store.recover_desired(ROOT, self.journal, lease=self.lease,
+            recover_configuration = (self.store.recover_previous_configuration if self.journal.recovery_target == 'previous'
+                                     else self.store.recover_desired)
+            recover_configuration(ROOT, self.journal, lease=self.lease,
                 original_generation=original.expected_generation + 1, expected=original.expected_desired,
                 target=DeploymentRevision(self.journal.installation_id, self.journal.candidate.deployment_revision, original.deployment))
         self.wait_os_receipt()
@@ -316,7 +332,7 @@ class RecoveredManagementController(ManagementController):
         def assert_stopped():
             if self.rpc('supervisor', 'assert_recovery_stopped').get('stopped') is not True:
                 raise ControlError('control_children_busy')
-        recover_management_links(ROOT, self.journal, lease=self.lease, target='candidate', assert_children_stopped=assert_stopped)
+        recover_management_links(ROOT, self.journal, lease=self.lease, target=self.journal.recovery_target, assert_children_stopped=assert_stopped)
         self.phase(state.LifecyclePhase.RECOVERY_REQUIRED, state.LifecyclePhase.EXCLUSIVE)
         self.phase(state.LifecyclePhase.EXCLUSIVE, state.LifecyclePhase.VERIFYING)
         self.journal = resume_candidate_verification(ROOT, self.journal, lease=self.lease)
@@ -325,12 +341,12 @@ class RecoveredManagementController(ManagementController):
         if self.journal.acceptance is None:
             digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
             self.advance(contract.ManagementStage.ACCEPTED,
-                acceptance=contract.AcceptanceEvidence(contract.execution_tuple_sha256(self.journal.candidate), digest))
+                acceptance=contract.AcceptanceEvidence(contract.execution_tuple_sha256(contract.selected_execution(self.journal)), digest))
         publish_accepted_execution(ROOT, self.journal, lease=self.lease)
-        if self.journal.action is contract.ManagementAction.CONFIGURE_APPLY:
+        if self.journal.action is contract.ManagementAction.CONFIGURE_APPLY and self.journal.recovery_target == 'candidate':
             self.store.promote_active(ROOT, self.journal, lease=self.lease)
         self.commit_and_wait_recovery()
-        self.advance(contract.ManagementStage.SUCCEEDED)
+        self.advance(contract.ManagementStage.ROLLED_BACK if self.journal.recovery_target == 'previous' else contract.ManagementStage.SUCCEEDED)
         self.complete()
 
     def finish_preserving(self) -> None:

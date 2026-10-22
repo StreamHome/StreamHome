@@ -82,6 +82,27 @@ class ManagementJournalTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_previous_target_is_explicit_version_two_and_accepts_only_previous_tuple(self):
+        payload = {**self.payload, 'schema_version': 2, 'recovery_target': 'previous', 'stage': 'verifying'}
+        journal = contract.parse_management_journal(payload)
+        self.assertEqual(contract.management_journal_payload(journal), payload)
+        self.assertEqual(contract.selected_execution(journal), journal.previous)
+        acceptance = {'execution_tuple_sha256': contract.execution_tuple_sha256(journal.previous), 'verification_sha256': '1' * 64}
+        accepted = contract.parse_management_journal({**payload, 'stage': 'accepted', 'acceptance': acceptance})
+        terminal = contract.parse_management_journal({**payload, 'stage': 'rolled_back', 'acceptance': acceptance})
+        contract.validate_journal_transition(accepted, terminal)
+        for changed in ({'acceptance': self._acceptance()}, {'stage': 'succeeded'}, {'schema_version': 1},
+                        {'recovery_target': 'candidate'}, {'activation_mode': 'save_only'}):
+            with self.subTest(changed=changed), self.assertRaises(contract.ManagementJournalError):
+                contract.parse_management_journal({**payload, 'stage': 'accepted', 'acceptance': acceptance, **changed})
+
+    def test_ordinary_progress_cannot_turn_candidate_acceptance_into_previous_acceptance(self):
+        candidate = self._journal(stage='accepted', acceptance=self._acceptance())
+        previous = replace(candidate, recovery_target='previous',
+            acceptance=contract.AcceptanceEvidence(contract.execution_tuple_sha256(candidate.previous), '1' * 64))
+        with self.assertRaises(contract.ManagementJournalError):
+            contract.validate_journal_transition(candidate, previous)
+
     def test_unknown_and_missing_fields_are_rejected_at_every_level(self) -> None:
         for key in self.payload:
             bad = deepcopy(self.payload)

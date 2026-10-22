@@ -111,8 +111,9 @@ def build(source: Path, output: Path, signing_key: Path, bundle_id: str) -> dict
             files[relative.as_posix()] = hashlib.sha256(raw).hexdigest()
         manifest = {"schema_version": 1, "bundle_id": bundle_id, "entry_protocol": 1,
                     "authority_versions": [1, 2], "control_protocol": 1, "files": files,
-                    "support": {"schema_version": 2, "platform": "ubuntu-24.04-x86_64-glibc-python-3.12.3-systemd-cgroup2",
+                    "support": {"schema_version": 3, "platform": "ubuntu-24.04-x86_64-glibc-python-3.12.3-systemd-cgroup2",
                         "provisioning_journal_versions": [1, 2],
+                        "management_journal_versions": [1, 2],
                         "deadlines_seconds": {"startup_recovery": 900, "startup_extension": 30,
                             "runtime_drain": 45, "runtime_stop": 60, "controller": 3600, "installation": 7200}}}
         write(versions / "manifest.json", encoded(manifest))

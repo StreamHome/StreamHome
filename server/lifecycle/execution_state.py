@@ -108,11 +108,12 @@ def publish_accepted_execution(
         ):
             raise state.OwnershipError("Active execution does not match the current controller journal.")
         current = read_active_execution(root)
-        updated = ExecutionRecord(journal.installation_id, journal.candidate, journal.operation_id, journal.generation)
+        selected = contract.selected_execution(journal)
+        updated = ExecutionRecord(journal.installation_id, selected, journal.operation_id, journal.generation)
         if current == updated:
             state._fsync_directory(layout.state)
             return current
-        if current.execution == journal.candidate and current.operation_id == journal.operation_id and current.generation < journal.generation:
+        if current.execution == selected and current.operation_id == journal.operation_id and current.generation < journal.generation:
             from .management_recovery_store import require_takeover_source
             source = require_takeover_source(root, journal)
             if source.acceptance != journal.acceptance or current.generation > source.generation:

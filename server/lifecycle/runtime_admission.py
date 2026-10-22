@@ -111,7 +111,7 @@ class RuntimeAdmission:
                 self._require_terminal_evidence()
                 if self.context.operation_type == state.OperationType.MANAGEMENT.value:
                     journal = management_store.inspect_management_journal(self.context.installation_root, self.context.operation_id)
-                    if journal.candidate != self.execution or journal.installation_id != self.installation_id:
+                    if contract.selected_execution(journal) != self.execution or journal.installation_id != self.installation_id:
                         raise RuntimeAdmissionError("Terminal management evidence does not identify this execution tuple.")
                 self._receipt(generation=authority.generation, pending=None)
                 self._settled = True

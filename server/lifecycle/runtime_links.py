@@ -83,6 +83,46 @@ def bind_management_runtime(root: Path, journal: contract.ManagementJournal, *, 
         _replace_links(root, journal.previous, journal.candidate, operation_id=journal.operation_id, generation=journal.generation)
 
 
+def _completed_previous_binding(root: Path, journal: contract.ManagementJournal, original: dict) -> bool:
+    """Explain a retained candidate receipt after an earlier accepted rollback.
+
+    Recovery deliberately retains the original receipt. A later operation must
+    prove the exact accepted execution, terminal previous-runtime journal and
+    completed paired-link recovery before using that older receipt as its base.
+    """
+    from .execution_state import ExecutionStateError, read_active_execution
+    from .management_recovery_store import inspect_takeover, _read, _sha
+    from dataclasses import replace
+    try:
+        active = read_active_execution(root)
+    except (FileNotFoundError, ExecutionStateError):
+        return False
+    if (active.execution != journal.previous or active.installation_id != journal.installation_id
+            or active.operation_id == journal.operation_id or active.generation >= journal.generation):
+        return False
+    previous = management_store.inspect_management_journal(root, active.operation_id)
+    if (previous.generation != active.generation or previous.installation_id != journal.installation_id
+            or previous.stage is not contract.ManagementStage.ROLLED_BACK or previous.recovery_target != 'previous'
+            or previous.acceptance is None or contract.selected_execution(previous) != journal.previous):
+        return False
+    intent = inspect_takeover(root, previous.operation_id, previous.generation)
+    if replace(previous, stage=contract.ManagementStage.RECOVERY_REQUIRED,
+            acceptance=intent.target_journal.acceptance) != intent.target_journal:
+        raise RuntimeBuildError('The completed rollback no longer matches its retained review.')
+    expected = {'schema_version': 1, 'operation_id': previous.operation_id, 'generation': previous.generation,
+        'review_id': intent.review_id, 'previous': contract.execution_tuple_sha256(previous.previous),
+        'candidate': contract.execution_tuple_sha256(previous.candidate), 'target': 'previous',
+        'source_receipt_sha256': _sha(original), 'stage': 'complete'}
+    # Several completed early aborts may retain the same much older base receipt.
+    # The latest accepted previous-runtime checkpoint binds its exact digest and
+    # completed destination pair; it must not guess that the base was rewritten
+    # by the immediately preceding operation.
+    receipt = layout_for_root(root).state / f'runtime-link-recovery-{previous.operation_id}-{previous.generation}.json'
+    if _read(receipt) != expected:
+        raise RuntimeBuildError('The completed rollback has no exact paired-link receipt.')
+    return True
+
+
 def recover_management_links(
     root: Path, journal: contract.ManagementJournal, *, lease: state.ControllerLeaseHandle,
     target: str, assert_children_stopped: Callable[[], None],
@@ -90,13 +130,13 @@ def recover_management_links(
     """Recover an exact old/candidate/mixed pair without rewriting its receipt.
 
     Recovery is limited to the original operation and its retained takeover
-    generations. Accepted work can only reconstruct candidate links. This does
+    generations. Accepted work can only reconstruct its selected links. This does
     not launch a runtime, accept it, roll back data or complete the operation.
     """
     from .management_recovery_store import inspect_takeover, require_takeover_source, _read, _sha
     if (journal.activation_mode is not contract.ActivationMode.CUTOVER
             or journal.stage is not contract.ManagementStage.RECOVERY_REQUIRED
-            or target not in {"previous", "candidate"} or target == "previous" and journal.acceptance is not None):
+            or target not in {"previous", "candidate"} or journal.acceptance is not None and target != journal.recovery_target):
         raise RuntimeBuildError("Web binding recovery does not permit the requested target.")
     with state.hold_operation_with_credential(root, operation_id=journal.operation_id, generation=journal.generation,
             expected_operation_type=state.OperationType.MANAGEMENT, expected_phase=state.LifecyclePhase.RECOVERY_REQUIRED) as authority:
@@ -105,7 +145,8 @@ def recover_management_links(
             raise state.OwnershipError("Web binding recovery requires its exact live journal.")
         intent = inspect_takeover(root, journal.operation_id, journal.generation)
         source = require_takeover_source(root, journal)
-        if target == "previous" and intent.action not in {"rollback", "safe_abort"} or target == "candidate" and intent.action != "continue_recovery":
+        if (target != journal.recovery_target or target == 'previous' and intent.target_journal.recovery_target != 'previous'
+                or target == 'candidate' and intent.action != 'continue_recovery'):
             raise RuntimeBuildError("The reviewed recovery selected another web binding target.")
         generations = {journal.generation, source.generation}
         for _ in range(128):
@@ -140,7 +181,7 @@ def recover_management_links(
         own = (original["operation_id"] == journal.operation_id and original["generation"] in generations
                and original["previous"] == previous_sha and original["candidate"] == candidate_sha)
         old_complete = (original["stage"] == "complete" and original["candidate"] == previous_sha)
-        if not own and not old_complete:
+        if not own and not old_complete and not _completed_previous_binding(root, journal, original):
             raise RuntimeBuildError("The original binding receipt does not explain this operation.")
         def recovery_transaction(selected_intent, selected_target):
             return {"schema_version": 1, "operation_id": journal.operation_id, "generation": selected_intent.target_journal.generation,
@@ -154,7 +195,7 @@ def recover_management_links(
             if not earlier.exists() and not earlier.is_symlink():
                 continue
             earlier_intent = inspect_takeover(root, journal.operation_id, generation)
-            selected_target = "candidate" if earlier_intent.action == "continue_recovery" else "previous"
+            selected_target = earlier_intent.target_journal.recovery_target
             expected = recovery_transaction(earlier_intent, selected_target)
             if _read(earlier) not in (expected, {**expected, "stage": "complete"}):
                 raise RuntimeBuildError("The retained binding recovery names another transaction.")

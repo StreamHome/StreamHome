@@ -161,6 +161,25 @@ class ManagementRecoveryStoreTests(unittest.TestCase):
         self.assertEqual(recovery.resume_candidate_verification(self.root, current, lease=self.lease), resumed)
         self.assertIsNotNone(state.inspect_state(self.root).active_operation)
 
+    def test_interrupted_rollback_phase_transitions_keep_previous_as_the_only_target(self):
+        _, current = self.take_over(action='rollback')
+        self.assertEqual(current.recovery_target, 'previous')
+        for before, after in (('recovery_required', 'exclusive'), ('exclusive', 'verifying')):
+            state.transition_operation_with_credential(self.root, operation_id=current.operation_id, generation=2,
+                expected_phase=before, next_phase=after)
+            plan = recovery.inspect_recovery(self.root, current.operation_id, 2)
+            self.assertEqual(plan['permitted_actions'], ['continue_recovery'])
+
+    def test_rollback_transfer_before_journal_rebinding_still_reviews_previous_target(self):
+        with patch.object(management_store, '_publish', side_effect=OSError('transfer gap')):
+            with self.assertRaises(OSError):
+                self.take_over(action='rollback')
+        physical = management_store.inspect_management_journal(self.root, self.journal.operation_id)
+        self.assertEqual(physical.recovery_target, 'candidate')
+        plan = recovery.inspect_recovery(self.root, self.journal.operation_id, 2)
+        self.assertEqual(plan['recovery_target'], 'previous')
+        self.assertEqual(plan['permitted_actions'], ['continue_recovery'])
+
 
 if __name__ == '__main__':
     unittest.main()

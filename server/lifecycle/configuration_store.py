@@ -479,6 +479,7 @@ class ConfigurationStore:
         from .management_recovery_store import inspect_takeover
         if (journal.stage is not management.ManagementStage.RECOVERY_REQUIRED
                 or journal.action is not management.ManagementAction.CONFIGURE_APPLY
+                or journal.recovery_target != 'candidate'
                 or journal.activation_mode not in {management.ActivationMode.CUTOVER, management.ActivationMode.SAVE_ONLY}
                 or target.installation_id != self.installation_id
                 or target.revision != journal.candidate.deployment_revision):
@@ -522,6 +523,60 @@ class ConfigurationStore:
             else:
                 os.fsync(self.fd)
             self._write_receipt(replace(receipt, stage=outcome))
+            return current
+
+    def recover_previous_configuration(self, root, journal, *, lease, original_generation: int,
+                                       expected: DeploymentReference, target: DeploymentRevision) -> ConfigurationManifest:
+        """Quarantine only the failed candidate while preserving active settings.
+
+        A never-published desired revision stays unpublished. Previous-runtime
+        acceptance requires this quarantine and failed receipt to be durable
+        already; it cannot manufacture missing earlier rollback evidence.
+        """
+        from .management_recovery_store import inspect_takeover
+        if (journal.stage is not management.ManagementStage.RECOVERY_REQUIRED
+                or journal.action is not management.ManagementAction.CONFIGURE_APPLY
+                or journal.activation_mode is not management.ActivationMode.CUTOVER
+                or journal.recovery_target != 'previous'
+                or target.installation_id != self.installation_id
+                or target.revision != journal.candidate.deployment_revision
+                or target.revision == journal.previous.deployment_revision):
+            raise ConfigurationStoreError('Previous configuration recovery requires the exact failed configure candidate.')
+        intent = inspect_takeover(root, journal.operation_id, journal.generation)
+        if intent.action not in {'rollback', 'safe_abort', 'continue_recovery'}:
+            raise ConfigurationStoreError('The review does not authorize previous-runtime recovery.')
+        self.prepare_revision(target)
+        missing = False
+        try:
+            self.rebind_apply_receipt(root, journal, lease=lease, original_generation=original_generation)
+        except ConfigurationReceiptMissingError:
+            missing = True
+        with self._management_lock(root, journal, lease):
+            current = self.inspect()
+            self._require_domains(current, journal)
+            if missing:
+                if (journal.acceptance is not None or current.desired != expected
+                        or current.active.revision != journal.previous.deployment_revision):
+                    raise ConfigurationConflictError('A missing receipt cannot explain a published or accepted rollback.')
+                receipt = self._intent(current, journal, expected, target.reference)
+            else:
+                receipt = self._receipt_for_journal(journal)
+            if (receipt.expected_desired != expected or receipt.target != target.reference
+                    or current.active != receipt.previous_active
+                    or current.active.revision != journal.previous.deployment_revision
+                    or current.desired not in {expected, target.reference}
+                    or receipt.stage not in {'prepared', 'applying', 'failed'}):
+                raise ConfigurationConflictError('The failed configure intent no longer explains the active and desired revisions.')
+            self.read_revision(current.active)
+            self.read_revision(current.desired)
+            if journal.acceptance is not None and (target.revision not in current.quarantined or receipt.stage != 'failed'):
+                raise ConfigurationConflictError('Accepted previous-runtime recovery requires its retained quarantine evidence.')
+            if target.revision not in current.quarantined:
+                current = replace(current, quarantined=tuple(sorted((*current.quarantined, target.revision))))
+                self._replace('manifest.json', current.payload())
+            else:
+                os.fsync(self.fd)
+            self._write_receipt(replace(receipt, stage='failed'))
             return current
 
     def _intent(self, current, journal, expected, target) -> ConfigurationApplyReceipt:
@@ -595,6 +650,7 @@ class ConfigurationStore:
         if (
             journal.action is not management.ManagementAction.CONFIGURE_APPLY
             or journal.activation_mode is not management.ActivationMode.CUTOVER
+            or journal.recovery_target != 'candidate'
             or journal.stage is not management.ManagementStage.ACCEPTED
         ):
             raise ConfigurationStoreError("Active publication requires durable canonical candidate acceptance.")

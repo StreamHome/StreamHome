@@ -34,6 +34,11 @@ class ReviewedFirstStartContractTests(unittest.TestCase):
         modern = {**support, 'schema_version': 2, 'provisioning_journal_versions': [1, 2],
             'deadlines_seconds': {**support['deadlines_seconds'], 'installation': 7200}}
         self.assertEqual(qualified_support(modern), (1, 2))
+        management = {**modern, 'schema_version': 3, 'management_journal_versions': [1, 2]}
+        self.assertEqual(qualified_support(management), (1, 2))
+        for formats in ([1], [2], [True, 2], '1,2', None):
+            with self.subTest(formats=formats), self.assertRaises(EntryError):
+                qualified_support({**management, 'management_journal_versions': formats})
         for change in ({'provisioning_journal_versions': [2]}, {'provisioning_journal_versions': [True, 2]}, {'extra': 'unqualified'}):
             with self.subTest(change=change), self.assertRaises(EntryError):
                 qualified_support({**modern, **change})

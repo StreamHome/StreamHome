@@ -38,11 +38,35 @@ Obtain the generation and evidence hash from a fresh `--review`. Both consent
 fields must be JSON booleans and true for continuation. Stale evidence is rejected;
 there is no force option or implicit retry loop.
 
-The current CLI exposes forward continuation. Link-recovery helpers and internal
-recovery-plan actions do not expose a guarded rollback or safe-abort command.
+Before candidate acceptance, an evidence-supported review may offer guarded
+restoration of the previous runtime:
+
+```bash
+sudo streamhome recover --operation <operation-uuid> --rollback --review
+sudo streamhome recover --operation <operation-uuid> --rollback
+```
+
+`--abort` selects that same guarded previous-runtime procedure only while the
+original unaccepted reservation has not entered exclusive cutover. Both choices
+interrupt owned children and require compatible bound control readers. Neither
+restores the user database. The failed configure revision is quarantined; a
+revision never published as desired remains unpublished. An explicit subsequent
+configure retry gets a new revision, rather than removing the old quarantine.
+
+Automation for rollback/abort uses request schema 2: all schema-1 fields plus
+exactly `action`, set to `rollback` or `safe_abort` to match the CLI option. A
+schema-1 forward consent cannot authorize either action. The requested action
+must still appear in a fresh review's permitted actions.
+
+The previous runtime must pass guarded startup, durable acceptance and mandatory
+recovery before completion. Once it is accepted, a failed recovery can only
+continue that same previous tuple with its original acceptance. The journal keeps
+both original tuples and an explicit previous-runtime target; it never changes
+which tuple was originally reviewed as the candidate.
 
 Preserving recovery completes the originally reviewed boot preference with a new
-finite OS grant. CUTOVER recovery preserves the current boot preference. No older
+finite OS grant. Forward CUTOVER recovery preserves the current boot preference;
+rollback/abort reviews restoration of the original preceding boot preference. No older
 OS receipt authorizes either action. A preserving backend acknowledges the full
 same-operation takeover chain from its process-local settled generation. Terminal
 save/OS evidence is durable before authority release; an interrupted release can
@@ -73,11 +97,18 @@ previous/candidate pair and retained receipts, after proving children stopped.
 Referenced environments and recovery evidence remain available. No database,
 media, account or provider rollback is performed.
 
+After a completed previous-runtime recovery, a later operation can reuse the
+retained original binding receipt only by proving the accepted execution, exact
+terminal journal and completed paired-link receipt naming that original digest.
+Repeated early aborts may retain the same older base receipt. Missing, incomplete
+or changed checkpoint evidence remains a conflict; the original receipt is not
+rewritten to make a new operation appear explainable.
+
 ## Acceptance and completion
 
-An unaccepted candidate must pass guarded verification before acceptance. Existing
+An unaccepted selected runtime must pass guarded verification before acceptance. Existing
 acceptance is preserved byte for byte: recovery cannot relabel another runtime as
-accepted or switch to the previous tuple after acceptance.
+accepted or switch to another tuple after acceptance.
 
 The accepted backend performs mandatory recovery before the controller publishes
 its terminal journal and completes canonical authority. The application separately

@@ -31,9 +31,10 @@ def deployment_for_start(layout: RuntimeLayout) -> DeploymentConfig:
                 require_current_guarded_authority(context)
                 journal = inspect_management_journal(layout.application, operation.operation_id)
                 validate_active_journal(journal, authority)
-                from .management_journal import ManagementAction
-                candidate_reference = manifest.desired if journal.action is ManagementAction.CONFIGURE_APPLY else manifest.active
-                if journal.activation_mode is not ActivationMode.CUTOVER or candidate_reference.revision != journal.candidate.deployment_revision:
+                from .management_journal import ManagementAction, selected_execution
+                candidate_reference = (manifest.desired if journal.action is ManagementAction.CONFIGURE_APPLY
+                    and journal.recovery_target == 'candidate' else manifest.active)
+                if journal.activation_mode is not ActivationMode.CUTOVER or candidate_reference.revision != selected_execution(journal).deployment_revision:
                     raise ConfigurationStoreError("The guarded candidate does not match the reviewed desired deployment.")
                 reference = candidate_reference
             if reference.revision in manifest.quarantined:
@@ -48,7 +49,7 @@ def execution_for_start(layout: RuntimeLayout):
     from . import state
     from .bootstrap import require_startup_context, require_current_guarded_authority
     from .execution_state import read_active_execution
-    from .management_journal import ActivationMode, validate_active_journal
+    from .management_journal import ActivationMode, selected_execution, validate_active_journal
     from .management_store import inspect_management_journal
     if not layout.managed:
         raise ConfigurationStoreError("Managed runtime selection requires a managed descriptor.")
@@ -63,7 +64,7 @@ def execution_for_start(layout: RuntimeLayout):
         validate_active_journal(journal, authority)
         if journal.activation_mode is not ActivationMode.CUTOVER:
             raise ConfigurationStoreError("Only a guarded cutover can select candidate runtime artifacts.")
-        return journal.candidate
+        return selected_execution(journal)
     # Update and restore startup remain guarded by their existing controller
     # protocols; their selected execution must be durably published separately.
     return read_active_execution(layout.application).execution

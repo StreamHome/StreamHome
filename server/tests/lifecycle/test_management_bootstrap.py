@@ -3,7 +3,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from lifecycle import bootstrap, management_journal as contract, management_store, state
+from lifecycle import bootstrap, management_journal as contract, management_store, management_recovery_store as recovery, state
+import uuid
 from tests.lifecycle.test_management_journal import _journal_payload
 
 
@@ -78,6 +79,34 @@ class ManagementBootstrapTests(unittest.TestCase):
         self.assertTrue(bootstrap.guarded_operation_completed(context, self.environment))
         state.claim_operation_with_credential(self.root, operation_type='restore', owner_kind='restore_controller')
         self.assertFalse(bootstrap.guarded_operation_completed(context, self.environment))
+
+    def test_guarded_previous_identity_acceptance_and_terminal_gap_preserve_the_same_context(self):
+        plan = recovery.inspect_recovery(self.root, self.journal.operation_id, self.journal.generation)
+        self.lease.release()
+        self.lease, _, self.journal = recovery.acquire_recovery_lease(self.root,
+            operation_id=self.journal.operation_id, generation=self.journal.generation,
+            evidence_sha256=plan['evidence_sha256'], review_id=str(uuid.uuid4()), action='rollback',
+            controller_invocation_id='1' * 32)
+        self.addCleanup(self.lease.release)
+        for before, after in (('recovery_required', 'exclusive'), ('exclusive', 'verifying')):
+            state.transition_operation_with_credential(self.root, operation_id=self.journal.operation_id,
+                generation=self.journal.generation, expected_phase=before, next_phase=after)
+        self.journal = recovery.resume_candidate_verification(self.root, self.journal, lease=self.lease)
+        self.environment.update({bootstrap.GENERATION_ENV: str(self.journal.generation),
+            'STREAMHOME_RUNTIME_TUPLE_SHA256': contract.execution_tuple_sha256(self.journal.previous)})
+        context = bootstrap.evaluate_startup(self.root, self.environment)
+        self.assertTrue(context.imports_application)
+        self.assertFalse(bootstrap.evaluate_startup(self.root, {**self.environment,
+            'STREAMHOME_RUNTIME_TUPLE_SHA256': contract.execution_tuple_sha256(self.journal.candidate)}).imports_application)
+        acceptance = contract.AcceptanceEvidence(contract.execution_tuple_sha256(self.journal.previous), 'a' * 64)
+        self.advance(contract.ManagementStage.ACCEPTED, acceptance=acceptance)
+        bootstrap.require_current_guarded_authority(context, self.environment)
+        self.advance(contract.ManagementStage.ROLLED_BACK, acceptance=acceptance)
+        bootstrap.require_current_guarded_authority(context, self.environment)
+        self.assertFalse(bootstrap.guarded_operation_completed(context, self.environment))
+        state.complete_operation_with_credential(self.root, operation_id=self.journal.operation_id,
+            generation=self.journal.generation, expected_phase='verifying')
+        self.assertTrue(bootstrap.guarded_operation_completed(context, self.environment))
 
 
 if __name__ == '__main__':

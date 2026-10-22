@@ -173,7 +173,7 @@ class Supervisor:
                 require_takeover_source(ROOT, journal)
                 if action == 'recover_children':
                     await self.stop_children()
-                    self.execution = journal.candidate if journal.acceptance else journal.previous
+                    self.execution = contract.selected_execution(journal) if journal.acceptance else journal.previous
                     self.config = self._deployment(self.execution)
                     await self.start_maintenance()
                 if self.children or runtime_children():
@@ -199,7 +199,7 @@ class Supervisor:
                         or self.children):
                     raise ControlError("control_candidate_unavailable")
                 await self.close_maintenance()
-                await self.launch(journal.candidate, journal=journal,
+                await self.launch(contract.selected_execution(journal), journal=journal,
                     authorize=lambda: self._controller(peer, arguments, phase=state.LifecyclePhase.VERIFYING))
                 return {"launched": True, "sequence": self.sequence, "backend_pid": self.children["backend"].process.pid}
             if action == "assert_stopped":

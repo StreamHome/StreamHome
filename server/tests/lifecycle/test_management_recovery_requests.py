@@ -124,6 +124,22 @@ class RecoveryGrantTests(unittest.TestCase):
             with self.assertRaisesRegex(ControlError, 'control_recovery_review_stale'):
                 command._consent(path, snapshot)
 
+    def test_forward_consent_cannot_be_reused_as_rollback_or_abort_consent(self):
+        snapshot = {'operation_id': self.current.operation_id, 'generation': 8, 'evidence_sha256': 'e' * 64}
+        value = {'schema_version': 1, 'operation_id': self.current.operation_id, 'expected_generation': 8,
+            'expected_evidence_sha256': 'e' * 64, 'continue_recovery': True, 'interruption_approved': True}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'request.json'
+            path.write_text(json.dumps(value))
+            for action in ('rollback', 'safe_abort'):
+                with self.subTest(action=action), self.assertRaises(ControlError):
+                    command._consent(path, snapshot, action=action)
+                path.write_text(json.dumps({**value, 'schema_version': 2, 'action': action}))
+                self.assertTrue(command._consent(path, snapshot, action=action))
+                with self.assertRaises(ControlError):
+                    command._consent(path, snapshot)
+                path.write_text(json.dumps(value))
+
     def test_root_recovery_command_does_not_import_canonical_or_application_code(self):
         script = "import sys; import lifecycle.control.recover; assert not {'lifecycle.state','lifecycle.control.recovery_requests','config','application','models','database'}.intersection(sys.modules)"
         result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=10)

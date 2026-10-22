@@ -189,6 +189,11 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
     repair.add_argument("--request", type=Path, help="Explicit noninteractive repair request with current identity and consent.")
     recovery = commands.add_parser("recover", help="Review continuation of an interrupted management operation.")
     recovery.add_argument("--operation", required=True, help="The exact unresolved operation UUID.")
+    recovery_action = recovery.add_mutually_exclusive_group()
+    recovery_action.add_argument('--rollback', dest='recovery_action', action='store_const', const='rollback',
+        help='Review guarded restoration of the previous runtime before candidate acceptance.')
+    recovery_action.add_argument('--abort', dest='recovery_action', action='store_const', const='safe_abort',
+        help='Review guarded restoration for an unaccepted reservation that has not entered cutover.')
     recovery_input = recovery.add_mutually_exclusive_group()
     recovery_input.add_argument("--request", type=Path, help="An exact evidence-bound recovery consent request.")
     recovery_input.add_argument("--review", action="store_true", help="Print the current recovery review without changing the installation.")
@@ -248,7 +253,8 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
         from .recover import recover
         from .provisioning import administrative_lock
         with administrative_lock():
-            return recover(parsed.operation, request_path=parsed.request, control_manifest_sha256=manifest_sha256, review_only=parsed.review)
+            return recover(parsed.operation, request_path=parsed.request, control_manifest_sha256=manifest_sha256,
+                review_only=parsed.review, action=parsed.recovery_action or 'continue_recovery')
     if parsed.command in {"bootstrap", "setup-code"}:
         bootstrap_code(renew=parsed.renew)
         return 0

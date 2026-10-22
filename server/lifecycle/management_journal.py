@@ -98,6 +98,7 @@ class ManagementJournal:
     supervisor_invocation_id: str | None
     stage: ManagementStage
     acceptance: AcceptanceEvidence | None
+    recovery_target: str = "candidate"
 
 
 def _object(value: Any, keys: set[str], description: str) -> Mapping[str, Any]:
@@ -182,10 +183,16 @@ def parse_execution_tuple(payload: Any) -> ExecutionTuple:
 
 def parse_management_journal(payload: Any) -> ManagementJournal:
     fields = set(ManagementJournal.__dataclass_fields__) | {"schema_version"}
+    if isinstance(payload, dict) and type(payload.get('schema_version')) is int and payload['schema_version'] == 1:
+        fields.remove('recovery_target')
     value = dict(_object(payload, fields, "management journal"))
     version = value.pop("schema_version")
-    if type(version) is not int or version != JOURNAL_SCHEMA_VERSION:
+    if type(version) is not int or version not in {1, 2}:
         raise ManagementJournalError("management journal schema is unsupported")
+    if version == 1:
+        value['recovery_target'] = 'candidate'
+    elif value['recovery_target'] != 'previous':
+        raise ManagementJournalError("journal version 2 requires an explicit previous-runtime recovery target")
     for name in ("installation_id", "operation_id", "review_id"):
         value[name] = _uuid(value[name], name)
     value["generation"] = _integer(value["generation"], 1, "operation generation")
@@ -220,6 +227,12 @@ def parse_management_journal(payload: Any) -> ManagementJournal:
 
 def _validate_action(journal: ManagementJournal) -> None:
     action, mode, stage = journal.action, journal.activation_mode, journal.stage
+    if journal.recovery_target not in {'candidate', 'previous'}:
+        raise ManagementJournalError('management recovery target is unsupported')
+    if journal.recovery_target == 'previous' and (mode is not ActivationMode.CUTOVER or stage not in {
+            ManagementStage.RECOVERY_REQUIRED, ManagementStage.VERIFYING,
+            ManagementStage.ACCEPTED, ManagementStage.ROLLED_BACK}):
+        raise ManagementJournalError('previous-runtime recovery requires an explicit guarded cutover')
     if (
         mode is ActivationMode.SAVE_ONLY and action is not ManagementAction.CONFIGURE_APPLY
         or mode is ActivationMode.OS_ONLY and action is not ManagementAction.PROVISION_CONTROL
@@ -255,18 +268,32 @@ def _validate_action(journal: ManagementJournal) -> None:
     acceptance = journal.acceptance
     if mode is not ActivationMode.CUTOVER and acceptance is not None:
         raise ManagementJournalError("non-cutover work cannot accept a candidate runtime")
-    if stage in {ManagementStage.ACCEPTED, ManagementStage.SUCCEEDED} and acceptance is None:
+    if (stage in {ManagementStage.ACCEPTED, ManagementStage.SUCCEEDED}
+            or stage is ManagementStage.ROLLED_BACK and journal.recovery_target == 'previous') and acceptance is None:
         raise ManagementJournalError("accepted runtime requires acceptance evidence")
     if acceptance is not None:
-        if stage not in {ManagementStage.ACCEPTED, ManagementStage.SUCCEEDED, ManagementStage.RECOVERY_REQUIRED}:
+        accepted_stages = {ManagementStage.ACCEPTED, ManagementStage.SUCCEEDED, ManagementStage.RECOVERY_REQUIRED}
+        if journal.recovery_target == 'previous':
+            accepted_stages.add(ManagementStage.ROLLED_BACK)
+        if stage not in accepted_stages:
             raise ManagementJournalError("acceptance cannot precede verification or permit rollback")
-        if acceptance.execution_tuple_sha256 != execution_tuple_sha256(journal.candidate):
-            raise ManagementJournalError("acceptance does not identify the exact candidate")
+        if acceptance.execution_tuple_sha256 != execution_tuple_sha256(selected_execution(journal)):
+            raise ManagementJournalError("acceptance does not identify the exact selected runtime")
+
+
+def selected_execution(journal: ManagementJournal) -> ExecutionTuple:
+    if journal.recovery_target == 'previous':
+        return journal.previous
+    if journal.recovery_target == 'candidate':
+        return journal.candidate
+    raise ManagementJournalError('management recovery target is unsupported')
 
 
 def management_journal_payload(journal: ManagementJournal) -> dict[str, Any]:
     payload = asdict(journal)
-    payload["schema_version"] = JOURNAL_SCHEMA_VERSION
+    payload["schema_version"] = 2 if journal.recovery_target == 'previous' else JOURNAL_SCHEMA_VERSION
+    if journal.recovery_target == 'candidate':
+        payload.pop('recovery_target')
     for name in ("previous", "candidate"):
         payload[name] = execution_tuple_payload(getattr(journal, name))
     for name in ("action", "activation_mode", "stage"):
@@ -322,7 +349,9 @@ def validate_journal_transition(previous: ManagementJournal, updated: Management
         ManagementStage.VERIFYING: {
             ManagementStage.ACCEPTED, ManagementStage.ROLLED_BACK, ManagementStage.RECOVERY_REQUIRED,
         },
-        ManagementStage.ACCEPTED: {ManagementStage.SUCCEEDED, ManagementStage.RECOVERY_REQUIRED},
+        ManagementStage.ACCEPTED: {
+            ManagementStage.ROLLED_BACK if previous.recovery_target == 'previous' else ManagementStage.SUCCEEDED,
+            ManagementStage.RECOVERY_REQUIRED},
     }
     if updated.stage not in legal.get(previous.stage, set()):
         raise ManagementJournalError("journal progress requires an explicit recovery protocol")

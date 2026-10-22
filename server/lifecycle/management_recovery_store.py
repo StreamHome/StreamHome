@@ -78,13 +78,16 @@ def parse_takeover_intent(payload: dict) -> TakeoverIntent:
     if (previous.generation > result.source_generation or target.generation != result.source_generation + 1
             or (previous.generation < result.source_generation) != (parent is not None)
             or target.stage is not contract.ManagementStage.RECOVERY_REQUIRED
-            or previous.stage is contract.ManagementStage.ROLLED_BACK
+            or previous.stage is contract.ManagementStage.ROLLED_BACK and previous.recovery_target != 'previous'
             or previous.stage is contract.ManagementStage.SUCCEEDED and previous.acceptance is None
             or result.action in {"rollback", "safe_abort"} and previous.acceptance is not None):
         raise ManagementRecoveryError("The recovery intent does not bind a recoverable generation.")
     before, after = contract.management_journal_payload(previous), contract.management_journal_payload(target)
-    if any(before[key] != after[key] for key in before.keys() - {"generation", "controller_invocation_id", "stage"}):
+    if any(before[key] != after[key] for key in before.keys() - {"generation", "controller_invocation_id", "stage", "schema_version", "recovery_target"}):
         raise ManagementRecoveryError("Recovery cannot alter reviewed inputs or acceptance.")
+    expected_target = 'previous' if result.action in {'rollback', 'safe_abort'} else previous.recovery_target
+    if target.recovery_target != expected_target:
+        raise ManagementRecoveryError('The recovery cannot switch its selected runtime without an unaccepted rollback review.')
     return result
 
 
@@ -168,19 +171,20 @@ def inspect_recovery(root: Path, operation_id: str, generation: int) -> dict:
                  or (journal.stage is contract.ManagementStage.EXCLUSIVE and operation.phase is state.LifecyclePhase.VERIFYING))
     if journal.stage is contract.ManagementStage.RECOVERY_REQUIRED and operation.phase in {state.LifecyclePhase.EXCLUSIVE, state.LifecyclePhase.VERIFYING}:
         intent = inspect_takeover(root, operation_id, journal.generation)
-        phase_gap = intent.action == 'continue_recovery' and intent.target_journal == journal
+        phase_gap = intent.action in ACTIONS and intent.target_journal == journal
     if operation.phase is not expected_phase and operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED and not phase_gap:
         raise ManagementRecoveryError("The journal does not explain the canonical phase.")
-    if effective.stage is contract.ManagementStage.ROLLED_BACK:
+    if effective.stage is contract.ManagementStage.ROLLED_BACK and effective.recovery_target != 'previous':
         raise ManagementRecoveryError("Terminal acknowledgement requires its completion protocol.")
     actions = ["continue_recovery"]
-    if effective.acceptance is None and effective.activation_mode is contract.ActivationMode.CUTOVER:
+    if effective.acceptance is None and effective.activation_mode is contract.ActivationMode.CUTOVER and effective.recovery_target == 'candidate':
         actions.append("rollback")
         if operation.phase is state.LifecyclePhase.RESERVED and journal.stage in {contract.ManagementStage.RESERVED, contract.ManagementStage.PREPARED}:
             actions.append("safe_abort")
     payload = {"operation_id": operation_id, "generation": generation, "phase": operation.phase.value,
                "journal_sha256": journal_sha256(journal), "parent_intent_sha256": parent_hash,
-               "accepted": effective.acceptance is not None, "permitted_actions": sorted(actions)}
+               "accepted": effective.acceptance is not None, "recovery_target": effective.recovery_target,
+               "permitted_actions": sorted(actions)}
     return {**payload, "evidence_sha256": _sha(payload)}
 
 
@@ -233,7 +237,8 @@ def acquire_recovery_lease(
         source = management_store.inspect_management_journal(root, operation_id)
         effective, parent = _effective_journal(root, authority, source)
         target = replace(effective, generation=generation + 1, controller_invocation_id=controller_invocation_id,
-                         stage=contract.ManagementStage.RECOVERY_REQUIRED)
+                         stage=contract.ManagementStage.RECOVERY_REQUIRED,
+                         recovery_target='previous' if action in {'rollback', 'safe_abort'} else effective.recovery_target)
         intent = TakeoverIntent(review_id, generation, authority.active_operation.phase, source, parent, action, target)
         _persist_intent(root, intent)
     capability = state.load_controller_capability(root, operation_id=operation_id, generation=generation)
@@ -280,7 +285,7 @@ def resume_candidate_verification(root: Path, journal: contract.ManagementJourna
     if journal.stage is not contract.ManagementStage.RECOVERY_REQUIRED or journal.activation_mode is not contract.ActivationMode.CUTOVER:
         raise ManagementRecoveryError("Only cutover recovery can resume candidate verification.")
     intent = inspect_takeover(root, journal.operation_id, journal.generation)
-    if intent.action != 'continue_recovery' or intent.target_journal != journal:
+    if intent.action not in ACTIONS or intent.target_journal != journal:
         raise ManagementRecoveryError("The recovery review does not authorize candidate verification.")
     updated = replace(journal, stage=contract.ManagementStage.ACCEPTED if journal.acceptance else contract.ManagementStage.VERIFYING)
     contract.parse_management_journal(contract.management_journal_payload(updated))

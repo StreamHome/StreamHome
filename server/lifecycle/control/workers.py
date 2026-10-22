@@ -56,7 +56,7 @@ def prepare_management_request(payload: dict, *, control_manifest_sha256: str) -
     if payload["purpose"] != "complete_install" and (changes_deployment or applies_pending):
         if deployment == active.settings:
             revision = manifest.active.revision
-        elif deployment == desired.settings:
+        elif deployment == desired.settings and desired.revision not in manifest.quarantined:
             revision = manifest.desired.revision
         else:
             revision = str(uuid.uuid4())
