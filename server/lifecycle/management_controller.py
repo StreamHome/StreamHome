@@ -58,6 +58,15 @@ class ManagementController:
             raise ControlError("control_operator_stopped")
         if self.lease is not None:
             self.lease.require_current()
+        if self.review.initial_service_state == 'stopped' and self.review.action is contract.ManagementAction.REPAIR_ENVIRONMENT:
+            from .control.stopped_repair import require_scope
+            if hasattr(self, 'grant'):
+                scope = self.grant.get('issuer_scope')
+            else:
+                from .control.runtime_preparation import read_grant
+                preparation = read_grant(self.review.operation_id)
+                scope = preparation.get('offline_scope')
+            require_scope(scope, self.review.installation_id)
         supervisor = self.review.supervisor
         if supervisor is not None:
             if state._process_start_identity(supervisor.pid) != supervisor.start_identity or process_cgroup(supervisor.pid) != RUNTIME_CGROUP:
@@ -217,6 +226,9 @@ class ManagementController:
             self.advance(contract.ManagementStage.SAVED if self.review.activation_mode is contract.ActivationMode.SAVE_ONLY else contract.ManagementStage.OS_COMPLETED)
             self.complete()
             return
+        if self.review.initial_service_state == 'stopped':
+            self.finish_stopped_repair(recovered=False)
+            return
         if self.review.supervisor is None:
             raise ControlError("control_supervisor_start_required")
         if self.preparing:
@@ -243,6 +255,47 @@ class ManagementController:
             self.store.promote_active(ROOT, self.journal, lease=self.lease)
         self.commit_and_wait_recovery()
         self.advance(contract.ManagementStage.SUCCEEDED)
+        self.complete()
+
+    def finish_stopped_repair(self, *, recovered: bool) -> None:
+        """Accept complete inactive artifacts while retaining the stopped outcome."""
+        if (self.review.action is not contract.ManagementAction.REPAIR_ENVIRONMENT
+                or self.review.initial_service_state != 'stopped' or self.review.supervisor is not None
+                or self.review.backend is not None or self.journal.activation_mode is not contract.ActivationMode.CUTOVER):
+            raise ControlError('control_stopped_repair_invalid')
+        from .control.stopped_repair import require_stopped
+        from .control.processes import require_service_quiescent
+        def assert_stopped():
+            self.checkpoint()
+            require_stopped()
+            require_service_quiescent(inspections=True)
+        assert_stopped()
+        if recovered:
+            from .runtime_links import recover_management_links
+            from .management_recovery_store import resume_candidate_verification
+            recover_management_links(ROOT, self.journal, lease=self.lease, target=self.journal.recovery_target,
+                assert_children_stopped=assert_stopped)
+            self.phase(state.LifecyclePhase.RECOVERY_REQUIRED, state.LifecyclePhase.EXCLUSIVE)
+            self.phase(state.LifecyclePhase.EXCLUSIVE, state.LifecyclePhase.VERIFYING)
+            self.journal = resume_candidate_verification(ROOT, self.journal, lease=self.lease)
+        else:
+            self.phase(state.LifecyclePhase.RESERVED, state.LifecyclePhase.EXCLUSIVE)
+            self.advance(contract.ManagementStage.EXCLUSIVE)
+            bind_management_runtime(ROOT, self.journal, lease=self.lease, assert_children_stopped=assert_stopped)
+            self.phase(state.LifecyclePhase.EXCLUSIVE, state.LifecyclePhase.VERIFYING)
+            self.advance(contract.ManagementStage.VERIFYING)
+        selected = contract.selected_execution(self.journal)
+        verify_runtime(ROOT, selected)
+        assert_stopped()
+        if self.journal.acceptance is None:
+            evidence = {'mode': 'stopped_repair', 'execution_sha256': contract.execution_tuple_sha256(selected),
+                'runtime_manifest_sha256': selected.runtime_manifest_sha256,
+                'os_receipt': read_os_receipt(self.review, self.journal.generation, self.invocation)}
+            digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+            self.advance(contract.ManagementStage.ACCEPTED, acceptance=contract.AcceptanceEvidence(contract.execution_tuple_sha256(selected), digest))
+        publish_accepted_execution(ROOT, self.journal, lease=self.lease)
+        assert_stopped()
+        self.advance(contract.ManagementStage.ROLLED_BACK if self.journal.recovery_target == 'previous' else contract.ManagementStage.SUCCEEDED)
         self.complete()
 
     def retain_recovery(self) -> None:
@@ -304,6 +357,9 @@ class RecoveredManagementController(ManagementController):
 
     def checkpoint(self) -> None:
         super().checkpoint()
+        if self.grant.get('schema_version') == 2:
+            from .control.stopped_repair import require_scope
+            require_scope(self.grant['issuer_scope'], self.review.installation_id)
         if self.grant['action'] in {'rollback', 'safe_abort'} or self.journal is not None and self.journal.recovery_target == 'previous':
             from .control.reader_support import require_previous_reader
             require_previous_reader(self.review.previous)
@@ -326,6 +382,9 @@ class RecoveredManagementController(ManagementController):
         self.wait_os_receipt()
         if self.journal.activation_mode is not contract.ActivationMode.CUTOVER:
             self.finish_preserving()
+            return
+        if self.review.initial_service_state == 'stopped':
+            self.finish_stopped_repair(recovered=True)
             return
         if self.rpc('supervisor', 'recover_children').get('stopped') is not True:
             raise ControlError('control_children_busy')

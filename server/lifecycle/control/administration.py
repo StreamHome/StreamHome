@@ -166,7 +166,7 @@ def _apply_fixed_boot_effect(payload: dict, observation: dict, *, recovery: bool
         if (unit["ActiveState"] not in {"active", "activating"} or unit["InvocationID"] != payload["supervisor_invocation_id"]
                 or int(unit["MainPID"]) != payload["supervisor"]["pid"]):
             raise ControlError("control_incarnation_changed")
-    elif recovery:
+    else:
         unit = unit_snapshot()
         if (unit['ActiveState'] not in {'inactive', 'failed'} or int(unit['MainPID']) != 0
                 or systemctl('show', 'streamhome.service', '--property=Job') not in {'Job=', 'Job=0'}):

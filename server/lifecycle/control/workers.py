@@ -172,7 +172,7 @@ def inspect_managed() -> dict:
         verify_runtime(ROOT, record.execution)
         verify_links(ROOT, record.execution)
         runtime_verified = True
-    except (RuntimeBuildError, OSError, ValueError):
+    except (RuntimeError, OSError, ValueError):
         runtime_error = "runtime_verification_failed"
     return {
         "installation_id": selected.installation_id, "lifecycle": state.public_projection(authority),
@@ -269,7 +269,7 @@ def main(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha256:
                 'expected_generation': grant['expected_generation'], 'action': contract.ManagementAction.REPAIR_ENVIRONMENT.value,
                 'activation_mode': contract.ActivationMode.CUTOVER.value, 'previous': grant['previous'], 'candidate': built['execution'],
                 'expected_desired': grant['expected_desired'], 'deployment': active['active_deployment'],
-                'initial_service_state': 'running', 'supervisor_invocation_id': grant['supervisor_invocation_id'],
+                'initial_service_state': 'stopped' if grant['schema_version'] == 2 else 'running', 'supervisor_invocation_id': grant['supervisor_invocation_id'],
                 'supervisor': grant['supervisor'], 'backend': grant['backend'], 'interruption_approved': True,
                 'boot_enabled': payload['boot_enabled'], 'previous_boot_enabled': payload['boot_enabled'],
                 'boot_id': grant['boot_id'], 'stop_epoch': grant['stop_epoch'], 'controller_control_manifest_sha256': manifest_sha256}

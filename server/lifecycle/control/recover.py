@@ -56,7 +56,8 @@ def _preserved_processes(snapshot: dict) -> dict:
 
 
 def recover(operation_id: str, *, request_path: Path | None, control_manifest_sha256: str, review_only: bool = False,
-            action: str = 'continue_recovery') -> int:
+            action: str = 'continue_recovery', scope_epoch: str | None = None,
+            expected_installation_id: str | None = None):
     require_root()
     _identity(operation_id)
     unit = operation_unit(operation_id)
@@ -65,13 +66,23 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
     from .stop import _require_empty
     _require_empty(f'streamhome-operation@{operation_id}.service')
     epoch = root_stop_epoch()
+    if scope_epoch is not None and epoch != scope_epoch:
+        raise ControlError('control_operator_stopped')
     snapshot = run_worker(['recovery-review', operation_id], timeout=120)
+    if expected_installation_id is not None and snapshot['installation_id'] != expected_installation_id:
+        raise ControlError('control_recovery_review_stale')
     if action not in snapshot['permitted_actions']:
         raise ControlError('control_recovery_action_unavailable')
     processes = _preserved_processes(snapshot)
     if review_only:
         print(json.dumps(snapshot, sort_keys=True, allow_nan=False))
         return 0
+    issuer_scope = None
+    if snapshot['initial_service_state'] == 'stopped':
+        from .stopped_repair import StoppedRepairHandoff, current_scope
+        if scope_epoch is None:
+            return StoppedRepairHandoff(snapshot['installation_id'], operation_id, epoch, request_path, action)
+        issuer_scope = current_scope(snapshot['installation_id'], epoch)
     if request_path is not None:
         approved = _consent(request_path, snapshot, action=action)
     else:
@@ -80,7 +91,11 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
             console.write('Operation: ' + operation_id)
             console.write('Generation: ' + str(snapshot['generation']))
             console.write('Recovery review SHA-256: ' + snapshot['evidence_sha256'])
-            if action in {'rollback', 'safe_abort'}:
+            if snapshot['initial_service_state'] == 'stopped':
+                console.write('The recorded inactive runtime will be verified. The service will stay stopped.')
+                console.write('Start at boot: ' + ('enabled' if (snapshot['previous_boot_enabled']
+                    if action in {'rollback', 'safe_abort'} else snapshot['boot_enabled']) else 'disabled'))
+            elif action in {'rollback', 'safe_abort'}:
                 console.write('The previous recorded runtime will be started under guarded verification.')
                 console.write('Owned application processes will be interrupted. User database writes are preserved.')
                 console.write('Start at boot: ' + ('enabled' if snapshot['previous_boot_enabled'] else 'disabled'))
@@ -102,11 +117,14 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
     fresh = run_worker(['recovery-review', operation_id], timeout=120)
     if fresh != snapshot:
         raise ControlError('control_recovery_review_stale')
-    grant = run_worker(['prepare-recovery'], payload={'operation_id': operation_id,
+    payload = {'operation_id': operation_id,
         'expected_evidence_sha256': snapshot['evidence_sha256'], 'recovery_review_id': str(uuid.uuid4()),
         'action': action,
         'processes': processes, 'boot_enabled': _boot_enabled(),
-        'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'stop_epoch': epoch})
+        'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'stop_epoch': epoch}
+    if issuer_scope is not None:
+        payload['issuer_scope'] = issuer_scope
+    grant = run_worker(['prepare-recovery'], payload=payload)
     if (grant['request']['controller_control_manifest_sha256'] != control_manifest_sha256
             or root_stop_epoch() != epoch):
         raise ControlError('control_recovery_review_stale')

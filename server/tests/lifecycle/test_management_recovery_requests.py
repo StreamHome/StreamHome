@@ -94,6 +94,35 @@ class RecoveryGrantTests(unittest.TestCase):
             with self.assertRaises(ControlError):
                 grants.parse_grant(value)
 
+    def test_stopped_recovery_scope_is_required_live_but_not_for_historical_evidence(self):
+        from lifecycle.control import stopped_repair
+        original, value = self.preserving_grant(running=False)
+        scope = {'unit': 'streamhome-install-' + original.installation_id + '-' + '2' * 32 + '.scope',
+                 'invocation': '3' * 32, 'pid': 100, 'start_identity': '200'}
+        value.update(schema_version=2, issuer_scope=scope)
+        current = parse_management_request(value['request'])
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(grants.request_contract, 'read_management_request', return_value=original))
+            stack.enter_context(patch.object(grants, 'read_protected_json', return_value=value))
+            stack.enter_context(patch.object(grants.Path, 'read_text', return_value=current.boot_id))
+            stack.enter_context(patch.object(grants, 'read_stop_epoch', return_value=current.stop_epoch))
+            stack.enter_context(patch.object(grants.time, 'monotonic', return_value=100))
+            live = stack.enter_context(patch.object(stopped_repair, 'require_scope'))
+            self.assertEqual(grants.read_grant(current.operation_id, current.expected_generation + 1), value)
+            live.assert_called_once_with(scope, original.installation_id)
+            live.side_effect = ControlError('control_stopped_repair_issuer_changed')
+            with self.assertRaises(ControlError):
+                grants.read_grant(current.operation_id, current.expected_generation + 1)
+            self.assertEqual(grants.read_grant(current.operation_id, current.expected_generation + 1, require_live=False), value)
+
+    def test_running_grant_cannot_borrow_an_offline_scope(self):
+        value = {**self.grant, 'schema_version': 2,
+                 'issuer_scope': {'unit': 'streamhome-install-' + self.original.installation_id + '-' + '2' * 32 + '.scope',
+                                  'invocation': '3' * 32, 'pid': 100, 'start_identity': '200'}}
+        with patch.object(grants.request_contract, 'read_management_request', return_value=self.original):
+            with self.assertRaises(ControlError):
+                grants.parse_grant(value)
+
     def test_preserving_prepare_finishes_original_boot_preference_under_a_new_review(self):
         original, grant = self.preserving_grant()
         snapshot = {'operation_id': original.operation_id, 'generation': original.expected_generation + 1,

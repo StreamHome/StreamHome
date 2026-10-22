@@ -32,8 +32,11 @@ def parse_grant(value: dict) -> dict:
     fields = {'schema_version', 'installation_id', 'preparation_id', 'expected_generation', 'previous',
               'expected_desired', 'supervisor', 'backend', 'supervisor_invocation_id', 'boot_id', 'stop_epoch',
               'control_manifest_sha256', 'expires_at_monotonic'}
+    offline = isinstance(value, dict) and type(value.get('schema_version')) is int and value['schema_version'] == 2
+    if offline:
+        fields.add('offline_scope')
     if (not isinstance(value, dict) or set(value) != fields or type(value['schema_version']) is not int
-            or value['schema_version'] != 1):
+            or value['schema_version'] not in {1, 2}):
         raise ControlError('control_preparation_invalid')
     for name in ('installation_id', 'preparation_id', 'boot_id'):
         contract._uuid(value[name], name)
@@ -41,9 +44,15 @@ def parse_grant(value: dict) -> dict:
     contract.parse_execution_tuple(value['previous'])
     for name in ('stop_epoch', 'control_manifest_sha256'):
         contract._text(value[name], contract._SHA256, name)
-    invocation = contract._text(value['supervisor_invocation_id'], contract._INVOCATION, 'preparation supervisor')
-    if not int(invocation, 16) or any(_process(value[name]) is None for name in ('supervisor', 'backend')):
-        raise ControlError('control_preparation_invalid')
+    if offline:
+        from .stopped_repair import parse_scope
+        parse_scope(value['offline_scope'], value['installation_id'])
+        if any(value[name] is not None for name in ('supervisor', 'backend', 'supervisor_invocation_id')):
+            raise ControlError('control_preparation_invalid')
+    else:
+        invocation = contract._text(value['supervisor_invocation_id'], contract._INVOCATION, 'preparation supervisor')
+        if not int(invocation, 16) or any(_process(value[name]) is None for name in ('supervisor', 'backend')):
+            raise ControlError('control_preparation_invalid')
     reference = value['expected_desired']
     if not isinstance(reference, dict) or set(reference) != {'revision', 'sha256'}:
         raise ControlError('control_preparation_invalid')
@@ -92,6 +101,13 @@ def require_current(value: dict) -> None:
                 raise ControlError('control_preparation_changed')
     finally:
         os.close(descriptor)
+    if value['schema_version'] == 2:
+        from .stopped_repair import require_scope, require_stopped
+        from .processes import require_service_quiescent
+        require_scope(value['offline_scope'], value['installation_id'])
+        require_stopped()
+        require_service_quiescent(preparation_id=value['preparation_id'])
+        return
     for name in ('supervisor', 'backend'):
         peer = _process(value[name])
         if state._process_start_identity(peer.pid) != peer.start_identity or process_cgroup(peer.pid) != '/system.slice/streamhome.service':
@@ -116,7 +132,7 @@ def result(preparation_id: str) -> dict:
     contract.parse_management_journal(contract.management_journal_payload(contract.ManagementJournal(
         value['installation_id'], preparation_id, value['expected_generation'] + 1,
         contract.ManagementAction.REPAIR_ENVIRONMENT, contract.ActivationMode.CUTOVER, preparation_id,
-        previous, candidate, 'running', '1' * 32, value['supervisor_invocation_id'],
+        previous, candidate, 'stopped' if value['schema_version'] == 2 else 'running', '1' * 32, value['supervisor_invocation_id'],
         contract.ManagementStage.RESERVED, None)))
     verify_runtime(ROOT, candidate)
     require_current(value)
@@ -165,9 +181,10 @@ def main(preparation_id: str, *, control_manifest_sha256: str) -> int:
         checkpoint()
         state._atomic_write_json(directory / 'progress.json', {'stage': description, 'status': 'done'})
     try:
-        if backend('register_cache_preparation').get('registered') is not True:
-            raise ControlError('control_preparation_changed')
-        registered = True
+        if value['schema_version'] == 1:
+            if backend('register_cache_preparation').get('registered') is not True:
+                raise ControlError('control_preparation_changed')
+            registered = True
         previous = contract.parse_execution_tuple(value['previous'])
         built = prepare_runtime(ROOT, application_commit=previous.application_commit,
             build_id=previous.application_build_id, stage=stage, checkpoint=checkpoint)

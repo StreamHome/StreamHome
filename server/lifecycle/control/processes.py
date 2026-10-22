@@ -25,10 +25,37 @@ def require_runtime_supervisor() -> None:
         raise ControlError("control_supervisor_forbidden")
 
 
-def require_service_quiescent() -> None:
+def _protected_reader(path: Path, fields: list[str]) -> bool:
+    """Allow only root-spawned, fixed read-only dispatcher inspections."""
+    try:
+        parent = Path('/proc') / fields[1]
+        if int(fields[1]) <= 1 or parent.stat().st_uid != 0:
+            return False
+        arguments = (path / 'cmdline').read_bytes().split(b'\0')
+        if arguments[-1:] == [b'']:
+            arguments.pop()
+        prefix = [b'/usr/bin/python3', b'-I', b'/usr/local/libexec/streamhome/provision']
+        if arguments[:3] != prefix or (parent / 'cmdline').read_bytes().split(b'\0')[:3] != prefix:
+            return False
+        tail = arguments[3:]
+        if tail[:1] == [b'--rescue']:
+            tail = tail[1:]
+        return (len(tail) in {2, 3} and tail[0] == b'--worker'
+            and tail[1] in {b'inspect', b'identity', b'release-check', b'check-listener',
+                            b'runtime-progress', b'runtime-result', b'bridge-observe', b'operation-result'})
+    except (OSError, IndexError):
+        return False
+
+
+def require_service_quiescent(*, preparation_id: str | None = None, inspections: bool = False) -> None:
     """Prove absence of live service-UID work beyond this independent reader."""
     if os.geteuid() == 0:
         raise ControlError("control_worker_forbidden")
+    allowed = None
+    if preparation_id is not None:
+        from ..management_journal import _uuid
+        _uuid(preparation_id, 'owned preparation')
+        allowed = f'/system.slice/streamhome-prepare@{preparation_id}.service'
     runtime = Path("/sys/fs/cgroup" + RUNTIME_CGROUP + "/cgroup.procs")
     try:
         if runtime.read_text().strip():
@@ -42,7 +69,14 @@ def require_service_quiescent() -> None:
             if path.stat().st_uid != os.geteuid():
                 continue
             fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
-            if not fields or fields[0] not in {"Z", "X"}:
+            if not fields:
+                raise ControlError('control_quiescence_unproven')
+            if fields[0] in {'Z', 'X'}:
+                continue
+            if ((allowed is not None and process_cgroup(int(path.name)) == allowed)
+                    or (allowed is not None or inspections) and _protected_reader(path, fields)):
+                continue
+            if fields[0] not in {"Z", "X"}:
                 raise ControlError("control_foreign_service_process")
         except FileNotFoundError:
             continue

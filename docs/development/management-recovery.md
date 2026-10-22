@@ -5,15 +5,40 @@ or environment activation is interrupted. A failed command does not authorize a
 reinstall, erase lifecycle state or reverse database writes. Recovery continues
 the recorded application, configuration and runtime tuple after a fresh review.
 
-The CUTOVER path requires the original systemd supervisor to remain running.
+An originally running CUTOVER path requires its original systemd supervisor to remain running.
 It supports failure before configuration publication,
 failure during guarded verification, failure after acceptance and a terminal
 `succeeded` journal whose canonical completion was interrupted. Preserving
 SAVE_ONLY and OS_ONLY operations can also continue with their original running
 or stopped outcome. A running outcome requires the identical settled backend and
 supervisor; it never restarts either process. A stopped outcome never starts them.
-Stopped or replaced CUTOVER supervisors and operation-bound environment/control
+An originally stopped environment repair instead verifies its inactive artifacts
+and retains the stopped outcome. Stopped or replaced originally running CUTOVER supervisors and operation-bound environment/control
 reconstruction require separate maintenance protocols.
+
+## Repair with the service stopped
+
+`sudo streamhome repair` can rebuild the accepted application's private Python,
+Node.js and web dependency generations while `streamhome.service` is stopped.
+It uses the authenticated independent control reader and base OS Python, so a
+broken selected application Python or Node environment does not prevent repair.
+The installation must have idle, resolved authority and no foreign service-account
+work. The application commit, deployment, policy/provider revisions and database
+are retained.
+
+Preparation runs in a cancellable root issuer scope, without claiming MANAGEMENT
+or changing the active execution. Activation claims MANAGEMENT only after the
+complete candidate tuple is known. It verifies artifacts, paired runtime links
+and the stopped process set before accepting and publishing that tuple. It does
+not start the application or claim live readiness. Run `sudo streamhome start`
+separately when the application should run; normal startup recovery still applies.
+
+An interrupted activation uses the same exact-operation `recover` review below.
+Both preparation and stopped recovery permissions are bound to the current issuer
+scope, boot and stop intent. Stopping the already inactive runtime cancels those
+permissions. Historical evidence remains readable after the issuer exits; it
+cannot authorize a new attempt. Cleanup follows the latest recovery grant and
+cannot stop a controller adopted by a newer explicit owner.
 
 ## Review and continue
 
@@ -26,7 +51,7 @@ sudo streamhome recover --operation <operation-uuid>
 
 The first command prints current evidence without changing canonical authority,
 configuration or application processes. The second reviews the recorded recovery
-action. CUTOVER interrupts owned application children; SAVE_ONLY and OS_ONLY
+action. An originally running CUTOVER interrupts owned application children; SAVE_ONLY and OS_ONLY
 preserve them. Empty Enter at its `[Y/n]` prompt means Yes; EOF,
 missing terminal and interrupted input are not consent. A declined review leaves
 the original operation unresolved.
@@ -48,7 +73,7 @@ sudo streamhome recover --operation <operation-uuid> --rollback
 
 `--abort` selects that same guarded previous-runtime procedure only while the
 original unaccepted reservation has not entered exclusive cutover. Both choices
-interrupt owned children and require compatible bound control readers. Neither
+interrupt owned children for an originally running operation and require compatible bound control readers. An originally stopped repair keeps the service stopped. Neither
 restores the user database. The failed configure revision is quarantined; a
 revision never published as desired remains unpublished. An explicit subsequent
 configure retry gets a new revision, rather than removing the old quarantine.

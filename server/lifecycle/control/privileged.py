@@ -247,14 +247,18 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
         from .repair import repair
         from .provisioning import administrative_lock
         with administrative_lock():
-            return repair(request_path=parsed.request, control_manifest_sha256=manifest_sha256)
+            result = repair(request_path=parsed.request, control_manifest_sha256=manifest_sha256)
+        from .stopped_repair import StoppedRepairHandoff, run_scoped
+        return run_scoped(result) if isinstance(result, StoppedRepairHandoff) else result
     if parsed.command == "recover":
         require_root()
         from .recover import recover
         from .provisioning import administrative_lock
         with administrative_lock():
-            return recover(parsed.operation, request_path=parsed.request, control_manifest_sha256=manifest_sha256,
+            result = recover(parsed.operation, request_path=parsed.request, control_manifest_sha256=manifest_sha256,
                 review_only=parsed.review, action=parsed.recovery_action or 'continue_recovery')
+        from .stopped_repair import StoppedRepairHandoff, run_scoped
+        return run_scoped(result) if isinstance(result, StoppedRepairHandoff) else result
     if parsed.command in {"bootstrap", "setup-code"}:
         bootstrap_code(renew=parsed.renew)
         return 0
@@ -297,6 +301,26 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
     global _RESCUE_MODE
     _RESCUE_MODE = rescue
     try:
+        if arguments and arguments[0] in {'--repair-stopped-scoped', '--recover-stopped-scoped'}:
+            require_root()
+            parser = argparse.ArgumentParser(prog='StreamHome stopped repair')
+            parser.add_argument('installation_id')
+            parser.add_argument('preparation_id')
+            parser.add_argument('stop_epoch')
+            parser.add_argument('--request', type=Path)
+            parser.add_argument('--action', choices=('continue_recovery', 'rollback', 'safe_abort'), default='continue_recovery')
+            selected = parser.parse_args(arguments[1:])
+            from .provisioning import administrative_lock
+            from .repair import repair
+            with administrative_lock():
+                if arguments[0] == '--recover-stopped-scoped':
+                    from .recover import recover
+                    return recover(selected.preparation_id, request_path=selected.request,
+                        control_manifest_sha256=manifest_sha256, action=selected.action,
+                        scope_epoch=selected.stop_epoch, expected_installation_id=selected.installation_id)
+                return repair(request_path=selected.request, control_manifest_sha256=manifest_sha256,
+                    scope_epoch=selected.stop_epoch, preparation_id=selected.preparation_id,
+                    expected_installation_id=selected.installation_id)
         if arguments == ["--select-public-source"]:
             from .source_selection import select_public_source
             print(json.dumps(select_public_source(), sort_keys=True))

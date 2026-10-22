@@ -105,17 +105,32 @@ def _prepare(grant: dict) -> dict:
         raise
 
 
-def repair(*, request_path: Path | None, control_manifest_sha256: str) -> int:
+def repair(*, request_path: Path | None, control_manifest_sha256: str,
+           scope_epoch: str | None = None, preparation_id: str | None = None,
+           expected_installation_id: str | None = None):
     require_root()
     selected = descriptor()
     if selected.status.value != 'ready':
         raise ControlError('control_installation_incomplete')
     epoch = root_stop_epoch()
+    if scope_epoch is not None and (scope_epoch != epoch or selected.installation_id != expected_installation_id):
+        raise ControlError('control_operator_stopped')
     snapshot = run_worker(['inspect'], timeout=120)
     if snapshot['lifecycle']['active_operation'] is not None:
         raise ControlError('control_operation_recovery_required')
     processes = process_snapshot()
-    if processes['initial_service_state'] != 'running' or processes['backend'] is None:
+    stopped = processes['initial_service_state'] == 'stopped'
+    if stopped and scope_epoch is None:
+        from .stopped_repair import StoppedRepairHandoff
+        return StoppedRepairHandoff(selected.installation_id, str(uuid.uuid4()), epoch, request_path)
+    offline_scope = None
+    if scope_epoch is not None:
+        from .stopped_repair import current_scope, require_stopped
+        if not stopped or preparation_id is None:
+            raise ControlError('control_stopped_repair_service_changed')
+        offline_scope = current_scope(selected.installation_id, epoch)
+        require_stopped()
+    if not stopped and processes['backend'] is None:
         raise ControlError('control_interrupting_repair_required')
     if snapshot['execution']['execution']['control_manifest_sha256'] != control_manifest_sha256:
         raise ControlError('control_bundle_mismatch')
@@ -125,12 +140,13 @@ def repair(*, request_path: Path | None, control_manifest_sha256: str) -> int:
         with open_console() as console:
             console.write('Repair prepares private Python, Node.js and web dependency generations for the accepted build.')
             console.write('Application build: ' + snapshot['execution']['execution']['application_build_id'])
-            console.write('The current environment stays in use during preparation. Activation pauses owned application work.')
+            console.write('The service will stay stopped. Activation replaces only the verified runtime selection.' if stopped
+                else 'The current environment stays in use during preparation. Activation pauses owned application work.')
             if not console.confirm('Prepare the replacement runtime?'):
                 return 0
     if root_stop_epoch() != epoch:
         raise ControlError('control_operator_stopped')
-    preparation = str(uuid.uuid4())
+    preparation = preparation_id if stopped else str(uuid.uuid4())
     grant = {'schema_version': 1, 'installation_id': selected.installation_id, 'preparation_id': preparation,
         'expected_generation': snapshot['lifecycle']['generation'], 'previous': snapshot['execution']['execution'],
         'expected_desired': snapshot['configuration']['deployment']['desired'],
@@ -138,6 +154,8 @@ def repair(*, request_path: Path | None, control_manifest_sha256: str) -> int:
         'supervisor_invocation_id': processes['supervisor_invocation_id'],
         'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'stop_epoch': epoch,
         'control_manifest_sha256': control_manifest_sha256, 'expires_at_monotonic': time.monotonic() + 3600}
+    if stopped:
+        grant.update(schema_version=2, offline_scope=offline_scope)
     if run_worker(['validate-preparation'], payload=grant) != grant:
         raise ControlError('control_preparation_changed')
     built = _prepare(grant)
@@ -147,7 +165,8 @@ def repair(*, request_path: Path | None, control_manifest_sha256: str) -> int:
     print('Verified replacement execution SHA-256: ' + sha256(built['execution']), flush=True)
     if accepted is None:
         with open_console() as console:
-            activate = console.confirm('Activate this verified runtime and pause owned application work?')
+            activate = console.confirm('Activate this verified runtime while keeping the service stopped?' if stopped
+                else 'Activate this verified runtime and pause owned application work?')
     else:
         activate = accepted['activate']
     if not activate:
