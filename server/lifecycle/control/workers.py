@@ -130,7 +130,7 @@ def operation_result(operation_id: str) -> dict:
 
 def check_listener(payload: dict) -> dict:
     from ..deployment_config import parse_deployment_payload
-    from ..port_check import OwnedWebListener, check_web_port
+    from ..port_check import ClosingConnectionsError, ListenerCheckError, OwnedWebListener, check_web_port
     if not isinstance(payload, dict) or set(payload) != {"deployment", "web", "invocation"}:
         raise ControlError("control_request_invalid")
     selected = layout_for_root(ROOT).descriptor.descriptor
@@ -142,7 +142,11 @@ def check_listener(payload: dict) -> dict:
             raise ControlError("control_request_invalid")
         owner = OwnedWebListener(selected.installation_id, selected.service_uid, payload["invocation"],
             web["pid"], web["start_identity"], config.web_bind, config.web_port)
-    result = check_web_port(config.web_bind, config.web_port, owner=owner, installation=selected)
+    try:
+        result = check_web_port(config.web_bind, config.web_port, owner=owner, installation=selected)
+    except ListenerCheckError as exc:
+        return {'available': False, 'reason': 'closing_connections' if isinstance(exc, ClosingConnectionsError) else 'listener_conflict',
+                'bind': config.web_bind, 'port': config.web_port}
     return {"available": True, "owned": result.reusable_owned_listener, "bind": result.bind, "port": result.port}
 
 

@@ -284,13 +284,8 @@ def configure(*, request_path: Path | None = None) -> int:
             unit = unit_snapshot()
             snapshot = supervisor_snapshot(selected, unit)
             web, invocation = snapshot.get("children", {}).get("web"), unit["InvocationID"]
-        try:
-            result = run_worker(["check-listener"], payload={"deployment": config.payload(), "web": web, "invocation": invocation})
-        except ControlError as exc:
-            raise DeploymentConfigError("The selected listener could not be verified. Choose another port or inspect the exact running service; no process was stopped.") from exc
-        if result.get("available") is not True or result.get("port") != config.web_port or result.get("bind") != config.web_bind:
-            raise DeploymentConfigError("The listener preflight result changed. Review the configuration again.")
-        return [f"Listener preflight passed: {config.web_bind}:{config.web_port}. External routing is not yet verified."]
+        from .listener_review import check_requested_listener
+        return check_requested_listener(config, web=web, invocation=invocation)
     if request_path is None:
         with open_console() as console:
             review = configure_wizard(console, current, running=processes["initial_service_state"] == "running",

@@ -394,6 +394,10 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
             print("Use sudo streamhome for this administrative command.", file=sys.stderr)
         if code == "control_stop_before_first_start_retry":
             print("Use sudo streamhome stop before reviewing a new first-start attempt.", file=sys.stderr)
+        if code == 'control_web_port_closing':
+            print('Closing TCP connections still reserve the requested port. Wait and retry, or choose another port.', file=sys.stderr)
+        if code == 'control_web_port_conflict':
+            print('Choose another web port or inspect its owner. No process was stopped.', file=sys.stderr)
         if os.geteuid() == 0 and arguments and arguments[0] in {"--install", "--resume-install", "--complete-install", "--retry-first-start"}:
             try:
                 from .provisioning import report_continuation

@@ -22,6 +22,10 @@ class ListenerCheckError(ValueError):
     pass
 
 
+class ClosingConnectionsError(ListenerCheckError):
+    pass
+
+
 @dataclass(frozen=True)
 class OwnedWebListener:
     installation_id: str
@@ -83,8 +87,8 @@ def _process_matches(owner: OwnedWebListener, installation: InstallationDescript
         return False
 
 
-def _socket_inodes(bind: str, port: int) -> set[str]:
-    result: set[str] = set()
+def _socket_entries(bind: str, port: int) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
     for family, table in ((socket.AF_INET, "tcp"), (socket.AF_INET6, "tcp6")):
         path = Path("/proc/self/net") / table
         try:
@@ -95,7 +99,7 @@ def _socket_inodes(bind: str, port: int) -> set[str]:
             raise ListenerCheckError("Kernel listener evidence is unavailable.")
         for line in raw.splitlines()[1:]:
             fields = line.split()
-            if len(fields) < 10 or fields[3] != "0A":
+            if len(fields) < 10 or fields[3] not in {"0A", "06"}:
                 continue
             encoded, separator, number = fields[1].partition(":")
             if not separator or int(number, 16) != port:
@@ -115,10 +119,14 @@ def _socket_inodes(bind: str, port: int) -> set[str]:
             else:
                 overlaps = bind == "0.0.0.0" or address.is_unspecified or str(address) == bind
             if overlaps:
-                if not fields[9].isdigit() or fields[9] == "0":
+                if not fields[9].isdigit() or fields[3] == '0A' and fields[9] == "0":
                     raise ListenerCheckError("Kernel socket ownership is incomplete.")
-                result.add(fields[9])
+                result.append((fields[3], fields[9]))
     return result
+
+
+def _socket_inodes(bind: str, port: int) -> set[str]:
+    return {inode for status, inode in _socket_entries(bind, port) if status == '0A'}
 
 
 def _owns_all_sockets(owner: OwnedWebListener, inodes: set[str]) -> bool:
@@ -164,4 +172,13 @@ def check_web_port(
                     return PortCheck(bind, selected, True)
         except (OSError, ValueError):
             pass
+    try:
+        entries = _socket_entries(bind, selected)
+        closing = not any(status == '0A' for status, _ in entries) and any(status == '06' for status, _ in entries)
+    except (OSError, ValueError):
+        closing = False
+    if closing:
+        # TIME_WAIT has no live owning process. This is diagnostic evidence,
+        # never permission to enable reuse or bypass another bound reservation.
+        raise ClosingConnectionsError("Closing TCP connections temporarily reserve the selected port. Wait for them to expire and retry.")
     raise ListenerCheckError("The selected web port is in use; no other process was stopped. Choose another port or verify exact installation ownership.")

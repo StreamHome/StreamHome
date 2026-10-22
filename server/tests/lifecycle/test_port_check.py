@@ -32,6 +32,33 @@ class WebPortCheckTests(unittest.TestCase):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as next_listener:
             next_listener.bind(("127.0.0.1", self.port))
 
+    def test_timewait_is_reported_without_making_a_reuse_probe(self) -> None:
+        self.listener.close()
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(('127.0.0.1', self.port))
+            listener.listen(1)
+            with socket.socket() as client:
+                client.connect(listener.getsockname())
+                accepted, _ = listener.accept()
+                with accepted:
+                    accepted.shutdown(socket.SHUT_WR)
+                    self.assertEqual(client.recv(1), b'')
+        self.assertFalse(port_check._socket_inodes('127.0.0.1', self.port))
+        self.assertIn(('06', '0'), port_check._socket_entries('127.0.0.1', self.port))
+        with self.assertRaises(port_check.ClosingConnectionsError):
+            port_check.check_web_port('127.0.0.1', self.port)
+
+    def test_bound_nonlistening_socket_with_reuse_is_still_a_conflict(self) -> None:
+        self.listener.close()
+        with socket.socket() as reserved:
+            reserved.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            reserved.bind(('127.0.0.1', self.port))
+            with self.assertRaises(port_check.ListenerCheckError) as raised:
+                port_check.check_web_port('127.0.0.1', self.port)
+            self.assertNotIsInstance(raised.exception, port_check.ClosingConnectionsError)
+            reserved.listen(1)
+
     def test_actual_proc_socket_inodes_match_current_listener(self) -> None:
         inodes = port_check._socket_inodes("127.0.0.1", self.port)
         self.assertTrue(inodes)

@@ -96,6 +96,16 @@ eligibility or idle lifecycle authority.
 
 ## Managed port policy
 
+Installed `streamhome configure` distinguishes an occupied listener from TCP
+TIME_WAIT reservations left by closing connections. For TIME_WAIT it reports a
+wait with a 65-second retry deadline. Each read-only inspection retains its
+30-second process timeout; no retry continues after the deadline is observed. Every
+attempt uses the same bind/listen probe without `SO_REUSEADDR` or `SO_REUSEPORT`.
+It never treats TIME_WAIT as proof of ownership, signals another process or
+bypasses a bound, non-listening reservation. A stop request cancels the wait;
+authority and configuration remain unchanged until preflight and review finish.
+Persistent conflicts and expired waits produce separate actionable diagnostics.
+
 `validate_managed_port` accepts integer or ASCII decimal input, returns a port in
 1024–65535, and excludes backend port 8000. It rejects booleans, fractional,
 signed, whitespace-padded and Unicode-digit input. Leading-zero decimal strings
