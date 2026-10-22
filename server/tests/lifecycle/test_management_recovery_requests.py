@@ -61,6 +61,55 @@ class RecoveryGrantTests(unittest.TestCase):
                 with self.subTest(extra=extra), self.assertRaises(ControlError):
                     grants.parse_grant({**self.grant, **extra})
 
+    def preserving_grant(self, mode='save_only', running=True):
+        original = replace(self.original, activation_mode=grants.contract.ActivationMode(mode),
+            interruption_approved=False, boot_enabled=False, previous_boot_enabled=True)
+        if mode == 'os_only':
+            original = replace(original, action=grants.contract.ManagementAction.PROVISION_CONTROL, candidate=original.previous)
+        if not running:
+            original = replace(original, initial_service_state='stopped', supervisor_invocation_id=None, supervisor=None, backend=None)
+        current = replace(original, expected_generation=original.expected_generation + 1,
+            previous_boot_enabled=True, stop_epoch='d' * 64)
+        return original, {**self.grant, 'source_request_sha256': original.sha256, 'request': current.payload()}
+
+    def test_preserving_grant_keeps_original_boot_target_and_exact_running_processes(self):
+        for mode in ('save_only', 'os_only'):
+            original, grant = self.preserving_grant(mode)
+            with self.subTest(mode=mode), patch.object(grants.request_contract, 'read_management_request', return_value=original):
+                self.assertEqual(grants.parse_grant(grant), grant)
+                for key, changed in (('boot_enabled', True), ('backend', {'pid': 9001, 'start_identity': '9'}),
+                                     ('supervisor', {'pid': 9002, 'start_identity': '8'}), ('backend', None)):
+                    value = deepcopy(grant)
+                    value['request'][key] = changed
+                    with self.subTest(key=key), self.assertRaises(ControlError):
+                        grants.parse_grant(value)
+
+    def test_stopped_preserving_grant_never_turns_into_a_start_permission(self):
+        original, grant = self.preserving_grant(running=False)
+        with patch.object(grants.request_contract, 'read_management_request', return_value=original):
+            self.assertEqual(grants.parse_grant(grant), grant)
+            value = deepcopy(grant)
+            value['request'].update(initial_service_state='running', supervisor_invocation_id='f' * 32,
+                supervisor={'pid': 100, 'start_identity': '9'}, backend={'pid': 101, 'start_identity': '10'})
+            with self.assertRaises(ControlError):
+                grants.parse_grant(value)
+
+    def test_preserving_prepare_finishes_original_boot_preference_under_a_new_review(self):
+        original, grant = self.preserving_grant()
+        snapshot = {'operation_id': original.operation_id, 'generation': original.expected_generation + 1,
+            'evidence_sha256': 'e' * 64, 'initial_service_state': 'running',
+            'supervisor_invocation_id': original.supervisor_invocation_id}
+        payload = {'operation_id': original.operation_id, 'expected_evidence_sha256': 'e' * 64,
+            'recovery_review_id': str(uuid.uuid4()), 'boot_enabled': True, 'boot_id': original.boot_id,
+            'stop_epoch': original.stop_epoch, 'processes': {'initial_service_state': 'running',
+                'supervisor_invocation_id': original.supervisor_invocation_id,
+                'supervisor': original.supervisor.payload(), 'backend': original.backend.payload()}}
+        with patch.object(grants.request_contract, 'read_management_request', return_value=original), patch.object(grants, 'review', return_value=snapshot):
+            result = grants.prepare(payload, control_manifest_sha256=original.controller_control_manifest_sha256)
+        self.assertFalse(result['request']['boot_enabled'])
+        self.assertTrue(result['request']['previous_boot_enabled'])
+        self.assertEqual(result['source_request_sha256'], original.sha256)
+
     def test_noninteractive_decline_and_stale_review_never_imply_consent(self):
         snapshot = {'operation_id': self.current.operation_id, 'generation': 8, 'evidence_sha256': 'e' * 64}
         value = {'schema_version': 1, 'operation_id': self.current.operation_id, 'expected_generation': 8,

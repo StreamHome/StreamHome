@@ -5,13 +5,15 @@ or environment activation is interrupted. A failed command does not authorize a
 reinstall, erase lifecycle state or reverse database writes. Recovery continues
 the recorded application, configuration and runtime tuple after a fresh review.
 
-The currently qualified path is a CUTOVER operation whose original systemd
-supervisor is still running. It supports failure before configuration publication,
+The CUTOVER path requires the original systemd supervisor to remain running.
+It supports failure before configuration publication,
 failure during guarded verification, failure after acceptance and a terminal
-`succeeded` journal whose canonical completion was interrupted. Stopped or replaced
-supervisors, save-only/OS-only recovery and operation-bound environment/control
-reconstruction require their separate maintenance protocols. This command refuses
-those unqualified cases.
+`succeeded` journal whose canonical completion was interrupted. Preserving
+SAVE_ONLY and OS_ONLY operations can also continue with their original running
+or stopped outcome. A running outcome requires the identical settled backend and
+supervisor; it never restarts either process. A stopped outcome never starts them.
+Stopped or replaced CUTOVER supervisors and operation-bound environment/control
+reconstruction require separate maintenance protocols.
 
 ## Review and continue
 
@@ -23,8 +25,9 @@ sudo streamhome recover --operation <operation-uuid>
 ```
 
 The first command prints current evidence without changing canonical authority,
-configuration or application processes. The second reviews an interruption of the
-owned application children. Empty Enter at its `[Y/n]` prompt means Yes; EOF,
+configuration or application processes. The second reviews the recorded recovery
+action. CUTOVER interrupts owned application children; SAVE_ONLY and OS_ONLY
+preserve them. Empty Enter at its `[Y/n]` prompt means Yes; EOF,
 missing terminal and interrupted input are not consent. A declined review leaves
 the original operation unresolved.
 
@@ -37,6 +40,13 @@ there is no force option or implicit retry loop.
 
 The current CLI exposes forward continuation. Link-recovery helpers and internal
 recovery-plan actions do not expose a guarded rollback or safe-abort command.
+
+Preserving recovery completes the originally reviewed boot preference with a new
+finite OS grant. CUTOVER recovery preserves the current boot preference. No older
+OS receipt authorizes either action. A preserving backend acknowledges the full
+same-operation takeover chain from its process-local settled generation. Terminal
+save/OS evidence is durable before authority release; an interrupted release can
+be reviewed again. Disk receipts cannot admit a replacement backend.
 
 ## Ownership and durable evidence
 

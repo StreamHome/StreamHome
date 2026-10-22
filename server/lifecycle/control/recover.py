@@ -33,6 +33,25 @@ def _consent(path: Path, snapshot: dict) -> bool:
     return value['continue_recovery'] and value['interruption_approved']
 
 
+def _preserved_processes(snapshot: dict) -> dict:
+    preserving = snapshot['activation_mode'] != 'cutover'
+    processes = process_snapshot(preserving_recovery=True) if preserving else process_snapshot()
+    if (processes['initial_service_state'] != snapshot['initial_service_state']
+            or processes['supervisor_invocation_id'] != snapshot['supervisor_invocation_id']):
+        raise ControlError('control_recovery_supervisor_required')
+    if preserving and snapshot['initial_service_state'] == 'running' and processes['backend'] is None:
+        raise ControlError('control_runtime_not_settled')
+    if snapshot['initial_service_state'] == 'stopped':
+        from .privileged import systemctl, unit_snapshot
+        from .stop import _require_empty
+        unit = unit_snapshot()
+        if (unit['ActiveState'] not in {'inactive', 'failed'} or int(unit['MainPID']) != 0
+                or systemctl('show', 'streamhome.service', '--property=Job') not in {'Job=', 'Job=0'}):
+            raise ControlError('control_recovery_supervisor_required')
+        _require_empty('streamhome.service')
+    return processes
+
+
 def recover(operation_id: str, *, request_path: Path | None, control_manifest_sha256: str, review_only: bool = False) -> int:
     require_root()
     _identity(operation_id)
@@ -43,10 +62,7 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
     _require_empty(f'streamhome-operation@{operation_id}.service')
     epoch = root_stop_epoch()
     snapshot = run_worker(['recovery-review', operation_id], timeout=120)
-    processes = process_snapshot()
-    if (processes['initial_service_state'] != 'running'
-            or processes['supervisor_invocation_id'] != snapshot['supervisor_invocation_id']):
-        raise ControlError('control_recovery_supervisor_required')
+    processes = _preserved_processes(snapshot)
     if review_only:
         print(json.dumps(snapshot, sort_keys=True, allow_nan=False))
         return 0
@@ -58,13 +74,17 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
             console.write('Operation: ' + operation_id)
             console.write('Generation: ' + str(snapshot['generation']))
             console.write('Recovery review SHA-256: ' + snapshot['evidence_sha256'])
-            console.write('The recorded application and configuration will be verified and continued.')
-            console.write('Owned application processes will be interrupted. Accepted changes remain accepted.')
+            if snapshot['activation_mode'] == 'cutover':
+                console.write('The recorded application and configuration will be verified and continued.')
+                console.write('Owned application processes will be interrupted. Accepted changes remain accepted.')
+            else:
+                console.write('The recorded settings and boot preference will be completed without restarting the application.')
+                console.write('Start at boot: ' + ('enabled' if snapshot['boot_enabled'] else 'disabled'))
             approved = console.confirm('Continue this operation?')
     if not approved:
         print('Operation recovery was declined.')
         return 0
-    if root_stop_epoch() != epoch or process_snapshot()['supervisor'] != processes['supervisor']:
+    if root_stop_epoch() != epoch or _preserved_processes(snapshot) != processes:
         raise ControlError('control_operator_stopped')
     fresh = run_worker(['recovery-review', operation_id], timeout=120)
     if fresh != snapshot:

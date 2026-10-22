@@ -78,8 +78,7 @@ def parse_takeover_intent(payload: dict) -> TakeoverIntent:
     if (previous.generation > result.source_generation or target.generation != result.source_generation + 1
             or (previous.generation < result.source_generation) != (parent is not None)
             or target.stage is not contract.ManagementStage.RECOVERY_REQUIRED
-            or previous.stage in {contract.ManagementStage.SAVED, contract.ManagementStage.OS_COMPLETED,
-                                  contract.ManagementStage.ROLLED_BACK}
+            or previous.stage is contract.ManagementStage.ROLLED_BACK
             or previous.stage is contract.ManagementStage.SUCCEEDED and previous.acceptance is None
             or result.action in {"rollback", "safe_abort"} and previous.acceptance is not None):
         raise ManagementRecoveryError("The recovery intent does not bind a recoverable generation.")
@@ -172,11 +171,10 @@ def inspect_recovery(root: Path, operation_id: str, generation: int) -> dict:
         phase_gap = intent.action == 'continue_recovery' and intent.target_journal == journal
     if operation.phase is not expected_phase and operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED and not phase_gap:
         raise ManagementRecoveryError("The journal does not explain the canonical phase.")
-    if effective.stage in {contract.ManagementStage.SAVED, contract.ManagementStage.OS_COMPLETED,
-                           contract.ManagementStage.ROLLED_BACK}:
+    if effective.stage is contract.ManagementStage.ROLLED_BACK:
         raise ManagementRecoveryError("Terminal acknowledgement requires its completion protocol.")
     actions = ["continue_recovery"]
-    if effective.acceptance is None:
+    if effective.acceptance is None and effective.activation_mode is contract.ActivationMode.CUTOVER:
         actions.append("rollback")
         if operation.phase is state.LifecyclePhase.RESERVED and journal.stage in {contract.ManagementStage.RESERVED, contract.ManagementStage.PREPARED}:
             actions.append("safe_abort")
@@ -295,6 +293,62 @@ def resume_candidate_verification(root: Path, journal: contract.ManagementJourna
             management_store._acknowledge_existing(path)
         elif current != journal:
             raise ManagementRecoveryError("The recovery journal changed before verification.")
+        else:
+            management_store._publish(path, updated)
+    return updated
+
+
+def preserving_continuation_source(root: Path, journal: contract.ManagementJournal, generation: int) -> contract.ManagementJournal:
+    """Prove an unbroken same-operation chain back to the live runtime's claim.
+
+    A disk settlement receipt is insufficient: the caller must own the original
+    process-local settled identity. No CUTOVER, execution change or skipped claim
+    is admitted by this helper.
+    """
+    if (journal.activation_mode is contract.ActivationMode.CUTOVER or journal.acceptance is not None
+            or journal.stage is not contract.ManagementStage.RECOVERY_REQUIRED):
+        raise ManagementRecoveryError("Only preserving recovery can acknowledge a live runtime.")
+    current = journal
+    for _ in range(128):
+        intent = inspect_takeover(root, current.operation_id, current.generation)
+        if intent.action != 'continue_recovery' or intent.target_journal != replace(current, stage=contract.ManagementStage.RECOVERY_REQUIRED):
+            raise ManagementRecoveryError("The preserving continuation changed its reviewed inputs.")
+        current = intent.source_journal
+        if current.generation == generation + 1:
+            return current
+        if current.generation <= generation + 1:
+            break
+    raise ManagementRecoveryError("The preserving continuation has no exact process-local lineage.")
+
+
+def finish_preserving_recovery(root: Path, journal: contract.ManagementJournal, *, lease) -> contract.ManagementJournal:
+    """Publish terminal evidence without inventing a reserved/exclusive cutover.
+
+    The controller must first verify desired publication, its fresh OS receipt
+    and the unchanged running/stopped outcome. Canonical authority remains in
+    recovery_required until its separate credential-fenced completion. A crash
+    in that gap is reviewed again, never inferred from the terminal file alone.
+    """
+    if journal.activation_mode is contract.ActivationMode.CUTOVER or journal.acceptance is not None:
+        raise ManagementRecoveryError("Cutover work cannot use preserving completion.")
+    intent = inspect_takeover(root, journal.operation_id, journal.generation)
+    if intent.action != 'continue_recovery' or intent.target_journal != journal:
+        raise ManagementRecoveryError("The review does not authorize preserving completion.")
+    terminal = (contract.ManagementStage.SAVED if journal.activation_mode is contract.ActivationMode.SAVE_ONLY
+                else contract.ManagementStage.OS_COMPLETED)
+    updated = replace(journal, stage=terminal)
+    contract.parse_management_journal(contract.management_journal_payload(updated))
+    with state.hold_operation_with_credential(root, operation_id=journal.operation_id, generation=journal.generation,
+            expected_phase=state.LifecyclePhase.RECOVERY_REQUIRED, expected_operation_type=state.OperationType.MANAGEMENT) as authority:
+        # Terminal preserving journals normally map to RESERVED. Here the exact
+        # retained takeover proves the deliberate RECOVERY_REQUIRED completion.
+        management_store._require_lease(lease.paths, lease, journal, authority)
+        _, path = management_store._journal_path(root, journal.operation_id)
+        current = management_store.inspect_management_journal(root, journal.operation_id)
+        if current == updated:
+            management_store._acknowledge_existing(path)
+        elif current != journal:
+            raise ManagementRecoveryError("The preserving journal changed before completion.")
         else:
             management_store._publish(path, updated)
     return updated

@@ -143,6 +143,34 @@ class RuntimeAdmission:
                 return {"acknowledged": True, "generation": journal.generation, "pid": self.pid,
                         "startIdentity": self.start, "executionTupleSha256": contract.execution_tuple_sha256(self.execution)}
 
+    def acknowledge_recovered_continuation(self, operation_id: str, *, controller_pid: int) -> dict:
+        from .management_recovery_store import preserving_continuation_source
+        with self._lock:
+            if not self._settled or not self._same_process() or self._pending is not None and self._pending.operation_id != operation_id:
+                raise RuntimeAdmissionError("Only the original settled process can acknowledge preserving recovery.")
+            journal = management_store.inspect_management_journal(self.context.installation_root, operation_id)
+            with state.hold_operation_with_credential(self.context.installation_root,
+                    operation_id=operation_id, generation=journal.generation,
+                    expected_phase=state.LifecyclePhase.RECOVERY_REQUIRED, expected_operation_type=state.OperationType.MANAGEMENT) as authority:
+                contract.validate_active_journal(journal, authority)
+                source = preserving_continuation_source(self.context.installation_root, journal, self.generation)
+                lease = state.read_controller_lease(self.context.installation_root)
+                if (journal.installation_id != self.installation_id or journal.previous != self.execution
+                        or journal.initial_service_state != 'running' or journal.supervisor_invocation_id != self.invocation
+                        or lease is None or not state.controller_lease_is_current(lease) or lease.pid != controller_pid
+                        or lease.operation_id != operation_id or lease.generation != journal.generation
+                        or lease.owner_kind is not state.OwnerKind.MANAGEMENT_CONTROLLER):
+                    raise RuntimeAdmissionError("The recovery does not preserve this exact settled runtime.")
+                if self._pending is not None:
+                    original_pending = replace(self._pending, generation=source.generation,
+                        controller_invocation_id=source.controller_invocation_id, stage=source.stage)
+                    if original_pending != source:
+                        raise RuntimeAdmissionError("The retained review does not explain this process's pending operation.")
+                self._receipt(generation=self.generation, pending=journal)
+                self._pending = journal
+                return {'acknowledged': True, 'generation': journal.generation, 'pid': self.pid,
+                        'startIdentity': self.start, 'executionTupleSha256': contract.execution_tuple_sha256(self.execution)}
+
     def admitted(self) -> bool:
         with self._lock:
             if not self._settled or not self._same_process():
@@ -162,6 +190,8 @@ class RuntimeAdmission:
                 else contract.ManagementStage.OS_COMPLETED if pending.activation_mode is contract.ActivationMode.OS_ONLY else None
             )
             if operation is not None:
+                if operation.phase is state.LifecyclePhase.RECOVERY_REQUIRED:
+                    return False
                 contract.validate_active_journal(journal, current)
                 lease = state.read_controller_lease(self.context.installation_root)
                 return (

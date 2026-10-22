@@ -29,11 +29,12 @@ idle-only migration. Tests initialize disposable version-2 fixtures directly;
 those writes are not a migration procedure. Older version-1-only binaries reject
 version 2; reverting a source checkout cannot downgrade authority.
 
-Until guarded management startup and recovery are complete, bootstrap returns
-`management_startup_unavailable` with no runtime effects. The legacy controller
-CLI cannot claim, transition or complete management. Its recovery planner and
-cleanup reject management instead of falling through to update behavior. These
-guards must remain until the corresponding complete protocols replace them.
+Guarded management startup requires an exact MANAGEMENT_VERIFY request, live
+controller and bound execution proof. An ordinary or unproven launch during
+MANAGEMENT returns `management_startup_unavailable` with no runtime effects.
+The legacy controller CLI cannot claim, transition or complete management; its
+recovery planner and cleanup reject management instead of falling through to
+update behavior. Reviewed installed-control recovery uses its own narrow path.
 
 ## Journal version 1
 
@@ -119,6 +120,13 @@ under the canonical lifecycle directory. Managed installations resolve it to
 The UID management controller uses this store for ordinary operation progress.
 Explicit generation takeover uses a separate retained-intent protocol and cannot
 be performed through an ordinary journal update.
+
+Preserving recovery can publish `saved` or `os_completed` while canonical phase
+remains `recovery_required`, after exact takeover, configuration, live-process or
+stopped-state and fresh OS-receipt checks. It then separately completes authority
+with that exact phase and credential. This completion gap does not authorize a
+new claim or normal admission. Another interruption requires a new review; the
+original running backend rebinds only an unbroken same-operation generation chain.
 
 Creation and progress require an exact living controller lease and current
 credential under controller-lock-before-state-lock ordering. The journal must

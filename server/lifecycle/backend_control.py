@@ -101,7 +101,7 @@ class BackendControl:
         require_current(record['grant'])
         return {'registered': True}
 
-    def _controller(self, peer: Peer, arguments: dict) -> tuple[str, int]:
+    def _controller(self, peer: Peer, arguments: dict, *, preserving_recovery: bool = False) -> tuple[str, int]:
         if set(arguments) != {"operation_id", "generation"}:
             raise ControlError("control_message_invalid")
         lease = state.read_controller_lease(self.root)
@@ -113,7 +113,7 @@ class BackendControl:
             or operation.active_operation is None or operation.generation != lease.generation
             or operation.active_operation.operation_id != lease.operation_id
             or operation.active_operation.operation_type is not state.OperationType.MANAGEMENT
-            or operation.active_operation.phase is not state.LifecyclePhase.RESERVED
+            or operation.active_operation.phase is not (state.LifecyclePhase.RECOVERY_REQUIRED if preserving_recovery else state.LifecyclePhase.RESERVED)
         ):
             raise ControlError("control_controller_changed")
         cgroups = Path(f"/proc/{peer.pid}/cgroup").read_text().splitlines()
@@ -163,7 +163,9 @@ class BackendControl:
                 "execution": execution_tuple_payload(read_active_execution(self.root).execution),
                 "readiness": get_startup_readiness().projection(),
             }
-        operation_id, generation = self._controller(peer, arguments)
+        operation_id, generation = self._controller(peer, arguments, preserving_recovery=action == 'ack_recovered_continuation')
+        if action == 'ack_recovered_continuation':
+            return require_runtime_admission().acknowledge_recovered_continuation(operation_id, controller_pid=peer.pid)
         if action in {"ack_continuation", "register_preparation"}:
             if operation_id in self.preparation:
                 return {"acknowledged": True, "generation": generation}

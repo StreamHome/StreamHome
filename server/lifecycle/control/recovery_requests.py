@@ -41,10 +41,14 @@ def parse_grant(payload: dict) -> dict:
     before, after = original.payload(), current.payload()
     if (any(before[key] != after[key] for key in before.keys() - mutable)
             or current.expected_generation <= original.expected_generation
-            or current.activation_mode is not contract.ActivationMode.CUTOVER
-            or current.initial_service_state != 'running'
             or current.supervisor_invocation_id != original.supervisor_invocation_id
-            or current.backend is not None or current.boot_enabled is not current.previous_boot_enabled):
+            or current.activation_mode is contract.ActivationMode.CUTOVER and (
+                current.initial_service_state != 'running' or current.backend is not None
+                or current.boot_enabled is not current.previous_boot_enabled)
+            or current.activation_mode is not contract.ActivationMode.CUTOVER and (
+                current.boot_enabled is not original.boot_enabled
+                or current.supervisor != original.supervisor or current.backend != original.backend
+                or current.initial_service_state == 'running' and current.backend is None)):
         raise ControlError('control_recovery_request_changed')
     return payload
 
@@ -85,10 +89,13 @@ def review(operation_id: str, *, control_manifest_sha256: str) -> dict:
     authority = state.inspect_state(root)
     plan = recovery.inspect_recovery(root, operation_id, authority.generation)
     journal = management_store.inspect_management_journal(root, operation_id)
-    if (original.activation_mode is not contract.ActivationMode.CUTOVER
-            or original.initial_service_state != 'running'
+    if (original.activation_mode is contract.ActivationMode.CUTOVER and original.initial_service_state != 'running'
             or original.previous != journal.previous or original.candidate != journal.candidate
             or original.review_id != journal.review_id
+            or original.action is not journal.action or original.activation_mode is not journal.activation_mode
+            or original.installation_id != journal.installation_id
+            or original.initial_service_state != journal.initial_service_state
+            or original.supervisor_invocation_id != journal.supervisor_invocation_id
             or original.controller_control_manifest_sha256 != control_manifest_sha256):
         raise ControlError('control_recovery_mode_unavailable')
     active = read_active_execution(root)
@@ -97,6 +104,9 @@ def review(operation_id: str, *, control_manifest_sha256: str) -> dict:
             or journal.acceptance is None and active.execution != journal.previous):
         raise ControlError('control_recovery_execution_changed')
     return {**plan, 'installation_id': journal.installation_id,
+            'activation_mode': original.activation_mode.value,
+            'initial_service_state': original.initial_service_state,
+            'boot_enabled': original.boot_enabled,
             'supervisor_invocation_id': original.supervisor_invocation_id,
             'source_request_sha256': original.sha256,
             'control_manifest_sha256': control_manifest_sha256}
@@ -111,12 +121,14 @@ def prepare(payload: dict, *, control_manifest_sha256: str) -> dict:
     processes = payload['processes']
     if (snapshot['evidence_sha256'] != payload['expected_evidence_sha256']
             or not isinstance(processes, dict) or set(processes) != {'initial_service_state', 'supervisor_invocation_id', 'supervisor', 'backend'}
-            or processes['initial_service_state'] != 'running'
+            or processes['initial_service_state'] != snapshot['initial_service_state']
             or processes['supervisor_invocation_id'] != snapshot['supervisor_invocation_id']):
         raise ControlError('control_recovery_review_stale')
     original = request_contract.read_management_request(payload['operation_id'])
-    current = replace(original, expected_generation=snapshot['generation'], supervisor=_process(processes['supervisor']), backend=None,
-                      previous_boot_enabled=payload['boot_enabled'], boot_enabled=payload['boot_enabled'],
+    preserving = original.activation_mode is not contract.ActivationMode.CUTOVER
+    current = replace(original, expected_generation=snapshot['generation'], supervisor=_process(processes['supervisor']),
+                      backend=_process(processes['backend']) if preserving else None,
+                      previous_boot_enabled=payload['boot_enabled'], boot_enabled=original.boot_enabled if preserving else payload['boot_enabled'],
                       boot_id=payload['boot_id'], stop_epoch=payload['stop_epoch'])
     value = {'schema_version': 1, 'recovery_review_id': payload['recovery_review_id'],
              'source_evidence_sha256': snapshot['evidence_sha256'], 'source_request_sha256': original.sha256,

@@ -69,7 +69,7 @@ def unit_stopped() -> int:
     return 0
 
 
-def process_snapshot() -> dict:
+def process_snapshot(*, preserving_recovery: bool = False) -> dict:
     selected = descriptor()
     unit = unit_snapshot()
     result = {"initial_service_state": "stopped", "supervisor_invocation_id": None, "supervisor": None, "backend": None}
@@ -86,7 +86,13 @@ def process_snapshot() -> dict:
             admitted = request(selected.paths.runtime / "backend.sock", expected_uid=selected.service_uid,
                 expected_pid=backend["pid"], installation_id=selected.installation_id, invocation=unit["InvocationID"],
                 action="snapshot", arguments={})
-            if admitted.get("admitted") is True and admitted.get("pid") == backend["pid"] and admitted.get("startIdentity") == backend["start_identity"]:
+            readiness = admitted.get('readiness')
+            recovering = (preserving_recovery and isinstance(readiness, dict)
+                and readiness.get('generalReady') is True and readiness.get('workersStarted') is True
+                and readiness.get('recoverySucceeded') is True)
+            if ((admitted.get("admitted") is True or recovering) and admitted.get("pid") == backend["pid"]
+                    and admitted.get("startIdentity") == backend["start_identity"]
+                    and admitted.get('installationId') == selected.installation_id and admitted.get('invocation') == unit['InvocationID']):
                 result["backend"] = {"pid": backend["pid"], "start_identity": backend["start_identity"]}
         except ControlError:
             pass  # Only a separately approved interrupting path may use this absence.
@@ -160,6 +166,13 @@ def _apply_fixed_boot_effect(payload: dict, observation: dict, *, recovery: bool
         if (unit["ActiveState"] not in {"active", "activating"} or unit["InvocationID"] != payload["supervisor_invocation_id"]
                 or int(unit["MainPID"]) != payload["supervisor"]["pid"]):
             raise ControlError("control_incarnation_changed")
+    elif recovery:
+        unit = unit_snapshot()
+        if (unit['ActiveState'] not in {'inactive', 'failed'} or int(unit['MainPID']) != 0
+                or systemctl('show', 'streamhome.service', '--property=Job') not in {'Job=', 'Job=0'}):
+            raise ControlError('control_incarnation_changed')
+        from .stop import _require_empty
+        _require_empty('streamhome.service')
     _verify_owned_units()
     suffix = "-" + str(observation["generation"]) if recovery else ""
     path = OPERATIONS / payload["operation_id"] / ("bridge" + suffix + ".json")

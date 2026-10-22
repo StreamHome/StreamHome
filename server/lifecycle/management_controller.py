@@ -248,6 +248,9 @@ class ManagementController:
         if operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED:
             state.transition_operation_with_credential(ROOT, operation_id=self.journal.operation_id, generation=self.journal.generation,
                 expected_phase=operation.phase, next_phase=state.LifecyclePhase.RECOVERY_REQUIRED)
+        if self.journal.stage in {contract.ManagementStage.SAVED, contract.ManagementStage.OS_COMPLETED,
+                                  contract.ManagementStage.SUCCEEDED, contract.ManagementStage.ROLLED_BACK}:
+            return  # Retain terminal evidence when only canonical completion failed.
         updated = replace(self.journal, stage=contract.ManagementStage.RECOVERY_REQUIRED)
         self.journal = management_store.advance_management_journal(ROOT, self.journal, updated, lease=self.lease)
 
@@ -284,7 +287,7 @@ def main(operation_id: str, *, control_manifest_sha256: str) -> int:
 
 
 class RecoveredManagementController(ManagementController):
-    """Forward continuation after a fresh exact review, on the same supervisor."""
+    """Forward continuation preserving the reviewed running/stopped outcome."""
     def __init__(self, grant: dict, *, control_manifest_sha256: str):
         from .control.requests import parse_management_request
         from .control.recovery_requests import parse_grant
@@ -305,6 +308,9 @@ class RecoveredManagementController(ManagementController):
                 original_generation=original.expected_generation + 1, expected=original.expected_desired,
                 target=DeploymentRevision(self.journal.installation_id, self.journal.candidate.deployment_revision, original.deployment))
         self.wait_os_receipt()
+        if self.journal.activation_mode is not contract.ActivationMode.CUTOVER:
+            self.finish_preserving()
+            return
         if self.rpc('supervisor', 'recover_children').get('stopped') is not True:
             raise ControlError('control_children_busy')
         def assert_stopped():
@@ -326,3 +332,36 @@ class RecoveredManagementController(ManagementController):
         self.commit_and_wait_recovery()
         self.advance(contract.ManagementStage.SUCCEEDED)
         self.complete()
+
+    def finish_preserving(self) -> None:
+        from .management_recovery_store import finish_preserving_recovery
+        from .runtime_links import verify_links
+        self.checkpoint()
+        current = self.store.inspect()
+        if (read_active_execution(ROOT).execution != self.journal.previous
+                or current.active.revision != self.journal.previous.deployment_revision
+                or current.policy_revisions != self.journal.previous.policy_revisions
+                or current.provider_revisions != self.journal.previous.provider_revisions
+                or self.journal.activation_mode is contract.ActivationMode.OS_ONLY and current.desired != self.review.expected_desired):
+            raise ControlError('control_recovery_execution_changed')
+        verify_links(ROOT, self.journal.previous)
+        if self.review.initial_service_state == 'running':
+            acknowledgement = self.rpc('backend', 'ack_recovered_continuation')
+            if (acknowledgement.get('acknowledged') is not True or acknowledgement.get('generation') != self.journal.generation
+                    or acknowledgement.get('pid') != self.review.backend.pid
+                    or acknowledgement.get('startIdentity') != self.review.backend.start_identity
+                    or acknowledgement.get('executionTupleSha256') != contract.execution_tuple_sha256(self.journal.previous)):
+                raise ControlError('control_runtime_not_settled')
+        else:
+            try:
+                members = Path('/sys/fs/cgroup' + RUNTIME_CGROUP + '/cgroup.procs').read_text().split()
+            except FileNotFoundError:
+                members = []
+            if members:
+                raise ControlError('control_recovery_supervisor_required')
+        self.checkpoint()
+        self.journal = finish_preserving_recovery(ROOT, self.journal, lease=self.lease)
+        self.checkpoint()
+        state.complete_operation_with_credential(ROOT, operation_id=self.journal.operation_id,
+            generation=self.journal.generation, expected_phase=state.LifecyclePhase.RECOVERY_REQUIRED,
+            expected_operation_type=state.OperationType.MANAGEMENT)

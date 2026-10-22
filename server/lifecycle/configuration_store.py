@@ -479,10 +479,10 @@ class ConfigurationStore:
         from .management_recovery_store import inspect_takeover
         if (journal.stage is not management.ManagementStage.RECOVERY_REQUIRED
                 or journal.action is not management.ManagementAction.CONFIGURE_APPLY
-                or journal.activation_mode is not management.ActivationMode.CUTOVER
+                or journal.activation_mode not in {management.ActivationMode.CUTOVER, management.ActivationMode.SAVE_ONLY}
                 or target.installation_id != self.installation_id
                 or target.revision != journal.candidate.deployment_revision):
-            raise ConfigurationStoreError("Desired recovery requires the original cutover configuration.")
+            raise ConfigurationStoreError("Desired recovery requires the original configure intent.")
         intent = inspect_takeover(root, journal.operation_id, journal.generation)
         if intent.action != 'continue_recovery':
             raise ConfigurationStoreError("The recovery review does not authorize desired publication.")
@@ -511,7 +511,8 @@ class ConfigurationStore:
                     raise ConfigurationConflictError("Accepted configure recovery requires its prior desired publication.")
                 os.fsync(self.fd)
                 return current
-            if current.active != receipt.previous_active or receipt.stage not in {'prepared', 'applying'}:
+            outcome = 'saved' if journal.activation_mode is management.ActivationMode.SAVE_ONLY else 'applying'
+            if current.active != receipt.previous_active or receipt.stage not in {'prepared', outcome}:
                 raise ConfigurationConflictError("Unaccepted configure recovery cannot change the active revision.")
             self.read_revision(current.active)
             self.read_revision(current.desired)
@@ -520,7 +521,7 @@ class ConfigurationStore:
                 self._replace('manifest.json', current.payload())
             else:
                 os.fsync(self.fd)
-            self._write_receipt(replace(receipt, stage='applying'))
+            self._write_receipt(replace(receipt, stage=outcome))
             return current
 
     def _intent(self, current, journal, expected, target) -> ConfigurationApplyReceipt:
