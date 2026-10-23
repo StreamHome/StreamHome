@@ -50,10 +50,16 @@ def _protected_reader(path: Path, fields: list[str]) -> bool:
 
 def require_service_quiescent(*, preparation_id: str | None = None, inspections: bool = False,
                               controller: tuple[str, int, str] | None = None,
-                              startup_hook: tuple[int, str] | None = None) -> None:
+                              startup_hook: tuple[int, str] | None = None,
+                              runtime_supervisor: tuple[int, str, str] | None = None) -> None:
     """Prove absence of live service-UID work beyond this independent reader."""
     if os.geteuid() == 0:
         raise ControlError("control_worker_forbidden")
+    running_members = None
+    if runtime_supervisor is not None:
+        if controller is not None or startup_hook is not None or preparation_id is None:
+            raise ControlError('control_preparation_invalid')
+        running_members = _running_preparation_members(runtime_supervisor)
     allowed = None
     controller_pid = None
     if controller is not None:
@@ -98,10 +104,11 @@ def require_service_quiescent(*, preparation_id: str | None = None, inspections:
     runtime = Path("/sys/fs/cgroup" + RUNTIME_CGROUP + "/cgroup.procs")
     try:
         members = {int(value) for value in runtime.read_text().split()}
-        if (startup_members and members != startup_members) or (not startup_members and members):
+        if ((running_members is not None and members != running_members)
+                or running_members is None and ((startup_members and members != startup_members) or (not startup_members and members))):
             raise ControlError("control_children_busy")
     except FileNotFoundError:
-        if startup_members:
+        if startup_members or running_members is not None:
             raise ControlError('control_unit_hook_forbidden')
     except ValueError as exc:
         raise ControlError('control_quiescence_unproven') from exc
@@ -117,6 +124,8 @@ def require_service_quiescent(*, preparation_id: str | None = None, inspections:
             if fields[0] in {'Z', 'X'}:
                 continue
             if ((controller_pid is not None and int(path.name) == controller_pid)
+                    or (running_members is not None and int(path.name) in running_members
+                        and process_cgroup(int(path.name)) == RUNTIME_CGROUP)
                     or (allowed is not None and process_cgroup(int(path.name)) == allowed)
                     or (allowed is not None or inspections) and _protected_reader(path, fields)):
                 continue
@@ -126,6 +135,37 @@ def require_service_quiescent(*, preparation_id: str | None = None, inspections:
             continue
         except (OSError, IndexError) as exc:
             raise ControlError("control_quiescence_unproven") from exc
+    if runtime_supervisor is not None and _running_preparation_members(runtime_supervisor) != running_members:
+        raise ControlError('control_incarnation_changed')
+
+
+def _running_preparation_members(reference: tuple[int, str, str]) -> set[int]:
+    """Prove exact owned runtime custody; never authorize a launch or app IO."""
+    from .administration_lock import process_identity
+    from .privileged import descriptor, supervisor_snapshot, systemctl, unit_snapshot
+    if (not isinstance(reference, tuple) or len(reference) != 3 or type(reference[0]) is not int
+            or reference[0] <= 1 or not isinstance(reference[1], str) or not isinstance(reference[2], str)):
+        raise ControlError('control_preparation_invalid')
+    pid, start, invocation = reference
+    selected = descriptor()
+    unit = unit_snapshot()
+    observed_start, status = process_identity(pid)
+    if (selected.service_uid != os.geteuid() or unit['ActiveState'] not in {'active', 'activating'}
+            or int(unit['MainPID']) != pid or unit['InvocationID'] != invocation
+            or observed_start != start or status in {'Z', 'X'} or Path(f'/proc/{pid}').stat().st_uid != os.geteuid()
+            or process_cgroup(pid) != RUNTIME_CGROUP
+            or systemctl('show', 'streamhome.service', '--property=Job') not in {'Job=', 'Job=0'}):
+        raise ControlError('control_incarnation_changed')
+    snapshot = supervisor_snapshot(selected, unit)
+    if snapshot.get('launches_open') is not True or snapshot.get('start_identity') != start:
+        raise ControlError('control_operator_stopped')
+    try:
+        members = {int(value) for value in Path('/sys/fs/cgroup' + RUNTIME_CGROUP + '/cgroup.procs').read_text().split()}
+    except (FileNotFoundError, ValueError) as exc:
+        raise ControlError('control_quiescence_unproven') from exc
+    if pid not in members:
+        raise ControlError('control_incarnation_changed')
+    return members
 
 
 def controller_peer(pid: int, operation_id: str) -> None:

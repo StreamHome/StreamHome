@@ -58,6 +58,7 @@ class ManagementController:
             raise ControlError("control_operator_stopped")
         if self.lease is not None:
             self.lease.require_current()
+        self.require_preparation_issuer()
         if self.review.initial_service_state == 'stopped' and self.review.action is contract.ManagementAction.REPAIR_ENVIRONMENT:
             from .control.stopped_repair import require_scope
             if hasattr(self, 'grant'):
@@ -74,6 +75,22 @@ class ManagementController:
 
     def requires_original_supervisor(self) -> bool:
         return True
+
+    def require_preparation_issuer(self) -> None:
+        if (self.review.action is not contract.ManagementAction.REPAIR_ENVIRONMENT
+                or self.review.initial_service_state != 'running' or self.review.backend is not None):
+            return
+        from .control.runtime_preparation import read_grant
+        from .control.stopped_repair import require_scope
+        grant = read_grant(self.review.operation_id)
+        if (grant['schema_version'] != 3 or grant['previous'] != contract.execution_tuple_payload(self.review.previous)
+                or grant['expected_generation'] != self.review.expected_generation
+                or grant['supervisor'] != self.review.supervisor.payload()
+                or grant['supervisor_invocation_id'] != self.review.supervisor_invocation_id
+                or grant['stop_epoch'] != self.review.stop_epoch or grant['boot_id'] != self.review.boot_id
+                or time.monotonic() >= grant['expires_at_monotonic']):
+            raise ControlError('control_preparation_changed')
+        require_scope(grant['issuer_scope'], self.review.installation_id)
 
     def guarded_runtime_evidence(self) -> dict:
         return {"supervisor_invocation_id": self.review.supervisor_invocation_id}
@@ -228,6 +245,14 @@ class ManagementController:
             target = DeploymentRevision(self.review.installation_id, self.review.candidate.deployment_revision, self.review.deployment)
             self.store.publish_desired(ROOT, self.journal, lease=self.lease, expected=self.review.expected_desired, target=target.reference)
         self.wait_os_receipt()
+        if (self.review.action is contract.ManagementAction.REPAIR_ENVIRONMENT
+                and self.review.initial_service_state == 'running' and self.review.backend is None):
+            # Independent repair cannot borrow the unhealthy backend's cache
+            # registration or drain acknowledgement. Root stops the whole unit;
+            # a fresh post-stop review owns subsequent guarded activation.
+            while True:
+                self.checkpoint()
+                time.sleep(0.2)
         if self.review.activation_mode is not contract.ActivationMode.CUTOVER:
             self.advance(contract.ManagementStage.SAVED if self.review.activation_mode is contract.ActivationMode.SAVE_ONLY else contract.ManagementStage.OS_COMPLETED)
             self.complete()
@@ -363,6 +388,11 @@ class RecoveredManagementController(ManagementController):
 
     def requires_original_supervisor(self) -> bool:
         return self.grant['schema_version'] != 3
+
+    def require_preparation_issuer(self) -> None:
+        # Recovery has a newly reviewed finite grant; an expired builder scope
+        # remains history and cannot authorize or prevent this new ownership.
+        return
 
     def checkpoint(self) -> None:
         super().checkpoint()

@@ -35,8 +35,11 @@ def parse_grant(value: dict) -> dict:
     offline = isinstance(value, dict) and type(value.get('schema_version')) is int and value['schema_version'] == 2
     if offline:
         fields.add('offline_scope')
+    independent = isinstance(value, dict) and type(value.get('schema_version')) is int and value['schema_version'] == 3
+    if independent:
+        fields.add('issuer_scope')
     if (not isinstance(value, dict) or set(value) != fields or type(value['schema_version']) is not int
-            or value['schema_version'] not in {1, 2}):
+            or value['schema_version'] not in {1, 2, 3}):
         raise ControlError('control_preparation_invalid')
     for name in ('installation_id', 'preparation_id', 'boot_id'):
         contract._uuid(value[name], name)
@@ -51,8 +54,12 @@ def parse_grant(value: dict) -> dict:
             raise ControlError('control_preparation_invalid')
     else:
         invocation = contract._text(value['supervisor_invocation_id'], contract._INVOCATION, 'preparation supervisor')
-        if not int(invocation, 16) or any(_process(value[name]) is None for name in ('supervisor', 'backend')):
+        if (not int(invocation, 16) or _process(value['supervisor']) is None
+                or independent and value['backend'] is not None or not independent and _process(value['backend']) is None):
             raise ControlError('control_preparation_invalid')
+        if independent:
+            from .stopped_repair import parse_scope
+            parse_scope(value['issuer_scope'], value['installation_id'])
     reference = value['expected_desired']
     if not isinstance(reference, dict) or set(reference) != {'revision', 'sha256'}:
         raise ControlError('control_preparation_invalid')
@@ -107,6 +114,14 @@ def require_current(value: dict) -> None:
         require_scope(value['offline_scope'], value['installation_id'])
         require_stopped()
         require_service_quiescent(preparation_id=value['preparation_id'])
+        return
+    if value['schema_version'] == 3:
+        from .stopped_repair import require_scope
+        from .processes import require_service_quiescent
+        require_scope(value['issuer_scope'], value['installation_id'])
+        peer = _process(value['supervisor'])
+        require_service_quiescent(preparation_id=value['preparation_id'],
+            runtime_supervisor=(peer.pid, peer.start_identity, value['supervisor_invocation_id']))
         return
     for name in ('supervisor', 'backend'):
         peer = _process(value[name])

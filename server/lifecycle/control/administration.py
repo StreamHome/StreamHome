@@ -264,6 +264,11 @@ def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | N
                         else:
                             _apply_fixed_boot_effect(payload, observation, recovery=True)
                     effect_done = True
+                if (effect_done and recovery_grant is None and payload.get('action') == 'repair_environment'
+                        and payload.get('initial_service_state') == 'running' and payload.get('backend') is None
+                        and observation.get('stage') == 'prepared'):
+                    from .repair_interruption import stop_prepared
+                    stop_prepared(payload, observation)
                 if (effect_done and recovery_grant is not None and recovery_grant.get('schema_version') == 3
                         and observation.get('stage') in {'verifying', 'accepted'}):
                     from .resumption_dispatch import start as start_resumed

@@ -43,6 +43,29 @@ permissions. Historical evidence remains readable after the issuer exits; it
 cannot authorize a new attempt. Cleanup follows the latest recovery grant and
 cannot stop a controller adopted by a newer explicit owner.
 
+## Repair an unhealthy running service
+
+`sudo streamhome repair` also supports a living supervisor whose backend cannot
+acknowledge normal admission. It prepares new private environments with the
+independent control reader and base OS Python. It binds the exact supervisor and
+a cancellable root scope; it does not borrow a backend cache-preparation or drain
+acknowledgement. Other service-account work outside the owned runtime and exact
+preparation unit prevents this path.
+
+The complete candidate is verified before reserving MANAGEMENT. After activation
+approval, the root bridge records one whole-service stop intent and stops only
+the exact owned unit. Stop propagation cancels that issuer and controller. The
+command reports the operation UUID and the fresh `recover --operation UUID`
+review needed to start the guarded replacement. This continuation-required result
+is not a completed repair or permission to restart automatically. Declining that
+new review leaves the service stopped and the original operation unresolved.
+
+Broken selected Python or Node files do not block independent preparation. The
+old execution remains selected until the replacement passes guarded acceptance
+and mandatory recovery. Application commit, configuration, policy/provider
+revisions, assets and database writes are preserved. A stop during preparation
+cancels the builder before any claim; it never silently resumes the service.
+
 ## Review and continue
 
 Use the exact unresolved operation UUID reported by installation diagnostics:

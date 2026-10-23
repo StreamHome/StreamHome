@@ -81,13 +81,18 @@ class RuntimePreparationContractTests(unittest.TestCase):
         result = subprocess.run([sys.executable, '-c', code], env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[2])}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_root_repair_requires_resolved_authority_and_a_real_settled_backend_before_grant(self):
-        selected = SimpleNamespace(status=SimpleNamespace(value='ready'))
+    def test_root_repair_requires_resolved_authority_or_hands_unhealthy_work_to_a_scope(self):
+        selected = SimpleNamespace(status=SimpleNamespace(value='ready'), installation_id=str(uuid.uuid4()))
         for active, process in (({'operation_id': str(uuid.uuid4())}, None), (None, {'initial_service_state': 'running', 'backend': None})):
             snapshot = {'lifecycle': {'active_operation': active}}
             with self.subTest(active=active), patch.object(repair, 'require_root'), patch.object(repair, 'descriptor', return_value=selected), patch.object(repair, 'root_stop_epoch', return_value='a' * 64), patch.object(repair, 'run_worker', return_value=snapshot), patch.object(repair, 'process_snapshot', return_value=process), patch.object(repair, '_prepare') as build, patch.object(repair, 'open_console') as console:
-                with self.assertRaisesRegex(ControlError, 'control_operation_recovery_required' if active else 'control_interrupting_repair_required'):
-                    repair.repair(request_path=None, control_manifest_sha256='a' * 64)
+                if active:
+                    with self.assertRaisesRegex(ControlError, 'control_operation_recovery_required'):
+                        repair.repair(request_path=None, control_manifest_sha256='a' * 64)
+                else:
+                    result = repair.repair(request_path=None, control_manifest_sha256='a' * 64)
+                    self.assertTrue(result.running_repair)
+                    self.assertEqual(result.installation_id, selected.installation_id)
                 build.assert_not_called()
                 console.assert_not_called()
 

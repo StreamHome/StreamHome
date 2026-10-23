@@ -20,6 +20,7 @@ class StoppedRepairHandoff:
     stop_epoch: str
     request_path: Path | None
     recovery_action: str | None = None
+    running_repair: bool = False
 
 
 def _uuid(value: str) -> str:
@@ -103,7 +104,8 @@ def _cleanup(handoff: StoppedRepairHandoff, name: str) -> None:
                 if not path.exists() and not path.is_symlink():
                     return
                 grant = read_protected_json(path)
-                if grant.get('offline_scope', {}).get('unit') != name:
+                scope = grant.get('issuer_scope' if grant.get('schema_version') == 3 else 'offline_scope', {})
+                if scope.get('unit') != name:
                     raise ControlError('control_stopped_repair_issuer_changed')
                 roles = ('prepare', 'operation')
             else:
@@ -139,13 +141,16 @@ def run_scoped(handoff: StoppedRepairHandoff) -> int:
         raise ControlError('control_stopped_repair_invalid')
     if handoff.recovery_action not in {None, 'continue_recovery', 'rollback', 'safe_abort'}:
         raise ControlError('control_stopped_repair_invalid')
+    if type(handoff.running_repair) is not bool or handoff.running_repair and handoff.recovery_action is not None:
+        raise ControlError('control_stopped_repair_invalid')
     from . import privileged
     name = 'streamhome-install-' + handoff.installation_id + '-' + uuid.uuid4().hex + '.scope'
     arguments = ['/usr/bin/systemd-run', '--scope', '--quiet', '--collect', '--slice=system.slice', '--unit=' + name,
         '--description=StreamHome installation ' + handoff.installation_id, '--property=StopPropagatedFrom=streamhome.service',
         '--property=RuntimeMaxSec=3600', '/usr/bin/python3', '-I', '/usr/local/libexec/streamhome/provision',
         *(['--rescue'] if privileged._RESCUE_MODE else []),
-        '--recover-stopped-scoped' if handoff.recovery_action is not None else '--repair-stopped-scoped', handoff.installation_id,
+        ('--recover-stopped-scoped' if handoff.recovery_action is not None else
+         '--repair-running-scoped' if handoff.running_repair else '--repair-stopped-scoped'), handoff.installation_id,
         handoff.preparation_id, handoff.stop_epoch,
         *(['--action', handoff.recovery_action] if handoff.recovery_action is not None else []),
         *(['--request', os.path.abspath(handoff.request_path)] if handoff.request_path is not None else [])]
@@ -156,5 +161,17 @@ def run_scoped(handoff: StoppedRepairHandoff) -> int:
         raise
     if result.returncode:
         _cleanup(handoff, name)
+        if handoff.running_repair:
+            from .administration import _sha
+            from .tickets import read_protected_json
+            directory = Path('/etc/streamhome/control/operations') / handoff.preparation_id
+            marker = directory / 'repair-stop.json'
+            if marker.exists() or marker.is_symlink():
+                receipt = read_protected_json(marker)
+                if (receipt.get('schema_version') == 1 and receipt.get('operation_id') == handoff.preparation_id
+                        and receipt.get('request_sha256') == _sha(read_protected_json(directory / 'request.json'))
+                        and receipt.get('issuer_scope', {}).get('unit') == name):
+                    print('Runtime activation requires a fresh recovery review. Run:', flush=True)
+                    print('  sudo streamhome recover --operation ' + handoff.preparation_id, flush=True)
         raise ControlError('control_stopped_repair_scope_stopped')
     return 0

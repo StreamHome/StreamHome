@@ -301,7 +301,7 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
     global _RESCUE_MODE
     _RESCUE_MODE = rescue
     try:
-        if arguments and arguments[0] in {'--repair-stopped-scoped', '--recover-stopped-scoped'}:
+        if arguments and arguments[0] in {'--repair-stopped-scoped', '--repair-running-scoped', '--recover-stopped-scoped'}:
             require_root()
             parser = argparse.ArgumentParser(prog='StreamHome stopped repair')
             parser.add_argument('installation_id')
@@ -320,7 +320,8 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
                         scope_epoch=selected.stop_epoch, expected_installation_id=selected.installation_id)
                 return repair(request_path=selected.request, control_manifest_sha256=manifest_sha256,
                     scope_epoch=selected.stop_epoch, preparation_id=selected.preparation_id,
-                    expected_installation_id=selected.installation_id)
+                    expected_installation_id=selected.installation_id,
+                    running_scope=arguments[0] == '--repair-running-scoped')
         if arguments == ["--select-public-source"]:
             from .source_selection import select_public_source
             print(json.dumps(select_public_source(), sort_keys=True))
