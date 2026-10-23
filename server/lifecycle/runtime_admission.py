@@ -91,6 +91,13 @@ class RuntimeAdmission:
                 or journal["outcome"] not in {"succeeded", "rolled_back"}
             ):
                 raise RuntimeAdmissionError("The exact accepted restore has not published terminal evidence.")
+            if layout_for_root(self.context.installation_root).managed:
+                from .parent_execution import parse_parent_execution
+                if journal['schema_version'] != 2:
+                    raise RuntimeAdmissionError('The managed restore has no original execution binding.')
+                bound = parse_parent_execution(journal['managed_execution'])
+                if bound.execution != self.execution or bound.installation_id != self.installation_id:
+                    raise RuntimeAdmissionError('Terminal restore evidence names another execution.')
 
     def settle(self, readiness: StartupReadiness) -> None:
         from .bootstrap import guarded_operation_completed

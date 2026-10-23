@@ -113,6 +113,97 @@ class Supervisor:
         self.last_error = None
         self.sequence = 0
         self.resumption_binding = None
+        from .parent_handoff import Server as ParentHandoffServer
+        self.parent_handoff = ParentHandoffServer(self.layout.runtime / 'parent-handoff.sock',
+            authorize_offer=self.authorize_parent_offer, authorize_collect=self.authorize_parent_collect,
+            start_operation=self.start_parent_operation)
+
+    def _parent_journal(self, operation_id: str, generation: int, *, phase=None):
+        from ..parent_execution import parse_parent_execution
+        from ..restore_controller import inspect_restore_journal
+        if not self.launches_open:
+            raise ControlError('control_operator_stopped')
+        authority = state.inspect_state(ROOT)
+        operation = authority.active_operation
+        if (operation is None or operation.operation_id != operation_id or authority.generation != generation
+                or operation.operation_type is not state.OperationType.RESTORE
+                or operation.owner_kind is not state.OwnerKind.RESTORE_CONTROLLER
+                or phase is not None and operation.phase is not phase):
+            raise ControlError('control_authority_changed')
+        journal = inspect_restore_journal(ROOT, operation_id)
+        if journal['schema_version'] != 2 or journal['generation'] != generation:
+            raise ControlError('control_parent_binding_changed')
+        bound = parse_parent_execution(journal['managed_execution'])
+        if (bound.installation_id != self.installation or bound.supervisor_invocation_id != self.invocation
+                or bound.supervisor_pid != os.getpid() or bound.supervisor_start_identity != state._process_start_identity(os.getpid())
+                or bound.stop_epoch != read_stop_epoch()
+                or bound.boot_id != Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+                or bound.execution != self.execution or read_active_execution(ROOT).execution != bound.execution):
+            raise ControlError('control_parent_binding_changed')
+        return journal, bound
+
+    async def authorize_parent_offer(self, binding, peer):
+        from .administration_lock import process_identity
+        async with self.lock:
+            if (peer.uid != os.geteuid() or binding.installation_id != self.installation
+                    or binding.supervisor_invocation_id != self.invocation or binding.operation_type != 'restore'):
+                raise ControlError('control_peer_forbidden')
+            journal, bound = self._parent_journal(binding.operation_id, binding.generation,
+                                                 phase=state.LifecyclePhase.RESERVED)
+            backend = self.children.get('backend')
+            if (backend is None or backend.process.pid != peer.pid or bound.original_generation != binding.generation
+                    or journal['accepted'] or journal['progress'] not in {'claimed','drained'}):
+                raise ControlError('control_peer_forbidden')
+            start, status = process_identity(peer.pid)
+            if start != backend.start or status in {'Z','X'}:
+                raise ControlError('control_process_changed')
+            if not self.launches_open:raise ControlError('control_operator_stopped')
+
+    async def authorize_parent_collect(self, binding, peer):
+        from .privileged import systemctl
+        from .processes import process_cgroup
+        async with self.lock:
+            self._parent_journal(binding.operation_id, binding.generation, phase=state.LifecyclePhase.RESERVED)
+            controller_peer(peer.pid, binding.operation_id)
+            if peer.uid != os.geteuid():raise ControlError('control_peer_forbidden')
+            name = 'streamhome-operation@' + binding.operation_id + '.service'
+            raw = systemctl('show', name, '--property=ActiveState,MainPID,InvocationID,FragmentPath,ControlGroup,User')
+            actor = dict(line.split('=',1) for line in raw.splitlines() if '=' in line)
+            args = Path(f'/proc/{peer.pid}/cmdline').read_bytes().split(b'\0')
+            if (actor.get('ActiveState') not in {'active','activating'} or actor.get('MainPID') != str(peer.pid)
+                    or actor.get('User') != 'streamhome' or not actor.get('InvocationID')
+                    or actor.get('FragmentPath') != '/etc/systemd/system/streamhome-operation@.service'
+                    or actor.get('ControlGroup') != '/system.slice/' + name
+                    or process_cgroup(peer.pid) != actor['ControlGroup']
+                    or args != [b'/usr/bin/python3',b'-I',b'/usr/local/libexec/streamhome/provision',
+                                b'--operation',binding.operation_id.encode(),b'']):
+                raise ControlError('control_controller_forbidden')
+            self._parent_journal(binding.operation_id,binding.generation,phase=state.LifecyclePhase.RESERVED)
+
+    async def start_parent_operation(self, binding):
+        async with self.lock:
+            self._parent_journal(binding.operation_id, binding.generation, phase=state.LifecyclePhase.RESERVED)
+        from .privileged import _OS_ENV
+        result = await asyncio.to_thread(subprocess.run,
+            ['/usr/bin/systemctl','--no-pager','start','streamhome-operation@'+binding.operation_id+'.service'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd='/', env=_OS_ENV, timeout=15)
+        if result.returncode:raise ControlError('control_controller_start_failed')
+
+    def _restore_controller(self, peer, arguments):
+        if (set(arguments) != {'operation_id','generation'} or type(arguments['generation']) is not int
+                or peer.uid != os.geteuid()):
+            raise ControlError('control_message_invalid')
+        controller_peer(peer.pid,arguments['operation_id'])
+        journal,bound = self._parent_journal(arguments['operation_id'],arguments['generation'])
+        authority = state.inspect_state(ROOT)
+        lease = state.read_controller_lease(ROOT)
+        if (lease is None or not state.controller_lease_is_current(lease) or lease.pid != peer.pid
+                or lease.operation_id != arguments['operation_id'] or lease.generation != arguments['generation']
+                or lease.owner_kind is not state.OwnerKind.RESTORE_CONTROLLER
+                or authority.active_operation.phase not in {state.LifecyclePhase.EXCLUSIVE,
+                    state.LifecyclePhase.VERIFYING,state.LifecyclePhase.RECOVERY_REQUIRED}):
+            raise ControlError('control_controller_changed')
+        return journal,bound
 
     def initial_resumption(self):
         from .resumption_runtime import initial_binding
@@ -182,6 +273,35 @@ class Supervisor:
                 return {"stopping": True}
             if not self.launches_open:
                 raise ControlError("control_operator_stopped")
+            if action in {'restore_stop_children','restore_maintenance','restore_backend','restore_finish_web'}:
+                journal,bound = self._restore_controller(peer,arguments)
+                if action == 'restore_stop_children':
+                    await self.stop_children()
+                    self.execution,self.config = bound.execution,self._deployment(bound.execution)
+                    await self.start_maintenance()
+                    return {'stopped':True}
+                if action == 'restore_maintenance':
+                    if self.children or runtime_children():raise ControlError('control_children_busy')
+                    await self.start_maintenance();return {'maintenance':True}
+                authority = state.inspect_state(ROOT)
+                if authority.active_operation.phase is not state.LifecyclePhase.VERIFYING:
+                    raise ControlError('control_authority_changed')
+                if action == 'restore_backend':
+                    if journal['progress'] not in {'verifying_candidate','verifying_rollback','accepted','normal_recovery'}:
+                        raise ControlError('control_authority_changed')
+                    if self.children or runtime_children():raise ControlError('control_children_busy')
+                    await self.close_maintenance()
+                    await self.launch(bound.execution,restore=(journal,bound),backend_only=True,
+                                      authorize=lambda:self._restore_controller(peer,arguments))
+                    await self.start_maintenance(backend=False)
+                    return {'backend_pid':self.children['backend'].process.pid,'build_id':bound.execution.application_build_id}
+                if (not journal['accepted'] or journal['progress'] != 'normal_recovery'
+                        or set(self.children) != {'backend'}):
+                    raise ControlError('control_authority_changed')
+                await self.close_maintenance()
+                self._restore_controller(peer,arguments)
+                self._spawn('web',web_command(ROOT,bound.execution),self._environment(bound.execution,self.config),ROOT/'web')
+                return {'web_pid':self.children['web'].process.pid,'build_id':bound.execution.application_build_id}
             if action in {"recover_children", "assert_recovery_stopped"}:
                 from ..management_recovery_store import require_takeover_source
                 journal = self._controller(peer, arguments, phase=state.LifecyclePhase.RECOVERY_REQUIRED)
@@ -250,7 +370,7 @@ class Supervisor:
                    "start_ticks": identity, "recorded_at": time.time()}
         state._atomic_write_json(self.layout.runtime / f"{service}.runtime.json", payload)
 
-    async def launch(self, execution, *, journal=None, authorize=None) -> None:
+    async def launch(self, execution, *, journal=None, restore=None, backend_only=False, authorize=None) -> None:
         if not self.launches_open or self.children or runtime_children():
             raise ControlError("control_children_busy")
         fresh_layout = layout_for_root(ROOT)
@@ -266,9 +386,11 @@ class Supervisor:
         if self.layout.descriptor.descriptor.status is InstallationStatus.PROVISIONING:
             require_first_start(self.layout, execution, self.invocation)
         config = self._deployment(execution)
-        if state.inspect_state(ROOT).active_operation is not None and journal is None:
+        if state.inspect_state(ROOT).active_operation is not None and journal is None and restore is None:
             raise ControlError("control_recovery_required")
-        if journal is None:
+        if journal is not None and restore is not None or backend_only and restore is None:
+            raise ControlError('control_message_invalid')
+        if journal is None and restore is None:
             descriptor = os.open(self.layout.domains, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
             try:
                 with ConfigurationStore(descriptor, self.installation) as store:
@@ -277,33 +399,40 @@ class Supervisor:
                         raise ControlError("control_pending_deployment")
             finally:
                 os.close(descriptor)
-        environment = clean_environment(self.layout.state, Path(execution.node_executable).parent)
-        environment.update({
-            "TMPDIR": str(self.layout.runtime / "tmp"),
-            "STREAMHOME_INSTANCE_ROOT": str(ROOT), "STREAMHOME_BUILD_ID": execution.application_build_id,
-            "STREAMHOME_INSTALLATION_ID": self.installation,
-            "STREAMHOME_RUNTIME_TUPLE_SHA256": contract.execution_tuple_sha256(execution),
-            "STREAMHOME_DEPLOYMENT_REVISION": execution.deployment_revision,
-            "WEB_PORT": str(config.web_port), "WEB_BIND": config.web_bind,
-            "PUBLIC_URL": config.public_origin, "TRUSTED_PROXY_CIDRS": ",".join(config.trusted_proxy_cidrs),
-            "ALLOWED_ORIGINS": ",".join(config.allowed_origins), "NODE_ENV": "production",
-            "INVOCATION_ID": self.invocation, "TSX_DISABLE_CACHE": "1",
-        })
+        environment = self._environment(execution,config)
         if journal is not None:
             environment.update(STREAMHOME_LIFECYCLE_STARTUP_MODE="management_verify",
                                STREAMHOME_LIFECYCLE_OPERATION_ID=journal.operation_id,
                                STREAMHOME_LIFECYCLE_GENERATION=str(journal.generation))
+        if restore is not None:
+            environment.update(STREAMHOME_LIFECYCLE_STARTUP_MODE='restore_verify',
+                STREAMHOME_LIFECYCLE_OPERATION_ID=restore[0]['operation_id'],
+                STREAMHOME_LIFECYCLE_GENERATION=str(restore[0]['generation']))
         if not self.launches_open:
             raise ControlError("control_operator_stopped")
         if journal is not None and (authorize is None or authorize() != journal):
             raise ControlError("control_controller_changed")
+        if restore is not None and (authorize is None or authorize() != restore):
+            raise ControlError('control_controller_changed')
         if self.layout.descriptor.descriptor.status is InstallationStatus.PROVISIONING:
             require_first_start(self.layout, execution, self.invocation)
         self.execution, self.config = execution, config
         self.last_error = None
         self.sequence += 1
         self._spawn("backend", [execution.python_executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000", "--no-proxy-headers"], environment, ROOT / "server")
-        self._spawn("web", web_command(ROOT, execution), environment, ROOT / "web")
+        if not backend_only:self._spawn("web", web_command(ROOT, execution), environment, ROOT / "web")
+
+    def _environment(self,execution,config):
+        environment = clean_environment(self.layout.state,Path(execution.node_executable).parent)
+        environment.update({
+            'TMPDIR':str(self.layout.runtime/'tmp'),'STREAMHOME_INSTANCE_ROOT':str(ROOT),
+            'STREAMHOME_BUILD_ID':execution.application_build_id,'STREAMHOME_INSTALLATION_ID':self.installation,
+            'STREAMHOME_RUNTIME_TUPLE_SHA256':contract.execution_tuple_sha256(execution),
+            'STREAMHOME_DEPLOYMENT_REVISION':execution.deployment_revision,
+            'WEB_PORT':str(config.web_port),'WEB_BIND':config.web_bind,'PUBLIC_URL':config.public_origin,
+            'TRUSTED_PROXY_CIDRS':','.join(config.trusted_proxy_cidrs),'ALLOWED_ORIGINS':','.join(config.allowed_origins),
+            'NODE_ENV':'production','INVOCATION_ID':self.invocation,'TSX_DISABLE_CACHE':'1'})
+        return environment
 
     async def stop_children(self) -> None:
         # Never reap a leader before its cgroup descendants have been stopped.
@@ -360,11 +489,11 @@ class Supervisor:
             writer.close()
             await writer.wait_closed()
 
-    async def start_maintenance(self) -> None:
+    async def start_maintenance(self, *, backend: bool = True) -> None:
         if self.maintenance or self.config is None:
             return
         try:
-            self.maintenance.append(await asyncio.start_server(self._maintenance_connection, "127.0.0.1", 8000, limit=4097))
+            if backend:self.maintenance.append(await asyncio.start_server(self._maintenance_connection, "127.0.0.1", 8000, limit=4097))
             self.maintenance.append(await asyncio.start_server(self._maintenance_connection, self.config.web_bind, self.config.web_port, limit=4097))
         except BaseException:
             await self.close_maintenance()
@@ -420,6 +549,7 @@ class Supervisor:
                 if ready_kind is None:
                     return
                 notify("READY=1\nSTATUS=StreamHome " + ready_kind + " runtime is ready")
+            await self.parent_handoff.start()
             state._atomic_write_json(self.layout.runtime / "supervisor.json", self.snapshot())
             while not self.stopping.is_set():
                 await asyncio.sleep(0.25)
@@ -436,6 +566,7 @@ class Supervisor:
                         state._atomic_write_json(self.layout.runtime / "supervisor.json", self.snapshot())
         finally:
             self.launches_open = False
+            await self.parent_handoff.close()
             await self.server.close()
             await self.close_maintenance()
             await self.stop_children()

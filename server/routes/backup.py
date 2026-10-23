@@ -2,8 +2,7 @@ import os
 import asyncio
 from typing import List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status
-from starlette.background import BackgroundTask
-from starlette.responses import JSONResponse
+from lifecycle.response_gate import ControllerResponse
 
 from config import settings
 from models import AuthSession
@@ -218,7 +217,8 @@ async def restore_backup_endpoint(filename: str, session: AuthSession = Depends(
             generation=generation,
             owner_capability=claimed.owner_capability,
         )
-        return JSONResponse(
+        return ControllerResponse(
+            handoff=handoff,
             status_code=status.HTTP_202_ACCEPTED,
             content={
                 "status": "accepted",
@@ -228,7 +228,6 @@ async def restore_backup_endpoint(filename: str, session: AuthSession = Depends(
                 "status_url": "/__streamhome/restore-status",
                 "restart_required": False,
             },
-            background=BackgroundTask(handoff.release_after_response),
         )
     except HTTPException:
         raise

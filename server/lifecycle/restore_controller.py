@@ -25,7 +25,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib import error as urlerror
 from urllib import request as urlrequest
 import uuid
@@ -115,13 +115,25 @@ class RestorePaths:
     backup_dir: Path
 
 
+class ControllerProcess(Protocol):
+    pid: int
+    def poll(self) -> int | None: ...
+    def terminate(self) -> None: ...
+
+
 @dataclass(slots=True)
 class RestoreHandoff:
-    process: subprocess.Popen[bytes]
+    process: ControllerProcess
     operation_id: str
     generation: int
     _gate_fd: int
     _released: bool = False
+
+    def abort_response(self) -> None:
+        """Close an unconfirmed response gate without its authorization byte."""
+        if self._released:return
+        try:os.close(self._gate_fd)
+        finally:self._released=True
 
     def release_after_response(self) -> None:
         if self._released:
@@ -319,15 +331,28 @@ def _validate_journal(payload: Mapping[str, Any], paths: RestorePaths) -> dict[s
         "previous_sha256", "rollback_activation_size", "rollback_activation_sha256", "accepted",
         "outcome", "error_code", "created_at", "updated_at", "drain_timed_out",
     }
+    version = payload.get('schema_version')
+    if type(version) is not int or version not in {1, 2}:
+        raise RestorePersistenceError('restore journal schema is unsupported')
+    if version == 2:
+        required.add('managed_execution')
     if set(payload) != required:
         raise RestorePersistenceError("restore journal contains missing or unsupported fields")
-    if payload.get("schema_version") != JOURNAL_SCHEMA_VERSION:
-        raise RestorePersistenceError("restore journal schema is unsupported")
     if payload.get("operation_id") != paths.operation_id:
         raise RestorePersistenceError("restore journal operation does not match")
     generation = payload.get("generation")
     if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
         raise RestorePersistenceError("restore journal generation is invalid")
+    if version == 2:
+        from .parent_execution import parse_parent_execution
+        from .control.rpc import ControlError
+        try:
+            binding = parse_parent_execution(payload['managed_execution'])
+        except ControlError as exc:
+            raise RestorePersistenceError('managed restore execution is invalid') from exc
+        if (binding.operation_id != paths.operation_id or binding.operation_type != 'restore'
+                or binding.original_generation > generation):
+            raise RestorePersistenceError('managed restore execution names another parent')
     try:
         progress = RestoreProgress(payload.get("progress"))
         activation = ActivationState(payload.get("activation_state"))
@@ -532,6 +557,9 @@ _LEGAL_PROGRESS_TRANSITIONS: Mapping[RestoreProgress, frozenset[RestoreProgress]
 def _validate_journal_transition(before: Mapping[str, Any], after: Mapping[str, Any]) -> None:
     if after["operation_id"] != before["operation_id"] or after["generation"] != before["generation"]:
         raise RestorePersistenceError("restore journal identity cannot change")
+    if (after['schema_version'] != before['schema_version']
+            or after.get('managed_execution') != before.get('managed_execution')):
+        raise RestorePersistenceError('restore execution binding cannot change')
     previous = RestoreProgress(before["progress"])
     following = RestoreProgress(after["progress"])
     if following is not previous and following not in _LEGAL_PROGRESS_TRANSITIONS[previous]:
@@ -604,6 +632,14 @@ def create_restore_journal(
             "created_at": now,
             "updated_at": now,
         }
+        from .layout import layout_for_root
+        if layout_for_root(paths.root).managed:
+            from .parent_execution import capture
+            captured = capture(paths.root, operation_id=operation_id, generation=generation, operation_type='restore')
+            from .control.reader_support import require_managed_restore_reader
+            require_managed_restore_reader(captured.execution)
+            payload.update(schema_version=2, managed_execution=captured.payload())
+        _validate_journal(payload, paths)
         _atomic_write_json(paths.journal_path, payload)
         return payload
     finally:
@@ -1381,6 +1417,11 @@ def spawn_restore_controller(
     timeout: float = 10.0,
 ) -> RestoreHandoff:
     installation = state.resolve_installation_root(root)
+    from .layout import layout_for_root
+    if layout_for_root(installation).managed:
+        from .managed_restore import spawn
+        return spawn(installation,operation_id=operation_id,generation=generation,
+                     owner_capability=owner_capability,timeout=timeout)
     ack_read, ack_write = os.pipe()
     cap_read, cap_write = os.pipe()
     gate_read, gate_write = os.pipe()
@@ -1483,6 +1524,10 @@ def _read_env_value(root: Path, name: str, default: str) -> str:
 
 
 def _web_port(root: Path) -> int:
+    from .layout import layout_for_root
+    if layout_for_root(root).managed:
+        from .managed_restore import deployment
+        return deployment(root).web_port
     try:
         port = int(_read_env_value(root, "WEB_PORT", "3000"))
     except ValueError as exc:
@@ -1499,6 +1544,12 @@ def _runtime_control():
 
 
 def _stop_supported_runtime(root: Path, web_port: int) -> None:
+    from .layout import layout_for_root
+    if layout_for_root(root).managed:
+        from .managed_restore import command
+        if command(root,'restore_stop_children') != {'stopped':True}:
+            raise RestoreRecoveryRequired('managed runtime shutdown could not be proven')
+        return
     if _runtime_control().stop_runtime(root, [8000, web_port], quiet=True, startup=False) != 0:
         raise RestoreRecoveryRequired("supported runtime shutdown could not be proven")
 
@@ -1508,6 +1559,10 @@ def _runtime_token() -> str:
 
 
 def _build_id(root: Path) -> str:
+    from .layout import layout_for_root
+    if layout_for_root(root).managed:
+        from .managed_restore import bound_journal
+        return bound_journal(root)[1].execution.application_build_id
     result = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "--short=12", "HEAD"],
         text=True,
@@ -1518,7 +1573,13 @@ def _build_id(root: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else "dev"
 
 
-def _start_maintenance(root: Path, operation_id: str, web_port: int) -> subprocess.Popen[bytes]:
+def _start_maintenance(root: Path, operation_id: str, web_port: int) -> subprocess.Popen[bytes] | None:
+    from .layout import layout_for_root
+    if layout_for_root(root).managed:
+        from .managed_restore import command
+        if command(root,'restore_maintenance') != {'maintenance':True}:
+            raise RestoreRecoveryRequired('managed maintenance responder is unavailable')
+        return None
     token = _runtime_token()
     environment = os.environ.copy()
     environment.update(
@@ -1560,7 +1621,13 @@ def _start_maintenance(root: Path, operation_id: str, web_port: int) -> subproce
     raise RestoreRecoveryRequired("maintenance responder did not acquire the web port")
 
 
-def _start_backend(root: Path, operation_id: str, generation: int) -> tuple[subprocess.Popen[bytes], str]:
+def _start_backend(root: Path, operation_id: str, generation: int) -> tuple[ControllerProcess, str]:
+    from .layout import layout_for_root
+    if layout_for_root(root).managed:
+        from .managed_restore import command,ManagedChild
+        value = command(root,'restore_backend')
+        pid = value['backend_pid']
+        return ManagedChild(pid,state._process_start_identity(pid),operation_id),value['build_id']
     token = _runtime_token()
     build = _build_id(root)
     environment = os.environ.copy()
@@ -1705,7 +1772,14 @@ def _wait_general_ready(build: str, timeout: float = 1800.0) -> None:
     raise RestoreRecoveryRequired("post-restore mandatory recovery did not complete")
 
 
-def _start_web(root: Path, web_port: int, build: str) -> subprocess.Popen[bytes]:
+def _start_web(root: Path, web_port: int, build: str) -> ControllerProcess:
+    from .layout import layout_for_root
+    if layout_for_root(root).managed:
+        from .managed_restore import command,bound_journal,ManagedChild
+        value = command(root,'restore_finish_web')
+        if value.get('build_id') != build:raise RestoreRecoveryRequired('managed web build changed')
+        pid = value['web_pid']
+        return ManagedChild(pid,state._process_start_identity(pid),bound_journal(root)[0]['operation_id'])
     token = _runtime_token()
     environment = os.environ.copy()
     environment.update(
@@ -1757,6 +1831,17 @@ def _start_web(root: Path, web_port: int, build: str) -> subprocess.Popen[bytes]
                 process.kill()
                 process.wait(timeout=2)
         raise
+
+
+def _finish_maintenance(root: Path,web_port: int,build: str,*,required: bool=False) -> None:
+    from .layout import layout_for_root
+    if layout_for_root(root).managed:
+        _start_web(root,web_port,build)
+        return
+    if not _runtime_control().terminate_owned_service(root,'maintenance'):
+        raise RestoreRecoveryRequired('maintenance responder could not be stopped')
+    if required or _runtime_control().port_is_available(web_port):
+        _start_web(root,web_port,build)
 
 
 def _transition_recovery_required(root: Path, operation_id: str, generation: int) -> bool:
@@ -1819,6 +1904,10 @@ def _enter_fail_closed(
     except Exception:
         pass
     try:
+        from .layout import layout_for_root
+        if layout_for_root(paths.root).managed:
+            _start_maintenance(paths.root,paths.operation_id,web_port)
+            return
         if _runtime_control().port_is_available(web_port):
             _start_maintenance(paths.root, paths.operation_id, web_port)
     except Exception:
@@ -1960,9 +2049,7 @@ def _complete_automatic_rollback(
         progress=RestoreProgress.NORMAL_RECOVERY.value,
     )
     _wait_general_ready(build)
-    if not _runtime_control().terminate_owned_service(root, "maintenance"):
-        raise RestoreRecoveryRequired("maintenance responder could not be stopped")
-    _start_web(root, web_port, build)
+    _finish_maintenance(root,web_port,build,required=True)
     _verify_authority(root, operation_id, generation, capability)
     record_restore_completion_intent(paths, generation=generation, outcome="rolled_back")
     result = state.complete_operation_with_credential(
@@ -2259,11 +2346,8 @@ def _run_controller(
             )
             _wait_general_ready(build)
             _verify_authority(root, operation_id, generation, capability)
-            if not _runtime_control().terminate_owned_service(root, "maintenance"):
-                raise RestoreRecoveryRequired("maintenance responder could not be stopped")
+            _finish_maintenance(root,web_port,build)
             maintenance = None
-            if _runtime_control().port_is_available(web_port):
-                _start_web(root, web_port, build)
             _verify_authority(root, operation_id, generation, capability)
             record_restore_completion_intent(
                 paths,

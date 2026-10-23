@@ -29,7 +29,11 @@ def require_bound_repair_reader(execution) -> None:
     _require_reader(execution, resumption=False, bound_repair=True)
 
 
-def _require_reader(execution, *, resumption: bool, bound_repair: bool = False) -> None:
+def require_managed_restore_reader(execution) -> None:
+    _require_reader(execution, resumption=False, managed_restore=True)
+
+
+def _require_reader(execution, *, resumption: bool, bound_repair: bool = False, managed_restore: bool = False) -> None:
     try:
         identity = uuid.UUID(execution.control_bundle_id)
         if (not identity.int or str(identity) != execution.control_bundle_id
@@ -47,9 +51,10 @@ def _require_reader(execution, *, resumption: bool, bound_repair: bool = False) 
         qualified_support(support)
         if (hashlib.sha256(raw).hexdigest() != execution.control_manifest_sha256
                 or value.get('bundle_id') != execution.control_bundle_id
-                or support.get('schema_version') not in {3, 4, 5} or support.get('management_journal_versions') != [1, 2]
-                or resumption and support.get('schema_version') not in {4, 5}
-                or bound_repair and support.get('schema_version') != 5):
+                or support.get('schema_version') not in {3, 4, 5, 6} or support.get('management_journal_versions') != [1, 2]
+                or resumption and support.get('schema_version') not in {4, 5, 6}
+                or bound_repair and support.get('schema_version') not in {5, 6}
+                or managed_restore and support.get('schema_version') != 6):
             raise ControlError('control_bound_reader_incompatible')
     except (EntryError, OSError, ValueError, TypeError) as exc:
         raise ControlError('control_bound_reader_incompatible') from exc

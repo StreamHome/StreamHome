@@ -1081,6 +1081,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(StartupModeGateMiddleware)
+# Confirm controller responses outside middleware that buffers their bodies.
+from lifecycle.response_gate import ControllerResponseGateMiddleware
+app.add_middleware(ControllerResponseGateMiddleware)
 
 app.include_router(queue_router)
 app.include_router(auth_router)

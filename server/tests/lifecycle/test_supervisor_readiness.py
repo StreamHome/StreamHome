@@ -86,6 +86,7 @@ class SupervisorReadinessTests(unittest.IsolatedAsyncioTestCase):
         instance.lock = asyncio.Lock()
         instance.children = {}
         instance.resumption_binding = None
+        instance.parent_handoff = SimpleNamespace(start=AsyncMock(),close=AsyncMock())
         instance.initial_resumption = Mock(return_value=None)
         return instance
 

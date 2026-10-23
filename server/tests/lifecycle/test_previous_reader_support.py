@@ -21,12 +21,27 @@ class PreviousReaderSupportTests(unittest.TestCase):
             'deadlines_seconds': {'startup_recovery': 900, 'startup_extension': 30, 'runtime_drain': 45,
                 'runtime_stop': 60, 'controller': 3600, 'installation': 7200}}}
 
-    def check(self, manifest, *, resumption=False, bound_repair=False):
+    def check(self, manifest, *, resumption=False, bound_repair=False, managed_restore=False):
         raw = json.dumps(manifest).encode()
         execution = replace(self.execution, control_manifest_sha256=hashlib.sha256(raw).hexdigest())
         with patch.object(support, '_protected'), patch.object(support, '_read', return_value=raw):
-            return (support.require_bound_repair_reader if bound_repair else support.require_resumption_reader
+            return (support.require_managed_restore_reader if managed_restore else support.require_bound_repair_reader
+                    if bound_repair else support.require_resumption_reader
                     if resumption else support.require_previous_reader)(execution)
+
+    def test_managed_restore_requires_explicit_fd_and_controller_compatibility(self):
+        with self.assertRaises(ControlError):self.check(self.manifest,managed_restore=True)
+        current={**self.manifest,'support':{**self.manifest['support'],'schema_version':6,
+            'recovery_request_versions':[1,2,3,4],'resumption_plan_versions':[1],
+            'runtime_recovery_cache_versions':[1],'maintenance_actions':['repair_bound_environment'],
+            'descriptor_handoff_versions':[1],'managed_restore_versions':[1]}}
+        self.assertIsNone(self.check(current,managed_restore=True))
+        self.assertIsNone(self.check(current,bound_repair=True))
+        self.assertIsNone(self.check(current,resumption=True))
+        for change in ({'descriptor_handoff_versions':[True]},{'managed_restore_versions':[]},
+                       {'managed_update_versions':[1]}):
+            with self.subTest(change=change),self.assertRaises(ControlError):
+                self.check({**current,'support':{**current['support'],**change}},managed_restore=True)
 
     def test_bound_repair_requires_explicit_maintenance_and_grant_compatibility(self):
         with self.assertRaises(ControlError):self.check(self.manifest, bound_repair=True)

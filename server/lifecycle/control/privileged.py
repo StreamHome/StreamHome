@@ -421,6 +421,12 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
             selected = descriptor()
             if len(arguments) != 2 or os.geteuid() != selected.service_uid or os.geteuid() == 0:
                 raise ControlError("control_controller_forbidden")
+            from .. import state
+            authority = state.inspect_state(selected.paths.application)
+            active = authority.active_operation
+            if active is not None and active.operation_type is state.OperationType.RESTORE:
+                from ..managed_restore import execute
+                return execute(selected.paths.application,arguments[1],control_manifest_sha256=manifest_sha256)
             from ..management_controller import main
             return main(arguments[1], control_manifest_sha256=manifest_sha256)
         if arguments and arguments[0] == "--cli":
