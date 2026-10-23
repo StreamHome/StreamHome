@@ -85,7 +85,52 @@ class SupervisorReadinessTests(unittest.IsolatedAsyncioTestCase):
         instance.stopping = asyncio.Event()
         instance.lock = asyncio.Lock()
         instance.children = {}
+        instance.resumption_binding = None
+        instance.initial_resumption = Mock(return_value=None)
         return instance
+
+    async def test_resumed_start_selects_guarded_tuple_before_reading_broken_active_environment(self):
+        instance = self.waiting_supervisor()
+        execution = parse_management_request(request_payload()).candidate
+        journal = object()
+        binding = Mock()
+        instance.initial_resumption.return_value = (journal, binding)
+        instance.server = SimpleNamespace(start=AsyncMock(), close=AsyncMock())
+        instance.layout = SimpleNamespace(runtime=Path('/disposable-runtime'))
+        instance._deployment = Mock(return_value=object())
+        instance.stop_children = AsyncMock()
+        instance.close_maintenance = AsyncMock()
+        instance.snapshot = Mock(return_value={})
+        async def launch(selected, *, journal, authorize):
+            self.assertIs(selected, execution)
+            self.assertIs(authorize(), journal)
+            self.assertIs(instance.resumption_binding, binding)
+        instance.launch = AsyncMock(side_effect=launch)
+        async def ready(deadline):
+            instance.stopping.set()
+            return 'guarded'
+        instance.wait_initial_readiness = ready
+        with patch.object(supervisor, 'extending_startup', return_value=nullcontext(time.monotonic() + 10)), patch.object(supervisor, 'notify'), patch.object(supervisor.contract, 'selected_execution', return_value=execution), patch.object(supervisor, 'read_active_execution', side_effect=AssertionError('Broken old runtime must not be selected')), patch.object(supervisor.state, '_atomic_write_json'):
+            await instance.run_owned()
+        instance.launch.assert_awaited_once()
+
+    async def test_canceled_resumption_fails_before_another_readiness_probe(self):
+        instance = self.waiting_supervisor()
+        instance.resumption_binding = Mock()
+        instance.resumption_binding.require_current.side_effect = ControlError('control_operator_stopped')
+        instance.selected_readiness = Mock(return_value='guarded')
+        with self.assertRaisesRegex(ControlError, 'control_operator_stopped'):
+            await instance.wait_initial_readiness(time.monotonic() + 10)
+        instance.selected_readiness.assert_not_called()
+
+    def test_exact_terminal_binding_is_released_only_after_validation(self):
+        instance = self.waiting_supervisor()
+        binding = Mock()
+        binding.require_current.return_value = False
+        instance.resumption_binding = binding
+        instance.require_resumption()
+        binding.require_current.assert_called_once_with(supervisor.ROOT)
+        self.assertIsNone(instance.resumption_binding)
 
     async def test_initial_start_waits_through_recovery_without_early_ready(self):
         instance = self.waiting_supervisor()

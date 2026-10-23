@@ -42,26 +42,69 @@ def _protected_reader(path: Path, fields: list[str]) -> bool:
             tail = tail[1:]
         return (len(tail) in {2, 3} and tail[0] == b'--worker'
             and tail[1] in {b'inspect', b'identity', b'release-check', b'check-listener',
-                            b'runtime-progress', b'runtime-result', b'bridge-observe', b'operation-result'})
+                            b'runtime-progress', b'runtime-result', b'bridge-observe', b'operation-result',
+                            b'resumption-observe', b'resumption-required'})
     except (OSError, IndexError):
         return False
 
 
-def require_service_quiescent(*, preparation_id: str | None = None, inspections: bool = False) -> None:
+def require_service_quiescent(*, preparation_id: str | None = None, inspections: bool = False,
+                              controller: tuple[str, int, str] | None = None,
+                              startup_hook: tuple[int, str] | None = None) -> None:
     """Prove absence of live service-UID work beyond this independent reader."""
     if os.geteuid() == 0:
         raise ControlError("control_worker_forbidden")
     allowed = None
+    controller_pid = None
+    if controller is not None:
+        from ..management_journal import _uuid
+        from .administration_lock import process_identity
+        if not isinstance(controller, tuple) or len(controller) != 3 or type(controller[1]) is not int or controller[1] <= 1:
+            raise ControlError('control_controller_changed')
+        operation, controller_pid, expected_start = controller
+        _uuid(operation, 'owned controller')
+        try:
+            observed_start, observed_status = process_identity(controller_pid)
+            if (observed_start != expected_start or observed_status in {'Z', 'X'}
+                    or process_cgroup(controller_pid) != f'/system.slice/streamhome-operation@{operation}.service'
+                    or Path(f'/proc/{controller_pid}').stat().st_uid != os.geteuid()):
+                raise ControlError('control_controller_changed')
+        except FileNotFoundError as exc:
+            raise ControlError('control_controller_changed') from exc
     if preparation_id is not None:
         from ..management_journal import _uuid
         _uuid(preparation_id, 'owned preparation')
         allowed = f'/system.slice/streamhome-prepare@{preparation_id}.service'
+    startup_members = set()
+    if startup_hook is not None:
+        from .administration_lock import process_identity
+        if (not isinstance(startup_hook, tuple) or len(startup_hook) != 2
+                or type(startup_hook[0]) is not int or startup_hook[0] <= 1 or startup_hook[0] != os.getppid()):
+            raise ControlError('control_unit_hook_forbidden')
+        hook_pid, hook_start = startup_hook
+        try:
+            observed_start, observed_status = process_identity(hook_pid)
+            hook = Path(f'/proc/{hook_pid}')
+            arguments = (hook / 'cmdline').read_bytes().split(b'\0')
+            if arguments[-1:] == [b'']:arguments.pop()
+            expected = [b'/usr/bin/python3', b'-I', b'/usr/local/libexec/streamhome/provision']
+            if (observed_start != hook_start or observed_status in {'Z', 'X'} or hook.stat().st_uid != 0
+                    or process_cgroup(hook_pid) != RUNTIME_CGROUP or process_cgroup(os.getpid()) != RUNTIME_CGROUP
+                    or arguments not in (expected + [b'--before-start'], expected + [b'--rescue', b'--before-start'])):
+                raise ControlError('control_unit_hook_forbidden')
+        except FileNotFoundError as exc:
+            raise ControlError('control_unit_hook_forbidden') from exc
+        startup_members = {hook_pid, os.getpid()}
     runtime = Path("/sys/fs/cgroup" + RUNTIME_CGROUP + "/cgroup.procs")
     try:
-        if runtime.read_text().strip():
+        members = {int(value) for value in runtime.read_text().split()}
+        if (startup_members and members != startup_members) or (not startup_members and members):
             raise ControlError("control_children_busy")
     except FileNotFoundError:
-        pass
+        if startup_members:
+            raise ControlError('control_unit_hook_forbidden')
+    except ValueError as exc:
+        raise ControlError('control_quiescence_unproven') from exc
     for path in Path("/proc").iterdir():
         if not path.name.isdigit() or int(path.name) == os.getpid():
             continue
@@ -73,7 +116,8 @@ def require_service_quiescent(*, preparation_id: str | None = None, inspections:
                 raise ControlError('control_quiescence_unproven')
             if fields[0] in {'Z', 'X'}:
                 continue
-            if ((allowed is not None and process_cgroup(int(path.name)) == allowed)
+            if ((controller_pid is not None and int(path.name) == controller_pid)
+                    or (allowed is not None and process_cgroup(int(path.name)) == allowed)
                     or (allowed is not None or inspections) and _protected_reader(path, fields)):
                 continue
             if fields[0] not in {"Z", "X"}:

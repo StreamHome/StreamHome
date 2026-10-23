@@ -184,7 +184,7 @@ def inspect_managed() -> dict:
 
 def main(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha256: str) -> int:
     parser = argparse.ArgumentParser(prog="streamhome internal reader")
-    parser.add_argument("action", choices=("inspect", "prepare-request", "bridge-observe", "operation-result", "select-source", "initial-result", "initial-progress", "initial-listener", "initial-authority", "initial-retry-check", "check-listener", "identity", "release-check", "validate-preparation", "runtime-progress", "runtime-result", "prepare-runtime-request", "recovery-review", "prepare-recovery"))
+    parser.add_argument("action", choices=("inspect", "prepare-request", "bridge-observe", "operation-result", "select-source", "initial-result", "initial-progress", "initial-listener", "initial-authority", "initial-retry-check", "check-listener", "identity", "release-check", "validate-preparation", "runtime-progress", "runtime-result", "prepare-runtime-request", "recovery-review", "prepare-recovery", "resumption-observe", "resumption-required"))
     parser.add_argument("operation_id", nargs="?")
     parsed = parser.parse_args(arguments)
     snapshot = inspect_installation()
@@ -225,6 +225,19 @@ def main(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha256:
         return 0
     if parsed.action == "inspect":
         print(json.dumps(inspect_managed(), sort_keys=True, allow_nan=False))
+        return 0
+    if parsed.action == 'resumption-required':
+        active = state.inspect_state(ROOT).active_operation
+        print(json.dumps({'required': active is not None and active.operation_type is state.OperationType.MANAGEMENT}))
+        return 0
+    if parsed.action == 'resumption-observe':
+        from .resumption_observation import observe
+        from ..configure_wizard import parse_request_json
+        payload = parse_request_json(sys.stdin.buffer.read(32769))
+        if (not isinstance(payload, dict) or not isinstance(payload.get('plan'), dict)
+                or payload['plan'].get('control_manifest_sha256') != manifest_sha256):
+            raise ControlError('control_bundle_mismatch')
+        print(json.dumps(observe(payload), sort_keys=True, allow_nan=False))
         return 0
     if parsed.action in {"recovery-review", "prepare-recovery"}:
         from . import recovery_requests

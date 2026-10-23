@@ -21,11 +21,22 @@ class PreviousReaderSupportTests(unittest.TestCase):
             'deadlines_seconds': {'startup_recovery': 900, 'startup_extension': 30, 'runtime_drain': 45,
                 'runtime_stop': 60, 'controller': 3600, 'installation': 7200}}}
 
-    def check(self, manifest):
+    def check(self, manifest, *, resumption=False):
         raw = json.dumps(manifest).encode()
         execution = replace(self.execution, control_manifest_sha256=hashlib.sha256(raw).hexdigest())
         with patch.object(support, '_protected'), patch.object(support, '_read', return_value=raw):
-            return support.require_previous_reader(execution)
+            return (support.require_resumption_reader if resumption else support.require_previous_reader)(execution)
+
+    def test_resumption_requires_an_explicit_new_reader_declaration(self):
+        with self.assertRaises(ControlError):self.check(self.manifest, resumption=True)
+        current = {**self.manifest, 'support': {**self.manifest['support'], 'schema_version': 4,
+            'recovery_request_versions': [1, 2, 3], 'resumption_plan_versions': [1]}}
+        self.assertIsNone(self.check(current, resumption=True))
+        self.assertIsNone(self.check(current))
+        for change in ({'recovery_request_versions': [1, 2]}, {'resumption_plan_versions': [True]},
+                       {'resumption_plan_versions': [1, 2]}):
+            with self.subTest(change=change), self.assertRaises(ControlError):
+                self.check({**current, 'support': {**current['support'], **change}}, resumption=True)
 
     def test_exact_protected_manifest_declares_previous_acceptance_format(self):
         self.assertIsNone(self.check(self.manifest))

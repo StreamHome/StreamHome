@@ -36,9 +36,15 @@ def _consent(path: Path, snapshot: dict, *, action: str = 'continue_recovery') -
     return value['continue_recovery'] and value['interruption_approved']
 
 
-def _preserved_processes(snapshot: dict) -> dict:
+def _preserved_processes(snapshot: dict, *, resuming: bool = False) -> dict:
     preserving = snapshot['activation_mode'] != 'cutover'
     processes = process_snapshot(preserving_recovery=True) if preserving else process_snapshot()
+    if resuming:
+        if snapshot['initial_service_state'] != 'running' or preserving or processes['initial_service_state'] != 'stopped':
+            raise ControlError('control_resumption_mode_unavailable')
+        from .stopped_repair import require_stopped
+        require_stopped()
+        return processes
     if (processes['initial_service_state'] != snapshot['initial_service_state']
             or processes['supervisor_invocation_id'] != snapshot['supervisor_invocation_id']):
         raise ControlError('control_recovery_supervisor_required')
@@ -73,17 +79,26 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
         raise ControlError('control_recovery_review_stale')
     if action not in snapshot['permitted_actions']:
         raise ControlError('control_recovery_action_unavailable')
-    processes = _preserved_processes(snapshot)
+    from .privileged import unit_snapshot
+    runtime = unit_snapshot()
+    resuming = (snapshot['initial_service_state'] == 'running' and snapshot['activation_mode'] == 'cutover'
+                and runtime['ActiveState'] in {'inactive', 'failed'} and int(runtime['MainPID']) == 0)
+    processes = _preserved_processes(snapshot, resuming=resuming)
     if review_only:
         print(json.dumps(snapshot, sort_keys=True, allow_nan=False))
         return 0
     issuer_scope = None
-    if snapshot['initial_service_state'] == 'stopped':
+    if snapshot['initial_service_state'] == 'stopped' or resuming:
         from .stopped_repair import StoppedRepairHandoff, current_scope
         if scope_epoch is None:
             return StoppedRepairHandoff(snapshot['installation_id'], operation_id, epoch, request_path, action)
         issuer_scope = current_scope(snapshot['installation_id'], epoch)
-    if request_path is not None:
+    resumption = None
+    if resuming:
+        from . import resumption_review
+        resumption = resumption_review.make_review(snapshot, action, control_manifest_sha256=control_manifest_sha256)
+        approved = resumption_review.consent(resumption, request_path)
+    elif request_path is not None:
         approved = _consent(request_path, snapshot, action=action)
     else:
         with open_console() as console:
@@ -112,7 +127,7 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
     if not approved:
         print('Operation recovery was declined.')
         return 0
-    if root_stop_epoch() != epoch or _preserved_processes(snapshot) != processes:
+    if root_stop_epoch() != epoch or _preserved_processes(snapshot, resuming=resuming) != processes:
         raise ControlError('control_operator_stopped')
     fresh = run_worker(['recovery-review', operation_id], timeout=120)
     if fresh != snapshot:
@@ -124,10 +139,16 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
         'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'stop_epoch': epoch}
     if issuer_scope is not None:
         payload['issuer_scope'] = issuer_scope
+    if resumption is not None:
+        plan = resumption_review.launch_plan(resumption, approved=True)
+        payload.update(resumption_plan_id=plan['plan_id'], recovery_review_id=plan['review_id'])
     grant = run_worker(['prepare-recovery'], payload=payload)
     if (grant['request']['controller_control_manifest_sha256'] != control_manifest_sha256
             or root_stop_epoch() != epoch):
         raise ControlError('control_recovery_review_stale')
+    if resumption is not None:
+        from .resumption_store import publish
+        publish(plan, resumption.issuer, control_manifest_sha256=control_manifest_sha256)
     run_operation(grant['request'], recovery_grant=grant)
     print('StreamHome operation recovery completed.')
     return 0

@@ -11,6 +11,19 @@ from lifecycle.control.units import unit_files
 
 
 class RootPublicationBoundaryTests(unittest.TestCase):
+    def test_resumption_publication_is_limited_to_one_plan_and_two_named_stages(self):
+        base = Path('/etc/streamhome/control/resumption') / str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ('plan.json', 'candidate_start.json', 'previous_start.json', 'resumption-start.json'):
+                with self.subTest(name=name), patch.object(root_files.os, 'geteuid', return_value=0), patch.object(root_files, 'root_directory', side_effect=lambda _: os.open(directory, os.O_RDONLY | os.O_DIRECTORY)), patch.object(root_files.os, 'fchown'):
+                    target = Path('/etc/streamhome/control/resumption-start.json') if name == 'resumption-start.json' else base / name
+                    root_files.atomic_root_json(target, {'schema_version': 1}, gid=999, mode=0o640)
+                self.assertEqual((Path(directory) / name).stat().st_mode & 0o777, 0o640)
+        for name in ('retry_start.json', 'candidate_start-2.json', 'command.json', '../plan.json'):
+            with self.subTest(name=name), patch.object(root_files.os, 'geteuid', return_value=0), patch.object(root_files, 'root_directory') as parent:
+                with self.assertRaises(ControlError):root_files.atomic_root_json(base / name, {})
+                parent.assert_not_called()
+
     def test_generation_bound_recovery_files_are_publishable_and_paths_stay_fixed(self):
         operation, review = str(uuid.uuid4()), str(uuid.uuid4())
         base = Path('/etc/streamhome/control/operations') / operation

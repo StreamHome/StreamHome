@@ -340,13 +340,24 @@ def _prepare_application(intent: ProvisioningIntent) -> dict:
         raise
 
 
-def before_start() -> int:
+def before_start(*, control_manifest_sha256: str | None = None) -> int:
     """Consume the root first-start permit before the supervisor can execute."""
     require_root()
     if Path("/proc/self/cgroup").read_text().splitlines() != ["0::/system.slice/streamhome.service"]:
         raise ControlError("control_unit_hook_forbidden")
     selected = descriptor()
     if selected.status is InstallationStatus.READY:
+        from .resumption_store import START_INTENT
+        if START_INTENT.exists() or START_INTENT.is_symlink():
+            required = run_worker(['resumption-required'])
+            if type(required.get('required')) is not bool:
+                raise ControlError('control_worker_invalid')
+            if required['required']:
+                if control_manifest_sha256 is None:
+                    raise ControlError('control_resumption_review_changed')
+                from .resumption_dispatch import before_start as resume
+                resume(control_manifest_sha256=control_manifest_sha256)
+                return 0
         # A direct systemctl start must respect the same administrator exclusion
         # as the CLI. Release before scheduling the independent observer so its
         # own lock acquisition cannot race a still-held ExecStartPre lock.

@@ -26,6 +26,63 @@ class RecoveryGrantTests(unittest.TestCase):
             'source_request_sha256': self.original.sha256, 'action': 'continue_recovery', 'request': self.current.payload(),
             'expires_at_monotonic': 1000.0}
 
+    def resuming_grant(self):
+        current = replace(self.current, supervisor=self.original.supervisor)
+        scope = {'unit': 'streamhome-install-' + current.installation_id + '-' + '2' * 32 + '.scope',
+                 'invocation': '3' * 32, 'pid': 100, 'start_identity': '200'}
+        return {**self.grant, 'schema_version': 3, 'request': current.payload(),
+                'issuer_scope': scope, 'resumption_plan_id': str(uuid.uuid4())}
+
+    def test_resumption_preserves_original_supervisor_history_without_claiming_it_is_live(self):
+        value = self.resuming_grant()
+        with patch.object(grants.request_contract, 'read_management_request', return_value=self.original):
+            self.assertEqual(grants.parse_grant(value), value)
+            changed = deepcopy(value);changed['request']['supervisor'] = self.current.supervisor.payload()
+            with self.assertRaises(ControlError):grants.parse_grant(changed)
+            missing = dict(value);missing.pop('resumption_plan_id')
+            with self.assertRaises(ControlError):grants.parse_grant(missing)
+
+    def test_live_resumption_grant_requires_its_exact_root_plan_but_history_survives_issuer_death(self):
+        from lifecycle.control import stopped_repair, resumption_ticket
+        value = self.resuming_grant();current = parse_management_request(value['request'])
+        record = {'plan': {'operation_id': current.operation_id, 'generation': current.expected_generation + 1,
+            'review_id': value['recovery_review_id'], 'owner_type': 'management', 'action': current.action.value},
+            'issuer': {'scope': value['issuer_scope']}}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(grants.request_contract, 'read_management_request', return_value=self.original))
+            stack.enter_context(patch.object(grants, 'read_protected_json', return_value=value))
+            stack.enter_context(patch.object(grants.Path, 'read_text', return_value=current.boot_id))
+            stack.enter_context(patch.object(grants, 'read_stop_epoch', return_value=current.stop_epoch))
+            stack.enter_context(patch.object(grants.time, 'monotonic', return_value=100))
+            live = stack.enter_context(patch.object(stopped_repair, 'require_scope'))
+            selected = stack.enter_context(patch.object(resumption_ticket, 'reviewed_plan', return_value=record))
+            self.assertEqual(grants.read_grant(current.operation_id, current.expected_generation + 1), value)
+            selected.assert_called_once_with(value['resumption_plan_id'], installation_id=current.installation_id,
+                control_manifest_sha256=current.controller_control_manifest_sha256)
+            record['plan']['generation'] += 1
+            with self.assertRaises(ControlError):grants.read_grant(current.operation_id, current.expected_generation + 1)
+            live.side_effect = ControlError('control_stopped_repair_issuer_changed')
+            selected.side_effect = ControlError('control_resumption_review_changed')
+            self.assertEqual(grants.read_grant(current.operation_id, current.expected_generation + 1, require_live=False), value)
+
+    def test_prepare_resumption_uses_actual_stopped_proof_and_retains_original_request_identities(self):
+        value = self.resuming_grant()
+        snapshot = {'operation_id': self.original.operation_id, 'generation': self.current.expected_generation,
+            'evidence_sha256': 'e' * 64, 'initial_service_state': 'running', 'activation_mode': 'cutover',
+            'supervisor_invocation_id': self.original.supervisor_invocation_id}
+        payload = {'operation_id': self.original.operation_id, 'expected_evidence_sha256': 'e' * 64,
+            'recovery_review_id': value['recovery_review_id'], 'boot_enabled': True, 'boot_id': self.current.boot_id,
+            'stop_epoch': self.current.stop_epoch, 'issuer_scope': value['issuer_scope'],
+            'resumption_plan_id': value['resumption_plan_id'],
+            'processes': {'initial_service_state': 'stopped', 'supervisor_invocation_id': None, 'supervisor': None, 'backend': None}}
+        with patch.object(grants.request_contract, 'read_management_request', return_value=self.original), patch.object(grants, 'review', return_value=snapshot), patch('lifecycle.control.stopped_repair.require_scope'), patch('lifecycle.control.reader_support.require_resumption_reader') as reader:
+            result = grants.prepare(payload, control_manifest_sha256=self.original.controller_control_manifest_sha256)
+        reader.assert_called_once_with(self.original.candidate)
+        self.assertEqual(result['schema_version'], 3)
+        self.assertEqual(result['request']['supervisor'], self.original.supervisor.payload())
+        self.assertEqual(result['request']['supervisor_invocation_id'], self.original.supervisor_invocation_id)
+        self.assertIsNone(result['request']['backend'])
+
     def test_recovery_preserves_reviewed_tuple_settings_and_original_intent(self):
         with patch.object(grants.request_contract, 'read_management_request', return_value=self.original):
             self.assertEqual(grants.parse_grant(self.grant), self.grant)

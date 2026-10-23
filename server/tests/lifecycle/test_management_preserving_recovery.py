@@ -93,7 +93,7 @@ class PreservingRecoveryTests(unittest.TestCase):
         self.assertEqual(plan['permitted_actions'], ['continue_recovery'])
         value = controller.RecoveredManagementController.__new__(controller.RecoveredManagementController)
         value.review = replace(self.original, expected_generation=authority.generation)
-        value.grant = {'source_evidence_sha256': plan['evidence_sha256'], 'recovery_review_id': str(uuid.uuid4()), 'action': 'continue_recovery'}
+        value.grant = {'schema_version': 1, 'source_evidence_sha256': plan['evidence_sha256'], 'recovery_review_id': str(uuid.uuid4()), 'action': 'continue_recovery'}
         value.invocation = '2' * 32
         value.store = self.fixture.store
         value.lease = value.claim = value.journal = None

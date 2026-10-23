@@ -174,7 +174,7 @@ class StoppedControllerTests(unittest.TestCase):
         value = controller.RecoveredManagementController.__new__(controller.RecoveredManagementController)
         value.review = replace(original.review, expected_generation=authority.generation)
         value.store = self.fixture.store;value.invocation = '3' * 32
-        value.grant = {'source_evidence_sha256': plan['evidence_sha256'], 'recovery_review_id': str(uuid.uuid4()), 'action': 'continue_recovery'}
+        value.grant = {'schema_version': 1, 'source_evidence_sha256': plan['evidence_sha256'], 'recovery_review_id': str(uuid.uuid4()), 'action': 'continue_recovery'}
         value.lease = value.claim = value.journal = None
         value.checkpoint = lambda: value.lease.require_current() if value.lease else None
         value.wait_os_receipt = Mock();value.rpc = Mock(side_effect=AssertionError('stopped recovery cannot launch a supervisor'))

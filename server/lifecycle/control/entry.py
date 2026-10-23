@@ -25,14 +25,16 @@ class EntryError(RuntimeError):
 
 def qualified_support(support: dict) -> tuple[int, ...]:
     deadlines = {"startup_recovery": 900, "startup_extension": 30, "runtime_drain": 45, "runtime_stop": 60, "controller": 3600}
-    if not isinstance(support, dict) or type(support.get("schema_version")) is not int or support["schema_version"] not in {1, 2, 3}:
+    if not isinstance(support, dict) or type(support.get("schema_version")) is not int or support["schema_version"] not in {1, 2, 3, 4}:
         raise EntryError("The installed control support contract is incompatible.")
     fields = {"schema_version", "platform", "deadlines_seconds"}
     if support["schema_version"] >= 2:
         fields.add("provisioning_journal_versions")
         deadlines["installation"] = 7200
-    if support['schema_version'] == 3:
+    if support['schema_version'] >= 3:
         fields.add('management_journal_versions')
+    if support['schema_version'] == 4:
+        fields.update({'recovery_request_versions', 'resumption_plan_versions'})
     versions = [1] if support["schema_version"] == 1 else support.get("provisioning_journal_versions")
     if (set(support) != fields or support["platform"] != "ubuntu-24.04-x86_64-glibc-python-3.12.3-systemd-cgroup2"
             or support["deadlines_seconds"] != deadlines
@@ -40,9 +42,13 @@ def qualified_support(support: dict) -> tuple[int, ...]:
             or versions != ([1] if support["schema_version"] == 1 else [1, 2])
             or any(type(value) is not int for value in versions)):
         raise EntryError("The installed control support contract is incompatible.")
-    if support['schema_version'] == 3 and (support.get('management_journal_versions') != [1, 2]
+    if support['schema_version'] >= 3 and (support.get('management_journal_versions') != [1, 2]
             or any(type(value) is not int for value in support['management_journal_versions'])):
         raise EntryError('The installed management journal support contract is incompatible.')
+    if support['schema_version'] == 4:
+        for name, expected in (('recovery_request_versions', [1, 2, 3]), ('resumption_plan_versions', [1])):
+            if support.get(name) != expected or any(type(value) is not int for value in support[name]):
+                raise EntryError('The installed resumption support contract is incompatible.')
     return tuple(versions)
 
 

@@ -29,6 +29,7 @@ class SupervisorWebProcessTests(unittest.TestCase):
         instance = managed.Supervisor.__new__(managed.Supervisor)
         instance.launches_open = True
         instance.children = {}
+        instance.resumption_binding = None
         instance.layout = SimpleNamespace(runtime=Path('/run/streamhome'))
         process = SimpleNamespace(pid=123)
 
@@ -42,6 +43,19 @@ class SupervisorWebProcessTests(unittest.TestCase):
                 instance._spawn('web', ['/usr/bin/node'], {}, Path('/'))
         self.assertEqual(spawn.call_count, 1)
         self.assertEqual(set(instance.children), {'backend'})
+
+    def test_stop_during_resumption_validation_prevents_any_new_process(self):
+        instance = managed.Supervisor.__new__(managed.Supervisor)
+        instance.launches_open = True
+        instance.resumption_binding = Mock()
+        def stopped(root):
+            instance.launches_open = False
+            return True
+        instance.resumption_binding.require_current.side_effect = stopped
+        with patch.object(managed.subprocess, 'Popen') as spawn:
+            with self.assertRaisesRegex(ControlError, 'control_operator_stopped'):
+                instance._spawn('backend', ['/usr/bin/python3'], {}, Path('/'))
+        spawn.assert_not_called()
 
     def test_changed_operator_stop_epoch_rejects_live_controller(self):
         reviewed=parse_management_request(request_payload())

@@ -1,4 +1,5 @@
 import signal
+import uuid
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -8,6 +9,48 @@ from lifecycle.control.rpc import ControlError
 
 
 class OwnedProcessSignalTests(unittest.TestCase):
+    def test_prestart_quiescence_allows_only_the_exact_root_hook_and_its_reader(self):
+        members = ['100 200']
+        command = [b'/usr/bin/python3\0-I\0/usr/local/libexec/streamhome/provision\0--before-start\0']
+        class Hook:
+            name = '200'
+            def stat(self):return SimpleNamespace(st_uid=0)
+            def __truediv__(self, _):return SimpleNamespace(read_bytes=lambda: command[0])
+        def path(name):
+            if name == '/proc':return SimpleNamespace(iterdir=lambda: [Hook()])
+            if name == '/proc/200':return Hook()
+            return SimpleNamespace(read_text=lambda: members[0])
+        with patch.object(processes.os, 'geteuid', return_value=1000), patch.object(processes.os, 'getpid', return_value=100), patch.object(processes.os, 'getppid', return_value=200), patch.object(processes, 'Path', side_effect=path), patch.object(processes, 'process_cgroup', return_value=processes.RUNTIME_CGROUP), patch('lifecycle.control.administration_lock.process_identity', return_value=('2000', 'S')):
+            processes.require_service_quiescent(startup_hook=(200, '2000'))
+            members[0] = '100 200 201'
+            with self.assertRaisesRegex(ControlError, 'control_children_busy'):
+                processes.require_service_quiescent(startup_hook=(200, '2000'))
+            members[0] = '100 200';command[0] = b'/usr/bin/python3\0/tmp/untrusted.py\0'
+            with self.assertRaisesRegex(ControlError, 'control_unit_hook_forbidden'):
+                processes.require_service_quiescent(startup_hook=(200, '2000'))
+            with self.assertRaisesRegex(ControlError, 'control_unit_hook_forbidden'):
+                processes.require_service_quiescent(startup_hook=(201, '2000'))
+
+    def test_quiescence_exempts_only_the_exact_live_controller_identity(self):
+        operation = str(uuid.uuid4())
+        class Process:
+            def __init__(self, name):self.name = name
+            def stat(self):return SimpleNamespace(st_uid=1000)
+            def __truediv__(self, _):return SimpleNamespace(read_text=lambda: self.name + ' (fixture) S 0')
+        peers = [Process('200')]
+        def path(name):
+            if name == '/proc':return SimpleNamespace(iterdir=lambda: peers)
+            if name == '/proc/200':return SimpleNamespace(stat=lambda: SimpleNamespace(st_uid=1000))
+            return SimpleNamespace(read_text=lambda: '')
+        with patch.object(processes.os, 'geteuid', return_value=1000), patch.object(processes.os, 'getpid', return_value=100), patch.object(processes, 'Path', side_effect=path), patch.object(processes, 'process_cgroup', return_value='/system.slice/streamhome-operation@' + operation + '.service'), patch('lifecycle.control.administration_lock.process_identity', return_value=('300', 'S')) as identity:
+            processes.require_service_quiescent(controller=(operation, 200, '300'))
+            peers.append(Process('201'))
+            with self.assertRaisesRegex(ControlError, 'control_foreign_service_process'):
+                processes.require_service_quiescent(controller=(operation, 200, '300'))
+            peers.pop();identity.return_value = ('301', 'S')
+            with self.assertRaisesRegex(ControlError, 'control_controller_changed'):
+                processes.require_service_quiescent(controller=(operation, 200, '300'))
+
     def test_independent_retry_reader_rejects_foreign_service_work_and_unknown_processes(self):
         class Process:
             name = '200'

@@ -68,9 +68,15 @@ class ManagementController:
                 scope = preparation.get('offline_scope')
             require_scope(scope, self.review.installation_id)
         supervisor = self.review.supervisor
-        if supervisor is not None:
+        if supervisor is not None and self.requires_original_supervisor():
             if state._process_start_identity(supervisor.pid) != supervisor.start_identity or process_cgroup(supervisor.pid) != RUNTIME_CGROUP:
                 raise ControlError("control_incarnation_changed")
+
+    def requires_original_supervisor(self) -> bool:
+        return True
+
+    def guarded_runtime_evidence(self) -> dict:
+        return {"supervisor_invocation_id": self.review.supervisor_invocation_id}
 
     def rpc(self, service: str, action: str, *, timeout: float = 60) -> dict:
         self.checkpoint()
@@ -151,7 +157,7 @@ class ManagementController:
                             raise ControlError("control_web_identity_changed")
                     return {"backend": live, "web_build_id": execution.application_build_id,
                             "execution_sha256": contract.execution_tuple_sha256(execution),
-                            "supervisor_invocation_id": self.review.supervisor_invocation_id}
+                            **self.guarded_runtime_evidence()}
             except (OSError, ValueError, urllib.error.URLError):
                 pass
             time.sleep(0.25)
@@ -355,14 +361,61 @@ class RecoveredManagementController(ManagementController):
         self.grant = parse_grant(grant)
         super().__init__(parse_management_request(grant['request']), control_manifest_sha256=control_manifest_sha256)
 
+    def requires_original_supervisor(self) -> bool:
+        return self.grant['schema_version'] != 3
+
     def checkpoint(self) -> None:
         super().checkpoint()
+        if self.grant['schema_version'] == 3:
+            from .control.recovery_requests import read_grant
+            if read_grant(self.review.operation_id, self.review.expected_generation + 1) != self.grant:
+                raise ControlError('control_resumption_review_changed')
         if self.grant.get('schema_version') == 2:
             from .control.stopped_repair import require_scope
             require_scope(self.grant['issuer_scope'], self.review.installation_id)
         if self.grant['action'] in {'rollback', 'safe_abort'} or self.journal is not None and self.journal.recovery_target == 'previous':
             from .control.reader_support import require_previous_reader
             require_previous_reader(self.review.previous)
+
+    def resumed_binding(self):
+        from .control.privileged import unit_snapshot
+        from .control.resumption_runtime import require_binding
+        self.checkpoint()
+        unit = unit_snapshot()
+        if unit['ActiveState'] not in {'active', 'activating'} or int(unit['MainPID']) <= 1:
+            return None
+        return require_binding(ROOT, self.journal, unit['InvocationID'],
+            control_manifest_sha256=self.review.controller_control_manifest_sha256, allow_original=False)
+
+    def guarded_runtime_evidence(self) -> dict:
+        if self.grant['schema_version'] != 3:
+            return super().guarded_runtime_evidence()
+        binding = self.resumed_binding()
+        if binding is None:
+            raise ControlError('control_incarnation_changed')
+        return {'supervisor_invocation_id': binding.invocation,
+                'resumption_plan_sha256': binding.plan_sha256,
+                'resumption_receipt_sha256': binding.receipt_sha256}
+
+    def prepare_resumed_runtime(self) -> None:
+        from .control.stopped_repair import require_stopped
+        from .control.processes import require_service_quiescent
+        from .runtime_links import recover_management_links
+        from .management_recovery_store import resume_candidate_verification
+        def assert_stopped():
+            self.checkpoint()
+            require_stopped()
+            require_service_quiescent(inspections=True)
+        recover_management_links(ROOT, self.journal, lease=self.lease, target=self.journal.recovery_target,
+                                 assert_children_stopped=assert_stopped)
+        self.phase(state.LifecyclePhase.RECOVERY_REQUIRED, state.LifecyclePhase.EXCLUSIVE)
+        self.phase(state.LifecyclePhase.EXCLUSIVE, state.LifecyclePhase.VERIFYING)
+        self.journal = resume_candidate_verification(ROOT, self.journal, lease=self.lease)
+        deadline = time.monotonic() + 120
+        while self.resumed_binding() is None:
+            if time.monotonic() >= deadline:
+                raise ControlError('control_resumption_start_timeout')
+            time.sleep(0.2)
 
     def execute(self) -> None:
         from .management_recovery_store import acquire_recovery_lease, resume_candidate_verification
@@ -386,16 +439,19 @@ class RecoveredManagementController(ManagementController):
         if self.review.initial_service_state == 'stopped':
             self.finish_stopped_repair(recovered=True)
             return
-        if self.rpc('supervisor', 'recover_children').get('stopped') is not True:
-            raise ControlError('control_children_busy')
-        def assert_stopped():
-            if self.rpc('supervisor', 'assert_recovery_stopped').get('stopped') is not True:
+        if self.grant['schema_version'] == 3:
+            self.prepare_resumed_runtime()
+        else:
+            if self.rpc('supervisor', 'recover_children').get('stopped') is not True:
                 raise ControlError('control_children_busy')
-        recover_management_links(ROOT, self.journal, lease=self.lease, target=self.journal.recovery_target, assert_children_stopped=assert_stopped)
-        self.phase(state.LifecyclePhase.RECOVERY_REQUIRED, state.LifecyclePhase.EXCLUSIVE)
-        self.phase(state.LifecyclePhase.EXCLUSIVE, state.LifecyclePhase.VERIFYING)
-        self.journal = resume_candidate_verification(ROOT, self.journal, lease=self.lease)
-        self.rpc('supervisor', 'launch_recovered')
+            def assert_stopped():
+                if self.rpc('supervisor', 'assert_recovery_stopped').get('stopped') is not True:
+                    raise ControlError('control_children_busy')
+            recover_management_links(ROOT, self.journal, lease=self.lease, target=self.journal.recovery_target, assert_children_stopped=assert_stopped)
+            self.phase(state.LifecyclePhase.RECOVERY_REQUIRED, state.LifecyclePhase.EXCLUSIVE)
+            self.phase(state.LifecyclePhase.EXCLUSIVE, state.LifecyclePhase.VERIFYING)
+            self.journal = resume_candidate_verification(ROOT, self.journal, lease=self.lease)
+            self.rpc('supervisor', 'launch_recovered')
         evidence = self.wait_guarded()
         if self.journal.acceptance is None:
             digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()

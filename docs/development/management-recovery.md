@@ -5,7 +5,8 @@ or environment activation is interrupted. A failed command does not authorize a
 reinstall, erase lifecycle state or reverse database writes. Recovery continues
 the recorded application, configuration and runtime tuple after a fresh review.
 
-An originally running CUTOVER path requires its original systemd supervisor to remain running.
+An originally running CUTOVER path can continue through its original live systemd
+supervisor, or use a separately reviewed start after the whole service has stopped.
 It supports failure before configuration publication,
 failure during guarded verification, failure after acceptance and a terminal
 `succeeded` journal whose canonical completion was interrupted. Preserving
@@ -13,8 +14,10 @@ SAVE_ONLY and OS_ONLY operations can also continue with their original running
 or stopped outcome. A running outcome requires the identical settled backend and
 supervisor; it never restarts either process. A stopped outcome never starts them.
 An originally stopped environment repair instead verifies its inactive artifacts
-and retains the stopped outcome. Stopped or replaced originally running CUTOVER supervisors and operation-bound environment/control
-reconstruction require separate maintenance protocols.
+and retains the stopped outcome. A replacement running supervisor cannot borrow
+the original invocation. Stop the owned service before requesting the fresh start
+review below. Operation-bound environment/control reconstruction remains a
+separate maintenance protocol.
 
 ## Repair with the service stopped
 
@@ -62,6 +65,43 @@ exactly `schema_version` (1), `operation_id`, `expected_generation`,
 Obtain the generation and evidence hash from a fresh `--review`. Both consent
 fields must be JSON booleans and true for continuation. Stale evidence is rejected;
 there is no force option or implicit retry loop.
+
+## Resume an originally running cutover after a stop
+
+When the recorded CUTOVER operation was running but the service is now stopped,
+the same `recover` command presents a fresh start review inside a new cancellable
+root scope. This review explicitly authorizes one guarded start of the selected
+recorded runtime. Enter means Yes; declining leaves the service stopped. A review
+printed by `--review` alone does not authorize that start.
+
+Automation must answer the new live challenge. Start `recover --request FILE`
+with a nonexistent response path. It prints `resumption_review`, its SHA-256 and
+`request_schema_version: 3`, then waits up to 900 seconds. Atomically publish a
+JSON response containing exactly these fields:
+
+- `schema_version`: 3.
+- `operation_id`, `expected_generation`, `expected_evidence_sha256`: the current
+  operation, generation and canonical evidence from the emitted review.
+- `action`: `continue_recovery`, `rollback` or `safe_abort`, matching the command.
+- `continue_recovery`, `interruption_approved`, `resume_service`: JSON booleans,
+  all true to approve.
+- `expected_resumption_sha256`: the newly emitted `resumption_review_sha256`.
+
+Each challenge binds the living issuer, boot, stop intent, selected execution and
+generation. Schema-1/2 requests and responses from previous scopes cannot approve
+a new start. A stop cancels pending permission even while the runtime is inactive.
+Consumption is durable before the fixed systemd start; ExecStartPre binds its one
+new invocation. A timeout or lost reply never retries that consumed permission.
+If the outcome remains unresolved, obtain a fresh review after the service is
+stopped. No automatic fallback to a different runtime is authorized.
+
+The independent UID observer verifies canonical ownership and paired artifacts
+before launch. The replacement supervisor starts the exact guarded runtime,
+retains the original supervisor identity in journal history and requires live
+root custody until exact accepted completion. The temporary binding can then be
+released in that same process. A stored ticket cannot enroll another supervisor.
+The bound control reader must explicitly support recovery requests 1/2/3 and
+resumption plan 1; older readers are refused for this path.
 
 Before candidate acceptance, an evidence-supported review may offer guarded
 restoration of the previous runtime:

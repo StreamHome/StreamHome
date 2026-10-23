@@ -112,6 +112,16 @@ class Supervisor:
         self.config = None
         self.last_error = None
         self.sequence = 0
+        self.resumption_binding = None
+
+    def initial_resumption(self):
+        from .resumption_runtime import initial_binding
+        return initial_binding(ROOT, self.invocation,
+                               control_manifest_sha256=self.control_manifest_sha256)
+
+    def require_resumption(self) -> None:
+        if self.resumption_binding is not None and not self.resumption_binding.require_current(ROOT):
+            self.resumption_binding = None
 
     def _deployment(self, execution):
         descriptor = os.open(self.layout.domains, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -141,8 +151,13 @@ class Supervisor:
             raise ControlError("control_authority_changed")
         journal = management_store.inspect_management_journal(ROOT, operation.operation_id)
         contract.validate_active_journal(journal, authority)
-        if journal.installation_id != self.installation or journal.supervisor_invocation_id != self.invocation:
+        if journal.installation_id != self.installation:
             raise ControlError("control_incarnation_changed")
+        if journal.supervisor_invocation_id != self.invocation:
+            from .resumption_runtime import require_binding
+            require_binding(ROOT, journal, self.invocation,
+                            control_manifest_sha256=self.control_manifest_sha256,
+                            own_supervisor=True, allow_original=False)
         from .recovery_requests import effective_request
         reviewed = effective_request(journal, original=read_management_request(journal.operation_id))
         if (journal.review_id != reviewed.review_id or journal.generation != reviewed.expected_generation + 1
@@ -223,6 +238,7 @@ class Supervisor:
         environment = {**environment, "STREAMHOME_SERVICE": service, "STREAMHOME_INSTANCE_TOKEN": token}
         # The signal handler may close admission after the preceding child was
         # launched. Each child must independently honor that decision.
+        self.require_resumption()
         if not self.launches_open:
             raise ControlError("control_operator_stopped")
         process = subprocess.Popen(arguments, cwd=cwd, env=environment, stdin=subprocess.DEVNULL, start_new_session=True)
@@ -374,11 +390,21 @@ class Supervisor:
             with extending_startup(notify, lambda: self.launches_open) as deadline:
                 notify("STATUS=StreamHome is verifying its selected runtime")
                 await self.server.start()
-                execution = read_active_execution(ROOT).execution
+                resumed = self.initial_resumption()
+                if resumed is None:
+                    execution = read_active_execution(ROOT).execution
+                    journal = None
+                else:
+                    journal, self.resumption_binding = resumed
+                    execution = contract.selected_execution(journal)
                 self.execution, self.config = execution, self._deployment(execution)
                 try:
                     async with self.lock:
-                        await self.launch(execution)
+                        if journal is None:
+                            await self.launch(execution)
+                        else:
+                            await self.launch(execution, journal=journal,
+                                              authorize=lambda: self.initial_resumption()[0])
                 except Exception as exc:
                     self.last_error = exc.code if isinstance(exc, ControlError) else "control_runtime_unavailable"
                     await self.stop_children()
@@ -398,6 +424,7 @@ class Supervisor:
             while not self.stopping.is_set():
                 await asyncio.sleep(0.25)
                 async with self.lock:
+                    self.require_resumption()
                     self._remember_backend_socket()
                     # Popen.poll would reap an exited leader before descendant
                     # cleanup. WNOWAIT observes death while retaining identity.
@@ -415,6 +442,7 @@ class Supervisor:
             notify("STOPPING=1\nSTATUS=StreamHome runtime stopped")
 
     def selected_readiness(self) -> str | None:
+        self.require_resumption()
         backend, web = self.children.get("backend"), self.children.get("web")
         if backend is None or web is None or self.execution is None or self.config is None:
             return None
@@ -452,6 +480,7 @@ class Supervisor:
             if time.monotonic() >= deadline:
                 raise ControlError("control_startup_recovery_timeout")
             async with self.lock:
+                self.require_resumption()
                 if any(os.waitid(os.P_PID, child.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None for child in self.children.values()):
                     raise ControlError("control_runtime_exited")
                 try:

@@ -62,7 +62,7 @@ class ManagementRecoveryExecutionTests(unittest.TestCase):
         original_patch = patch.object(controller, 'read_management_request', return_value=replace(value.review, expected_generation=self.source.generation - 1))
         original_patch.start()
         self.addCleanup(original_patch.stop)
-        value.grant = {'source_evidence_sha256': snapshot['evidence_sha256'], 'recovery_review_id': str(uuid.uuid4()), 'action': action}
+        value.grant = {'schema_version': 1, 'source_evidence_sha256': snapshot['evidence_sha256'], 'recovery_review_id': str(uuid.uuid4()), 'action': action}
         value.invocation = '2' * 32
         value.store = self.fixture.store
         value.lease = value.claim = value.journal = None
@@ -111,6 +111,35 @@ class ManagementRecoveryExecutionTests(unittest.TestCase):
         self.assertEqual(execution_state.read_active_execution(self.root).execution, self.source.candidate)
         self.assertEqual(execution_state.read_active_execution(self.root).generation, 2)
         self.assertIsNone(state.inspect_state(self.root).active_operation)
+
+    def test_stopped_originally_running_recovery_pairs_links_before_guarded_os_start(self):
+        value = self.make_controller()
+        value.grant['schema_version'] = 3
+        def resumed():
+            self.assertEqual(state.inspect_state(self.root).active_operation.phase, state.LifecyclePhase.VERIFYING)
+            runtime_links.verify_links(self.root, value.journal.candidate)
+            self.assertEqual(value.journal.supervisor_invocation_id, self.source.supervisor_invocation_id)
+            return object()
+        value.resumed_binding = Mock(side_effect=resumed)
+        with patch('lifecycle.control.stopped_repair.require_stopped') as stopped, patch('lifecycle.control.processes.require_service_quiescent') as quiescent:
+            value.execute()
+        self.assertGreater(stopped.call_count, 0)
+        self.assertGreater(quiescent.call_count, 0)
+        value.rpc.assert_not_called()
+        self.assertIsNone(state.inspect_state(self.root).active_operation)
+        self.assertEqual(value.journal.stage, contract.ManagementStage.SUCCEEDED)
+
+    def test_failed_resumption_never_accepts_or_silently_calls_the_historical_supervisor(self):
+        value = self.make_controller()
+        value.grant['schema_version'] = 3
+        value.resumed_binding = Mock(side_effect=RuntimeError('root permission canceled'))
+        with patch('lifecycle.control.stopped_repair.require_stopped'), patch('lifecycle.control.processes.require_service_quiescent'):
+            with self.assertRaisesRegex(RuntimeError, 'root permission canceled'):
+                value.execute()
+        value.rpc.assert_not_called()
+        value.wait_guarded.assert_not_called()
+        self.assertIsNone(value.journal.acceptance)
+        self.assertEqual(execution_state.read_active_execution(self.root).execution, self.source.previous)
 
     def test_recovery_failure_after_acceptance_keeps_claim_and_never_restores_previous(self):
         acceptance = self.accept_source()

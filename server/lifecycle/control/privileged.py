@@ -327,7 +327,7 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
             return 0
         if arguments == ["--before-start"]:
             from .provisioning import before_start
-            return before_start()
+            return before_start(control_manifest_sha256=manifest_sha256)
         if arguments == ["--after-start"]:
             from .startup import after_start
             return after_start()

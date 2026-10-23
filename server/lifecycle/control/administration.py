@@ -150,7 +150,8 @@ def publish_request(payload: dict) -> None:
     atomic_root_json(path, payload, gid=selected.service_gid, mode=0o640)
 
 
-def _apply_fixed_boot_effect(payload: dict, observation: dict, *, recovery: bool = False) -> None:
+def _apply_fixed_boot_effect(payload: dict, observation: dict, *, recovery: bool = False,
+                             resumption_grant: dict | None = None) -> None:
     selected = descriptor()
     if (payload["stop_epoch"] != root_stop_epoch() or payload["boot_id"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip()
             or observation.get("request_sha256") != _sha(payload) or observation.get("generation") != payload["expected_generation"] + 1
@@ -161,7 +162,14 @@ def _apply_fixed_boot_effect(payload: dict, observation: dict, *, recovery: bool
             or int(controller["MainPID"]) != observation.get("controller_pid")
             or controller["InvocationID"] != observation.get("controller_invocation_id")):
         raise ControlError("control_controller_changed")
-    if payload["initial_service_state"] == "running":
+    if resumption_grant is not None:
+        from .resumption_dispatch import qualify
+        from .stopped_repair import require_stopped
+        if resumption_grant.get('request') != payload:
+            raise ControlError('control_resumption_review_changed')
+        qualify(resumption_grant, control_manifest_sha256=payload['controller_control_manifest_sha256'])
+        require_stopped()
+    elif payload["initial_service_state"] == "running":
         unit = unit_snapshot()
         if (unit["ActiveState"] not in {"active", "activating"} or unit["InvocationID"] != payload["supervisor_invocation_id"]
                 or int(unit["MainPID"]) != payload["supervisor"]["pid"]):
@@ -251,8 +259,15 @@ def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | N
                     if recovery_grant is None:
                         _apply_fixed_boot_effect(payload, observation)
                     else:
-                        _apply_fixed_boot_effect(payload, observation, recovery=True)
+                        if recovery_grant.get('schema_version') == 3:
+                            _apply_fixed_boot_effect(payload, observation, recovery=True, resumption_grant=recovery_grant)
+                        else:
+                            _apply_fixed_boot_effect(payload, observation, recovery=True)
                     effect_done = True
+                if (effect_done and recovery_grant is not None and recovery_grant.get('schema_version') == 3
+                        and observation.get('stage') in {'verifying', 'accepted'}):
+                    from .resumption_dispatch import start as start_resumed
+                    start_resumed(recovery_grant, control_manifest_sha256=payload['controller_control_manifest_sha256'])
         if unit["ActiveState"] in {"inactive", "failed"}:
             try:
                 result = run_worker(["operation-result", operation])

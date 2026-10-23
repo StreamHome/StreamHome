@@ -16,6 +16,15 @@ def require_previous_reader(execution) -> None:
     Data-only compatibility inspection cannot select a control version or import
     its modules. The independently authenticated entry remains the only loader.
     """
+    _require_reader(execution, resumption=False)
+
+
+def require_resumption_reader(execution) -> None:
+    """Refuse a bound reader that cannot validate replacement-supervisor grants."""
+    _require_reader(execution, resumption=True)
+
+
+def _require_reader(execution, *, resumption: bool) -> None:
     try:
         identity = uuid.UUID(execution.control_bundle_id)
         if (not identity.int or str(identity) != execution.control_bundle_id
@@ -33,7 +42,8 @@ def require_previous_reader(execution) -> None:
         qualified_support(support)
         if (hashlib.sha256(raw).hexdigest() != execution.control_manifest_sha256
                 or value.get('bundle_id') != execution.control_bundle_id
-                or support.get('schema_version') != 3 or support.get('management_journal_versions') != [1, 2]):
+                or support.get('schema_version') not in {3, 4} or support.get('management_journal_versions') != [1, 2]
+                or resumption and support.get('schema_version') != 4):
             raise ControlError('control_bound_reader_incompatible')
     except (EntryError, OSError, ValueError, TypeError) as exc:
         raise ControlError('control_bound_reader_incompatible') from exc
