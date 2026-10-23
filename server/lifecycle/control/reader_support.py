@@ -24,7 +24,12 @@ def require_resumption_reader(execution) -> None:
     _require_reader(execution, resumption=True)
 
 
-def _require_reader(execution, *, resumption: bool) -> None:
+def require_bound_repair_reader(execution) -> None:
+    """The repaired parent must retain a reader that understands its new grant."""
+    _require_reader(execution, resumption=False, bound_repair=True)
+
+
+def _require_reader(execution, *, resumption: bool, bound_repair: bool = False) -> None:
     try:
         identity = uuid.UUID(execution.control_bundle_id)
         if (not identity.int or str(identity) != execution.control_bundle_id
@@ -42,8 +47,9 @@ def _require_reader(execution, *, resumption: bool) -> None:
         qualified_support(support)
         if (hashlib.sha256(raw).hexdigest() != execution.control_manifest_sha256
                 or value.get('bundle_id') != execution.control_bundle_id
-                or support.get('schema_version') not in {3, 4} or support.get('management_journal_versions') != [1, 2]
-                or resumption and support.get('schema_version') != 4):
+                or support.get('schema_version') not in {3, 4, 5} or support.get('management_journal_versions') != [1, 2]
+                or resumption and support.get('schema_version') not in {4, 5}
+                or bound_repair and support.get('schema_version') != 5):
             raise ControlError('control_bound_reader_incompatible')
     except (EntryError, OSError, ValueError, TypeError) as exc:
         raise ControlError('control_bound_reader_incompatible') from exc

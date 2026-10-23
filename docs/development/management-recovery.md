@@ -66,6 +66,44 @@ and mandatory recovery. Application commit, configuration, policy/provider
 revisions, assets and database writes are preserved. A stop during preparation
 cancels the builder before any claim; it never silently resumes the service.
 
+## Repair environments bound to an unresolved MANAGEMENT operation
+
+Stop the whole runtime before reviewing this maintenance action:
+
+```bash
+sudo streamhome repair --operation <operation-uuid> --review
+sudo streamhome repair --operation <operation-uuid>
+```
+
+The independent control reader verifies the original operation, selected tuple,
+exact cached manifest and every required content object. It displays the current
+phase, acceptance boundary, bound bundle and intended filesystem effects. A live
+controller, foreign service-account work, changed review or unavailable exact
+inputs prevents reconstruction. This action currently supports MANAGEMENT;
+managed UPDATE/RESTORE integration is still pending.
+
+Approval transfers the existing parent's fenced ownership to a new generation.
+Corrupt Python, Node, web and tool trees are preserved beside their original
+permanent paths before exact reconstruction. The cache contains manifest-named
+dependency bytes, never database, media or application configuration. Valid source
+hardlinks are copied into independent cache objects; cache hardlinks and symlinks
+are refused. The original bundle IDs and manifest hashes remain unchanged.
+
+Successful reconstruction leaves the same parent recovery-required and the
+service stopped. It changes neither acceptance nor configuration/runtime
+selection and cannot complete or roll back the parent. Request a fresh separate
+`recover --operation` review to continue under the original acceptance boundary.
+A canceled partial reconstruction retains its receipts and corrupt evidence;
+retry requires a fresh review of its new generation and filesystem state.
+
+For noninteractive approval, `--request FILE` accepts exactly `schema_version`
+(1), `operation_id`, `expected_generation`, `expected_evidence_sha256` and
+`repair_bound_environment` (a boolean). Take generation and evidence from the
+fresh repair review. This request cannot include permission to start or continue
+the parent. Empty Enter on the interactive `[Y/n]` prompt means Yes; EOF and
+missing terminal remain refusal. Direct stop, including a stop of the already
+inactive service, cancels the root issuer and any attached reconstruction.
+
 ## Review and continue
 
 Use the exact unresolved operation UUID reported by installation diagnostics:

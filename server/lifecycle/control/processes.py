@@ -43,7 +43,7 @@ def _protected_reader(path: Path, fields: list[str]) -> bool:
         return (len(tail) in {2, 3} and tail[0] == b'--worker'
             and tail[1] in {b'inspect', b'identity', b'release-check', b'check-listener',
                             b'runtime-progress', b'runtime-result', b'bridge-observe', b'operation-result',
-                            b'resumption-observe', b'resumption-required'})
+                            b'resumption-observe', b'resumption-required', b'bound-repair-review', b'bound-repair-result'})
     except (OSError, IndexError):
         return False
 

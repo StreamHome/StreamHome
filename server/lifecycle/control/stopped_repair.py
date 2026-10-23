@@ -139,7 +139,7 @@ def run_scoped(handoff: StoppedRepairHandoff) -> int:
     _uuid(handoff.preparation_id)
     if not isinstance(handoff.stop_epoch, str) or not re.fullmatch(r'[0-9a-f]{64}', handoff.stop_epoch):
         raise ControlError('control_stopped_repair_invalid')
-    if handoff.recovery_action not in {None, 'continue_recovery', 'rollback', 'safe_abort'}:
+    if handoff.recovery_action not in {None, 'continue_recovery', 'rollback', 'safe_abort', 'repair_bound_environment'}:
         raise ControlError('control_stopped_repair_invalid')
     if type(handoff.running_repair) is not bool or handoff.running_repair and handoff.recovery_action is not None:
         raise ControlError('control_stopped_repair_invalid')
@@ -149,10 +149,11 @@ def run_scoped(handoff: StoppedRepairHandoff) -> int:
         '--description=StreamHome installation ' + handoff.installation_id, '--property=StopPropagatedFrom=streamhome.service',
         '--property=RuntimeMaxSec=3600', '/usr/bin/python3', '-I', '/usr/local/libexec/streamhome/provision',
         *(['--rescue'] if privileged._RESCUE_MODE else []),
-        ('--recover-stopped-scoped' if handoff.recovery_action is not None else
+        ('--repair-bound-scoped' if handoff.recovery_action == 'repair_bound_environment' else
+         '--recover-stopped-scoped' if handoff.recovery_action is not None else
          '--repair-running-scoped' if handoff.running_repair else '--repair-stopped-scoped'), handoff.installation_id,
         handoff.preparation_id, handoff.stop_epoch,
-        *(['--action', handoff.recovery_action] if handoff.recovery_action is not None else []),
+        *(['--action', handoff.recovery_action] if handoff.recovery_action in {'continue_recovery', 'rollback', 'safe_abort'} else []),
         *(['--request', os.path.abspath(handoff.request_path)] if handoff.request_path is not None else [])]
     try:
         result = subprocess.run(arguments, stdin=subprocess.DEVNULL, cwd='/', env=_OS_ENV, timeout=3630)

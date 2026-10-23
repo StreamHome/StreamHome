@@ -381,6 +381,10 @@ def prepare_runtime(root: Path, *, build_id: str, application_commit: str, stage
             "source": {name: hashlib.sha256(raw).hexdigest() for name, raw in inputs.items()},
         }
         state._atomic_write_json(bundle_dir / "manifest.json", manifest)
+        from .layout import layout_for_root
+        from .runtime_recovery_cache import capture
+        capture(bundle_dir, layout_for_root(root).cache / 'runtime-recovery', file_sha256(bundle_dir / 'manifest.json'),
+                checkpoint=checkpoint or (lambda: None))
     return PreparedRuntime(bundle, python_id, node_id, web_id, file_sha256(bundle_dir / "manifest.json"), file_sha256(web_dir / "assets.json"))
 
 

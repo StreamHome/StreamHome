@@ -21,11 +21,24 @@ class PreviousReaderSupportTests(unittest.TestCase):
             'deadlines_seconds': {'startup_recovery': 900, 'startup_extension': 30, 'runtime_drain': 45,
                 'runtime_stop': 60, 'controller': 3600, 'installation': 7200}}}
 
-    def check(self, manifest, *, resumption=False):
+    def check(self, manifest, *, resumption=False, bound_repair=False):
         raw = json.dumps(manifest).encode()
         execution = replace(self.execution, control_manifest_sha256=hashlib.sha256(raw).hexdigest())
         with patch.object(support, '_protected'), patch.object(support, '_read', return_value=raw):
-            return (support.require_resumption_reader if resumption else support.require_previous_reader)(execution)
+            return (support.require_bound_repair_reader if bound_repair else support.require_resumption_reader
+                    if resumption else support.require_previous_reader)(execution)
+
+    def test_bound_repair_requires_explicit_maintenance_and_grant_compatibility(self):
+        with self.assertRaises(ControlError):self.check(self.manifest, bound_repair=True)
+        current = {**self.manifest, 'support': {**self.manifest['support'], 'schema_version': 5,
+            'recovery_request_versions': [1, 2, 3, 4], 'resumption_plan_versions': [1],
+            'runtime_recovery_cache_versions': [1], 'maintenance_actions': ['repair_bound_environment']}}
+        self.assertIsNone(self.check(current, bound_repair=True))
+        self.assertIsNone(self.check(current, resumption=True))
+        for change in ({'recovery_request_versions': [1, 2, 3]}, {'runtime_recovery_cache_versions': [True]},
+                       {'maintenance_actions': ['repair_bound_environment', 'start']}):
+            with self.subTest(change=change), self.assertRaises(ControlError):
+                self.check({**current, 'support': {**current['support'], **change}}, bound_repair=True)
 
     def test_resumption_requires_an_explicit_new_reader_declaration(self):
         with self.assertRaises(ControlError):self.check(self.manifest, resumption=True)

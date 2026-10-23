@@ -184,7 +184,7 @@ def inspect_managed() -> dict:
 
 def main(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha256: str) -> int:
     parser = argparse.ArgumentParser(prog="streamhome internal reader")
-    parser.add_argument("action", choices=("inspect", "prepare-request", "bridge-observe", "operation-result", "select-source", "initial-result", "initial-progress", "initial-listener", "initial-authority", "initial-retry-check", "check-listener", "identity", "release-check", "validate-preparation", "runtime-progress", "runtime-result", "prepare-runtime-request", "recovery-review", "prepare-recovery", "resumption-observe", "resumption-required"))
+    parser.add_argument("action", choices=("inspect", "prepare-request", "bridge-observe", "operation-result", "select-source", "initial-result", "initial-progress", "initial-listener", "initial-authority", "initial-retry-check", "check-listener", "identity", "release-check", "validate-preparation", "runtime-progress", "runtime-result", "prepare-runtime-request", "recovery-review", "prepare-recovery", "resumption-observe", "resumption-required", "bound-repair-review", "bound-repair-prepare", "bound-repair-result"))
     parser.add_argument("operation_id", nargs="?")
     parsed = parser.parse_args(arguments)
     snapshot = inspect_installation()
@@ -229,6 +229,15 @@ def main(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha256:
     if parsed.action == 'resumption-required':
         active = state.inspect_state(ROOT).active_operation
         print(json.dumps({'required': active is not None and active.operation_type is state.OperationType.MANAGEMENT}))
+        return 0
+    if parsed.action in {'bound-repair-review', 'bound-repair-prepare', 'bound-repair-result'}:
+        from .. import bound_management_repair
+        from ..configure_wizard import parse_request_json
+        result = (bound_management_repair.plan(parsed.operation_id, control_manifest_sha256=manifest_sha256)
+                  if parsed.action == 'bound-repair-review' else bound_management_repair.result(parsed.operation_id)
+                  if parsed.action == 'bound-repair-result' else bound_management_repair.prepare(
+                      parse_request_json(sys.stdin.buffer.read(32769)), control_manifest_sha256=manifest_sha256))
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
         return 0
     if parsed.action == 'resumption-observe':
         from .resumption_observation import observe

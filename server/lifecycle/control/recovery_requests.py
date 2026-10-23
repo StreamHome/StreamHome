@@ -23,6 +23,8 @@ def recovery_path(operation_id: str, generation: int):
 
 
 def parse_grant(payload: dict) -> dict:
+    if isinstance(payload, dict) and type(payload.get('schema_version')) is int and payload['schema_version'] == 4:
+        return _parse_maintenance_grant(payload)
     fields = {'schema_version', 'recovery_review_id', 'source_evidence_sha256', 'source_request_sha256', 'action', 'request', 'expires_at_monotonic'}
     scoped = isinstance(payload, dict) and type(payload.get('schema_version')) is int and payload['schema_version'] in {2, 3}
     resuming = scoped and payload['schema_version'] == 3
@@ -73,6 +75,30 @@ def parse_grant(payload: dict) -> dict:
     return payload
 
 
+def _parse_maintenance_grant(payload: dict) -> dict:
+    fields = {'schema_version', 'recovery_review_id', 'source_evidence_sha256', 'source_request_sha256',
+        'action', 'request', 'expires_at_monotonic', 'issuer_scope', 'repair_review_sha256',
+        'execution_sha256', 'filesystem_sha256'}
+    if set(payload) != fields or payload['action'] != recovery.MAINTENANCE_ACTION:
+        raise ControlError('control_recovery_request_invalid')
+    contract._uuid(payload['recovery_review_id'], 'bound repair review')
+    for name in ('source_evidence_sha256', 'source_request_sha256', 'repair_review_sha256', 'execution_sha256', 'filesystem_sha256'):
+        contract._text(payload[name], contract._SHA256, name)
+    expiry = payload['expires_at_monotonic']
+    if type(expiry) not in {int, float} or not math.isfinite(expiry) or not 0 < expiry < 10**12:
+        raise ControlError('control_recovery_request_invalid')
+    current = parse_management_request(payload['request'])
+    original = request_contract.read_management_request(current.operation_id)
+    from .stopped_repair import parse_scope
+    parse_scope(payload['issuer_scope'], current.installation_id)
+    if (current.activation_mode is not contract.ActivationMode.CUTOVER or current.backend is not None
+            or original.sha256 != payload['source_request_sha256'] or current.expected_generation <= original.expected_generation
+            or any(original.payload()[name] != current.payload()[name] for name in original.payload().keys()
+                   - {'expected_generation', 'backend', 'boot_id', 'stop_epoch'})):
+        raise ControlError('control_recovery_request_changed')
+    return payload
+
+
 def read_grant(operation_id: str, generation: int, *, require_live: bool = True) -> dict:
     grant = parse_grant(read_protected_json(recovery_path(operation_id, generation)))
     retained = REQUEST_ROOT / operation_id / ('recovery-review-' + grant['recovery_review_id'] + '.json')
@@ -84,7 +110,7 @@ def read_grant(operation_id: str, generation: int, *, require_live: bool = True)
     if require_live and (time.monotonic() >= grant['expires_at_monotonic'] or reviewed.boot_id != Path('/proc/sys/kernel/random/boot_id').read_text().strip()
             or reviewed.stop_epoch != read_stop_epoch()):
         raise ControlError('control_recovery_permission_expired')
-    if require_live and grant['schema_version'] in {2, 3}:
+    if require_live and grant['schema_version'] in {2, 3, 4}:
         from .stopped_repair import require_scope
         require_scope(grant['issuer_scope'], reviewed.installation_id)
     if require_live and grant['schema_version'] == 3:

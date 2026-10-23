@@ -187,6 +187,8 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
     configuration.add_argument("--request", type=Path, help="Apply an explicit revision-bound noninteractive JSON request.")
     repair = commands.add_parser("repair", help="Review dependency repair or an interrupted first-start attempt.")
     repair.add_argument("--request", type=Path, help="Explicit noninteractive repair request with current identity and consent.")
+    repair.add_argument('--operation', help='Repair only exact dependencies bound to this unresolved operation.')
+    repair.add_argument('--review', action='store_true', help='Print the exact bound repair plan without mutation.')
     recovery = commands.add_parser("recover", help="Review continuation of an interrupted management operation.")
     recovery.add_argument("--operation", required=True, help="The exact unresolved operation UUID.")
     recovery_action = recovery.add_mutually_exclusive_group()
@@ -240,6 +242,16 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
             return configure(request_path=parsed.request)
     if parsed.command == "repair":
         require_root()
+        if parsed.operation is not None:
+            from .bound_repair import repair as repair_bound
+            from .provisioning import administrative_lock
+            with administrative_lock():
+                result = repair_bound(parsed.operation, request_path=parsed.request,
+                    control_manifest_sha256=manifest_sha256, review_only=parsed.review)
+            from .stopped_repair import StoppedRepairHandoff, run_scoped
+            return run_scoped(result) if isinstance(result, StoppedRepairHandoff) else result
+        if parsed.review:
+            raise ControlError('control_operation_id_required')
         selected = descriptor()
         if selected.status is InstallationStatus.PROVISIONING:
             from .first_start_retry import retry_installation
@@ -301,7 +313,7 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
     global _RESCUE_MODE
     _RESCUE_MODE = rescue
     try:
-        if arguments and arguments[0] in {'--repair-stopped-scoped', '--repair-running-scoped', '--recover-stopped-scoped'}:
+        if arguments and arguments[0] in {'--repair-stopped-scoped', '--repair-running-scoped', '--recover-stopped-scoped', '--repair-bound-scoped'}:
             require_root()
             parser = argparse.ArgumentParser(prog='StreamHome stopped repair')
             parser.add_argument('installation_id')
@@ -313,6 +325,11 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
             from .provisioning import administrative_lock
             from .repair import repair
             with administrative_lock():
+                if arguments[0] == '--repair-bound-scoped':
+                    from .bound_repair import repair as repair_bound
+                    return repair_bound(selected.preparation_id, request_path=selected.request,
+                        control_manifest_sha256=manifest_sha256, scope_epoch=selected.stop_epoch,
+                        expected_installation_id=selected.installation_id)
                 if arguments[0] == '--recover-stopped-scoped':
                     from .recover import recover
                     return recover(selected.preparation_id, request_path=selected.request,

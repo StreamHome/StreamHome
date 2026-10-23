@@ -357,8 +357,12 @@ def main(operation_id: str, *, control_manifest_sha256: str) -> int:
     authority = state.inspect_state(ROOT)
     next_path = recovery_path(operation_id, max(2, authority.generation + 1))
     if authority.active_operation is not None and next_path.exists():
-        controller = RecoveredManagementController(read_grant(operation_id, authority.generation + 1),
-            control_manifest_sha256=control_manifest_sha256)
+        grant = read_grant(operation_id, authority.generation + 1)
+        if grant['schema_version'] == 4:
+            from .bound_management_repair import BoundEnvironmentController
+            controller = BoundEnvironmentController(grant, control_manifest_sha256=control_manifest_sha256)
+        else:
+            controller = RecoveredManagementController(grant, control_manifest_sha256=control_manifest_sha256)
     else:
         reviewed = read_management_request(operation_id)
         controller = ManagementController(reviewed, control_manifest_sha256=control_manifest_sha256)
@@ -387,7 +391,7 @@ class RecoveredManagementController(ManagementController):
         super().__init__(parse_management_request(grant['request']), control_manifest_sha256=control_manifest_sha256)
 
     def requires_original_supervisor(self) -> bool:
-        return self.grant['schema_version'] != 3
+        return self.grant['schema_version'] not in {3, 4}
 
     def require_preparation_issuer(self) -> None:
         # Recovery has a newly reviewed finite grant; an expired builder scope
@@ -396,7 +400,7 @@ class RecoveredManagementController(ManagementController):
 
     def checkpoint(self) -> None:
         super().checkpoint()
-        if self.grant['schema_version'] == 3:
+        if self.grant['schema_version'] in {3, 4}:
             from .control.recovery_requests import read_grant
             if read_grant(self.review.operation_id, self.review.expected_generation + 1) != self.grant:
                 raise ControlError('control_resumption_review_changed')

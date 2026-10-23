@@ -19,6 +19,7 @@ from . import management_journal as contract, management_store, state
 
 MAX_INTENT_BYTES = 96 * 1024
 ACTIONS = frozenset({"safe_abort", "continue_recovery", "rollback"})
+MAINTENANCE_ACTION = 'repair_bound_environment'
 
 
 class ManagementRecoveryError(ValueError):
@@ -68,7 +69,7 @@ def parse_takeover_intent(payload: dict) -> TakeoverIntent:
         value["source_phase"] = state.LifecyclePhase(value["source_phase"])
     except (ValueError, TypeError) as exc:
         raise ManagementRecoveryError("The recovery source phase is invalid.") from exc
-    if not isinstance(value["action"], str) or value["action"] not in ACTIONS:
+    if not isinstance(value["action"], str) or value["action"] not in ACTIONS | {MAINTENANCE_ACTION}:
         raise ManagementRecoveryError("The recovery action is unavailable.")
     parent = value["parent_intent_sha256"]
     if parent is not None:
@@ -156,7 +157,7 @@ def _effective_journal(root: Path, authority, journal):
     return parent.target_journal, _sha(parent.payload())
 
 
-def inspect_recovery(root: Path, operation_id: str, generation: int) -> dict:
+def inspect_recovery(root: Path, operation_id: str, generation: int, *, maintenance: bool = False) -> dict:
     """Bounded read-only review; a returned plan grants no takeover authority."""
     authority = state.inspect_state(root)
     operation = authority.active_operation
@@ -171,13 +172,17 @@ def inspect_recovery(root: Path, operation_id: str, generation: int) -> dict:
                  or (journal.stage is contract.ManagementStage.EXCLUSIVE and operation.phase is state.LifecyclePhase.VERIFYING))
     if journal.stage is contract.ManagementStage.RECOVERY_REQUIRED and operation.phase in {state.LifecyclePhase.EXCLUSIVE, state.LifecyclePhase.VERIFYING}:
         intent = inspect_takeover(root, operation_id, journal.generation)
-        phase_gap = intent.action in ACTIONS and intent.target_journal == journal
+        phase_gap = intent.action in ACTIONS | {MAINTENANCE_ACTION} and intent.target_journal == journal
     if operation.phase is not expected_phase and operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED and not phase_gap:
         raise ManagementRecoveryError("The journal does not explain the canonical phase.")
     if effective.stage is contract.ManagementStage.ROLLED_BACK and effective.recovery_target != 'previous':
         raise ManagementRecoveryError("Terminal acknowledgement requires its completion protocol.")
     actions = ["continue_recovery"]
-    if effective.acceptance is None and effective.activation_mode is contract.ActivationMode.CUTOVER and effective.recovery_target == 'candidate':
+    if maintenance:
+        if effective.activation_mode is not contract.ActivationMode.CUTOVER:
+            raise ManagementRecoveryError('Bound environment repair requires a cutover journal.')
+        actions = [MAINTENANCE_ACTION]
+    if not maintenance and effective.acceptance is None and effective.activation_mode is contract.ActivationMode.CUTOVER and effective.recovery_target == 'candidate':
         actions.append("rollback")
         if operation.phase is state.LifecyclePhase.RESERVED and journal.stage in {contract.ManagementStage.RESERVED, contract.ManagementStage.PREPARED}:
             actions.append("safe_abort")
@@ -222,13 +227,13 @@ def acquire_recovery_lease(
     contract._text(controller_invocation_id, contract._INVOCATION, "recovery invocation")
     if int(controller_invocation_id, 16) == 0:
         raise ManagementRecoveryError("The recovery invocation is invalid.")
-    plan = inspect_recovery(root, operation_id, generation)
+    plan = inspect_recovery(root, operation_id, generation, maintenance=action == MAINTENANCE_ACTION)
     if plan["evidence_sha256"] != evidence_sha256 or action not in plan["permitted_actions"]:
         raise ManagementRecoveryError("The reviewed recovery evidence changed.")
     intent = None
     def check():
         nonlocal intent
-        fresh = inspect_recovery(root, operation_id, generation)
+        fresh = inspect_recovery(root, operation_id, generation, maintenance=action == MAINTENANCE_ACTION)
         if fresh != plan:
             raise ManagementRecoveryError("Recovery evidence changed before ownership transfer.")
         if pre_transfer_check is not None:

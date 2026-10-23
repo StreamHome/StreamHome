@@ -103,6 +103,24 @@ class ManagementRecoveryExecutionTests(unittest.TestCase):
         self.assertEqual(execution_state.read_active_execution(self.root).generation, 2)
         self.assertEqual(recovery.inspect_takeover(self.root, value.journal.operation_id, 2).source_journal, self.source)
 
+    def test_fresh_forward_review_after_bound_repair_traverses_unchanged_parent_receipts(self):
+        value = self.make_controller()
+        maintenance = recovery.inspect_recovery(self.root, self.source.operation_id, 1, maintenance=True)
+        lease, _, rebound = recovery.acquire_recovery_lease(self.root, operation_id=self.source.operation_id, generation=1,
+            evidence_sha256=maintenance['evidence_sha256'], review_id=str(uuid.uuid4()),
+            action=recovery.MAINTENANCE_ACTION, controller_invocation_id='3' * 32)
+        lease.release()
+        self.assertEqual(rebound.candidate, self.source.candidate)
+        self.assertIsNone(rebound.acceptance)
+        fresh = recovery.inspect_recovery(self.root, self.source.operation_id, 2)
+        self.assertNotIn(recovery.MAINTENANCE_ACTION, fresh['permitted_actions'])
+        value.review = replace(value.review, expected_generation=2)
+        value.grant.update(source_evidence_sha256=fresh['evidence_sha256'], recovery_review_id=str(uuid.uuid4()))
+        value.execute()
+        self.assertEqual(value.journal.generation, 3)
+        self.assertIsNone(state.inspect_state(self.root).active_operation)
+        self.assertEqual(self.fixture.store.inspect().active, self.target.reference)
+
     def test_accepted_forward_continuation_preserves_original_acceptance_and_candidate(self):
         acceptance = self.accept_source()
         value = self.make_controller()

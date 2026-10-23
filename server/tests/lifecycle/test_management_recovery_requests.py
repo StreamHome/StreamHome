@@ -33,6 +33,18 @@ class RecoveryGrantTests(unittest.TestCase):
         return {**self.grant, 'schema_version': 3, 'request': current.payload(),
                 'issuer_scope': scope, 'resumption_plan_id': str(uuid.uuid4())}
 
+    def test_bound_repair_grant_retains_history_and_can_never_be_a_start_grant(self):
+        value = self.resuming_grant();value.pop('resumption_plan_id')
+        current = replace(self.original, expected_generation=self.current.expected_generation, backend=None,
+                          stop_epoch=self.current.stop_epoch)
+        value.update(schema_version=4, action='repair_bound_environment', request=current.payload(),
+            repair_review_sha256='a' * 64, execution_sha256='b' * 64, filesystem_sha256='c' * 64)
+        with patch.object(grants.request_contract, 'read_management_request', return_value=self.original):
+            self.assertEqual(grants.parse_grant(value), value)
+            for changed in ({'resumption_plan_id': str(uuid.uuid4())}, {'action': 'continue_recovery'}, {'filesystem_sha256': 'bad'}):
+                with self.subTest(changed=changed), self.assertRaises((ControlError, ValueError)):
+                    grants.parse_grant({**value, **changed})
+
     def test_resumption_preserves_original_supervisor_history_without_claiming_it_is_live(self):
         value = self.resuming_grant()
         with patch.object(grants.request_contract, 'read_management_request', return_value=self.original):

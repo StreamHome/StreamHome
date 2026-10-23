@@ -241,7 +241,11 @@ def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | N
         # Type=exec acknowledges the executable, not operation completion. This
         # avoids treating a merely queued start job as an exited controller.
         systemctl("start", f"streamhome-operation@{operation}.service", timeout=30)
-    deadline = time.monotonic() + 300
+    # Reconstruction copies/fsyncs complete bound environments. Its existing
+    # scoped grant has a 900-second limit; the ordinary management observer's
+    # shorter wait must not cancel a still-authorized reconstruction at 300s.
+    bound_repair = recovery_grant is not None and recovery_grant.get('schema_version') == 4
+    deadline = time.monotonic() + (900 if bound_repair else 300)
     effect_done = False
     last_stage = None
     while time.monotonic() < deadline:
@@ -255,7 +259,8 @@ def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | N
                 if observation.get("stage") != last_stage:
                     last_stage = observation.get("stage")
                     print("[StreamHome] Management: " + str(last_stage), flush=True)
-                if observation.get("os_effect_requested") is True and not effect_done:
+                if (observation.get("os_effect_requested") is True and not effect_done
+                        and (recovery_grant is None or recovery_grant.get('schema_version') != 4)):
                     if recovery_grant is None:
                         _apply_fixed_boot_effect(payload, observation)
                     else:
@@ -275,7 +280,8 @@ def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | N
                     start_resumed(recovery_grant, control_manifest_sha256=payload['controller_control_manifest_sha256'])
         if unit["ActiveState"] in {"inactive", "failed"}:
             try:
-                result = run_worker(["operation-result", operation])
+                result = run_worker(["bound-repair-result" if recovery_grant is not None and recovery_grant.get('schema_version') == 4
+                                     else "operation-result", operation], timeout=120)
             except ControlError:
                 result = {"completed": False}
             if result.get("completed") is True:
