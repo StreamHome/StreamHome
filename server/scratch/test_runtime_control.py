@@ -80,7 +80,7 @@ class RuntimeControlTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix" and Path("/proc").is_dir(), "Linux /proc required")
     def test_start_registration_preserves_leading_dash_token_exactly(self) -> None:
-        start_source = (Path(__file__).resolve().parents[2] / "start.sh").read_text(encoding="utf-8")
+        start_source = (Path(__file__).resolve().parents[2] / "scripts/runtime/start.sh").read_text(encoding="utf-8")
         begin = start_source.index("record_service() {")
         end = start_source.index("\n}", begin) + 2
         function = start_source[begin:end]

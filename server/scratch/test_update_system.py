@@ -1127,7 +1127,7 @@ class UpdateSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(lifecycle_state.inspect_state(self.workspace_root).active_operation)
 
     def test_first_phase_one_adoption_is_explicitly_legacy_protected(self) -> None:
-        script = (Path(__file__).resolve().parents[2] / "update.sh").read_text(encoding="utf-8")
+        script = (Path(__file__).resolve().parents[2] / "scripts/runtime/update.sh").read_text(encoding="utf-8")
         self.assertIn("installed_release_lifecycle_support", script)
         self.assertIn("PRE_PHASE1_CONFIRMED", script)
         self.assertIn("PHASE1_CONFIRMED", script)
