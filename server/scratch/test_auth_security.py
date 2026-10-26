@@ -17,7 +17,7 @@ from sqlalchemy import delete
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from config import settings
+from config import runtime_layout, settings
 from db import engine, init_db
 from models import AuthChallenge, AuthSession, RecoveryCode, SecurityEvent, User
 import routes.auth as auth_routes
@@ -88,7 +88,7 @@ async def protected(user: User = Depends(get_current_user)):
 def run() -> None:
     original_readiness = auth_routes.get_startup_readiness
     auth_routes.get_startup_readiness = lambda: SimpleNamespace(
-        context=SimpleNamespace(mode="normal"),
+        context=SimpleNamespace(mode="normal", installation_root=runtime_layout.application),
         projection=lambda: {
             "generalReady": True,
             "guardedReady": False,
