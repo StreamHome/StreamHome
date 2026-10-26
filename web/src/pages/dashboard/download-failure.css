@@ -1,0 +1,16 @@
+.download-failure {
+  margin-block: 12px;
+  padding: 12px;
+  border: 1px solid currentColor;
+  border-radius: 8px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font: 400 14px/1.5 var(--font-body, system-ui, sans-serif);
+}
+.download-failure.download-failure p { margin: 0 0 8px; color: inherit; font: inherit; }
+.download-failure.download-failure strong { color: inherit; font: inherit; font-weight: 600; }
+.download-failure summary { cursor: pointer; padding-block: 10px; min-height: 44px; }
+.download-failure summary:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.download-failure dl { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 6px 12px; }
+.download-failure dt { font-weight: 600; }
+.download-failure dd { margin: 0; min-width: 0; }

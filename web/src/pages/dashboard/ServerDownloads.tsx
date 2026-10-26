@@ -3,6 +3,7 @@ import { ProgressBar } from "../../components/ui/ProgressBar";
 import { useThemeStore } from "../../stores/themeStore";
 import { downloadFraction } from "../../utils/media";
 import { useDownloadStream, type DownloadConnectionState } from "./useDownloadStream";
+import { DownloadFailureNotice } from "./DownloadFailureNotice";
 
 const CONNECTION_LABEL: Record<DownloadConnectionState, string> = {
   disconnected: "Offline",
@@ -50,7 +51,7 @@ export function ServerDownloads() {
                 <strong>{Math.round(download.progress)}%</strong>
               </header>
               {statusKind(download.status) === "active" && <p>{download.speed} · ETA {download.eta}</p>}
-              {statusKind(download.status) === "failed" && <p className="server-downloads__failure-help">Check that the source is available in the app that submitted this job. If the problem continues, ask the server operator to inspect it.</p>}
+              {statusKind(download.status) === "failed" && <DownloadFailureNotice download={download} />}
               <ProgressBar className="server-downloads__progress" progress={downloadFraction(download.progress)} />
             </article>
           ))}

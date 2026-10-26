@@ -1,4 +1,5 @@
 import os
+from dataclasses import replace
 import re
 import time
 import httpx
@@ -464,7 +465,7 @@ async def _download_and_merge_controlled(
 
         diagnostics_path = write_task_diagnostics(task_id, "ffmpeg", diagnostics)
         failure = classify_failure(diagnostics)
-        failure = IngestionFailure(failure.code, failure.message, failure.retryable, diagnostics_path)
+        failure = replace(failure, diagnostics_path=diagnostics_path, stage="download")
         update_task_metrics(task_id, 0.0, speed="Failed", eta="00:00:00")
         return False, failure
             

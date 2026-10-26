@@ -470,6 +470,17 @@ export interface UpdateStatus {
   policy: UpdatePolicy;
 }
 
+export interface DownloadFailure {
+  code: string;
+  message: string;
+  guidance: string;
+  stage?: string;
+  inputRole?: string;
+  httpStatus?: number;
+  provider?: "cloudflare";
+  providerCode?: "1005";
+}
+
 export interface DownloadEvent {
   id: string;
   title: string;
@@ -477,6 +488,7 @@ export interface DownloadEvent {
   progress: number;
   speed: string;
   eta: string;
+  failure?: DownloadFailure;
 }
 
 export interface DiscoverMovie {

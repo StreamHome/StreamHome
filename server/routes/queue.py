@@ -16,6 +16,7 @@ from db import engine, get_session
 from models import DownloadTask, DownloadAddRequest, Movie, Episode, IntegrationCredential
 from services.queue import queue_manager
 from services.state import ACTIVE_DOWNLOAD_METRICS
+from services.download_failures import public_failure
 from services.tmdb import tmdb_client
 from services.vibe_analysis import compute_trope_vectors
 
@@ -35,6 +36,11 @@ from lifecycle.coordination import EffectClass, runtime_work
 
 router = APIRouter()
 queue_security = HTTPBearer(auto_error=False)
+
+
+def task_failure(task: DownloadTask) -> dict | None:
+    return public_failure(task.status, task.failure_details_str, task.error_message)
+
 
 def is_local_playable_url(url: Optional[str]) -> bool:
     return bool(url and url.startswith("/media/"))
@@ -347,6 +353,7 @@ async def download_progress_generator():
                     "id": t.id,
                     "title": t.title or f"TMDB {t.tmdb_id}",
                     "status": status_text,
+                    "failure": task_failure(t),
                     "progress": progress,
                     "speed": metrics["speed"],
                     "eta": metrics["eta"]
@@ -360,6 +367,7 @@ async def download_progress_generator():
                     "id": t.id,
                     "title": t.title or f"TMDB {t.tmdb_id}",
                     "status": status_text,
+                    "failure": task_failure(t),
                     "progress": progress,
                     "speed": "Finished" if t.status == "COMPLETED" else "Failed",
                     "eta": "00:00:00"
@@ -400,6 +408,7 @@ async def current_download_snapshot() -> list[dict[str, Any]]:
             "id": task.id,
             "title": task.title or f"TMDB {task.tmdb_id}",
             "status": status_text,
+            "failure": task_failure(task),
             "progress": 100.0 if task.status == "COMPLETED" else (0.0 if task.status == "FAILED" else metrics["progress"]),
             "speed": "Finished" if task.status == "COMPLETED" else ("Failed" if task.status == "FAILED" else metrics["speed"]),
             "eta": "00:00:00" if task.status in ("COMPLETED", "FAILED") else metrics["eta"],

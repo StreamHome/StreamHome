@@ -1002,6 +1002,38 @@ Do not expose the internal API port publicly merely to avoid a browser security 
 
 ### Submitted source cannot be downloaded
 
+StreamHome's download views show a safe explanation for failed tasks, with an
+optional **Details** disclosure for the task reference, error code, and any known
+stage, input role, HTTP status, or recognized provider error. A source HTTP 403
+means access was denied; it does not by itself establish a network or ASN ban.
+When the source's rejected response specifically reports Cloudflare error 1005,
+the explanation identifies the reported network block. This reporting does not
+remove the block or change automatic retry behavior.
+
+`GET /api/downloads` and `GET /api/downloads/stream` include the same additive
+`failure` object on failed tasks; nonfailed tasks have `failure: null`. Existing
+fields and status strings are unchanged. For example:
+
+```json
+{
+  "code": "SOURCE_FORBIDDEN",
+  "message": "The source provider refused access from this server.",
+  "guidance": "Check source permissions or contact the source provider.",
+  "stage": "source_preparation",
+  "input_role": "video",
+  "http_status": 403
+}
+```
+
+Optional fields are omitted when unavailable. Recognized Cloudflare 1005 evidence
+adds `provider: "cloudflare"` and `provider_code: "1005"`; it does not change the
+underlying `SOURCE_FORBIDDEN` code. Older task records retain a safe explanation
+where their existing error code is recognized, without inventing missing context.
+Unknown failures receive a generic explanation. Clients must tolerate absent
+failure objects from older servers and unknown future codes. Raw source URLs,
+credentials, upstream error pages, and private diagnostic paths are never part
+of this public failure contract.
+
 Check:
 
 * the URL is still valid;

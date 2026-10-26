@@ -23,6 +23,7 @@ from lifecycle.coordination import EffectClass, runtime_work
 from lifecycle.media_work import settle
 from services.hls_context import SourceContextPolicy
 from services.ingestion_errors import write_task_diagnostics
+from services.source_denial import denial_context
 from services.ingestion_security import (
     UnsafeIngestionSource,
     pinned_source_client,
@@ -177,6 +178,8 @@ class SourceRelay:
                                                           client_address=self.client_address,
                                                           context_policy=self.context_policy)
                 if response.status_code not in {200, 206}:
+                    evidence = await denial_context(response)
+                    response.extensions["streamhome_denial_context"] = evidence
                     raise httpx.HTTPStatusError(f"Upstream media returned HTTP {response.status_code}",
                                                request=response.request, response=response)
                 first = await anext(response.aiter_bytes(64 * 1024).__aiter__(), b"")
@@ -305,6 +308,14 @@ class SourceRelay:
         self.failure_count += 1
         response = error.response if isinstance(error, httpx.HTTPStatusError) else response
         status = response.status_code if response is not None else 0
+        context = {"input_role": self.input_role}
+        if phase != "relay-close":
+            context["stage"] = "source_resource" if resource or request_id or phase == "response-close" else "source_preparation"
+        if status:
+            context["http_status"] = status
+        if response is not None:
+            context.update(response.extensions.get("streamhome_denial_context", {}))
+        error.streamhome_failure_context = context
         self.status_counts[str(status)] = self.status_counts.get(str(status), 0) + 1
         if len(self.failures) < 8:
             snapshot = {"request_id": request_id, "method": method, "http_status": status,

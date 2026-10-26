@@ -1,23 +1,9 @@
 import { useEffect, useState } from "react";
 import { useAuthStore } from "../../stores/authStore";
 import type { DownloadEvent } from "../../types/api";
+import { normalizeDownload } from "../../api/downloads";
 
 export type DownloadConnectionState = "disconnected" | "connecting" | "connected" | "reconnecting";
-
-function normalizeDownload(value: unknown): DownloadEvent | null {
-  if (!value || typeof value !== "object") return null;
-  const item = value as Record<string, unknown>;
-  const progress = Number(item.progress);
-  if (item.id == null || typeof item.title !== "string" || !Number.isFinite(progress)) return null;
-  return {
-    id: String(item.id),
-    title: item.title,
-    status: typeof item.status === "string" ? item.status : "Pending",
-    progress: Math.min(Math.max(progress, 0), 100),
-    speed: typeof item.speed === "string" ? item.speed : "—",
-    eta: typeof item.eta === "string" ? item.eta : "—",
-  };
-}
 
 export function parseDownloadPayload(payload: string): DownloadEvent[] | null {
   try {

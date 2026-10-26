@@ -22,6 +22,7 @@ from services.logger import logger
 from services.media_analysis import duration_label, refreshed_analysis, current_duration_analysis, stored_analysis, positive_number
 from services.media_probe import probe_media_stream, notify_video_sender, probe_completed_media
 from services.ingestion_errors import IngestionFailure, IngestionTaskError, prune_task_diagnostics, write_task_diagnostics
+from services.download_failures import encode_failure
 from services.ingest_preview import ingest_preview_service
 from services.rclone import rclone_service
 from services.storage_capacity import StorageCapacityError, storage_capacity
@@ -717,6 +718,8 @@ class DownloadQueueManager:
                     if not task or task.status != "PENDING":
                         return
                     task.status = "DOWNLOADING"
+                    task.error_message = None
+                    task.failure_details_str = None
                     db.add(task)
                     await db.commit()
                 await self._process_admitted_task(task_id)
@@ -1168,6 +1171,7 @@ class DownloadQueueManager:
                 finalized_media = await db.merge(model.model_validate(candidate_data))
                 task.status = "COMPLETED"
                 task.error_message = None
+                task.failure_details_str = None
                 db.add(task)
                 finalized_media_id = media_id
                 try:
@@ -1266,6 +1270,7 @@ class DownloadQueueManager:
                 ingest_preview_service.mark_error(preview_id or task.current_preview_id or task_id, failure.code, failure.message)
                 task.status = "FAILED"
                 task.error_message = failure.display
+                task.failure_details_str = encode_failure(failure)
                 db.add(task)
 
                 await db.commit()
@@ -1916,6 +1921,7 @@ class DownloadQueueManager:
                     continue
                 task.status = "COMPLETED"
                 task.error_message = None
+                task.failure_details_str = None
                 if getattr(media_obj, "preview_task_id", None) == task.id:
                     media_obj.preview_task_id = None
                     db.add(media_obj)

@@ -133,6 +133,8 @@ async def init_db(
                 if "error_message" not in columns:
                     logger.info("[Database] Migrating: Adding 'error_message' column to 'downloadtask' table...")
                     sync_conn.exec_driver_sql("ALTER TABLE downloadtask ADD COLUMN error_message TEXT")
+                if "failure_details_str" not in columns:
+                    sync_conn.exec_driver_sql("ALTER TABLE downloadtask ADD COLUMN failure_details_str TEXT")
                 if "has_video" not in columns:
                     logger.info("[Database] Migrating: Adding 'has_video' column to 'downloadtask' table...")
                     sync_conn.exec_driver_sql("ALTER TABLE downloadtask ADD COLUMN has_video BOOLEAN")

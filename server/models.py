@@ -697,6 +697,7 @@ class DownloadTask(SQLModel, table=True):
     quality: Optional[str] = Field(default=None)
     language: Optional[str] = Field(default=None)
     error_message: Optional[str] = Field(default=None)
+    failure_details_str: Optional[str] = Field(default=None)
     has_video: Optional[bool] = Field(default=None)
     has_audio: Optional[bool] = Field(default=None)
     scan_quality: Optional[str] = Field(default=None)

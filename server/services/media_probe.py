@@ -1,5 +1,6 @@
 from lifecycle.media_work import supervised_output
 import os
+from dataclasses import replace
 import shutil
 import asyncio
 import json
@@ -268,7 +269,7 @@ async def probe_media_stream(
             
             if process.returncode != 0:
                 err_msg = stderr.decode("utf-8", errors="ignore").strip()
-                failure = classify_failure(err_msg, "MEDIA_PROBE_FAILED")
+                failure = replace(classify_failure(err_msg, "MEDIA_PROBE_FAILED"), stage="probe", input_role=input_role)
                 return {
                     "has_video": False,
                     "has_audio": False,
@@ -317,7 +318,7 @@ async def probe_media_stream(
             }
             
         except Exception as e:
-            failure = classify_failure(str(e), "MEDIA_PROBE_FAILED")
+            failure = replace(classify_failure(str(e), "MEDIA_PROBE_FAILED"), stage="probe", input_role=input_role)
             return {
                 "has_video": False,
                 "has_audio": False,
@@ -371,7 +372,7 @@ async def probe_media_stream(
         diagnostics = str(failure_result.get("diagnostics") or "").strip()
         if diagnostics:
             diagnostics_path = write_task_diagnostics(task_id, "ffprobe", diagnostics)
-            failure = IngestionFailure(failure.code, failure.message, failure.retryable, diagnostics_path)
+            failure = replace(failure, diagnostics_path=diagnostics_path)
     
     quality = resolution_label(video_res.get("width"), height) if has_video else ("Audio Only" if has_audio else "Source")
 

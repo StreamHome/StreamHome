@@ -13,6 +13,11 @@ class IngestionFailure:
     message: str
     retryable: bool = False
     diagnostics_path: Optional[str] = None
+    stage: Optional[str] = None
+    input_role: Optional[str] = None
+    http_status: Optional[int] = None
+    provider: Optional[str] = None
+    provider_code: Optional[str] = None
 
     @property
     def display(self) -> str:

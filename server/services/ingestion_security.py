@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import ipaddress
 import re
 import socket
@@ -45,8 +46,11 @@ def source_request_failure(error: Exception):
         failure = IngestionFailure("SOURCE_UNREACHABLE", "The media sender source could not be reached.", True)
     else:
         failure = IngestionFailure("MEDIA_SOURCE_FAILED", "The media source could not be processed.", False)
-    return IngestionFailure(failure.code, failure.message, failure.retryable,
-                            getattr(error, "streamhome_diagnostics_path", None))
+    from services.download_failures import safe_context
+    context = safe_context(getattr(error, "streamhome_failure_context", None))
+    if isinstance(error, httpx.HTTPStatusError):
+        context["http_status"] = error.response.status_code
+    return replace(failure, diagnostics_path=getattr(error, "streamhome_diagnostics_path", None), **context)
 
 
 def validate_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
