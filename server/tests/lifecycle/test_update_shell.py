@@ -18,7 +18,7 @@ class UpdateShellLifecycleTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.temp = Path(self.temporary.name)
         self.repository_root = Path(__file__).resolve().parents[3]
-        script = (self.repository_root / "update.sh").read_text(encoding="utf-8")
+        script = (self.repository_root / "scripts/runtime/update.sh").read_text(encoding="utf-8")
         prefix, marker, _ = script.partition('case "${1:-}" in')
         self.assertTrue(marker)
         self.library = self.temp / "update-functions.sh"
@@ -47,6 +47,264 @@ class UpdateShellLifecycleTests(unittest.TestCase):
             check=False,
             timeout=timeout,
         )
+
+    def test_managed_database_effects_and_rollback_stop_before_mutation_on_permission_failure(self):
+        database = self.temp/'canonical.db';database.write_bytes(b'unchanged canonical sentinel')
+        for command in ('create_database_checkpoint', 'restore_database_checkpoint'):
+            result = self._shell('STREAMHOME_MANAGED_UPDATE=true\n'
+                'UPDATE_DATABASE="$FIXTURE_DATABASE"\n'
+                'managed_update_runtime() { return 41; }\n'+command,
+                environment={'FIXTURE_DATABASE': str(database)})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(database.read_bytes(), b'unchanged canonical sentinel')
+
+    def test_managed_readiness_probe_uses_typed_port_without_legacy_environment(self):
+        result = self._shell('''
+STREAMHOME_MANAGED_UPDATE=true
+WEB_PORT=43127
+read_env() { echo legacy_environment_read >&2; return 1; }
+python3() { printf '%s\\n' "$2"; }
+runtime_endpoints_ready aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa fixture
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '43127\n')
+        self.assertNotIn('legacy_environment_read', result.stderr)
+
+    def test_managed_interrupted_rollback_uses_bound_environments_without_legacy_staging_or_setup(self):
+        status = self.temp/'interrupted.json'
+        status.write_text(json.dumps({'phase': 'recovering', 'previous_commit': 'a'*40,
+            'target_commit': 'e'*40, 'transaction_id': str(uuid.uuid4()), 'staging_dir': '',
+            'web_artifacts_swapped': True, 'web_dependencies_swapped': True,
+            'python_dependencies_changed': True, 'runtime_committed': False,
+            'lifecycle_generation': 3, 'lifecycle_phase': 'exclusive'}))
+        checkpoint = self.temp/'bound-checkpoint.db';checkpoint.write_bytes(b'synthetic checkpoint')
+        result = self._shell('''
+STREAMHOME_MANAGED_UPDATE=true
+STATUS_FILE="$FIXTURE_STATUS";UPDATE_DATABASE_CHECKPOINT="$FIXTURE_CHECKPOINT"
+ROOT_DIR="$FIXTURE_ROOT";RUN_DIR="$FIXTURE_ROOT";WEB_PORT=3000
+LIFECYCLE_ENABLED=true
+initialize_update_paths() { :; }
+lifecycle_cli() { return 5; }
+initialize_lifecycle_authority() { :; }
+acquire_update_lock() { :; }
+cleanup() { :; }
+runtime_endpoints_ready() { return 1; }
+write_state() { printf 'state:%s\\n' "$1"; }
+stop_installed_runtime_with_target_lifecycle() { echo stopped; }
+preserve_unexpected_worktree_changes() { echo preserved; }
+git() { if [[ "$3" == rev-parse ]]; then printf '%040d\\n' 0 | tr 0 e; else echo reset; fi; }
+restore_database_checkpoint() { echo checkpoint; }
+managed_update_runtime() { printf 'helper:%s\\n' "$1"; }
+recovery_staging_is_safe() { echo unexpected_legacy_staging >&2; return 1; }
+installed_release_has_guarded_bootstrap() { return 0; }
+stop_maintenance() { :; }
+start_installed_update_runtime() { echo start; }
+promote_recovered_guarded_runtime() { echo promote; }
+cleanup_update_checkpoint() { echo cleanup; }
+recover_interrupted_release
+''', environment={'FIXTURE_STATUS': str(status), 'FIXTURE_CHECKPOINT': str(checkpoint),
+                'FIXTURE_ROOT': str(self.temp)})
+        self.assertEqual(result.returncode, 12, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['state:rolling_back', 'stopped',
+            'helper:assert_rollback', 'preserved', 'reset', 'checkpoint', 'helper:bind_previous',
+            'state:rolling_back', 'helper:verify_previous', 'state:recovering', 'start',
+            'state:rolled_back', 'promote', 'cleanup'])
+        self.assertNotIn('unexpected_legacy_staging', result.stderr)
+
+    def test_accepted_managed_recovery_replaces_old_backend_and_retains_exact_previous_selection(self):
+        for same_commit in (False, True):
+            previous = 'a'*40;target = previous if same_commit else 'e'*40
+            script = '''
+STREAMHOME_MANAGED_UPDATE=true
+OLD_COMMIT="$FIXTURE_PREVIOUS";TARGET_COMMIT="$FIXTURE_TARGET"
+UPDATE_RECOVERY_COMMIT="$OLD_COMMIT";UPDATE_RECOVERY_TARGET=previous
+TRANSACTION_ID=fixture
+stop_installed_runtime_with_target_lifecycle() { echo stopped; }
+runtime_backend_live() { echo stale_health_must_not_settle; return 0; }
+start_installed_update_runtime() { echo guarded_start; }
+stop_maintenance() { :; }
+runtime_endpoints_ready() { printf 'endpoints:%s\\n' "$1"; }
+commit_updated_runtime() { printf 'accept:%s\\n' "$1"; }
+wait_for_committed_runtime() { printf 'ready:%s\\n' "$1"; }
+cleanup_update_checkpoint() { echo cleanup; }
+write_state() { printf 'state:%s:%s\\n' "$1" "$5"; }
+record_post_commit_recovery_failure() { echo unexpected_failure; }
+recover_accepted_update_runtime "$OLD_COMMIT"
+'''
+            result = self._shell(script, environment={'FIXTURE_PREVIOUS': previous, 'FIXTURE_TARGET': target})
+            with self.subTest(same_commit=same_commit):
+                self.assertEqual(result.returncode, 12, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ['stopped', 'state:recovering:'+previous,
+                    'guarded_start', 'endpoints:'+previous, 'accept:'+previous, 'state:recovering:'+previous,
+                    'ready:'+previous, 'cleanup', 'state:rolled_back:'+previous])
+
+    def test_accepted_recovery_stop_failure_preserves_acceptance_without_start_or_cleanup(self):
+        result = self._shell('''
+STREAMHOME_MANAGED_UPDATE=true
+OLD_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+TARGET_COMMIT=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+UPDATE_RECOVERY_COMMIT="$OLD_COMMIT";UPDATE_RECOVERY_TARGET=previous
+stop_installed_runtime_with_target_lifecycle() { return 1; }
+start_installed_update_runtime() { echo must_not_start; }
+cleanup_update_checkpoint() { echo must_not_cleanup; }
+record_post_commit_recovery_failure() { printf 'preserved:%s\\n' "$1"; }
+recover_accepted_update_runtime "$OLD_COMMIT"
+''')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, 'preserved:'+'a'*40+'\n')
+        result = self._shell('OLD_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+            'TARGET_COMMIT=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n'
+            'validate_lifecycle_authority() { return 0; }\n'
+            'write_state() { return 1; }\n'
+            'stop_installed_runtime_with_target_lifecycle() { printf unexpected-stop; }\n'
+            'rollback_release')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('unexpected-stop', result.stdout)
+
+    def test_managed_script_paths_are_typed_data_and_refuse_stale_or_injected_context(self):
+        operation = str(uuid.uuid4())
+        context = {'schema_version': 1, 'operation_id': operation, 'generation': 2,
+            'runtime_directory': '/var/lib/streamhome', 'database': '/var/lib/streamhome/database.db',
+            'update_log': '/var/lib/streamhome/update.log',
+            'staging_directory': '/var/cache/streamhome/update-preparation/'+operation,
+            'previous_python': '/opt/streamhome/runtime/python/previous/venv/bin/python',
+            'candidate_python': '/opt/streamhome/runtime/python/candidate/venv/bin/python',
+            'database_checkpoint': '/var/lib/streamhome/update-checkpoints/'+operation+'/database.db',
+            'recovery_commit': 'a'*40,
+            'recovery_target': 'candidate',
+            'web_port': 3002, 'public_origin': ''}
+        script = ('STREAMHOME_MANAGED_UPDATE=true\nROOT_DIR=/opt/streamhome\n'
+            'LIFECYCLE_OPERATION_ID="$FIXTURE_OPERATION"\nLIFECYCLE_GENERATION=2\n'
+            'read_managed_update_context() { printf "%s" "$FIXTURE_CONTEXT"; }\n'
+            'initialize_update_paths || exit 1\n'
+            'printf "%s\\n" "$RUN_DIR" "$UPDATE_DATABASE" "$WEB_PORT" "$PUBLIC_URL"')
+        def execute(value):
+            return self._shell(script, environment={'FIXTURE_OPERATION': operation,
+                'FIXTURE_CONTEXT': json.dumps(value)})
+        result = execute(context)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '/var/lib/streamhome\n/var/lib/streamhome/database.db\n3002\n\n')
+        for changes in ({'generation': True}, {'generation': 3}, {'extra': 1},
+                {'database': 'relative/database.db'}, {'web_port': 8000}, {'recovery_commit': 'invalid'},
+                {'public_origin': 'https://example.invalid/\nRUN_DIR=other'}):
+            with self.subTest(changes=changes):
+                self.assertNotEqual(execute({**context, **changes}).returncode, 0)
+        marker = self.temp/'must-not-execute'
+        value = {**context, 'public_origin': '$(touch '+str(marker)+')'}
+        self.assertEqual(execute(value).returncode, 0)
+        self.assertFalse(marker.exists())
+
+    def test_managed_context_worker_is_directly_parented_by_registered_bash_even_inside_command_substitution(self):
+        observed = self.temp/'context-peer.json';worker = self.temp/'context-worker.py'
+        worker.write_text('import json,os,sys\nfrom pathlib import Path\n'
+            'Path('+repr(str(observed))+').write_text(json.dumps({"pid":os.getpid(),"parent":os.getppid(),"packet":json.load(sys.stdin)}))\n'
+            'print("{\\"context\\":true}")\n')
+        source = self.library.read_text()
+        start = source.index('read_managed_update_context() {')
+        end = source.index('\ninitialize_update_paths()', start)
+        function = source[start:end].replace('/usr/local/libexec/streamhome/provision', str(worker))
+        script = ('STREAMHOME_MANAGED_UPDATE=true\nROOT_DIR=/opt/streamhome\nLIFECYCLE_GENERATION=2\n'
+            'LIFECYCLE_OPERATION_ID='+str(uuid.uuid4())+'\n'+function+
+            '\ncontext="$(read_managed_update_context)" || exit 1\nprintf "%s\\n" "$BASHPID" "$context"\n')
+        result = self._shell(script, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parent, context = result.stdout.splitlines()
+        self.assertEqual(json.loads(context), {'context': True})
+        self.assertEqual(json.loads(observed.read_text())['parent'], int(parent))
+        self.assertEqual(json.loads(observed.read_text())['packet'], {'schema_version': 1, 'generation': 2})
+
+    def test_managed_runtime_refusal_never_falls_back_to_legacy_process_or_mutable_environment_paths(self):
+        commands = {
+            'start_maintenance': 'maintenance',
+            'stop_installed_runtime_with_target_lifecycle': 'stop',
+            'activate_prepared_web': 'bind_candidate',
+            'restore_previous_web': 'bind_previous',
+            'validate_current_python_environment': 'verify_previous',
+            'start_installed_update_runtime': 'start',
+        }
+        for command, expected in commands.items():
+            with self.subTest(command=command):
+                result = self._shell('STREAMHOME_MANAGED_UPDATE=true\n'
+                    'managed_update_runtime() { printf "runtime:%s\\n" "$1"; return 41; }\n'
+                    'prepare_lifecycle_for_guarded_start() { return 0; }\n'
+                    'ensure_guarded_commit_token() { return 0; }\n'
+                    'write_state() { printf unexpected-write; return 97; }\n'
+                    + command)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, 'runtime:'+expected+'\n', result.stderr)
+        result = self._shell('STREAMHOME_MANAGED_UPDATE=true\n'
+            'MAINTENANCE_PID=999999\nstop_maintenance\nrecord_prepared_setup_state')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+        result = self._shell('STREAMHOME_MANAGED_UPDATE=true\ninstall_python_wheelhouse')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_retention_failure_blocks_exact_lifecycle_completion_and_preserves_owner_flags(self):
+        script = """
+LIFECYCLE_ENABLED=true
+LIFECYCLE_PRESERVE=false
+LIFECYCLE_OPERATION_ID=00000000-0000-4000-8000-000000000001
+LIFECYCLE_GENERATION=2
+LIFECYCLE_PHASE=verifying
+ROOT_DIR="$FIXTURE_REPOSITORY"
+retain_bound_update_before_completion() { printf 'retention\\n'; return "$FIXTURE_RETENTION_CODE"; }
+lifecycle_cli() { printf completion > "$FIXTURE_COMPLETION_MARKER"; return 0; }
+release_lifecycle_authority
+result=$?
+printf 'result=%s enabled=%s\\n' "$result" "$LIFECYCLE_ENABLED"
+"""
+        for retained in (False, True):
+            with self.subTest(retained=retained):
+                marker = self.temp / ('completion-' + str(retained))
+                result = self._shell(script, environment={"FIXTURE_REPOSITORY": str(self.repository_root),
+                    "FIXTURE_RETENTION_CODE": "0" if retained else "1",
+                    "FIXTURE_COMPLETION_MARKER": str(marker)})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('retention\n', result.stdout)
+                self.assertEqual(marker.exists(), retained)
+                self.assertIn('result=0 enabled=false' if retained else 'result=1 enabled=true', result.stdout)
+
+    def test_fallback_stop_materializes_legacy_or_split_body_from_exact_target(self):
+        for split, missing in ((False, False), (True, False), (True, True)):
+            with self.subTest(split=split, missing=missing):
+                root = self.temp / ("target-" + str(split) + "-" + str(missing))
+                root.mkdir()
+                (root / ".run").mkdir()
+                helper = root / "server/scratch/runtime_control.py"
+                helper.parent.mkdir(parents=True)
+                helper.write_text("# Exact synthetic target helper\n")
+                body = ('#!/usr/bin/env bash\n'
+                    '[[ "$1" == --quiet && -d "$STREAMHOME_ROOT_OVERRIDE/.run" ]] || exit 81\n'
+                    'printf target > "$STREAMHOME_ROOT_OVERRIDE/stop-proof"\n')
+                if split:
+                    (root / "stop.sh").write_text((self.repository_root / "stop.sh").read_text())
+                    if not missing:
+                        internal = root / "scripts/runtime/stop.sh"
+                        internal.parent.mkdir(parents=True)
+                        internal.write_text(body)
+                else:
+                    (root / "stop.sh").write_text(body)
+                def git(*args):
+                    return subprocess.run(["git", "-C", str(root), *args], check=True,
+                        text=True, capture_output=True).stdout.strip()
+                git("init", "-q")
+                git("add", "stop.sh", "server")
+                if split and not missing:
+                    git("add", "scripts")
+                git("-c", "user.name=Qualification", "-c", "user.email=qualification@example.invalid",
+                    "commit", "-qm", "Synthetic lifecycle target")
+                target = git("rev-parse", "HEAD")
+                # Neither body may come from a subsequently changed checkout.
+                (root / "stop.sh").write_text("exit 82\n")
+                if split and not missing:
+                    internal.write_text("exit 83\n")
+                result = self._shell('ROOT_DIR="$FIXTURE_ROOT"\nRUN_DIR="$ROOT_DIR/.run"\n'
+                    'STAGING_DIR="$ROOT_DIR/absent-stage"\nTARGET_COMMIT="$FIXTURE_TARGET"\n'
+                    'stop_installed_runtime_with_target_lifecycle',
+                    environment={"FIXTURE_ROOT": str(root), "FIXTURE_TARGET": target})
+                self.assertEqual(result.returncode == 0, not missing, result.stderr)
+                self.assertEqual((root / "stop-proof").exists(), not missing)
+                self.assertEqual(list((root / ".run").iterdir()), [])
 
     def _committed_runtime_probe(
         self,
@@ -196,6 +454,8 @@ class UpdateShellLifecycleTests(unittest.TestCase):
         (root / "server").mkdir(parents=True)
         shutil.copytree(self.repository_root / "server" / "lifecycle", root / "server" / "lifecycle")
         shutil.copy2(self.repository_root / "update.sh", root / "update.sh")
+        (root / "scripts/runtime").mkdir(parents=True)
+        shutil.copy2(self.repository_root / "scripts/runtime/update.sh", root / "scripts/runtime/update.sh")
         (root / "start.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
         return root
 
@@ -603,7 +863,7 @@ class UpdateShellLifecycleTests(unittest.TestCase):
         self.assertFalse(rollback.exists())
 
     def test_post_commit_failure_retains_recovery_without_rollback(self) -> None:
-        source = (self.repository_root / "update.sh").read_text(encoding="utf-8")
+        source = (self.repository_root / "scripts/runtime/update.sh").read_text(encoding="utf-8")
         failure = source[
             source.index("record_post_commit_recovery_failure()"):
             source.index("installed_release_has_guarded_bootstrap()")
@@ -614,7 +874,7 @@ class UpdateShellLifecycleTests(unittest.TestCase):
         self.assertNotIn("rollback_release", failure)
 
     def test_phase_five_cutover_and_recovery_use_canonical_boundaries(self) -> None:
-        source = (self.repository_root / "update.sh").read_text(encoding="utf-8")
+        source = (self.repository_root / "scripts/runtime/update.sh").read_text(encoding="utf-8")
         validate = source[
             source.index("validate_lifecycle_authority()"):
             source.index("advance_lifecycle_phase()")

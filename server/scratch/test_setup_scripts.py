@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import re
 import json
 import sqlite3
 import shutil
@@ -90,6 +92,13 @@ def create_fixture_repository(directory: Path) -> None:
     git(["commit", "-m", "fixture"], cwd=directory)
 
 
+def copy_runtime_script(name: str, destination: Path) -> None:
+    shutil.copy2(ROOT / name, destination)
+    internal = destination.parent / "scripts/runtime" / name
+    internal.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "scripts/runtime" / name, internal)
+
+
 def bash_path(path: Path) -> str:
     resolved = str(path.resolve())
     if os.name != "nt":
@@ -117,7 +126,7 @@ class SetupScriptContracts(unittest.TestCase):
         bash = bash_command()
         if not bash:
             self.skipTest("Bash is unavailable")
-        source = (ROOT / "setup.sh").read_text(encoding="utf-8")
+        source = (ROOT / "scripts/runtime/setup.sh").read_text(encoding="utf-8")
         validation = source.split("validate_versions() {", 1)[1].split(
             "\nstop_existing_runtime() {", 1
         )[0]
@@ -154,36 +163,21 @@ validate_versions
 
     def test_linux_bootstrap_setup_and_lifecycle_contracts(self) -> None:
         install_sh = (ROOT / "install.sh").read_text(encoding="utf-8")
-        setup_sh = (ROOT / "setup.sh").read_text(encoding="utf-8")
-        restart_sh = (ROOT / "restart.sh").read_text(encoding="utf-8")
-        update_sh = (ROOT / "update.sh").read_text(encoding="utf-8")
-        start_sh = (ROOT / "start.sh").read_text(encoding="utf-8")
-        stop_sh = (ROOT / "stop.sh").read_text(encoding="utf-8")
-        test_sh = (ROOT / "test.sh").read_text(encoding="utf-8")
+        setup_sh = (ROOT / "scripts/runtime/setup.sh").read_text(encoding="utf-8")
+        restart_sh = (ROOT / "scripts/runtime/restart.sh").read_text(encoding="utf-8")
+        update_sh = (ROOT / "scripts/runtime/update.sh").read_text(encoding="utf-8")
+        start_sh = (ROOT / "scripts/runtime/start.sh").read_text(encoding="utf-8")
+        stop_sh = (ROOT / "scripts/runtime/stop.sh").read_text(encoding="utf-8")
+        test_sh = (ROOT / "scripts/runtime/test.sh").read_text(encoding="utf-8")
         setup_py = (ROOT / "server" / "routes" / "setup.py").read_text(encoding="utf-8")
         cli_py = (ROOT / "server" / "cli.py").read_text(encoding="utf-8")
 
-        self.assertIn(REPOSITORY_URL, install_sh)
-        self.assertIn("remote set-url origin", install_sh)
-        self.assertIn("https://github.com/WaqSea/StreamHome.git", install_sh)
-        self.assertIn("status --porcelain --untracked-files=normal", install_sh)
-        self.assertIn("merge-base --is-ancestor", install_sh)
-        self.assertIn(".streamhome-install.", install_sh)
-        self.assertIn("install.lock", install_sh)
-        self.assertIn("--manual-execute", install_sh)
-        self.assertIn("health-gated update", install_sh)
-        self.assertIn("verify_existing_update_trust", install_sh)
-        self.assertIn("UPDATE_TRUSTED_SIGNERS", install_sh)
-        self.assertIn('verify-commit "$commit"', install_sh)
-        self.assertIn("--no-start is not supported for existing-installation updates", install_sh)
-        self.assertIn("already at the requested release", install_sh)
-        self.assertNotIn('git -C "$INSTALL_DIR" checkout "$INSTALL_REF"', install_sh)
-        self.assertIn("setup_args+=(--no-start)", install_sh)
-        self.assertIn("./setup.sh", install_sh)
-        self.assertIn('INSTALL_REF="${STREAMHOME_REF:-main}"', install_sh)
-        self.assertIn("Git branch or tag (default: main)", install_sh)
-        self.assertIn('[[ "$(uname -s)" == "Linux" ]]', install_sh)
-        self.assertNotIn("brew install", install_sh)
+        self.assertIn("StreamHome managed installer", install_sh)
+        self.assertIn("/opt/streamhome", install_sh)
+        self.assertIn("/usr/bin/python3 -I", install_sh)
+        self.assertIn("sha256sum --check --status", install_sh)
+        self.assertNotIn("git clone", install_sh)
+        self.assertNotIn("./setup.sh", install_sh)
 
         self.assertIn("npm ci", setup_sh)
         self.assertIn("npm run build", setup_sh)
@@ -464,7 +458,7 @@ validate_versions
                 stale_time = time.time() - 60
                 os.utime(update_lock, (stale_time, stale_time))
 
-            update_source = (ROOT / "update.sh").read_text(encoding="utf-8")
+            update_source = (ROOT / "scripts/runtime/update.sh").read_text(encoding="utf-8")
             function_source = update_source.split('\ncase "${1:-}" in\n', 1)[0]
             harness = fixture / "update-controller.test.sh"
             harness.write_text(
@@ -544,110 +538,40 @@ validate_versions
             self.assertEqual(return_codes, [0, 10], contender_results)
             self.assertFalse(update_lock.exists())
 
-    def test_linux_bootstrap_is_atomic_rejects_unverified_no_start_and_refuses_dirty_update(self) -> None:
+    def test_managed_shell_bootstrap_refuses_corrupt_source_and_only_executes_verified_frontend(self) -> None:
         bash = bash_command()
-        if not bash:
-            self.skipTest("Bash is not installed")
-
+        if not bash or os.name == "nt":
+            self.skipTest("Native Linux Bash is required")
         with tempfile.TemporaryDirectory(dir=ROOT / "temp") as temporary:
             root = Path(temporary)
-            remote = root / "remote"
-            install_directory = root / "linux-install"
-            create_fixture_repository(remote)
-            fixture_url = remote.resolve().as_uri()
-            source = (ROOT / "install.sh").read_text(encoding="utf-8")
-            source = source.replace(REPOSITORY_URL, fixture_url)
-            health_start = source.index("existing_runtime_ready() {")
-            health_end = source.index("\n\nrecover_current_installation()", health_start)
-            source = (
-                source[:health_start]
-                + "existing_runtime_ready() {\n"
-                + "    [[ -f \"$INSTALL_DIR/.runtime-ready\" ]]\n"
-                + "}"
-                + source[health_end:]
-            )
-            if os.name == "nt":
-                source = source.replace(
-                    '[[ "$(uname -s)" == "Linux" ]] || fail "The alpha server installer supports Linux only."',
-                    "true",
-                )
-            installer = root / "install-fixture.sh"
-            installer.write_text(source, encoding="utf-8", newline="\n")
-            installer.chmod(0o755)
-
-            environment = os.environ.copy()
-            environment["STREAMHOME_INSTALL_DIR"] = bash_path(install_directory)
-            environment["STREAMHOME_REF"] = "main"
-            first = run([bash, "-lc", f"'{bash_path(installer)}'"], cwd=root, env=environment)
-            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-            self.assertEqual((install_directory / ".setup-ran").read_text(encoding="utf-8"), "ready")
-
-            (remote / "release.txt").write_text("next release\n", encoding="utf-8")
-            git(["add", "release.txt"], cwd=remote)
-            git(["commit", "-m", "next fixture release"], cwd=remote)
-            expected_commit = run(["git", "rev-parse", "HEAD"], cwd=remote).stdout.strip()
-
-            (install_directory / ".setup-ran").unlink()
-            forwarded = run(
-                [bash, "-lc", f"'{bash_path(installer)}' --no-start --skip-system-packages"],
-                cwd=root,
-                env=environment,
-            )
-            self.assertNotEqual(forwarded.returncode, 0, forwarded.stdout + forwarded.stderr)
-            self.assertIn("--no-start is not supported for existing-installation updates", forwarded.stdout + forwarded.stderr)
-            self.assertNotEqual(run(["git", "rev-parse", "HEAD"], cwd=install_directory).stdout.strip(), expected_commit)
-
-            forwarded = run(
-                [bash, "-lc", f"'{bash_path(installer)}' --skip-system-packages"],
-                cwd=root,
-                env=environment,
-            )
-            self.assertEqual(forwarded.returncode, 0, forwarded.stdout + forwarded.stderr)
-            installed_commit = run(["git", "rev-parse", "HEAD"], cwd=install_directory).stdout.strip()
-            self.assertEqual(installed_commit, expected_commit)
-            self.assertEqual((install_directory / "release.txt").read_text(encoding="utf-8"), "next release\n")
-
-            (install_directory / ".runtime-ready").unlink(missing_ok=True)
-            recovered = run([bash, "-lc", f"'{bash_path(installer)}'"], cwd=root, env=environment)
-            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
-            self.assertTrue((install_directory / ".runtime-ready").is_file())
-            self.assertEqual(
-                (install_directory / ".setup-args").read_text(encoding="utf-8").splitlines(),
-                ["--no-start"],
-            )
-            self.assertIn("prepared runtime is stale or unhealthy", recovered.stdout)
-            self.assertIn("recovered successfully", recovered.stdout)
-
-            (install_directory / ".setup-ran").unlink()
-            prepared_only = run(
-                [bash, "-lc", f"'{bash_path(installer)}' --no-start"],
-                cwd=root,
-                env=environment,
-            )
-            self.assertEqual(prepared_only.returncode, 0, prepared_only.stdout + prepared_only.stderr)
-            self.assertEqual(
-                (install_directory / ".setup-args").read_text(encoding="utf-8").splitlines(),
-                ["--no-start"],
-            )
-            self.assertIn("prepared and left stopped by request", prepared_only.stdout)
-
-            (install_directory / ".setup-ran").unlink()
-            local_change = install_directory / "local-change.txt"
-            local_change.write_text("preserve me", encoding="utf-8")
-            dirty = run([bash, "-lc", f"'{bash_path(installer)}'"], cwd=root, env=environment)
-            self.assertNotEqual(dirty.returncode, 0)
-            self.assertIn("local changes", (dirty.stdout + dirty.stderr).lower())
-            self.assertEqual(local_change.read_text(encoding="utf-8"), "preserve me")
-
-            failed_install = root / "failed-install"
-            failed_environment = environment.copy()
-            failed_environment["STREAMHOME_INSTALL_DIR"] = bash_path(failed_install)
-            failed_environment["STREAMHOME_REF"] = "missing-ref"
-            failed = run([bash, "-lc", f"'{bash_path(installer)}'"], cwd=root, env=failed_environment)
-            self.assertNotEqual(failed.returncode, 0)
-            self.assertFalse(failed_install.exists())
-            self.assertFalse(Path(f"{failed_install}.install.lock").exists())
-            self.assertEqual(list(root.glob(".streamhome-install.*")), [])
+            marker = root / "executed.json"
+            payload = ("import json,sys\nfrom pathlib import Path\nPath(" + repr(str(marker))
+                       + ").write_text(json.dumps(sys.argv[1:]))\n").encode()
+            fake_curl = root / "fixture-curl"
+            fake_curl.write_text("#!/usr/bin/python3\nimport sys\nfrom pathlib import Path\n"
+                + "Path(sys.argv[sys.argv.index('--output')+1]).write_bytes(" + repr(payload) + ")\n")
+            fake_curl.chmod(0o755)
+            # Substitute transport only. Source verification and cleanup execute
+            # through the real shell and sha256sum, without network/elevation.
+            source = (ROOT / "install.sh").read_text().replace('/usr/bin/curl', str(fake_curl))
+            source = source.replace('/tmp/streamhome-bootstrap.XXXXXXXX', str(root / 'bootstrap.XXXXXXXX'))
+            installer = root / "installer.sh"
+            installer.write_text(source)
+            refused = run([bash, str(installer)], cwd=root)
+            self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+            self.assertIn("Bootstrap source verification failed", refused.stderr)
+            self.assertFalse(marker.exists())
+            self.assertEqual(list(root.glob('bootstrap.*')), [])
+            # An explicitly substituted fixture trust pin permits exactly the
+            # downloaded frontend and forwards request arguments unchanged.
+            pin = re.search(r"'[0-9a-f]{64}'", source)
+            self.assertIsNotNone(pin)
+            source = source[:pin.start()] + repr(hashlib.sha256(payload).hexdigest()) + source[pin.end():]
+            installer.write_text(source)
+            accepted = run([bash, str(installer), '--request', 'fixture request.json'], cwd=root)
+            self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+            self.assertEqual(json.loads(marker.read_text()), ['--request', 'fixture request.json'])
+            self.assertEqual(list(root.glob('bootstrap.*')), [])
 
     def test_linux_stop_executes_without_pid_records_under_nounset(self) -> None:
         bash = bash_command()
@@ -657,7 +581,7 @@ validate_versions
         with tempfile.TemporaryDirectory(dir=ROOT / "temp") as temporary:
             fixture = Path(temporary)
             script = fixture / "stop.sh"
-            shutil.copy2(ROOT / "stop.sh", script)
+            copy_runtime_script("stop.sh", script)
             if os.name == "nt":
                 result = run([bash, "-lc", f"'{bash_path(script)}' --help"], cwd=fixture)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -684,7 +608,7 @@ validate_versions
 
         with tempfile.TemporaryDirectory(dir=ROOT / "temp") as temporary:
             fixture = Path(temporary)
-            shutil.copy2(ROOT / "restart.sh", fixture / "restart.sh")
+            copy_runtime_script("restart.sh", fixture / "restart.sh")
             start_script = fixture / "start.sh"
             start_script.write_text(
                 "#!/usr/bin/env bash\n"
@@ -828,7 +752,7 @@ validate_versions
             )
             fake_npm.chmod(0o755)
             controller = fixture / "controller.sh"
-            controller_source = (ROOT / "update.sh").read_text(encoding="utf-8").replace(
+            controller_source = (ROOT / "scripts/runtime/update.sh").read_text(encoding="utf-8").replace(
                 "https://github.com/StreamHome/StreamHome.git",
                 remote.as_uri(),
             )
@@ -903,7 +827,7 @@ validate_versions
             unrelated_directory = fixture / "unrelated"
             server_directory.mkdir()
             unrelated_directory.mkdir()
-            shutil.copy2(ROOT / "stop.sh", fixture / "stop.sh")
+            copy_runtime_script("stop.sh", fixture / "stop.sh")
             runtime_helper = fixture / "server" / "scratch" / "runtime_control.py"
             runtime_helper.parent.mkdir(parents=True)
             shutil.copy2(ROOT / "server" / "scratch" / "runtime_control.py", runtime_helper)
@@ -986,7 +910,7 @@ validate_versions
             fixture = Path(temporary)
             runtime_helper = fixture / "server" / "scratch" / "runtime_control.py"
             runtime_helper.parent.mkdir(parents=True)
-            shutil.copy2(ROOT / "stop.sh", fixture / "stop.sh")
+            copy_runtime_script("stop.sh", fixture / "stop.sh")
             shutil.copy2(ROOT / "server" / "scratch" / "runtime_control.py", runtime_helper)
             (fixture / ".env").write_text("WEB_PORT=3000\n", encoding="utf-8")
             (fixture / ".run").mkdir()

@@ -111,12 +111,19 @@ def build(source: Path, output: Path, signing_key: Path, bundle_id: str) -> dict
             files[relative.as_posix()] = hashlib.sha256(raw).hexdigest()
         manifest = {"schema_version": 1, "bundle_id": bundle_id, "entry_protocol": 1,
                     "authority_versions": [1, 2], "control_protocol": 1, "files": files,
-                    "support": {"schema_version": 6, "platform": "ubuntu-24.04-x86_64-glibc-python-3.12.3-systemd-cgroup2",
+                    "support": {"schema_version": 13, "platform": "ubuntu-24.04-x86_64-glibc-python-3.12.3-systemd-cgroup2",
                         "provisioning_journal_versions": [1, 2],
                         "management_journal_versions": [1, 2],
-                        "recovery_request_versions": [1, 2, 3, 4], "resumption_plan_versions": [1],
-                        "runtime_recovery_cache_versions": [1], "maintenance_actions": ["repair_bound_environment"],
+                        "recovery_request_versions": [1, 2, 3, 4, 5, 6], "resumption_plan_versions": [1, 2, 3],
+                        "runtime_recovery_cache_versions": [1], "maintenance_actions": ["repair_bound_environment","repair_bound_control"],
                         "descriptor_handoff_versions": [1], "managed_restore_versions": [1],
+                        "managed_parent_recovery_versions": [1, 2, 3, 4],
+                        "managed_parent_environment_repair_versions": [1],
+                        "managed_update_versions": [1], "managed_update_recovery_versions": [1, 2, 3, 4],
+                        "managed_update_environment_repair_versions": [1],
+                        "control_maintenance_versions": [1],
+                        "bound_control_repair_versions": [1],
+                        "cloudflare_connector_versions": [1],
                         "deadlines_seconds": {"startup_recovery": 900, "startup_extension": 30,
                             "runtime_drain": 45, "runtime_stop": 60, "controller": 3600, "installation": 7200}}}
         write(versions / "manifest.json", encoded(manifest))
@@ -139,7 +146,8 @@ def build(source: Path, output: Path, signing_key: Path, bundle_id: str) -> dict
         for path in package.rglob("*"):
             if path.is_dir():
                 path.chmod(0o755)
-        environment = {"PATH": "/usr/bin:/bin", "HOME": str(stage), "LC_ALL": "C", "SOURCE_DATE_EPOCH": "0"}
+        environment = {"PATH": "/usr/bin:/bin", "HOME": str(stage), "TMPDIR": str(stage),
+                       "LC_ALL": "C", "SOURCE_DATE_EPOCH": "0"}
         subprocess.run(["/usr/bin/dpkg-deb", "--build", "--root-owner-group", "--uniform-compression", "-Zgzip", str(package), str(artifact)], check=True, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         release = {"schema_version": 1, "format": "streamhome-control-bootstrap-deb-v1", "bundle_id": bundle_id,
                    "manifest_sha256": manifest_sha, "artifact": artifact.name, "artifact_sha256": digest(artifact),

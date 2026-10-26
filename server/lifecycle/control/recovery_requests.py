@@ -23,6 +23,8 @@ def recovery_path(operation_id: str, generation: int):
 
 
 def parse_grant(payload: dict) -> dict:
+    if isinstance(payload,dict) and type(payload.get('schema_version')) is int and payload['schema_version']==5:
+        return _parse_control_maintenance_grant(payload)
     if isinstance(payload, dict) and type(payload.get('schema_version')) is int and payload['schema_version'] == 4:
         return _parse_maintenance_grant(payload)
     fields = {'schema_version', 'recovery_review_id', 'source_evidence_sha256', 'source_request_sha256', 'action', 'request', 'expires_at_monotonic'}
@@ -43,6 +45,10 @@ def parse_grant(payload: dict) -> dict:
     for name in ('source_evidence_sha256', 'source_request_sha256'):
         contract._text(payload[name], contract._SHA256, name)
     current = parse_management_request(payload['request'])
+    if (current.action is contract.ManagementAction.PROVISION_CONTROL
+            and current.activation_mode is contract.ActivationMode.CUTOVER
+            and payload['schema_version'] != (3 if current.initial_service_state=='running' else 2)):
+        raise ControlError('control_recovery_request_invalid')
     if scoped:
         from .stopped_repair import parse_scope
         parse_scope(payload['issuer_scope'], current.installation_id)
@@ -59,7 +65,8 @@ def parse_grant(payload: dict) -> dict:
     mutable = {'expected_generation', 'supervisor', 'backend', 'boot_id', 'stop_epoch', 'previous_boot_enabled', 'boot_enabled'}
     before, after = original.payload(), current.payload()
     reversing = payload['action'] in {'rollback', 'safe_abort'}
-    stopped_repair = current.initial_service_state == 'stopped' and current.action is contract.ManagementAction.REPAIR_ENVIRONMENT
+    stopped_repair = current.initial_service_state == 'stopped' and current.action in {
+        contract.ManagementAction.REPAIR_ENVIRONMENT,contract.ManagementAction.PROVISION_CONTROL}
     if (any(before[key] != after[key] for key in before.keys() - mutable)
             or current.expected_generation <= original.expected_generation
             or current.supervisor_invocation_id != original.supervisor_invocation_id
@@ -72,6 +79,41 @@ def parse_grant(payload: dict) -> dict:
                 or current.supervisor != original.supervisor or current.backend != original.backend
                 or current.initial_service_state == 'running' and current.backend is None)):
         raise ControlError('control_recovery_request_changed')
+    return payload
+
+
+def _parse_control_maintenance_grant(payload: dict) -> dict:
+    fields={'schema_version','action','request','source_request_sha256','source_evidence_sha256',
+        'recovery_review_id','repair_review_sha256','filesystem_sha256','artifact','selection',
+        'issuer_scope','expires_at_monotonic'}
+    if set(payload)!=fields or payload['action']!=recovery.CONTROL_MAINTENANCE_ACTION:
+        raise ControlError('control_recovery_request_invalid')
+    contract._uuid(payload['recovery_review_id'],'control repair review')
+    for name in ('source_request_sha256','source_evidence_sha256','repair_review_sha256','filesystem_sha256'):
+        contract._text(payload[name],contract._SHA256,name)
+    artifact=payload['artifact']
+    if not isinstance(artifact,dict) or set(artifact)!={'bundle_id','manifest_sha256','artifact_sha256','entry_sha256'}:
+        raise ControlError('control_recovery_request_invalid')
+    contract._uuid(artifact['bundle_id'],'bound control')
+    for name in ('manifest_sha256','artifact_sha256','entry_sha256'):
+        contract._text(artifact[name],contract._SHA256,name)
+    selection=payload['selection']
+    if (not isinstance(selection,dict) or type(selection.get('schema_version')) is not int
+            or selection!={'schema_version':1,'bundle_id':artifact['bundle_id'],'manifest_sha256':artifact['manifest_sha256']}):
+        raise ControlError('control_recovery_request_invalid')
+    expiry=payload['expires_at_monotonic']
+    if type(expiry) not in {int,float} or not math.isfinite(expiry) or not 0<expiry<10**12:
+        raise ControlError('control_recovery_request_invalid')
+    current=parse_management_request(payload['request'])
+    original=request_contract.read_management_request(current.operation_id)
+    before,after=original.payload(),current.payload()
+    mutable={'expected_generation','backend','boot_id','stop_epoch'}
+    if (payload['source_request_sha256']!=original.sha256
+            or current.expected_generation<=original.expected_generation or current.backend is not None
+            or any(before[name]!=after[name] for name in before.keys()-mutable)):
+        raise ControlError('control_recovery_request_changed')
+    from .stopped_repair import parse_scope
+    parse_scope(payload['issuer_scope'],current.installation_id)
     return payload
 
 
@@ -110,7 +152,7 @@ def read_grant(operation_id: str, generation: int, *, require_live: bool = True)
     if require_live and (time.monotonic() >= grant['expires_at_monotonic'] or reviewed.boot_id != Path('/proc/sys/kernel/random/boot_id').read_text().strip()
             or reviewed.stop_epoch != read_stop_epoch()):
         raise ControlError('control_recovery_permission_expired')
-    if require_live and grant['schema_version'] in {2, 3, 4}:
+    if require_live and grant['schema_version'] in {2, 3, 4, 5}:
         from .stopped_repair import require_scope
         require_scope(grant['issuer_scope'], reviewed.installation_id)
     if require_live and grant['schema_version'] == 3:
@@ -148,7 +190,7 @@ def review(operation_id: str, *, control_manifest_sha256: str) -> dict:
     plan = recovery.inspect_recovery(root, operation_id, authority.generation)
     journal = management_store.inspect_management_journal(root, operation_id)
     if (original.activation_mode is contract.ActivationMode.CUTOVER and original.initial_service_state != 'running'
-            and original.action is not contract.ManagementAction.REPAIR_ENVIRONMENT
+            and original.action not in {contract.ManagementAction.REPAIR_ENVIRONMENT,contract.ManagementAction.PROVISION_CONTROL}
             or original.previous != journal.previous or original.candidate != journal.candidate
             or original.review_id != journal.review_id
             or original.action is not journal.action or original.activation_mode is not journal.activation_mode
@@ -165,7 +207,7 @@ def review(operation_id: str, *, control_manifest_sha256: str) -> dict:
             or journal.acceptance is None and active.execution != journal.previous
             or effective.recovery_target == 'previous' and active.execution != selected):
         raise ControlError('control_recovery_execution_changed')
-    return {**plan, 'installation_id': journal.installation_id,
+    result = {**plan, 'installation_id': journal.installation_id,
             'management_action': original.action.value,
             'previous_execution_sha256': contract.execution_tuple_sha256(journal.previous),
             'candidate_execution_sha256': contract.execution_tuple_sha256(journal.candidate),
@@ -178,6 +220,10 @@ def review(operation_id: str, *, control_manifest_sha256: str) -> dict:
             'supervisor_invocation_id': original.supervisor_invocation_id,
             'source_request_sha256': original.sha256,
             'control_manifest_sha256': control_manifest_sha256}
+    if journal.action is contract.ManagementAction.PROVISION_CONTROL and journal.activation_mode is contract.ActivationMode.CUTOVER:
+        result.update(previous_control_manifest_sha256=journal.previous.control_manifest_sha256,
+            selected_control_manifest_sha256=selected.control_manifest_sha256)
+    return result
 
 
 def prepare(payload: dict, *, control_manifest_sha256: str) -> dict:

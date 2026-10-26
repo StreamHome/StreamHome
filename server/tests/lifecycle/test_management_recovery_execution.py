@@ -339,6 +339,32 @@ class ManagementRecoveryExecutionTests(unittest.TestCase):
             with self.subTest(changed=changed), self.assertRaises(runtime_links.RuntimeBuildError):
                 runtime_links._completed_previous_binding(self.root, following, original)
 
+    def test_completed_forward_recovery_explains_the_retained_older_base_receipt(self):
+        first=self.make_controller()
+        first.execute()
+        following=replace(self.source,operation_id=str(uuid.uuid4()),generation=first.journal.generation+1,
+            previous=first.journal.candidate)
+        original=recovery._read(self.state_dir/'runtime-links.json')
+        self.assertTrue(runtime_links._completed_previous_binding(self.root,following,original))
+        path=self.state_dir/f'runtime-link-recovery-{first.journal.operation_id}-{first.journal.generation}.json'
+        receipt=recovery._read(path)
+        for changes in ({'stage':'applying'},{'source_receipt_sha256':'f'*64},{'target':'previous'}):
+            state._atomic_write_json(path,{**receipt,**changes})
+            with self.subTest(changes=changes),self.assertRaises(runtime_links.RuntimeBuildError):
+                runtime_links._completed_previous_binding(self.root,following,original)
+
+    def test_recovered_forward_execution_must_still_be_exactly_accepted_and_terminal(self):
+        first=self.make_controller()
+        first.execute()
+        following=replace(self.source,operation_id=str(uuid.uuid4()),generation=first.journal.generation+1,
+            previous=first.journal.candidate)
+        original=recovery._read(self.state_dir/'runtime-links.json')
+        saved=first.journal
+        for changes in ({'stage':contract.ManagementStage.ACCEPTED},{'acceptance':None},
+                {'recovery_target':'previous'}):
+            with self.subTest(changes=changes),patch.object(management_store,'inspect_management_journal',return_value=replace(saved,**changes)):
+                self.assertFalse(runtime_links._completed_previous_binding(self.root,following,original))
+
 
 if __name__ == '__main__':
     unittest.main()

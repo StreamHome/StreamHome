@@ -16,8 +16,15 @@ class ResumptionObservationTests(unittest.TestCase):
     def setUp(self):
         self.prepare()
 
-    def prepare(self, *, accepted=False):
-        fixture = recovery_fixture.ManagementRecoveryStoreTests();fixture.setUp();self.addCleanup(fixture.doCleanups)
+    def prepare(self, *, accepted=False, control=False):
+        fixture = recovery_fixture.ManagementRecoveryStoreTests()
+        if control:
+            source=recovery_fixture._journal_payload()
+            source.update(action='provision_control')
+            source['candidate']={**source['previous'],'control_bundle_id':str(uuid.uuid4()),'control_manifest_sha256':'1'*64}
+            with patch.object(recovery_fixture,'_journal_payload',return_value=source):fixture.setUp()
+        else:fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
         self.fixture = fixture
         if accepted:
             current = fixture.journal
@@ -47,6 +54,9 @@ class ResumptionObservationTests(unittest.TestCase):
                          action=current.action.value, review_id=takeover.review_id)
         self.plan['stages'] = [{'kind': 'candidate_start', 'generation': generation, 'handoff_sha256': None,
             'execution_sha256': journal_contract.execution_tuple_sha256(journal_contract.selected_execution(current))}]
+        if control:
+            self.plan.update(schema_version=3,control_manifest_sha256=current.previous.control_manifest_sha256)
+            self.plan['stages'][0]['control_manifest_sha256']=journal_contract.selected_execution(current).control_manifest_sha256
         self.payload = {'plan': self.plan, 'kind': 'candidate_start', 'controller_pid': os.getpid(),
                         'controller_invocation_id': current.controller_invocation_id}
         reviewed = SimpleNamespace(expected_generation=generation - 1, previous=current.previous, candidate=current.candidate,
@@ -76,6 +86,17 @@ class ResumptionObservationTests(unittest.TestCase):
         lease = self.fixture.lease.lease
         self.quiet.assert_called_once_with(inspections=True, controller=(self.journal.operation_id, lease.pid, lease.process_start_identity))
         self.verify.assert_called_once();self.links.assert_called_once()
+
+    def test_control_stage_reader_is_proved_against_the_real_selected_canonical_tuple(self):
+        self.prepare(control=True)
+        before=self.snapshot()
+        observed=observer.observe(self.payload)
+        self.assertEqual(observed['control_manifest_sha256'],self.journal.candidate.control_manifest_sha256)
+        self.assertNotEqual(observed['control_manifest_sha256'],self.plan['control_manifest_sha256'])
+        self.assertEqual(before,self.snapshot())
+        self.plan['stages'][0]['control_manifest_sha256']='9'*64
+        with self.assertRaises(ControlError):observer.observe(self.payload)
+        self.assertEqual(before,self.snapshot())
 
     def test_stale_generation_actor_review_or_tuple_cannot_authorize_os_resumption(self):
         for changed in ({'generation': self.plan['generation'] + 1}, {'review_id': str(uuid.uuid4())}):

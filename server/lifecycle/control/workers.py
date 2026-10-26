@@ -26,9 +26,13 @@ def prepare_management_request(payload: dict, *, control_manifest_sha256: str) -
     fields = {"purpose", "operation_id", "review_id", "expected_generation", "expected_desired_revision",
               "deployment", "activate_deployment", "boot_enabled", "previous_boot_enabled", "initial_service_state",
               "supervisor_invocation_id", "supervisor", "backend", "interruption_approved", "boot_id", "stop_epoch"}
-    if (not isinstance(payload, dict) or set(payload) != fields or payload["purpose"] not in {"configure", "complete_install", "activate_pending"}
+    if isinstance(payload,dict) and payload.get('purpose') == 'maintain_control':
+        fields.add('control_candidate')
+    if (not isinstance(payload, dict) or set(payload) != fields or payload["purpose"] not in {"configure", "complete_install", "activate_pending", "maintain_control"}
             or any(type(payload[name]) is not bool for name in ("activate_deployment", "boot_enabled", "previous_boot_enabled", "interruption_approved"))):
         raise ControlError("control_request_invalid")
+    from ..cloudflare_connector import require_deployment
+    require_deployment(parse_deployment_payload(payload['deployment']))
     layout = layout_for_root(ROOT)
     authority = state.inspect_state(ROOT)
     record = read_active_execution(ROOT)
@@ -53,7 +57,24 @@ def prepare_management_request(payload: dict, *, control_manifest_sha256: str) -
     action, mode = contract.ManagementAction.PROVISION_CONTROL, contract.ActivationMode.OS_ONLY
     changes_deployment = deployment != desired.settings
     applies_pending = payload["activate_deployment"] and manifest.active != manifest.desired
-    if payload["purpose"] != "complete_install" and (changes_deployment or applies_pending):
+    if payload['purpose'] == 'maintain_control':
+        # Root supplies only the authenticated inactive control identity. Keep
+        # canonical/application interpretation here, under the installation UID.
+        control = payload['control_candidate']
+        if (not isinstance(control,dict) or set(control) != {'control_bundle_id','control_manifest_sha256','control_protocol_version'}
+                or deployment != active.settings or payload['boot_enabled'] != payload['previous_boot_enabled']
+                or not payload['activate_deployment'] or not payload['interruption_approved']
+                or record.execution.control_manifest_sha256 != control_manifest_sha256
+                or manifest.active.revision != record.execution.deployment_revision
+                or manifest.policy_revisions != record.execution.policy_revisions
+                or manifest.provider_revisions != record.execution.provider_revisions):
+            raise ControlError('control_review_stale')
+        candidate = contract.parse_execution_tuple({**contract.execution_tuple_payload(record.execution),**control})
+        if candidate == record.execution:
+            return {'no_changes':True}
+        mode = contract.ActivationMode.CUTOVER
+        deployment = active.settings
+    elif payload["purpose"] != "complete_install" and (changes_deployment or applies_pending):
         if deployment == active.settings:
             revision = manifest.active.revision
         elif deployment == desired.settings and desired.revision not in manifest.quarantined:
@@ -105,11 +126,26 @@ def bridge_observe(payload: dict) -> dict:
         # their own OS receipt. Other observations are progress and cannot wait
         # on the controller's long exclusive runtime verification lock.
         state.validate_operation_with_credential(ROOT, operation_id=journal.operation_id, generation=journal.generation, expected_phase=authority.active_operation.phase)
-    return {"request_sha256": reviewed.sha256, "generation": journal.generation,
+    result = {"request_sha256": reviewed.sha256, "generation": journal.generation,
             "stage": journal.stage.value, "os_effect_requested": effect_requested,
             "previous_boot_enabled": reviewed.previous_boot_enabled, "boot_enabled": reviewed.boot_enabled,
             "controller_invocation_id": journal.controller_invocation_id, "controller_pid": lease.pid,
             "accepted": journal.acceptance is not None}
+    if journal.action is contract.ManagementAction.PROVISION_CONTROL and journal.activation_mode is contract.ActivationMode.CUTOVER:
+        if effect_requested and (reviewed.initial_service_state=='stopped' or recovering):
+            from .processes import require_service_quiescent
+            require_service_quiescent(inspections=True,
+                controller=(journal.operation_id,lease.pid,lease.process_start_identity))
+            if (state.inspect_state(ROOT) != authority
+                    or management_store.inspect_management_journal(ROOT,journal.operation_id) != journal
+                    or not state.controller_lease_is_current(lease)):
+                raise ControlError('control_controller_changed')
+        selected=contract.selected_execution(journal)
+        result.update(selected_execution_sha256=contract.execution_tuple_sha256(selected),
+            selected_control={'control_bundle_id':selected.control_bundle_id,
+                'control_manifest_sha256':selected.control_manifest_sha256,
+                'control_protocol_version':selected.control_protocol_version})
+    return result
 
 
 def operation_result(operation_id: str) -> dict:
@@ -184,12 +220,58 @@ def inspect_managed() -> dict:
 
 def main(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha256: str) -> int:
     parser = argparse.ArgumentParser(prog="streamhome internal reader")
-    parser.add_argument("action", choices=("inspect", "prepare-request", "bridge-observe", "operation-result", "select-source", "initial-result", "initial-progress", "initial-listener", "initial-authority", "initial-retry-check", "check-listener", "identity", "release-check", "validate-preparation", "runtime-progress", "runtime-result", "prepare-runtime-request", "recovery-review", "prepare-recovery", "resumption-observe", "resumption-required", "bound-repair-review", "bound-repair-prepare", "bound-repair-result"))
+    parser.add_argument("action", choices=("inspect", "prepare-request", "bridge-observe", "operation-result", "select-source", "initial-result", "initial-progress", "initial-listener", "initial-authority", "initial-retry-check", "check-listener", "identity", "release-check", "validate-preparation", "runtime-progress", "runtime-result", "prepare-runtime-request", "recovery-review", "prepare-recovery", "resumption-observe", "resumption-required", "bound-control-review", "bound-control-prepare", "bound-control-observe", "bound-control-result", "bound-repair-review", "bound-repair-prepare", "bound-repair-result", "prepare-parent-recovery", "parent-recovery-result", "retain-update", "update-runtime", "update-context", "prepare-update-recovery", "update-recovery-result"))
     parser.add_argument("operation_id", nargs="?")
     parsed = parser.parse_args(arguments)
     snapshot = inspect_installation()
     if snapshot is None or snapshot.descriptor.service_uid != os.geteuid() or os.geteuid() == 0:
         raise ControlError("control_worker_forbidden")
+    if parsed.action == 'update-context':
+        from ..configure_wizard import parse_request_json
+        from ..managed_update import bound_journal, delegated_controller, execution_context
+        payload = parse_request_json(sys.stdin.buffer.read(32769))
+        if (not isinstance(payload, dict) or set(payload) != {'schema_version', 'generation'}
+                or type(payload['schema_version']) is not int or payload['schema_version'] != 1
+                or type(payload['generation']) is not int or not 0 < payload['generation'] < 2**63):
+            raise ControlError('control_request_invalid')
+        _, _, bound = bound_journal(ROOT, parsed.operation_id)
+        if bound.parent.execution.control_manifest_sha256 != manifest_sha256:
+            raise ControlError('control_parent_binding_changed')
+        proof = delegated_controller(ROOT, parsed.operation_id, payload['generation'])
+        print(json.dumps(execution_context(ROOT, proof), sort_keys=True, allow_nan=False))
+        return 0
+    if parsed.action == 'update-runtime':
+        from ..configure_wizard import parse_request_json
+        from ..managed_update import bound_journal, delegated_controller, runtime_action
+        payload = parse_request_json(sys.stdin.buffer.read(32769))
+        if (not isinstance(payload, dict) or set(payload) != {'schema_version', 'generation', 'action'}
+                or type(payload['schema_version']) is not int or payload['schema_version'] != 1
+                or type(payload['generation']) is not int or not 0 < payload['generation'] < 2**63
+                or not isinstance(payload['action'], str)
+                or payload['action'] not in {'stop', 'assert_stopped', 'maintenance', 'bind_candidate', 'bind_previous', 'start_candidate', 'start_previous', 'readiness', 'start', 'verify_previous', 'prepared', 'assert_rollback', 'create_checkpoint', 'restore_checkpoint', 'cleanup_checkpoint'}):
+            raise ControlError('control_request_invalid')
+        _, _, bound = bound_journal(ROOT, parsed.operation_id)
+        if bound.parent.execution.control_manifest_sha256 != manifest_sha256:
+            raise ControlError('control_parent_binding_changed')
+        proof = delegated_controller(ROOT, parsed.operation_id, payload['generation'])
+        print(json.dumps(runtime_action(ROOT, proof, payload['action']), sort_keys=True, allow_nan=False))
+        return 0
+    if parsed.action == 'retain-update':
+        from ..configure_wizard import parse_request_json
+        from ..managed_update import bound_journal, delegated_controller, retain_completed_from_delegate
+        payload = parse_request_json(sys.stdin.buffer.read(32769))
+        if (not isinstance(payload, dict) or set(payload) != {'schema_version', 'generation'}
+                or type(payload['schema_version']) is not int or payload['schema_version'] != 1
+                or type(payload['generation']) is not int or not 0 < payload['generation'] < 2**63):
+            raise ControlError('control_request_invalid')
+        _, _, bound = bound_journal(ROOT, parsed.operation_id)
+        if bound.parent.execution.control_manifest_sha256 != manifest_sha256:
+            raise ControlError('control_parent_binding_changed')
+        proof = delegated_controller(ROOT, parsed.operation_id, payload['generation'])
+        retained = retain_completed_from_delegate(ROOT, proof)
+        print(json.dumps({'retained': True, 'generation': retained['generation'],
+            'journal_sha256': retained['journal_sha256']}, sort_keys=True, allow_nan=False))
+        return 0
     if parsed.action == "identity":
         record = read_active_execution(ROOT)
         print(json.dumps({"installation_id":record.installation_id,"application_commit":record.execution.application_commit,
@@ -228,11 +310,46 @@ def main(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha256:
         return 0
     if parsed.action == 'resumption-required':
         active = state.inspect_state(ROOT).active_operation
-        print(json.dumps({'required': active is not None and active.operation_type is state.OperationType.MANAGEMENT}))
+        print(json.dumps({'required': active is not None and active.operation_type in {
+            state.OperationType.MANAGEMENT, state.OperationType.RESTORE, state.OperationType.UPDATE}}))
         return 0
+    if parsed.action in {'bound-control-review','bound-control-prepare','bound-control-observe','bound-control-result'}:
+        from .. import bound_control_repair
+        from ..configure_wizard import parse_request_json
+        if parsed.action=='bound-control-result':
+            value=bound_control_repair.result(parsed.operation_id,control_manifest_sha256=manifest_sha256)
+        else:
+            payload=parse_request_json(sys.stdin.buffer.read(32769))
+            if parsed.action=='bound-control-review':
+                if not isinstance(payload,dict) or set(payload)!={'artifact'}:
+                    raise ControlError('control_request_invalid')
+                value=bound_control_repair.plan(parsed.operation_id,payload['artifact'],control_manifest_sha256=manifest_sha256)
+            else:
+                if not isinstance(payload,dict) or payload.get('operation_id')!=parsed.operation_id:
+                    raise ControlError('control_request_invalid')
+                method=bound_control_repair.prepare if parsed.action=='bound-control-prepare' else bound_control_repair.observe
+                value=method(payload,control_manifest_sha256=manifest_sha256)
+        print(json.dumps(value,sort_keys=True,allow_nan=False));return 0
     if parsed.action in {'bound-repair-review', 'bound-repair-prepare', 'bound-repair-result'}:
         from .. import bound_management_repair
         from ..configure_wizard import parse_request_json
+        active=state.inspect_state(ROOT).active_operation
+        if active is not None and active.operation_type is state.OperationType.UPDATE:
+            from .. import bound_update_repair
+            result = (bound_update_repair.plan(ROOT, parsed.operation_id, control_manifest_sha256=manifest_sha256)
+                if parsed.action == 'bound-repair-review' else bound_update_repair.result(
+                    ROOT, parsed.operation_id, control_manifest_sha256=manifest_sha256)
+                if parsed.action == 'bound-repair-result' else bound_update_repair.prepare(
+                    ROOT, parse_request_json(sys.stdin.buffer.read(32769)), control_manifest_sha256=manifest_sha256))
+            print(json.dumps(result, sort_keys=True, allow_nan=False));return 0
+        if active is not None and active.operation_type is state.OperationType.RESTORE:
+            from .. import bound_parent_repair
+            result=(bound_parent_repair.plan(ROOT,parsed.operation_id,control_manifest_sha256=manifest_sha256)
+                if parsed.action=='bound-repair-review' else bound_parent_repair.result(
+                    ROOT,parsed.operation_id,control_manifest_sha256=manifest_sha256)
+                if parsed.action=='bound-repair-result' else bound_parent_repair.prepare(
+                    ROOT,parse_request_json(sys.stdin.buffer.read(32769)),control_manifest_sha256=manifest_sha256))
+            print(json.dumps(result,sort_keys=True,allow_nan=False));return 0
         result = (bound_management_repair.plan(parsed.operation_id, control_manifest_sha256=manifest_sha256)
                   if parsed.action == 'bound-repair-review' else bound_management_repair.result(parsed.operation_id)
                   if parsed.action == 'bound-repair-result' else bound_management_repair.prepare(
@@ -246,11 +363,53 @@ def main(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha256:
         if (not isinstance(payload, dict) or not isinstance(payload.get('plan'), dict)
                 or payload['plan'].get('control_manifest_sha256') != manifest_sha256):
             raise ControlError('control_bundle_mismatch')
+        if payload['plan'].get('owner_type') == 'restore':
+            from .parent_resumption_observation import observe
+        elif payload['plan'].get('owner_type') == 'update':
+            from .update_resumption_observation import observe
         print(json.dumps(observe(payload), sort_keys=True, allow_nan=False))
         return 0
+    if parsed.action in {'prepare-update-recovery', 'update-recovery-result'}:
+        from ..configure_wizard import parse_request_json
+        from .. import update_recovery
+        from . import update_grants
+        payload = parse_request_json(sys.stdin.buffer.read(32769))
+        if parsed.action == 'update-recovery-result':
+            if (parsed.operation_id is None or not isinstance(payload, dict) or set(payload) != {'controller_generation'}
+                    or type(payload['controller_generation']) is not int or not 2 <= payload['controller_generation'] < 2**63):
+                raise ControlError('control_request_invalid')
+            value = update_recovery.result(ROOT, parsed.operation_id, payload['controller_generation'],
+                control_manifest_sha256=manifest_sha256)
+        else:
+            if parsed.operation_id is not None:
+                raise ControlError('control_request_invalid')
+            value = update_grants.prepare(ROOT, payload, control_manifest_sha256=manifest_sha256)
+        print(json.dumps(value, sort_keys=True, allow_nan=False));return 0
+    if parsed.action in {'prepare-parent-recovery', 'parent-recovery-result'}:
+        from ..configure_wizard import parse_request_json
+        from .. import parent_recovery
+        from . import parent_grants
+        payload = parse_request_json(sys.stdin.buffer.read(32769))
+        if parsed.action == 'parent-recovery-result':
+            if (not isinstance(payload, dict) or set(payload) != {'controller_generation'}
+                    or type(payload['controller_generation']) is not int or payload['controller_generation'] < 2):
+                raise ControlError('control_request_invalid')
+            value = parent_recovery.result(ROOT, parsed.operation_id, payload['controller_generation'])
+        else:
+            value = parent_grants.prepare(ROOT, payload, control_manifest_sha256=manifest_sha256)
+        print(json.dumps(value, sort_keys=True, allow_nan=False));return 0
     if parsed.action in {"recovery-review", "prepare-recovery"}:
         from . import recovery_requests
         from ..configure_wizard import parse_request_json
+        active = state.inspect_state(ROOT).active_operation if parsed.action == 'recovery-review' else None
+        if active is not None and active.operation_type is state.OperationType.UPDATE:
+            from ..update_recovery import review
+            value = review(ROOT, parsed.operation_id, control_manifest_sha256=manifest_sha256)
+            print(json.dumps(value, sort_keys=True, allow_nan=False));return 0
+        if active is not None and active.operation_type is state.OperationType.RESTORE:
+            from ..parent_recovery import review
+            value = review(ROOT, parsed.operation_id, control_manifest_sha256=manifest_sha256)
+            print(json.dumps(value, sort_keys=True, allow_nan=False));return 0
         value = (recovery_requests.review(parsed.operation_id, control_manifest_sha256=manifest_sha256)
                  if parsed.action == "recovery-review" else recovery_requests.prepare(
                      parse_request_json(sys.stdin.buffer.read(32769)), control_manifest_sha256=manifest_sha256))

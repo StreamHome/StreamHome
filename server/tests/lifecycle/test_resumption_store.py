@@ -69,6 +69,26 @@ class ResumptionStoreTests(unittest.TestCase):
         with self.assertRaises(ControlError):store.bind_start(self.plan['plan_id'], 'candidate_start', '3' * 32, control_manifest_sha256=self.manifest)
         self.assertEqual(self.receipt_path().read_bytes(), original)
 
+    def test_control_cutover_issuer_and_new_runtime_cannot_borrow_each_others_reader(self):
+        self.plan.update(schema_version=3,action='provision_control')
+        self.plan['stages'][0]['control_manifest_sha256']='1'*64
+        self.plan['stages'][1]['control_manifest_sha256']=self.manifest
+        self.publish()
+        observed={**self.observation(),'control_manifest_sha256':'1'*64}
+        self.consume(observation=observed)
+        original=self.receipt_path().read_bytes()
+        with self.assertRaises(ControlError):
+            store.bind_start(self.plan['plan_id'],'candidate_start','3'*32,control_manifest_sha256=self.manifest)
+        self.assertEqual(self.receipt_path().read_bytes(),original)
+        with self.assertRaises(ControlError):
+            store.consume_stage(self.plan['plan_id'],'candidate_start',observed,control_manifest_sha256='1'*64)
+        bound=store.bind_start(self.plan['plan_id'],'candidate_start','3'*32,control_manifest_sha256='1'*64)
+        self.assertEqual(bound['status'],'bound')
+        with self.assertRaises(ControlError):
+            store.live_state(self.plan['plan_id'],'candidate_start',control_manifest_sha256=self.manifest,runtime_reader=True)
+        self.assertEqual(store.live_state(self.plan['plan_id'],'candidate_start',
+            control_manifest_sha256='1'*64,runtime_reader=True)['receipt'],bound)
+
     def test_concurrent_issuers_cannot_consume_the_same_stage_twice(self):
         self.publish()
         def attempt(_):

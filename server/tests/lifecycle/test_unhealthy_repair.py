@@ -1,4 +1,5 @@
 from copy import deepcopy
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import uuid
 from unittest.mock import patch
 
 from lifecycle import management_journal as contract
@@ -153,6 +155,46 @@ class PreparedRepairInterruptionTests(unittest.TestCase):
         code = "import sys;import lifecycle.control.repair_interruption;assert not {'lifecycle.state','lifecycle.management_journal','config','application','database'}.intersection(sys.modules)"
         result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class PreparedControlInterruptionTests(unittest.TestCase):
+    def setUp(self):
+        from lifecycle.control import artifact_stage
+        fixture=PreparedRepairInterruptionTests();fixture.setUp();self.addCleanup(fixture.doCleanups)
+        self.fixture=fixture;self.payload=fixture.payload;self.observation=fixture.observation
+        self.payload.update(action='provision_control',backend={'pid':999,'start_identity':'1001'})
+        self.payload['candidate']={**self.payload['previous'],'control_bundle_id':str(uuid.uuid4()),'control_manifest_sha256':'f'*64}
+        self.observation['request_sha256']=interrupt._sha(self.payload)
+        self.permission={'issuer':{'owner':{'pid':os.getpid()},'scope':fixture.grant['issuer_scope']}}
+        self.prepared=artifact_stage.PreparedControl(self.payload['candidate']['control_bundle_id'],'f'*64,'a'*64,'b'*64)
+        self.live=self.enterContext(patch('lifecycle.control.control_permission.require_initial',return_value=self.permission))
+        self.prepare=self.enterContext(patch('lifecycle.control.control_activation.prepared_for',return_value=self.prepared))
+        self.enterContext(patch('lifecycle.control.artifact_stage.require_prepared'))
+
+    def test_control_stop_keeps_its_own_permission_and_one_use_receipt_without_starting(self):
+        with self.assertRaisesRegex(ControlError,'control_operation_recovery_required'):
+            interrupt.stop_control_prepared(self.payload,self.observation)
+        marker=self.fixture.directory/'control-stop.json'
+        self.assertTrue(marker.exists())
+        self.assertEqual(json.loads(marker.read_text())['request_sha256'],interrupt._sha(self.payload))
+        self.assertEqual(self.live.call_count,2)
+        self.fixture.systemctl.assert_any_call('stop','streamhome.service',timeout=90)
+        self.fixture.systemctl.reset_mock()
+        with self.assertRaisesRegex(ControlError,'control_repair_interruption_consumed'):
+            interrupt.stop_control_prepared(self.payload,self.observation)
+        self.assertFalse(any(call.args[0]=='stop' for call in self.fixture.systemctl.call_args_list))
+
+    def test_permission_loss_after_stop_intent_prevents_os_dispatch(self):
+        self.live.side_effect=[self.permission,ControlError('issuer cancelled')]
+        with self.assertRaises(ControlError):interrupt.stop_control_prepared(self.payload,self.observation)
+        self.assertTrue((self.fixture.directory/'control-stop.json').exists())
+        self.assertFalse(any(call.args[0]=='stop' for call in self.fixture.systemctl.call_args_list))
+
+    def test_wrong_prepared_control_cannot_interrupt_the_healthy_service(self):
+        self.prepare.return_value=replace(self.prepared,bundle_id=str(uuid.uuid4()))
+        with self.assertRaises(ControlError):interrupt.stop_control_prepared(self.payload,self.observation)
+        self.fixture.systemctl.assert_not_called()
+        self.assertFalse((self.fixture.directory/'control-stop.json').exists())
 
 
 if __name__ == '__main__':unittest.main()

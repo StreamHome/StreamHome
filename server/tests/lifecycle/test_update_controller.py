@@ -86,6 +86,87 @@ class UpdateControllerTests(unittest.TestCase):
         )
         self.journal.chmod(0o600)
 
+    def test_bound_update_mutation_and_takeover_cannot_retarget_original_execution(self):
+        from tests.lifecycle.test_update_execution import journal
+        payload = journal(self.previous, self.target)
+        operation = self.claimed.state.active_operation.operation_id
+        payload['transaction_id'] = operation
+        payload['managed_execution']['operation_id'] = operation
+        self.journal.write_text(json.dumps(payload))
+        update_controller.mutate_update_journal(self.root, operation_id=operation, generation=1,
+            expected_lifecycle_phase='reserved', expected_detail_phases=frozenset({'preflight'}),
+            changes={'message': 'Same original operation preflight.'})
+        saved = self.journal.read_bytes()
+        for field in ('target_commit', 'previous_commit'):
+            with self.subTest(field=field), self.assertRaises(update_controller.UpdateControllerConflict):
+                update_controller.mutate_update_journal(self.root, operation_id=operation, generation=1,
+                    expected_lifecycle_phase='reserved', changes={field: 'f'*40})
+            self.assertEqual(self.journal.read_bytes(), saved)
+        lease, transferred = state.acquire_transferred_controller_lease(self.root, operation_id=operation,
+            generation=1, expected_phase=state.LifecyclePhase.RESERVED,
+            owner_capability=self.claimed.owner_capability, next_owner_kind=state.OwnerKind.UPDATER)
+        try:
+            with self.assertRaises(update_controller.UpdateControllerConflict):
+                update_controller._record_transferred_generation(self.root, operation_id=operation,
+                    previous_generation=1, generation=transferred.state.generation,
+                    lifecycle_phase=state.LifecyclePhase.RESERVED,
+                    target_commit='f'*40, previous_commit=self.previous)
+            self.assertEqual(self.journal.read_bytes(), saved)
+            update_controller._record_transferred_generation(self.root, operation_id=operation,
+                previous_generation=1, generation=transferred.state.generation,
+                lifecycle_phase=state.LifecyclePhase.RESERVED,
+                target_commit=self.target, previous_commit=self.previous)
+            recorded = update_controller.read_update_journal(self.journal)
+            self.assertEqual(recorded['managed_execution'], payload['managed_execution'])
+            self.assertEqual(recorded['lifecycle_generation'], transferred.state.generation)
+        finally:
+            lease.release()
+
+    def test_target_wrapper_materializes_its_same_commit_internal_controller(self) -> None:
+        internal=self.root/'scripts/runtime/update.sh'
+        internal.parent.mkdir(parents=True)
+        expected=b'#!/usr/bin/env bash\nprintf "target-internal\\n"\n'
+        internal.write_bytes(expected)
+        (self.root/'update.sh').write_text('#!/usr/bin/env bash\n'
+            '# StreamHome compatibility entry: scripts/runtime/update.sh\n'
+            'exec bash "$(dirname "$0")/scripts/runtime/update.sh" "$@"\n')
+        self._git('add','update.sh','scripts/runtime/update.sh')
+        self._git('commit','-m','target with internal controller')
+        target=self._git('rev-parse','HEAD')
+        internal.write_bytes(b'#!/usr/bin/env bash\nprintf "wrong-working-tree\\n"\n')
+        operation=self.claimed.state.active_operation.operation_id
+        result=update_controller._materialize_target_controller(self.root,operation,target)
+        self.assertEqual(result.read_bytes(),expected)
+        output=subprocess.check_output(['bash',str(result)],text=True)
+        self.assertEqual(output,'target-internal\n')
+
+    def test_old_materializer_can_execute_new_target_wrapper_without_current_tree_dependency(self) -> None:
+        source=Path(__file__).resolve().parents[3]
+        wrapper=(source/'update.sh').read_bytes()
+        internal=self.root/'scripts/runtime/update.sh';internal.parent.mkdir(parents=True)
+        expected=b'#!/usr/bin/env bash\nprintf "target-internal %s\\n" "$BASHPID"\n'
+        internal.write_bytes(expected);(self.root/'update.sh').write_bytes(wrapper)
+        self._git('add','update.sh','scripts/runtime/update.sh')
+        self._git('commit','-m','new target for old materializer')
+        target=self._git('rev-parse','HEAD')
+        internal.write_bytes(b'#!/usr/bin/env bash\nexit 28\n')
+        copied=self.root/'.run'/('update-controller.'+self.claimed.state.active_operation.operation_id+'.sh')
+        copied.write_bytes(wrapper);copied.chmod(0o700)
+        process=subprocess.Popen([str(copied),'--manual-execute',target,self.previous,'main','true',str(self.root)],
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        output,error=process.communicate(timeout=10)
+        self.assertEqual(process.returncode,0,error)
+        self.assertEqual(output,'target-internal '+str(process.pid)+'\n')
+
+    def test_target_wrapper_missing_its_committed_controller_is_refused(self) -> None:
+        (self.root/'update.sh').write_text('#!/usr/bin/env bash\n'
+            '# StreamHome compatibility entry: scripts/runtime/update.sh\nexit 0\n')
+        self._git('add','update.sh');self._git('commit','-m','incomplete target wrapper')
+        target=self._git('rev-parse','HEAD')
+        with self.assertRaises(update_controller.UpdateControllerConflict):
+            update_controller._materialize_target_controller(self.root,
+                self.claimed.state.active_operation.operation_id,target)
+
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
@@ -387,6 +468,23 @@ class UpdateControllerTests(unittest.TestCase):
                 changes={"runtime_committed": False},
             )
         self.assertTrue(json.loads(self.journal.read_text())["runtime_committed"])
+
+    def test_only_unaccepted_recovery_can_enter_original_rollback_path(self) -> None:
+        operation, generation = self._move_to_verifying()
+        payload = json.loads(self.journal.read_text())
+        payload.update(phase='recovering', runtime_committed=False, runtime_committed_at=None)
+        self.journal.write_text(json.dumps(payload))
+        changes = {'phase': 'rolling_back', 'failed_target': self.target}
+        updated = update_controller.mutate_update_journal(self.root, operation_id=operation,
+            generation=generation, expected_lifecycle_phase='verifying', changes=changes)
+        self.assertEqual(updated['phase'], 'rolling_back')
+        payload.update(runtime_committed=True, runtime_committed_at=time.time())
+        self.journal.write_text(json.dumps(payload))
+        before = self.journal.read_bytes()
+        with self.assertRaises(update_controller.UpdateControllerConflict):
+            update_controller.mutate_update_journal(self.root, operation_id=operation,
+                generation=generation, expected_lifecycle_phase='verifying', changes=changes)
+        self.assertEqual(self.journal.read_bytes(), before)
 
     def test_unreadable_committed_journal_is_never_reconstructed(self) -> None:
         operation_id, generation = self._move_to_verifying()

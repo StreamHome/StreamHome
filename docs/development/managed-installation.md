@@ -1,20 +1,40 @@
 # Managed installation identity contract
 
-The first implementation increment provides a read-only descriptor reader and
-managed web-port validator in `server/lifecycle/installation.py`. It can be
-imported without application configuration, database or service imports. Current
-installation/start/update scripts still use their existing layout. Descriptor
-publication, shared runtime-path integration, systemd supervision and the global
-management command are subsequent increments.
+The managed installer, protected global command, fixed layout and foreground
+systemd supervisor are integrated in this source tree. Runtime preparation uses
+application-owned pinned dependencies and exact immutable execution tuples.
+[Installation](../installation.md) documents current operator entry points;
+[configuration contracts](configuration-management.md), [management authority](management-protocol.md)
+and [recovery](management-recovery.md) describe the trust and lifecycle boundaries.
 
-The next increment adds [versioned management authority and bound journal
-persistence](management-protocol.md), without exposing those unfinished commands
-or migrating an installed instance.
+This contract does not establish publication or deployment status. Root-control
+maintenance, provider integration and operation-specific native qualification must
+meet their own release gates. A descriptor alone is never mutation or launch authority.
 
-Shared [configuration and installer components](configuration-management.md) now
-provide deployment drafts/validation, revision CAS and apply receipts, listener
-preflight, existing-install evidence and isolated release probing. Production
-installer/service/command integration remains in progress.
+## Existing Cloudflare connectors
+
+Control support schema 13 advertises `cloudflare_connector_versions: [1]`.
+The optional `streamhome-tunnel@.service` and
+`streamhome-tunnel-reconcile.service` stay outside the unchanged six-unit core
+protocol. Registration publishes an immutable UUID reference and a root-only
+token after final consent. The pinned vendor executable is hash-verified before
+publication; no system cloudflared executable or account-wide service is adopted.
+
+Canonical deployment revisions own connector selection, port, origin and proxy
+policy. Registration alone does not alter provider revisions or start a service.
+The root reconciler consumes the UID's verified active settings and admitted
+backend plus exact OS invocation; it never parses canonical state as root.
+Write-ahead selection metadata permits an interrupted switch to stop only the
+previous protected StreamHome connector. Fixed unit bytes and loaded properties
+are checked before effects. Requisite/PartOf prevent a connector from starting
+the primary application and stop it with that application. A dynamic service UID
+receives its token through systemd credentials.
+
+Startup queues reconciliation without blocking the primary startup job. Waiting
+for canonical acceptance happens outside the administrator lock and is bounded;
+provider health never certifies application readiness. Read-only CLI commands
+never schedule reconciliation. Real tunnel/DNS/public authentication checks are
+a separate operator-server qualification gate.
 
 ## Descriptor version 1
 

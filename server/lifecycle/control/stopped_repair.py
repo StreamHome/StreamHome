@@ -21,6 +21,7 @@ class StoppedRepairHandoff:
     request_path: Path | None
     recovery_action: str | None = None
     running_repair: bool = False
+    control_artifact: Path | None = None
 
 
 def _uuid(value: str) -> str:
@@ -99,7 +100,19 @@ def _cleanup(handoff: StoppedRepairHandoff, name: str) -> None:
     _require_empty(name)
     try:
         with administrative_lock():
-            if handoff.recovery_action is None:
+            if handoff.recovery_action=='repair_bound_control':
+                directory=Path('/etc/streamhome/control/operations')/handoff.preparation_id
+                if _latest_recovery_scope(directory)!=name:return
+                roles=('operation',)
+            elif handoff.control_artifact is not None:
+                path=Path('/etc/streamhome/control/operations')/handoff.preparation_id/'control-permission.json'
+                if not path.exists() and not path.is_symlink():
+                    return
+                permission=read_protected_json(path)
+                if permission.get('issuer',{}).get('scope',{}).get('unit') != name:
+                    raise ControlError('control_stopped_repair_issuer_changed')
+                roles=('operation',)
+            elif handoff.recovery_action is None:
                 path = Path('/etc/streamhome/control/preparations') / handoff.preparation_id / 'request.json'
                 if not path.exists() and not path.is_symlink():
                     return
@@ -139,20 +152,28 @@ def run_scoped(handoff: StoppedRepairHandoff) -> int:
     _uuid(handoff.preparation_id)
     if not isinstance(handoff.stop_epoch, str) or not re.fullmatch(r'[0-9a-f]{64}', handoff.stop_epoch):
         raise ControlError('control_stopped_repair_invalid')
-    if handoff.recovery_action not in {None, 'continue_recovery', 'rollback', 'safe_abort', 'repair_bound_environment'}:
+    if handoff.recovery_action not in {None, 'continue_recovery', 'rollback', 'safe_abort', 'repair_bound_environment','repair_bound_control'}:
         raise ControlError('control_stopped_repair_invalid')
     if type(handoff.running_repair) is not bool or handoff.running_repair and handoff.recovery_action is not None:
+        raise ControlError('control_stopped_repair_invalid')
+    if handoff.control_artifact is not None and (not isinstance(handoff.control_artifact,Path)
+            or handoff.running_repair or handoff.recovery_action not in {None,'repair_bound_control'}):
+        raise ControlError('control_stopped_repair_invalid')
+    if handoff.recovery_action=='repair_bound_control' and handoff.control_artifact is None:
         raise ControlError('control_stopped_repair_invalid')
     from . import privileged
     name = 'streamhome-install-' + handoff.installation_id + '-' + uuid.uuid4().hex + '.scope'
     arguments = ['/usr/bin/systemd-run', '--scope', '--quiet', '--collect', '--slice=system.slice', '--unit=' + name,
         '--description=StreamHome installation ' + handoff.installation_id, '--property=StopPropagatedFrom=streamhome.service',
         '--property=RuntimeMaxSec=3600', '/usr/bin/python3', '-I', '/usr/local/libexec/streamhome/provision',
-        *(['--rescue'] if privileged._RESCUE_MODE else []),
-        ('--repair-bound-scoped' if handoff.recovery_action == 'repair_bound_environment' else
+        *(['--rescue'] if privileged._RESCUE_MODE and handoff.recovery_action!='repair_bound_control' else []),
+        ('--repair-control-scoped' if handoff.recovery_action=='repair_bound_control' else
+         '--maintain-control-scoped' if handoff.control_artifact is not None else
+         '--repair-bound-scoped' if handoff.recovery_action == 'repair_bound_environment' else
          '--recover-stopped-scoped' if handoff.recovery_action is not None else
          '--repair-running-scoped' if handoff.running_repair else '--repair-stopped-scoped'), handoff.installation_id,
         handoff.preparation_id, handoff.stop_epoch,
+        *(['--artifact',os.path.abspath(handoff.control_artifact)] if handoff.control_artifact is not None else []),
         *(['--action', handoff.recovery_action] if handoff.recovery_action in {'continue_recovery', 'rollback', 'safe_abort'} else []),
         *(['--request', os.path.abspath(handoff.request_path)] if handoff.request_path is not None else [])]
     try:
@@ -162,11 +183,11 @@ def run_scoped(handoff: StoppedRepairHandoff) -> int:
         raise
     if result.returncode:
         _cleanup(handoff, name)
-        if handoff.running_repair:
+        if (handoff.running_repair or handoff.control_artifact is not None) and handoff.recovery_action!='repair_bound_control':
             from .administration import _sha
             from .tickets import read_protected_json
             directory = Path('/etc/streamhome/control/operations') / handoff.preparation_id
-            marker = directory / 'repair-stop.json'
+            marker = directory / ('control-stop.json' if handoff.control_artifact is not None else 'repair-stop.json')
             if marker.exists() or marker.is_symlink():
                 receipt = read_protected_json(marker)
                 if (receipt.get('schema_version') == 1 and receipt.get('operation_id') == handoff.preparation_id

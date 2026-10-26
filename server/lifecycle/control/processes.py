@@ -6,8 +6,11 @@ import os
 from pathlib import Path
 import signal
 import stat
+import math
+import time
 
 from .rpc import ControlError
+from . import entry
 
 
 RUNTIME_CGROUP = "/system.slice/streamhome.service"
@@ -38,20 +41,71 @@ def _protected_reader(path: Path, fields: list[str]) -> bool:
         if arguments[:3] != prefix or (parent / 'cmdline').read_bytes().split(b'\0')[:3] != prefix:
             return False
         tail = arguments[3:]
+        rescue=False;operation_rescue=False
         if tail[:1] == [b'--rescue']:
-            tail = tail[1:]
+            tail = tail[1:];rescue=True
+        if tail[:1]==[b'--control-repair-review-worker']:
+            if rescue or len(tail)!=2:return False
+            pin=entry.operation_selection(tail[1].decode('ascii'))
+            selection=pin or entry._decode(entry._read(entry.CONTROL/'selected.json',4096))
+            entry.verify_bundle(selection,rescue=True)
+            tail=[b'--worker',b'bound-control-review',tail[1]];operation_rescue=True
+        if tail[:1] in ([b'--operation-worker'],[b'--operation-rescue-worker']):
+            if rescue or len(tail) not in {3,4}:
+                return False
+            operation_rescue=tail[0]==b'--operation-rescue-worker'
+            if operation_rescue and tail[2] not in {b'bound-control-review',b'bound-control-observe',b'bound-control-result'}:
+                return False
+            pin=entry.operation_selection(tail[1].decode('ascii'))
+            if pin is None:
+                return False
+            # Keep the same read-only exemption, but prove the full immutable
+            # pinned tree instead of trusting a new argv spelling by itself.
+            entry.verify_bundle(pin,rescue=operation_rescue)
+            tail=[b'--worker',*tail[2:]]
         return (len(tail) in {2, 3} and tail[0] == b'--worker'
-            and tail[1] in {b'inspect', b'identity', b'release-check', b'check-listener',
+            and (operation_rescue and tail[1] in {b'bound-control-review',b'bound-control-observe',b'bound-control-result'}
+                or not operation_rescue and tail[1] in {b'inspect', b'identity', b'release-check', b'check-listener',
                             b'runtime-progress', b'runtime-result', b'bridge-observe', b'operation-result',
-                            b'resumption-observe', b'resumption-required', b'bound-repair-review', b'bound-repair-result'})
-    except (OSError, IndexError):
+                            b'resumption-observe', b'resumption-required', b'bound-repair-review', b'bound-repair-result',
+                            b'recovery-review', b'parent-recovery-result', b'update-recovery-result'}))
+    except (entry.EntryError,OSError,IndexError,ValueError,TypeError):
         return False
 
 
 def require_service_quiescent(*, preparation_id: str | None = None, inspections: bool = False,
                               controller: tuple[str, int, str] | None = None,
                               startup_hook: tuple[int, str] | None = None,
-                              runtime_supervisor: tuple[int, str, str] | None = None) -> None:
+                              runtime_supervisor: tuple[int, str, str] | None = None,
+                              update_delegate: tuple[int, str, int, str] | None = None,
+                              settle_timeout: float = 0) -> None:
+    """Require a fresh full proof, optionally waiting for transient readers to exit.
+
+    No live process is exempted by this wait. Every attempt repeats the complete
+    unit/cgroup/controller/UID scan; unknown identities and metadata errors still
+    fail immediately. Persistent foreign work remains a refusal.
+    """
+    if (type(settle_timeout) not in {int,float} or not math.isfinite(settle_timeout)
+            or not 0 <= settle_timeout <= 2):
+        raise ControlError('control_quiescence_unproven')
+    deadline = time.monotonic() + settle_timeout
+    while True:
+        try:
+            _require_service_quiescent(preparation_id=preparation_id, inspections=inspections,
+                controller=controller, startup_hook=startup_hook, runtime_supervisor=runtime_supervisor,
+                update_delegate=update_delegate)
+            return
+        except ControlError as exc:
+            if exc.code != 'control_foreign_service_process' or time.monotonic() >= deadline:
+                raise
+            time.sleep(min(.02, max(0, deadline-time.monotonic())))
+
+
+def _require_service_quiescent(*, preparation_id: str | None, inspections: bool,
+                               controller: tuple[str, int, str] | None,
+                               startup_hook: tuple[int, str] | None,
+                               runtime_supervisor: tuple[int, str, str] | None,
+                               update_delegate: tuple[int, str, int, str] | None = None) -> None:
     """Prove absence of live service-UID work beyond this independent reader."""
     if os.geteuid() == 0:
         raise ControlError("control_worker_forbidden")
@@ -62,6 +116,20 @@ def require_service_quiescent(*, preparation_id: str | None = None, inspections:
         running_members = _running_preparation_members(runtime_supervisor)
     allowed = None
     controller_pid = None
+    delegated_members = set()
+    def prove_delegate():
+        from .. import managed_update, state
+        if (controller is None or not isinstance(update_delegate, tuple) or len(update_delegate) != 4
+                or any(type(update_delegate[index]) is not int or update_delegate[index] <= 1 for index in (0, 2))):
+            raise ControlError('control_controller_changed')
+        root = Path('/opt/streamhome')
+        lease = state.read_controller_lease(root)
+        if (lease is None or (lease.operation_id, lease.pid, lease.process_start_identity) != controller
+                or managed_update.quiescent_delegate(root, lease, helper_pid=update_delegate[2]) != update_delegate):
+            raise ControlError('control_controller_changed')
+    if update_delegate is not None:
+        prove_delegate()
+        delegated_members = {update_delegate[0], update_delegate[2]}
     if controller is not None:
         from ..management_journal import _uuid
         from .administration_lock import process_identity
@@ -124,6 +192,7 @@ def require_service_quiescent(*, preparation_id: str | None = None, inspections:
             if fields[0] in {'Z', 'X'}:
                 continue
             if ((controller_pid is not None and int(path.name) == controller_pid)
+                    or int(path.name) in delegated_members
                     or (running_members is not None and int(path.name) in running_members
                         and process_cgroup(int(path.name)) == RUNTIME_CGROUP)
                     or (allowed is not None and process_cgroup(int(path.name)) == allowed)
@@ -137,6 +206,8 @@ def require_service_quiescent(*, preparation_id: str | None = None, inspections:
             raise ControlError("control_quiescence_unproven") from exc
     if runtime_supervisor is not None and _running_preparation_members(runtime_supervisor) != running_members:
         raise ControlError('control_incarnation_changed')
+    if update_delegate is not None:
+        prove_delegate()
 
 
 def _running_preparation_members(reference: tuple[int, str, str]) -> set[int]:

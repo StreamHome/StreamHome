@@ -278,6 +278,11 @@ async def commit_updated_runtime(
             # authority. The strict generic writer still preserves the commit
             # boundary monotonically for rollback compatibility.
             write_update_state(runtime_committed=True, runtime_committed_at=time.time())
+        elif persisted.get('managed_update_version') is not None:
+            from lifecycle.managed_update import accept_verification
+            accept_verification(startup_context.installation_root,
+                operation_id=payload.transaction_id, generation=startup_context.generation,
+                expected_detail_phase=persisted_phase)
         else:
             write_authoritative_update_state(
                 operation_id=payload.transaction_id,

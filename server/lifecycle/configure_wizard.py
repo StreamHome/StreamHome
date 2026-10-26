@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 import uuid
 
 from .deployment_config import (
@@ -68,7 +68,8 @@ Diagnostics = Callable[[DeploymentConfig], Iterable[str]]
 
 
 def _access(
-    console: Console, current: DeploymentConfig, connectors: tuple[str, ...],
+    console: Console, current: DeploymentConfig, connectors: Sequence[str],
+    connector_draft: Callable[[Console],str] | None = None,
 ) -> DeploymentConfig:
     console.write("Access modes: local (this machine), lan, reverse_proxy, cloudflare (existing tunnel).")
     mode = console.value("Access mode (or back)", current.access_mode.value, lambda value: AccessMode(_back(value)))
@@ -90,18 +91,22 @@ def _access(
             ",".join(current.trusted_proxy_cidrs), _csv,
         )
     if mode is AccessMode.CLOUDFLARE:
-        if not connectors:
+        if not connectors and connector_draft is None:
             raise DeploymentConfigError("No protected existing Cloudflare connector is available; configure one first.")
         console.write("Available protected connector references: " + ", ".join(connectors))
+        if connector_draft is not None:
+            console.write("Choose 'new' to prepare an existing tunnel token file; registration waits for final confirmation.")
 
         def connector(value: str) -> str:
-            if _back(value) not in connectors:
+            if _back(value)=='new' and connector_draft is not None:
+                return str(uuid.UUID(connector_draft(console)))
+            if value not in connectors:
                 raise DeploymentConfigError("Choose an available protected connector reference.")
             return value
 
         payload["cloudflare_connector_id"] = console.value(
             "Existing connector reference (or back)",
-            current.cloudflare_connector_id if current.cloudflare_connector_id in connectors else "", connector,
+            current.cloudflare_connector_id if current.cloudflare_connector_id in connectors else 'new' if connector_draft is not None and not connectors else "", connector,
         )
         console.write("Route the provider hostname to this existing tunnel; local health and external routing are checked separately.")
     return parse_deployment_payload(payload)
@@ -158,8 +163,9 @@ def _review(
 
 def configure_wizard(
     console: Console, current: ConfigurationDraft, *, running: bool,
-    diagnostics: Diagnostics, connectors: tuple[str, ...] = (),
+    diagnostics: Diagnostics, connectors: Sequence[str] = (),
     active_deployment: DeploymentConfig | None = None,
+    connector_draft: Callable[[Console],str] | None = None,
 ) -> ConfigurationReview | None:
     draft = current
     console.write("StreamHome configuration. Enter keeps a displayed value; Back abandons the current edit.")
@@ -179,7 +185,7 @@ def configure_wizard(
                 port = console.value("Web port (or back)", str(draft.deployment.web_port), _port)
                 draft = replace(draft, deployment=patch_deployment(draft.deployment, {"web_port": port}))
             elif choice == "2":
-                draft = replace(draft, deployment=_access(console, draft.deployment, connectors))
+                draft = replace(draft, deployment=_access(console, draft.deployment, connectors,connector_draft))
             elif choice == "3":
                 origins = console.value(
                     "Additional exact origins; 'none' clears (or back)",
@@ -204,7 +210,8 @@ def configure_wizard(
 
 
 def installation_wizard(
-    console: Console, *, diagnostics: Diagnostics, connectors: tuple[str, ...] = (),
+    console: Console, *, diagnostics: Diagnostics, connectors: Sequence[str] = (),
+    connector_draft: Callable[[Console],str] | None = None,
 ) -> ConfigurationDraft | None:
     from .deployment_config import default_deployment
 
@@ -215,7 +222,7 @@ def installation_wizard(
             try:
                 port = console.value("Web port (or back)", str(config.web_port), _port)
                 config = patch_deployment(config, {"web_port": port})
-                config = _access(console, config, connectors)
+                config = _access(console, config, connectors,connector_draft)
                 for message in diagnostics(config):
                     console.write(message)
                 break

@@ -15,7 +15,7 @@ class StartShellRecoveryTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.temp = Path(self.temporary.name)
         self.repository_root = Path(__file__).resolve().parents[3]
-        source = (self.repository_root / "start.sh").read_text(encoding="utf-8")
+        source = (self.repository_root / "scripts/runtime/start.sh").read_text(encoding="utf-8")
         prefix, marker, _ = source.rpartition('\nmain "$@"')
         self.assertTrue(marker)
         self.library = self.temp / "start-functions.sh"
@@ -128,6 +128,8 @@ class StartShellRecoveryTests(unittest.TestCase):
         (root / "server").mkdir(parents=True)
         shutil.copytree(self.repository_root / "server" / "lifecycle", root / "server" / "lifecycle")
         shutil.copy2(self.repository_root / "start.sh", root / "start.sh")
+        (root / "scripts/runtime").mkdir(parents=True)
+        shutil.copy2(self.repository_root / "scripts/runtime/start.sh", root / "scripts/runtime/start.sh")
         marker = root / "update-launched"
         (root / "update.sh").write_text(
             "#!/usr/bin/env bash\n"

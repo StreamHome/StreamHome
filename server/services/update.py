@@ -19,6 +19,7 @@ from typing import Any
 
 from config import settings
 from lifecycle import state as lifecycle_state
+from lifecycle.layout import layout_for_root
 from lifecycle.coordination import (
     CoordinationError,
     DrainSnapshot,
@@ -62,10 +63,10 @@ UPDATE_CHECK_LOCK = asyncio.Lock()
 UPDATE_QUEUE_LOCK = asyncio.Lock()
 UPDATE_CUTOVER_LOCK = asyncio.Lock()
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
-RUN_DIR = WORKSPACE_ROOT / ".run"
+RUN_DIR = layout_for_root(WORKSPACE_ROOT).durable_runtime
 STATUS_PATH = RUN_DIR / "update-state.json"
 STATUS_LOCK_PATH = RUN_DIR / "update-state.lock"
-LOG_PATH = WORKSPACE_ROOT / "update.log"
+LOG_PATH = (RUN_DIR if layout_for_root(WORKSPACE_ROOT).managed else WORKSPACE_ROOT) / "update.log"
 START_SCRIPT = WORKSPACE_ROOT / "start.sh"
 UPDATE_SCRIPT = WORKSPACE_ROOT / "update.sh"
 ORPHANED_CONTROLLER_SECONDS = 30
@@ -235,9 +236,25 @@ def write_update_state(**changes: Any) -> dict[str, Any]:
                     raise UpdateJournalReadError(
                         "update journal transaction replacement is not authorized"
                     )
+                from lifecycle import update_execution
+                if update_execution.FIELDS.intersection(result):
+                    from lifecycle.update_history import require_retained
+                    from lifecycle.control.rpc import ControlError
+                    try:
+                        require_retained(WORKSPACE_ROOT, result, authority)
+                    except (ControlError, OSError, ValueError, lifecycle_state.LifecycleError) as exc:
+                        raise UpdateJournalReadError("the original managed update journal is not retired") from exc
+                    # Keep completed original evidence in its immutable history.
+                    # Discovery or a new reservation gets a distinct status record.
+                    carried = {key: result.get(key) for key in
+                        ("current_commit", "last_checked_at", "last_success_at", "failed_target")}
+                    result = _default_status()
+                    result.update(carried)
+                    committed, committed_at = False, None
                 if committed and changes.get("runtime_committed") is False and not replacing_transaction:
                     raise UpdateJournalReadError("runtime_committed cannot be reverted")
                 result.update(changes)
+                update_execution.parse(result)
                 if committed and not replacing_transaction:
                     result["runtime_committed"] = True
                     result["runtime_committed_at"] = committed_at
@@ -302,18 +319,33 @@ def write_authoritative_update_state(
 
 
 def _reserve_update_lifecycle() -> lifecycle_state.LifecycleState:
-    """Reserve shared lifecycle exclusion and persist its credential out of band."""
-
+    """Reserve the existing authority; negotiate managed support before claiming."""
+    admission = None
+    if layout_for_root(WORKSPACE_ROOT).managed:
+        from lifecycle.runtime_admission import require_runtime_admission
+        from lifecycle.control.reader_support import require_managed_update_reader
+        try:
+            admission = require_runtime_admission()
+            if not admission.admitted():
+                raise RuntimeError("runtime_not_settled")
+            require_managed_update_reader(admission.execution)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise RuntimeError("managed_update_unavailable") from exc
     try:
-        return lifecycle_state.claim_operation_with_credential(
-            WORKSPACE_ROOT,
-            operation_type=lifecycle_state.OperationType.UPDATE,
-            owner_kind=lifecycle_state.OwnerKind.UPDATER,
-        ).state
+        claimed = lifecycle_state.claim_operation_with_credential(
+            WORKSPACE_ROOT, operation_type=lifecycle_state.OperationType.UPDATE,
+            owner_kind=lifecycle_state.OwnerKind.UPDATER).state
     except lifecycle_state.LifecycleConflictError as exc:
         raise RuntimeError("lifecycle_conflict") from exc
     except lifecycle_state.LifecycleError as exc:
         raise RuntimeError("lifecycle_unavailable") from exc
+    if admission is not None:
+        try:
+            admission.note_update_claim(claimed.active_operation.operation_id)
+        except (OSError, ValueError, RuntimeError) as exc:
+            logger.error(f"[Update Service] The managed claim was retained for explicit recovery: {type(exc).__name__}")
+            raise RuntimeError("managed_update_claim_unresolved") from exc
+    return claimed
 
 
 def _release_unjournaled_update_claim(claimed: lifecycle_state.LifecycleState) -> None:
@@ -321,6 +353,15 @@ def _release_unjournaled_update_claim(claimed: lifecycle_state.LifecycleState) -
 
     operation = claimed.active_operation
     if operation is None:  # pragma: no cover - claim contract
+        return
+    if layout_for_root(WORKSPACE_ROOT).managed:
+        from lifecycle.runtime_admission import require_runtime_admission
+        try:
+            result = require_runtime_admission().abort_unjournaled_update_claim(claimed)
+            if result.credential_cleanup_error:
+                logger.warning("[Update Service] Unjournaled managed claim completed with credential cleanup warning.")
+        except (OSError, ValueError, RuntimeError) as exc:
+            logger.error(f"[Update Service] The managed claim remains preserved: {type(exc).__name__}")
         return
     try:
         with _update_state_lock():
@@ -376,6 +417,16 @@ def _release_update_lifecycle(status: dict[str, Any]) -> bool:
     if identity is None:
         return False
     operation_id, generation, phase = identity
+    admission = None
+    if layout_for_root(WORKSPACE_ROOT).managed:
+        from lifecycle import update_execution
+        from lifecycle.runtime_admission import require_runtime_admission
+        bound = update_execution.parse(status)
+        if (bound is None or generation != bound.parent.original_generation
+                or phase is not lifecycle_state.LifecyclePhase.RESERVED):
+            raise RuntimeError("managed_update_recovery_required")
+        admission = require_runtime_admission()
+        admission.retain_unstarted_update(operation_id)
     result = lifecycle_state.complete_operation_with_credential(
         WORKSPACE_ROOT,
         operation_id=operation_id,
@@ -388,10 +439,16 @@ def _release_update_lifecycle(status: dict[str, Any]) -> bool:
             "[Update Service] Lifecycle authority completed with credential cleanup warning: "
             f"{result.credential_cleanup_error}"
         )
+    if admission is not None:
+        admission.admitted()
     return True
 
 
 def _ensure_update_lifecycle(status: dict[str, Any]) -> dict[str, Any]:
+    if layout_for_root(WORKSPACE_ROOT).managed:
+        from lifecycle.update_execution import parse
+        if parse(status) is None:
+            raise RuntimeError("managed_update_unbound")
     identity = _lifecycle_identity(status)
     if identity is not None:
         operation_id, generation, phase = identity
@@ -437,6 +494,12 @@ def _ensure_update_lifecycle(status: dict[str, Any]) -> dict[str, Any]:
 
 def _record_terminal_update(status: dict[str, Any], **changes: Any) -> dict[str, Any]:
     identity = _lifecycle_identity(status)
+    if layout_for_root(WORKSPACE_ROOT).managed and identity is not None:
+        from lifecycle.update_execution import parse
+        bound = parse(status)
+        if (bound is None or identity[1] != bound.parent.original_generation
+                or identity[2] is not lifecycle_state.LifecyclePhase.RESERVED or status.get('phase') != 'queued'):
+            raise RuntimeError("managed_update_recovery_required")
     if identity is None:
         result = write_update_state(**changes)
     else:
@@ -1028,6 +1091,8 @@ async def commit_guarded_runtime(transaction: str, target: str) -> bool:
 
 
 def cleanup_reconciled_transaction(status: dict[str, Any]) -> None:
+    if layout_for_root(WORKSPACE_ROOT).managed:
+        raise RuntimeError("managed_update_recovery_required")
     transaction = str(status.get("transaction_id") or "")
     lease_path = RUN_DIR / "update-lease.json"
     try:
@@ -1094,6 +1159,8 @@ def cleanup_reconciled_transaction(status: dict[str, Any]) -> None:
 
 
 async def reconcile_orphaned_update() -> bool:
+    if layout_for_root(WORKSPACE_ROOT).managed:
+        return False  # The original fixed-unit controller/operator protocol owns recovery.
     status = read_update_state()
     phase = str(status.get("phase") or "")
     if update_lock_active() or shared_update_controller_active(status):
@@ -1328,7 +1395,18 @@ async def queue_update(
         if operation is None:  # pragma: no cover - claim contract
             raise RuntimeError("lifecycle_unavailable")
         try:
-            return write_update_state(
+            managed_fields = {}
+            managed = layout_for_root(WORKSPACE_ROOT).managed
+            if managed:
+                from lifecycle.parent_execution import capture
+                parent = capture(WORKSPACE_ROOT, operation_id=operation.operation_id,
+                    generation=claimed.generation, operation_type='update')
+                if parent.execution.application_commit != previous:
+                    raise RuntimeError("invalid_installed_commit")
+                managed_fields = {'managed_update_version': 1, 'managed_execution': parent.payload(),
+                    'managed_candidate': None, 'managed_accepted_execution_sha256': None,
+                    'managed_verification_execution_sha256': None, 'managed_database_checkpoint': None}
+            queued = write_update_state(
                 phase="queued",
                 message=(
                     "Immediate update requested. Isolated preflight will start now."
@@ -1350,13 +1428,19 @@ async def queue_update(
                 lifecycle_generation=claimed.generation,
                 lifecycle_phase=lifecycle_state.LifecyclePhase.RESERVED.value,
                 current_commit=previous,
+                target_commit=target,
                 previous_commit=previous,
                 staging_dir="",
                 web_artifacts_swapped=False,
                 web_dependencies_swapped=False,
                 controller_pid=None,
                 controller_start_ticks="",
+                **managed_fields,
             )
+            if managed:
+                from lifecycle.runtime_admission import require_runtime_admission
+                require_runtime_admission().acknowledge_update_reservation(operation.operation_id)
+            return queued
         except Exception:
             _release_unjournaled_update_claim(claimed)
             raise
@@ -1394,7 +1478,7 @@ async def cancel_queued_update() -> dict[str, Any]:
                     status,
                     phase="update_available",
                     message="The pending update was cancelled.",
-                    automatic=False,
+                    automatic=(bool(status.get("automatic")) if layout_for_root(WORKSPACE_ROOT).managed else False),
                     queued_at=None,
                     error="",
                 )

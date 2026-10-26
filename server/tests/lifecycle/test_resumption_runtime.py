@@ -12,7 +12,10 @@ from tests.lifecycle import test_resumption_observation as observer_fixture
 
 class ResumedRuntimeIdentityTests(unittest.TestCase):
     def setUp(self):
-        fixture = observer_fixture.ResumptionObservationTests();fixture.setUp();self.addCleanup(fixture.doCleanups)
+        self.prepare()
+
+    def prepare(self, *, control=False):
+        fixture = observer_fixture.ResumptionObservationTests();fixture.prepare(control=control);self.addCleanup(fixture.doCleanups)
         self.fixture = fixture;self.root = fixture.fixture.root;self.journal = fixture.journal
         self.plan = fixture.plan;self.invocation = '5' * 32
         receipt = contract.bind_invocation(self.plan,
@@ -34,7 +37,18 @@ class ResumedRuntimeIdentityTests(unittest.TestCase):
 
     def bind(self):
         return runtime.require_binding(self.root, self.journal, self.invocation,
-            control_manifest_sha256=self.plan['control_manifest_sha256'], own_supervisor=True, allow_original=False)
+            control_manifest_sha256=self.plan['stages'][0].get('control_manifest_sha256',self.plan['control_manifest_sha256']),
+            own_supervisor=True, allow_original=False)
+
+    def test_control_runtime_uses_new_reader_while_controller_keeps_old_reader(self):
+        self.prepare(control=True)
+        binding=self.bind()
+        self.assertEqual(binding.control_manifest_sha256,self.journal.candidate.control_manifest_sha256)
+        self.assertNotEqual(binding.control_manifest_sha256,self.plan['control_manifest_sha256'])
+        self.assertTrue(binding.require_current(self.root))
+        with self.assertRaises(ControlError):
+            runtime.require_binding(self.root,self.journal,self.invocation,
+                control_manifest_sha256=self.plan['control_manifest_sha256'],own_supervisor=True,allow_original=False)
 
     def test_replacement_is_bound_without_rewriting_original_supervisor_history(self):
         original = self.journal

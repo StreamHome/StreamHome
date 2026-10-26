@@ -156,7 +156,7 @@ class SettledUpdateTests(unittest.TestCase):
     def test_actual_shell_returns_no_recovery_only_for_strict_settled_receipt(self):
         repository = Path(__file__).resolve().parents[3]
         shutil.copytree(repository / 'server/lifecycle', self.root / 'server/lifecycle')
-        source = (repository / 'update.sh').read_text().partition('case "${1:-}" in')[0]
+        source = (repository / 'scripts/runtime/update.sh').read_text().partition('case "${1:-}" in')[0]
         library = Path(self.temporary.name) / 'update-library.sh'
         library.write_text(source)
         script = 'source "$1"\nROOT_DIR="$2"\nrecover_interrupted_release\n'
@@ -191,7 +191,7 @@ class SettledUpdateTests(unittest.TestCase):
         repository = Path(__file__).resolve().parents[3]
         shutil.copytree(repository / 'server/lifecycle', self.root / 'server/lifecycle')
         library = Path(self.temporary.name) / 'update-library.sh'
-        library.write_text((repository / 'update.sh').read_text().partition('case "${1:-}" in')[0])
+        library.write_text((repository / 'scripts/runtime/update.sh').read_text().partition('case "${1:-}" in')[0])
         script = 'source "$1"\nROOT_DIR="$2"\nrecover_interrupted_release\n'
         for phase in ('idle', 'checking', 'up_to_date'):
             with self.subTest(phase=phase):

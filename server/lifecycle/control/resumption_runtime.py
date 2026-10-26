@@ -12,7 +12,7 @@ from .administration_lock import process_identity
 from .privileged import unit_snapshot
 from .processes import RUNTIME_CGROUP, controller_peer, process_cgroup
 from .recovery_requests import effective_request, read_grant
-from .resumption_contract import digest
+from .resumption_contract import digest, stage_reader
 from .resumption_ticket import bound_ticket
 from .rpc import ControlError
 
@@ -108,14 +108,18 @@ def require_binding(root: Path, journal, invocation: str, *, control_manifest_sh
         raise ControlError('control_resumption_mode_unavailable')
     reviewed = effective_request(journal)
     grant = read_grant(journal.operation_id, journal.generation)
-    if (grant['schema_version'] != 3 or reviewed.controller_control_manifest_sha256 != control_manifest_sha256
-            or reviewed.previous != journal.previous or reviewed.candidate != journal.candidate):
+    if (grant['schema_version'] != 3 or reviewed.previous != journal.previous or reviewed.candidate != journal.candidate):
         raise ControlError('control_resumption_review_changed')
     ticket = bound_ticket(grant['resumption_plan_id'], 'candidate_start', invocation,
         installation_id=journal.installation_id, control_manifest_sha256=control_manifest_sha256)
     plan, receipt = ticket['plan'], ticket['receipt']
     execution = contract.selected_execution(journal)
-    if (plan['operation_id'] != journal.operation_id or plan['generation'] != journal.generation
+    if (reviewed.controller_control_manifest_sha256 != plan['control_manifest_sha256']
+            or plan['schema_version'] != 3 and reviewed.controller_control_manifest_sha256 != control_manifest_sha256
+            or plan['schema_version'] == 3 and (journal.action is not contract.ManagementAction.PROVISION_CONTROL
+                or execution.control_manifest_sha256 != control_manifest_sha256
+                or stage_reader(plan,'candidate_start') != control_manifest_sha256)
+            or plan['operation_id'] != journal.operation_id or plan['generation'] != journal.generation
             or plan['review_id'] != grant['recovery_review_id'] or plan['action'] != journal.action.value
             or plan['stages'][0]['execution_sha256'] != contract.execution_tuple_sha256(execution)):
         raise ControlError('control_resumption_review_changed')

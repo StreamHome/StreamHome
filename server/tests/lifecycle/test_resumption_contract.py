@@ -41,6 +41,47 @@ class ResumptionContractTests(unittest.TestCase):
         self.assertEqual(self.authorize(1), self.plan['stages'][1])
         self.assertEqual(self.plan, original)
 
+    def control_plan(self):
+        self.plan.update(schema_version=3,action='provision_control')
+        self.plan['stages'][0]['control_manifest_sha256']='1'*64
+        self.plan['stages'][1]['control_manifest_sha256']=self.plan['control_manifest_sha256']
+
+    def test_control_cutover_binds_distinct_controller_candidate_and_previous_readers(self):
+        self.control_plan()
+        for index in (0,1):
+            stage=self.plan['stages'][index]
+            observed={**self.observation(index),'control_manifest_sha256':stage['control_manifest_sha256']}
+            self.assertEqual(self.authorize(index,value=observed),stage)
+            self.assertEqual(contract.stage_reader(self.plan,stage['kind']),stage['control_manifest_sha256'])
+            with self.assertRaises(ControlError):
+                self.authorize(index,value={**observed,'control_manifest_sha256':'9'*64})
+        self.assertEqual(self.plan['control_manifest_sha256'],'b'*64)
+
+    def test_control_reader_shape_cannot_be_borrowed_by_legacy_or_parent_actions(self):
+        self.control_plan()
+        for change in ({'schema_version':1},{'schema_version':2},{'schema_version':True},
+                {'owner_type':'update'},{'action':'repair_environment'}):
+            with self.subTest(change=change),self.assertRaises(ControlError):
+                contract.parse_plan({**self.plan,**change})
+        for index,digest in ((1,'1'*64),(0,True)):
+            changed=deepcopy(self.plan);changed['stages'][index]['control_manifest_sha256']=digest
+            with self.subTest(index=index,digest=digest),self.assertRaises(ControlError):contract.parse_plan(changed)
+
+    def test_fresh_single_stage_control_rollback_can_select_the_original_reader(self):
+        self.control_plan()
+        self.plan['stages']=self.plan['stages'][:1]
+        self.plan['stages'][0]['control_manifest_sha256']=self.plan['control_manifest_sha256']
+        self.assertEqual(self.authorize(value={**self.observation(),'control_manifest_sha256':'b'*64}),self.plan['stages'][0])
+
+    def test_control_fallback_still_cannot_undo_acceptance_or_reuse_a_consumed_start(self):
+        self.control_plan()
+        observed={**self.observation(1),'control_manifest_sha256':'b'*64,'accepted':True}
+        with self.assertRaises(ControlError):self.authorize(1,value=observed)
+        observed={**self.observation(),'control_manifest_sha256':'1'*64}
+        stage=self.authorize(value=observed)
+        receipt=contract.consume(self.plan,stage,'2'*64,existing=None)
+        with self.assertRaises(ControlError):contract.consume(self.plan,stage,'3'*64,existing=receipt)
+
     def test_no_implicit_fallback_retry_or_other_os_command(self):
         self.plan['stages'] = self.plan['stages'][:1]
         observed = self.observation()

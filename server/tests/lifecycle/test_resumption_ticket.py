@@ -38,6 +38,17 @@ class ResumptionTicketTests(unittest.TestCase):
         with self.assertRaises(ControlError):ticket.bound_ticket(self.plan['plan_id'], 'candidate_start', '6' * 32,
             installation_id=self.plan['installation_id'], control_manifest_sha256=self.plan['control_manifest_sha256'])
 
+    def test_control_runtime_ticket_requires_the_candidate_reader_not_issuing_reader(self):
+        self.plan.update(schema_version=3,action='provision_control')
+        self.plan['stages'][0]['control_manifest_sha256']='1'*64
+        self.plan['stages'][1]['control_manifest_sha256']=self.plan['control_manifest_sha256']
+        self.receipt=contract.bind_invocation(self.plan,
+            contract.consume(self.plan,self.plan['stages'][0],'4'*64,existing=None),'5'*32)
+        with self.assertRaises(ControlError):self.read()
+        self.assertEqual(self.read(control_manifest_sha256='1'*64)['receipt'],self.receipt)
+        self.assertEqual(ticket.reviewed_plan(self.plan['plan_id'],installation_id=self.plan['installation_id'],
+            control_manifest_sha256=self.plan['control_manifest_sha256'])['plan'],self.plan)
+
     def test_consumed_without_binding_is_not_a_runtime_ticket(self):
         self.receipt = {**self.receipt, 'status': 'consumed', 'invocation': None}
         with self.assertRaises(ControlError):self.read()

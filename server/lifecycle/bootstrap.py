@@ -385,6 +385,9 @@ def evaluate_startup(
                     if context.mode is StartupMode.MANAGEMENT_VERIFY
                     else read_active_execution(context.installation_root).execution
                 )
+                if context.mode is StartupMode.UPDATE_VERIFY:
+                    from .managed_update import verification_execution
+                    execution = verification_execution(context.installation_root, selected)
                 import sys
                 if (
                     os.geteuid() != layout.descriptor.descriptor.service_uid

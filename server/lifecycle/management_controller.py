@@ -59,6 +59,10 @@ class ManagementController:
         if self.lease is not None:
             self.lease.require_current()
         self.require_preparation_issuer()
+        if (self.review.action is contract.ManagementAction.PROVISION_CONTROL
+                and self.review.activation_mode is contract.ActivationMode.CUTOVER and not hasattr(self,'grant')):
+            from .control.control_permission import require_initial
+            require_initial(self.review.payload())
         if self.review.initial_service_state == 'stopped' and self.review.action is contract.ManagementAction.REPAIR_ENVIRONMENT:
             from .control.stopped_repair import require_scope
             if hasattr(self, 'grant'):
@@ -211,6 +215,11 @@ class ManagementController:
 
     def execute(self) -> None:
         self.checkpoint()
+        if (self.review.action is contract.ManagementAction.PROVISION_CONTROL
+                and self.review.activation_mode is contract.ActivationMode.CUTOVER):
+            from .control.reader_support import require_control_maintenance_reader
+            require_control_maintenance_reader(self.review.previous)
+            require_control_maintenance_reader(self.review.candidate)
         authority = state.inspect_state(ROOT)
         manifest = self.store.inspect()
         if (authority.schema_version != 2 or authority.active_operation is not None or authority.generation != self.review.expected_generation
@@ -245,10 +254,12 @@ class ManagementController:
             target = DeploymentRevision(self.review.installation_id, self.review.candidate.deployment_revision, self.review.deployment)
             self.store.publish_desired(ROOT, self.journal, lease=self.lease, expected=self.review.expected_desired, target=target.reference)
         self.wait_os_receipt()
-        if (self.review.action is contract.ManagementAction.REPAIR_ENVIRONMENT
-                and self.review.initial_service_state == 'running' and self.review.backend is None):
-            # Independent repair cannot borrow the unhealthy backend's cache
-            # registration or drain acknowledgement. Root stops the whole unit;
+        if (self.review.initial_service_state == 'running' and (
+                self.review.action is contract.ManagementAction.REPAIR_ENVIRONMENT and self.review.backend is None
+                or self.review.action is contract.ManagementAction.PROVISION_CONTROL
+                    and self.review.activation_mode is contract.ActivationMode.CUTOVER)):
+            # Control cutover needs a replacement supervisor. Independent repair
+            # cannot borrow an unhealthy backend's admission. Root stops the unit;
             # a fresh post-stop review owns subsequent guarded activation.
             while True:
                 self.checkpoint()
@@ -290,7 +301,7 @@ class ManagementController:
 
     def finish_stopped_repair(self, *, recovered: bool) -> None:
         """Accept complete inactive artifacts while retaining the stopped outcome."""
-        if (self.review.action is not contract.ManagementAction.REPAIR_ENVIRONMENT
+        if (self.review.action not in {contract.ManagementAction.REPAIR_ENVIRONMENT,contract.ManagementAction.PROVISION_CONTROL}
                 or self.review.initial_service_state != 'stopped' or self.review.supervisor is not None
                 or self.review.backend is not None or self.journal.activation_mode is not contract.ActivationMode.CUTOVER):
             raise ControlError('control_stopped_repair_invalid')
@@ -318,14 +329,21 @@ class ManagementController:
         selected = contract.selected_execution(self.journal)
         verify_runtime(ROOT, selected)
         assert_stopped()
+        control_evidence=None
+        if self.review.action is contract.ManagementAction.PROVISION_CONTROL:
+            from .control.control_selection import require_selected
+            control_evidence=require_selected(selected)
         if self.journal.acceptance is None:
             evidence = {'mode': 'stopped_repair', 'execution_sha256': contract.execution_tuple_sha256(selected),
                 'runtime_manifest_sha256': selected.runtime_manifest_sha256,
                 'os_receipt': read_os_receipt(self.review, self.journal.generation, self.invocation)}
+            if control_evidence is not None:
+                evidence['control_selection']=require_selected(selected)
             digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
             self.advance(contract.ManagementStage.ACCEPTED, acceptance=contract.AcceptanceEvidence(contract.execution_tuple_sha256(selected), digest))
         publish_accepted_execution(ROOT, self.journal, lease=self.lease)
         assert_stopped()
+        if control_evidence is not None:require_selected(selected)
         self.advance(contract.ManagementStage.ROLLED_BACK if self.journal.recovery_target == 'previous' else contract.ManagementStage.SUCCEEDED)
         self.complete()
 
@@ -358,6 +376,9 @@ def main(operation_id: str, *, control_manifest_sha256: str) -> int:
     next_path = recovery_path(operation_id, max(2, authority.generation + 1))
     if authority.active_operation is not None and next_path.exists():
         grant = read_grant(operation_id, authority.generation + 1)
+        if grant['schema_version']==5:
+            from .bound_control_repair import run_controller
+            return run_controller(grant,control_manifest_sha256=control_manifest_sha256)
         if grant['schema_version'] == 4:
             from .bound_management_repair import BoundEnvironmentController
             controller = BoundEnvironmentController(grant, control_manifest_sha256=control_manifest_sha256)
@@ -400,7 +421,9 @@ class RecoveredManagementController(ManagementController):
 
     def checkpoint(self) -> None:
         super().checkpoint()
-        if self.grant['schema_version'] in {3, 4}:
+        if (self.grant['schema_version'] in {3, 4}
+                or self.review.action is contract.ManagementAction.PROVISION_CONTROL
+                    and self.review.activation_mode is contract.ActivationMode.CUTOVER):
             from .control.recovery_requests import read_grant
             if read_grant(self.review.operation_id, self.review.expected_generation + 1) != self.grant:
                 raise ControlError('control_resumption_review_changed')
@@ -419,7 +442,9 @@ class RecoveredManagementController(ManagementController):
         if unit['ActiveState'] not in {'active', 'activating'} or int(unit['MainPID']) <= 1:
             return None
         return require_binding(ROOT, self.journal, unit['InvocationID'],
-            control_manifest_sha256=self.review.controller_control_manifest_sha256, allow_original=False)
+            control_manifest_sha256=(contract.selected_execution(self.journal).control_manifest_sha256
+                if self.journal.action is contract.ManagementAction.PROVISION_CONTROL
+                else self.review.controller_control_manifest_sha256), allow_original=False)
 
     def guarded_runtime_evidence(self) -> dict:
         if self.grant['schema_version'] != 3:

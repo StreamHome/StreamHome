@@ -237,7 +237,7 @@ StreamHome is designed to operate efficiently, but FFmpeg processing, adaptive p
 
 | Resource             | Minimum                                                          | Recommended                                                               |
 | :------------------- | :--------------------------------------------------------------- | :------------------------------------------------------------------------ |
-| **Operating System** | Ubuntu 22.04 or an equivalent current Linux distribution         | Ubuntu 24.04 or Debian 12                                                  |
+| **Operating System** | Ubuntu 24.04 x86_64 with systemd and cgroup v2                    | The same qualified managed target                                         |
 | **CPU**              | 2 vCPUs                                                          | 4+ vCPUs                                                                  |
 | **RAM**              | 2 GB                                                             | 4–6+ GB                                                                   |
 | **Network**          | 20 Mbps (lower is no problem)                                    | Faster upload for multiple high-bitrate streams and cloud synchronization |
@@ -249,36 +249,34 @@ Background HEVC optimization pauses when users require server resources and ther
 
 ## 📦 Installation
 
-StreamHome currently supports Linux servers. Install it with the general installer:
+The qualified managed server target is Ubuntu 24.04 x86_64 with systemd and
+Python 3.12.3. Run the installer as an ordinary account with sudo access:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
 ```
 
-The installer prepares the application in `~/StreamHome`, installs or verifies the required server dependencies, builds the production web client, and starts StreamHome. When both services are healthy, it prints the browser URL and the one-time bootstrap code used to unlock first-run setup.
+The wizard reviews the web port, access mode and boot policy. Paths are fixed:
+application `/opt/streamhome`, configuration `/etc/streamhome`, and durable state
+`/var/lib/streamhome`. It prepares private pinned dependencies independently of
+global Node/npm. Repeating installation inspects an existing installation and
+checks update eligibility; it does not automatically reinstall or update it.
 
-Use a custom installation directory when needed:
-
-```bash
-STREAMHOME_INSTALL_DIR=/srv/streamhome \
-curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
-```
-
-To install and build without starting StreamHome:
+Manage the service from any directory and obtain the one-time setup code:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh \
-  | bash -s -- --no-start
+streamhome
+sudo streamhome status
+sudo streamhome configure
+sudo streamhome bootstrap
 ```
 
-After a no-start installation, run:
+Use `sudo streamhome start` and `sudo streamhome stop`, or the corresponding
+`systemctl` commands for `streamhome.service`. Existing checkout installations
+retain their supported scripts; the installer does not move their data.
 
-```bash
-cd ~/StreamHome
-./start.sh
-```
-
-See the [installation guide](docs/installation.md) for supported package managers, ports, lifecycle commands, and deployment notes.
+See the [installation guide](docs/installation.md) for platform requirements,
+fixed paths, first setup, configuration and recovery commands.
 
 ## 📚 Documentation and Support
 

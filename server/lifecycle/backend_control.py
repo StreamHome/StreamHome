@@ -124,7 +124,8 @@ class BackendControl:
     async def handle(self, peer: Peer, action: str, arguments: dict) -> dict:
         if action in {'register_cache_preparation', 'cache_preparation_status', 'release_cache_preparation'}:
             return await self.cache_preparation_action(peer, action, arguments)
-        if action == "readiness":
+        if action in {'readiness','restore_transport_readiness','restore_guarded_readiness',
+                'update_transport_readiness','update_guarded_readiness'}:
             # This narrow projection belongs to the backend's actual parent,
             # never another process running as the service account. It cannot
             # issue bootstrap codes, claim authority or acknowledge a handoff.
@@ -133,9 +134,43 @@ class BackendControl:
                     or process_cgroup(peer.pid) != RUNTIME_CGROUP):
                 raise ControlError("control_peer_forbidden")
             from .management_journal import execution_tuple_sha256
-            admission = require_runtime_admission()
+            if action in {'update_transport_readiness', 'update_guarded_readiness'}:
+                from .bootstrap import require_startup_context, require_current_guarded_authority, StartupMode
+                from .managed_update import bound_journal, verification_execution
+                context = require_startup_context()
+                if context.mode is not StartupMode.UPDATE_VERIFY:
+                    raise ControlError('control_authority_changed')
+                require_current_guarded_authority(context)
+                authority, journal, bound = bound_journal(self.root, context.operation_id)
+                execution = verification_execution(self.root, os.environ)
+                if (authority.generation != context.generation
+                        or authority.active_operation.phase is not state.LifecyclePhase.VERIFYING
+                        or action == 'update_transport_readiness' and (bound.accepted != execution
+                            or journal['phase'] not in {'recovering', 'succeeded', 'rolled_back'})
+                        or action == 'update_guarded_readiness' and (bound.verification != execution
+                            or bound.accepted is not None and bound.accepted != execution
+                            or journal['phase'] not in {'starting', 'recovering', 'failed', 'rolled_back'})):
+                    raise ControlError('control_authority_changed')
+            elif action in {'restore_transport_readiness','restore_guarded_readiness'}:
+                from .bootstrap import require_startup_context, require_current_guarded_authority, StartupMode
+                from .deployment_startup import execution_for_start
+                from .restore_controller import inspect_restore_journal
+                context = require_startup_context()
+                if context.mode is not StartupMode.RESTORE_VERIFY:
+                    raise ControlError('control_authority_changed')
+                require_current_guarded_authority(context)
+                journal = inspect_restore_journal(self.root, context.operation_id)
+                if (journal['generation'] != context.generation
+                        or action == 'restore_transport_readiness' and (not journal['accepted']
+                            or journal['progress'] != 'normal_recovery')
+                        or action == 'restore_guarded_readiness' and journal['progress'] not in {
+                            'verifying_candidate','verifying_rollback','accepted','normal_recovery'}):
+                    raise ControlError('control_authority_changed')
+                execution = execution_for_start(self.layout)
+            else:
+                execution = require_runtime_admission().execution
             return {"pid": os.getpid(), "start_identity": state._process_start_identity(os.getpid()),
-                    "execution_sha256": execution_tuple_sha256(admission.execution),
+                    "execution_sha256": execution_tuple_sha256(execution),
                     "readiness": current_readiness_projection(get_startup_readiness())}
         if action in {"snapshot", "bootstrap"}:
             if peer.uid != 0:

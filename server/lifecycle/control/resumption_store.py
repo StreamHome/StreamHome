@@ -49,22 +49,24 @@ def _locked(plan_id: str, *, create: bool = False):
         os.close(parent)
 
 
-def _selected(plan: dict, control_manifest_sha256: str):
+def _selected(plan: dict, control_manifest_sha256: str, *, runtime_kind: str | None = None):
     selected = descriptor()
+    expected = (contract.stage_reader(plan,runtime_kind) if runtime_kind is not None
+        else plan['control_manifest_sha256'])
     if (selected.status.value != 'ready' or selected.installation_id != plan['installation_id']
-            or control_manifest_sha256 != plan['control_manifest_sha256']):
+            or control_manifest_sha256 != expected):
         raise ControlError('control_resumption_review_changed')
     return selected
 
 
-def _read(directory: Path, control_manifest_sha256: str) -> dict:
+def _read(directory: Path, control_manifest_sha256: str, *, runtime_kind: str | None = None) -> dict:
     value = read_protected_json(directory / 'plan.json')
     if not isinstance(value, dict) or set(value) != {'plan', 'issuer'}:
         raise ControlError('control_resumption_plan_invalid')
     plan = contract.parse_plan(value['plan'])
     if plan['plan_id'] != directory.name:
         raise ControlError('control_resumption_review_changed')
-    _selected(plan, control_manifest_sha256)
+    _selected(plan, control_manifest_sha256,runtime_kind=runtime_kind)
     require_issuer(value['issuer'], plan)
     return value
 
@@ -134,7 +136,7 @@ def bind_start(plan_id: str, kind: str, invocation: str, *, control_manifest_sha
     if kind not in ('candidate_start', 'previous_start'):
         raise ControlError('control_resumption_stage_unavailable')
     with _locked(plan_id) as directory:
-        record = _read(directory, control_manifest_sha256)
+        record = _read(directory, control_manifest_sha256,runtime_kind=kind)
         path = directory / (kind + '.json')
         current = _receipt(directory, kind, record['plan'])
         contract.require_start_intent(read_protected_json(START_INTENT), record['plan'], current)
@@ -151,12 +153,13 @@ def bind_current_start(*, control_manifest_sha256: str) -> dict:
                       control_manifest_sha256=control_manifest_sha256)
 
 
-def live_state(plan_id: str, kind: str, *, control_manifest_sha256: str) -> dict:
+def live_state(plan_id: str, kind: str, *, control_manifest_sha256: str,
+               runtime_reader: bool = False) -> dict:
     require_root()
     if kind not in ('candidate_start', 'previous_start'):
         raise ControlError('control_resumption_stage_unavailable')
     with _locked(plan_id) as directory:
-        record = _read(directory, control_manifest_sha256)
+        record = _read(directory, control_manifest_sha256,runtime_kind=kind if runtime_reader else None)
         path = directory / (kind + '.json')
         receipt = _receipt(directory, kind, record['plan']) if path.exists() or path.is_symlink() else None
         return {**record, 'receipt': receipt}

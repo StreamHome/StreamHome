@@ -9,7 +9,7 @@ from typing import Callable
 import uuid
 
 from . import runtime_recovery_cache as cache, state
-from .runtime_build import RuntimeBuildError, canonical_bytes, generation, verify_runtime
+from .runtime_build import RuntimeBuildError, canonical_bytes, generation, require_runtime_root, verify_runtime
 
 
 def targets(root: Path, execution) -> dict[str, Path]:
@@ -49,6 +49,7 @@ def fingerprint(path: Path) -> str:
 
 
 def inspect(root: Path, cache_root: Path, execution, *, checkpoint: Callable[[], None]) -> dict:
+    require_runtime_root(root)
     manifest = cache.inspect(cache_root, execution, checkpoint=checkpoint)
     identities = {}
     for name, target in targets(root, execution).items():

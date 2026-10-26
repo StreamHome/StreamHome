@@ -78,12 +78,36 @@ class ManagedRestoreJournalTests(unittest.TestCase):
 
     def test_managed_runtime_helpers_delegate_to_supervisor_and_never_spawn_app_children(self):
         self.create()
+        self.enterContext(patch('lifecycle.managed_restore.resumption_offline',return_value=False))
         with patch('lifecycle.managed_restore.command',return_value={'stopped':True}) as command,patch.object(restore.subprocess,'Popen') as spawn:
             restore._stop_supported_runtime(self.root,3000)
             command.assert_called_once_with(self.root,'restore_stop_children');spawn.assert_not_called()
         with patch('lifecycle.managed_restore.command',return_value={'maintenance':True}) as command,patch.object(restore.subprocess,'Popen') as spawn:
             self.assertIsNone(restore._start_maintenance(self.root,self.operation,3000))
             command.assert_called_once_with(self.root,'restore_maintenance');spawn.assert_not_called()
+
+    def test_web_spawn_does_not_confirm_completion_before_supervised_proxy_readiness(self):
+        self.create()
+        replies=[{'web_pid':4321,'build_id':'expected-build'}, {'ready':False},
+                 {'ready':True,'web_pid':4321,'build_id':'expected-build'}]
+        with patch('lifecycle.managed_restore.command',side_effect=replies) as command,patch(
+            'lifecycle.managed_restore.bound_journal',return_value=({'operation_id':self.operation},self.bound)),patch(
+            'lifecycle.managed_restore.ManagedChild.poll',return_value=None),patch.object(
+            restore.state,'_process_start_identity',return_value='987'),patch.object(restore.time,'sleep'):
+            child=restore._start_web(self.root,3000,'expected-build')
+        self.assertEqual(child.pid,4321)
+        self.assertEqual([call.args[1] for call in command.call_args_list],
+            ['restore_finish_web','restore_web_readiness','restore_web_readiness'])
+
+    def test_web_readiness_for_another_process_or_build_cannot_complete_restore(self):
+        self.create()
+        replies=[{'web_pid':4321,'build_id':'expected-build'},
+                 {'ready':True,'web_pid':4322,'build_id':'another-build'}]
+        with patch('lifecycle.managed_restore.command',side_effect=replies),patch(
+            'lifecycle.managed_restore.bound_journal',return_value=({'operation_id':self.operation},self.bound)),patch(
+            'lifecycle.managed_restore.ManagedChild.poll',return_value=None),patch.object(
+            restore.state,'_process_start_identity',return_value='987'):
+            with self.assertRaises(restore.RestoreRecoveryRequired):restore._start_web(self.root,3000,'expected-build')
 
 
 if __name__=='__main__':unittest.main()

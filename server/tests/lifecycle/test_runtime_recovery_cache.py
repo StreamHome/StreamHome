@@ -19,7 +19,7 @@ class BoundRecoveryCacheTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.execution = parse_execution_tuple(_execution_payload())
         self.cache = self.root / 'recovery'
-        self.runtime = self.root / 'runtime';self.bundle = self.runtime / 'bundles' / self.execution.runtime_bundle_id
+        self.runtime = self.root / 'runtime';self.runtime.mkdir(mode=0o700);self.bundle = self.runtime / 'bundles' / self.execution.runtime_bundle_id
         self.bundle.mkdir(mode=0o700, parents=True)
         self.trees = {}
         for category, identity in (('python', self.execution.python_environment_id), ('node', self.execution.node_environment_id),

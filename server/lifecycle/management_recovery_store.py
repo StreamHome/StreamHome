@@ -20,6 +20,8 @@ from . import management_journal as contract, management_store, state
 MAX_INTENT_BYTES = 96 * 1024
 ACTIONS = frozenset({"safe_abort", "continue_recovery", "rollback"})
 MAINTENANCE_ACTION = 'repair_bound_environment'
+CONTROL_MAINTENANCE_ACTION = 'repair_bound_control'
+MAINTENANCE_ACTIONS = frozenset({MAINTENANCE_ACTION, CONTROL_MAINTENANCE_ACTION})
 
 
 class ManagementRecoveryError(ValueError):
@@ -69,7 +71,7 @@ def parse_takeover_intent(payload: dict) -> TakeoverIntent:
         value["source_phase"] = state.LifecyclePhase(value["source_phase"])
     except (ValueError, TypeError) as exc:
         raise ManagementRecoveryError("The recovery source phase is invalid.") from exc
-    if not isinstance(value["action"], str) or value["action"] not in ACTIONS | {MAINTENANCE_ACTION}:
+    if not isinstance(value["action"], str) or value["action"] not in ACTIONS | MAINTENANCE_ACTIONS:
         raise ManagementRecoveryError("The recovery action is unavailable.")
     parent = value["parent_intent_sha256"]
     if parent is not None:
@@ -157,8 +159,11 @@ def _effective_journal(root: Path, authority, journal):
     return parent.target_journal, _sha(parent.payload())
 
 
-def inspect_recovery(root: Path, operation_id: str, generation: int, *, maintenance: bool = False) -> dict:
+def inspect_recovery(root: Path, operation_id: str, generation: int, *, maintenance: bool = False,
+                     maintenance_action: str | None = None) -> dict:
     """Bounded read-only review; a returned plan grants no takeover authority."""
+    if maintenance_action is not None and (not isinstance(maintenance_action,str) or maintenance_action not in MAINTENANCE_ACTIONS):
+        raise ManagementRecoveryError('The maintenance action is unavailable.')
     authority = state.inspect_state(root)
     operation = authority.active_operation
     if (authority.schema_version != 2 or authority.generation != generation or operation is None
@@ -172,17 +177,17 @@ def inspect_recovery(root: Path, operation_id: str, generation: int, *, maintena
                  or (journal.stage is contract.ManagementStage.EXCLUSIVE and operation.phase is state.LifecyclePhase.VERIFYING))
     if journal.stage is contract.ManagementStage.RECOVERY_REQUIRED and operation.phase in {state.LifecyclePhase.EXCLUSIVE, state.LifecyclePhase.VERIFYING}:
         intent = inspect_takeover(root, operation_id, journal.generation)
-        phase_gap = intent.action in ACTIONS | {MAINTENANCE_ACTION} and intent.target_journal == journal
+        phase_gap = intent.action in ACTIONS | MAINTENANCE_ACTIONS and intent.target_journal == journal
     if operation.phase is not expected_phase and operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED and not phase_gap:
         raise ManagementRecoveryError("The journal does not explain the canonical phase.")
     if effective.stage is contract.ManagementStage.ROLLED_BACK and effective.recovery_target != 'previous':
         raise ManagementRecoveryError("Terminal acknowledgement requires its completion protocol.")
     actions = ["continue_recovery"]
-    if maintenance:
+    if maintenance or maintenance_action is not None:
         if effective.activation_mode is not contract.ActivationMode.CUTOVER:
-            raise ManagementRecoveryError('Bound environment repair requires a cutover journal.')
-        actions = [MAINTENANCE_ACTION]
-    if not maintenance and effective.acceptance is None and effective.activation_mode is contract.ActivationMode.CUTOVER and effective.recovery_target == 'candidate':
+            raise ManagementRecoveryError('Bound repair requires a cutover journal.')
+        actions = [maintenance_action or MAINTENANCE_ACTION]
+    if not maintenance and maintenance_action is None and effective.acceptance is None and effective.activation_mode is contract.ActivationMode.CUTOVER and effective.recovery_target == 'candidate':
         actions.append("rollback")
         if operation.phase is state.LifecyclePhase.RESERVED and journal.stage in {contract.ManagementStage.RESERVED, contract.ManagementStage.PREPARED}:
             actions.append("safe_abort")
@@ -227,13 +232,14 @@ def acquire_recovery_lease(
     contract._text(controller_invocation_id, contract._INVOCATION, "recovery invocation")
     if int(controller_invocation_id, 16) == 0:
         raise ManagementRecoveryError("The recovery invocation is invalid.")
-    plan = inspect_recovery(root, operation_id, generation, maintenance=action == MAINTENANCE_ACTION)
+    extra={'maintenance_action':action} if action in MAINTENANCE_ACTIONS else {}
+    plan = inspect_recovery(root, operation_id, generation, **extra)
     if plan["evidence_sha256"] != evidence_sha256 or action not in plan["permitted_actions"]:
         raise ManagementRecoveryError("The reviewed recovery evidence changed.")
     intent = None
     def check():
         nonlocal intent
-        fresh = inspect_recovery(root, operation_id, generation, maintenance=action == MAINTENANCE_ACTION)
+        fresh = inspect_recovery(root, operation_id, generation, **extra)
         if fresh != plan:
             raise ManagementRecoveryError("Recovery evidence changed before ownership transfer.")
         if pre_transfer_check is not None:

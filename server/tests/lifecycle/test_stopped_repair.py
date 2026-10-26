@@ -78,6 +78,39 @@ class StoppedPreparationTests(unittest.TestCase):
         self.assertIn('/usr/local/libexec/streamhome/provision', arguments)
         self.assertNotIn('start', arguments)
 
+    def test_control_handoff_uses_existing_cancellable_scope_and_fixed_artifact_argument(self):
+        value=offline_grant()
+        handoff=stopped.StoppedRepairHandoff(value['installation_id'],value['preparation_id'],value['stop_epoch'],None,
+            control_artifact=Path('/explicit/local/control.deb'))
+        with patch.object(stopped,'require_root'),patch.object(stopped.subprocess,'run',return_value=SimpleNamespace(returncode=0)) as run:
+            self.assertEqual(stopped.run_scoped(handoff),0)
+        arguments=run.call_args.args[0]
+        self.assertIn('--maintain-control-scoped',arguments)
+        self.assertIn('--property=StopPropagatedFrom=streamhome.service',arguments)
+        self.assertEqual(arguments[arguments.index('--artifact')+1],'/explicit/local/control.deb')
+        self.assertNotIn('start',arguments)
+        with patch.object(stopped,'require_root'),patch.object(stopped.subprocess,'run') as spawn:
+            with self.assertRaises(ControlError):stopped.run_scoped(replace(handoff,recovery_action='continue_recovery'))
+        spawn.assert_not_called()
+
+    def test_bound_control_handoff_loads_explicit_rescue_without_global_pointer_or_start_borrowing(self):
+        from lifecycle.control import privileged
+        value=offline_grant()
+        handoff=stopped.StoppedRepairHandoff(value['installation_id'],value['preparation_id'],value['stop_epoch'],None,
+            recovery_action='repair_bound_control',control_artifact=Path('/explicit/local/control.deb'))
+        with patch.object(stopped,'require_root'),patch.object(privileged,'_RESCUE_MODE',True), \
+                patch.object(stopped.subprocess,'run',return_value=SimpleNamespace(returncode=0)) as run:
+            self.assertEqual(stopped.run_scoped(handoff),0)
+        arguments=run.call_args.args[0]
+        self.assertIn('--repair-control-scoped',arguments)
+        self.assertNotIn('--rescue',arguments)
+        self.assertNotIn('--maintain-control-scoped',arguments)
+        self.assertNotIn('start',arguments)
+        self.assertIn('--property=StopPropagatedFrom=streamhome.service',arguments)
+        with patch.object(stopped,'require_root'),patch.object(stopped.subprocess,'run') as run, \
+                self.assertRaises(ControlError):stopped.run_scoped(replace(handoff,control_artifact=None))
+        run.assert_not_called()
+
     def test_old_recovery_scope_cannot_clean_up_a_newer_owner(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -156,6 +189,68 @@ class StoppedControllerTests(unittest.TestCase):
         self.assertEqual(execution_state.read_active_execution(self.root).execution, self.candidate)
         value.rpc.assert_not_called()
         self.assertGreaterEqual(self.stopped.call_count, 3)
+
+    def control_controller(self, *, claim=True):
+        value=self.make_controller()
+        self.candidate=replace(self.previous,control_bundle_id=str(uuid.uuid4()),control_manifest_sha256='f'*64)
+        value.review=replace(value.review,action=contract.ManagementAction.PROVISION_CONTROL,candidate=self.candidate,
+            controller_control_manifest_sha256=self.previous.control_manifest_sha256)
+        if not claim:return value
+        value.lease,value.claim=state.claim_management_controller(self.root,operation_id=value.review.operation_id,expected_generation=0)
+        journal=contract.ManagementJournal(value.review.installation_id,value.review.operation_id,value.claim.state.generation,
+            value.review.action,value.review.activation_mode,value.review.review_id,self.previous,self.candidate,
+            'stopped',value.invocation,None,contract.ManagementStage.RESERVED,None)
+        value.journal=management_store.create_management_journal(self.root,journal,lease=value.lease)
+        value.advance(contract.ManagementStage.PREPARED)
+        return value
+
+    def test_qualified_initial_stopped_control_runs_through_original_claim_and_acceptance(self):
+        value=self.control_controller(claim=False)
+        with patch('lifecycle.control.reader_support.require_control_maintenance_reader') as reader, \
+                patch('lifecycle.control.control_selection.require_selected',return_value={'manifest_sha256':'f'*64}):
+            value.execute()
+        self.assertEqual(reader.call_count,2)
+        self.assertEqual(value.journal.stage,contract.ManagementStage.SUCCEEDED)
+        self.assertIsNone(state.inspect_state(self.root).active_operation)
+        self.assertEqual(execution_state.read_active_execution(self.root).execution,self.candidate)
+        value.rpc.assert_not_called()
+
+    def test_stopped_control_accepts_only_verified_root_selection_without_any_supervisor_rpc(self):
+        value=self.control_controller()
+        with patch('lifecycle.control.control_selection.require_selected',return_value={'manifest_sha256':'f'*64}) as selected:
+            value.finish_stopped_repair(recovered=False)
+        self.assertEqual(execution_state.read_active_execution(self.root).execution,self.candidate)
+        self.assertIsNone(state.inspect_state(self.root).active_operation)
+        self.assertEqual(value.journal.stage,contract.ManagementStage.SUCCEEDED)
+        self.assertEqual(selected.call_count,3)
+        value.rpc.assert_not_called()
+
+    def test_wrong_root_control_selection_cannot_accept_the_inactive_candidate(self):
+        value=self.control_controller()
+        with patch('lifecycle.control.control_selection.require_selected',side_effect=ControlError('selected reader changed')):
+            with self.assertRaises(ControlError):value.finish_stopped_repair(recovered=False)
+        value.retain_recovery()
+        self.assertIsNone(value.journal.acceptance)
+        self.assertEqual(execution_state.read_active_execution(self.root).execution,self.previous)
+        self.assertEqual(value.journal.stage,contract.ManagementStage.RECOVERY_REQUIRED)
+        value.rpc.assert_not_called()
+
+    def test_stopped_control_bridge_requires_full_quiescence_before_returning_os_decision(self):
+        value=self.control_controller();lease=value.lease.lease
+        before=self.fixture.paths.state_path.read_bytes()
+        with patch.object(workers,'ROOT',self.root),patch('lifecycle.control.requests.read_management_request',return_value=value.review), \
+                patch.object(processes,'controller_peer'):
+            result=workers.bridge_observe({'operation_id':value.review.operation_id,'controller_pid':lease.pid,
+                'controller_invocation_id':value.invocation})
+            self.assertTrue(result['os_effect_requested'])
+            self.assertEqual(result['selected_control']['control_manifest_sha256'],self.candidate.control_manifest_sha256)
+            self.quiet.assert_called_once_with(inspections=True,
+                controller=(value.review.operation_id,lease.pid,lease.process_start_identity))
+            self.quiet.side_effect=ControlError('foreign service work')
+            with self.assertRaises(ControlError):
+                workers.bridge_observe({'operation_id':value.review.operation_id,'controller_pid':lease.pid,
+                    'controller_invocation_id':value.invocation})
+        self.assertEqual(self.fixture.paths.state_path.read_bytes(),before)
 
     def test_live_foreign_work_refuses_activation_and_keeps_previous_execution(self):
         value = self.make_controller();self.quiet.side_effect = ControlError('control_foreign_service_process')

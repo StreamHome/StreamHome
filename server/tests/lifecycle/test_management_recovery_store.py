@@ -66,6 +66,47 @@ class ManagementRecoveryStoreTests(unittest.TestCase):
         directory = self.paths.lifecycle_dir / 'management' / original.operation_id
         self.assertEqual((directory / ('review-' + intent.review_id + '.json')).stat().st_mode & 0o777, 0o600)
 
+    def test_exact_control_maintenance_rotates_original_owner_without_selecting_or_accepting(self):
+        original=self.journal
+        before={path:path.read_bytes() for path in self.paths.lifecycle_dir.rglob('*') if path.is_file()}
+        plan=recovery.inspect_recovery(self.root,original.operation_id,1,
+            maintenance_action=recovery.CONTROL_MAINTENANCE_ACTION)
+        self.assertEqual(plan['permitted_actions'],['repair_bound_control'])
+        self.assertEqual(before,{path:path.read_bytes() for path in self.paths.lifecycle_dir.rglob('*') if path.is_file()})
+        self.assertEqual(recovery.inspect_recovery(self.root,original.operation_id,1,maintenance=True),
+            recovery.inspect_recovery(self.root,original.operation_id,1,maintenance_action=recovery.MAINTENANCE_ACTION))
+        with self.assertRaises(state.LifecycleError):
+            recovery.acquire_recovery_lease(self.root,operation_id=original.operation_id,generation=1,
+                evidence_sha256=plan['evidence_sha256'],review_id=str(uuid.uuid4()),
+                action=recovery.CONTROL_MAINTENANCE_ACTION,controller_invocation_id='2'*32)
+        self.lease.release()
+        self.lease,transfer,current=recovery.acquire_recovery_lease(self.root,operation_id=original.operation_id,
+            generation=1,evidence_sha256=plan['evidence_sha256'],review_id=str(uuid.uuid4()),
+            action=recovery.CONTROL_MAINTENANCE_ACTION,controller_invocation_id='2'*32)
+        self.assertNotEqual(transfer.owner_capability,self.claim.owner_capability)
+        self.assertEqual(current.previous,original.previous)
+        self.assertEqual(current.candidate,original.candidate)
+        self.assertEqual(current.acceptance,original.acceptance)
+        self.assertEqual(current.recovery_target,original.recovery_target)
+        self.assertEqual(current.stage,contract.ManagementStage.RECOVERY_REQUIRED)
+        self.assertEqual(recovery.inspect_takeover(self.root,original.operation_id,2).action,'repair_bound_control')
+        self.assertIsNotNone(state.inspect_state(self.root).active_operation)
+        with self.assertRaises(state.LifecycleError):
+            state.validate_operation_owner(self.root,operation_id=original.operation_id,generation=1,
+                expected_phase='reserved',owner_capability=self.claim.owner_capability)
+
+    def test_control_maintenance_requires_its_distinct_review_and_refuses_unknown_action(self):
+        ordinary=recovery.inspect_recovery(self.root,self.journal.operation_id,1)
+        for action in ('invented_control_upgrade',True,[],{}):
+            with self.subTest(action=action),self.assertRaises(recovery.ManagementRecoveryError):
+                recovery.inspect_recovery(self.root,self.journal.operation_id,1,maintenance_action=action)
+        self.lease.release()
+        with self.assertRaises(recovery.ManagementRecoveryError):
+            recovery.acquire_recovery_lease(self.root,operation_id=self.journal.operation_id,generation=1,
+                evidence_sha256=ordinary['evidence_sha256'],review_id=str(uuid.uuid4()),
+                action=recovery.CONTROL_MAINTENANCE_ACTION,controller_invocation_id='2'*32)
+        self.assertEqual(state.inspect_state(self.root),self.claim.state)
+
     def test_live_controller_and_stale_review_prevent_any_takeover_intent(self):
         plan = recovery.inspect_recovery(self.root, self.journal.operation_id, 1)
         for digest in ('f' * 64, plan['evidence_sha256']):

@@ -63,6 +63,10 @@ def make_review(snapshot: dict, action: str, *, control_manifest_sha256: str) ->
         'boot_enabled': snapshot['previous_boot_enabled'] if previous else enabled,
         'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'stop_epoch': epoch,
         'issuer_sha256': contract.digest(issuer), 'control_manifest_sha256': control_manifest_sha256}
+    if snapshot['management_action']=='provision_control':
+        runtime_reader=snapshot.get('previous_control_manifest_sha256' if previous else 'selected_control_manifest_sha256')
+        contract._digest(runtime_reader)
+        payload['runtime_control_manifest_sha256']=runtime_reader
     return ResumptionReview(dict(snapshot), payload, issuer)
 
 
@@ -125,11 +129,15 @@ def launch_plan(review: ResumptionReview, *, approved: bool) -> dict:
     if approved is not True:
         raise ControlError('control_resumption_not_approved')
     value = review.payload
-    return contract.parse_plan({'schema_version': 1, 'plan_id': value['plan_id'],
+    plan = {'schema_version': 1, 'plan_id': value['plan_id'],
         'installation_id': value['installation_id'], 'operation_id': value['operation_id'], 'review_id': value['review_id'],
         'owner_type': 'management', 'action': value['management_action'], 'generation': value['generation'] + 1,
         'boot_id': value['boot_id'], 'stop_epoch': value['stop_epoch'], 'control_manifest_sha256': value['control_manifest_sha256'],
         'issuer_sha256': value['issuer_sha256'], 'expires_at_monotonic': time.monotonic() + 900,
         'prior_running': True, 'interruption_approved': True, 'resumption_approved': True,
         'stages': [{'kind': 'candidate_start', 'execution_sha256': value['execution_sha256'],
-                    'generation': value['generation'] + 1, 'handoff_sha256': None}]})
+                    'generation': value['generation'] + 1, 'handoff_sha256': None}]}
+    if value['management_action']=='provision_control':
+        plan['schema_version']=3
+        plan['stages'][0]['control_manifest_sha256']=value['runtime_control_manifest_sha256']
+    return contract.parse_plan(plan)

@@ -66,6 +66,14 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
             expected_installation_id: str | None = None):
     require_root()
     _identity(operation_id)
+    from .entry import operation_selection
+    pin = operation_selection(operation_id)
+    reader = {}
+    if pin is not None:
+        from .resumption_contract import _digest
+        _digest(pin['manifest_sha256'])
+        control_manifest_sha256=pin['manifest_sha256']
+        reader={'reader_operation_id':operation_id}
     unit = operation_unit(operation_id)
     if unit['ActiveState'] not in {'inactive', 'failed'} or int(unit['MainPID']) != 0:
         raise ControlError('control_controller_busy')
@@ -74,15 +82,28 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
     epoch = root_stop_epoch()
     if scope_epoch is not None and epoch != scope_epoch:
         raise ControlError('control_operator_stopped')
-    snapshot = run_worker(['recovery-review', operation_id], timeout=120)
+    snapshot = run_worker(['recovery-review', operation_id], timeout=120,**reader)
     if expected_installation_id is not None and snapshot['installation_id'] != expected_installation_id:
         raise ControlError('control_recovery_review_stale')
+    if snapshot.get('operation_type') == 'update':
+        from .update_recover import recover as recover_update
+        return recover_update(snapshot, request_path=request_path,
+            control_manifest_sha256=control_manifest_sha256, review_only=review_only,
+            action=action, scope_epoch=scope_epoch)
+    if snapshot.get('operation_type') == 'restore':
+        from .parent_recover import recover as recover_parent
+        return recover_parent(snapshot, request_path=request_path,
+            control_manifest_sha256=control_manifest_sha256, review_only=review_only,
+            action=action, scope_epoch=scope_epoch)
     if action not in snapshot['permitted_actions']:
         raise ControlError('control_recovery_action_unavailable')
     from .privileged import unit_snapshot
     runtime = unit_snapshot()
     resuming = (snapshot['initial_service_state'] == 'running' and snapshot['activation_mode'] == 'cutover'
                 and runtime['ActiveState'] in {'inactive', 'failed'} and int(runtime['MainPID']) == 0)
+    if (snapshot.get('management_action')=='provision_control' and snapshot['activation_mode']=='cutover'
+            and snapshot['initial_service_state']=='running' and not resuming):
+        raise ControlError('control_maintenance_stop_required')
     processes = _preserved_processes(snapshot, resuming=resuming)
     if review_only:
         print(json.dumps(snapshot, sort_keys=True, allow_nan=False))
@@ -129,7 +150,7 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
         return 0
     if root_stop_epoch() != epoch or _preserved_processes(snapshot, resuming=resuming) != processes:
         raise ControlError('control_operator_stopped')
-    fresh = run_worker(['recovery-review', operation_id], timeout=120)
+    fresh = run_worker(['recovery-review', operation_id], timeout=120,**reader)
     if fresh != snapshot:
         raise ControlError('control_recovery_review_stale')
     payload = {'operation_id': operation_id,
@@ -142,13 +163,13 @@ def recover(operation_id: str, *, request_path: Path | None, control_manifest_sh
     if resumption is not None:
         plan = resumption_review.launch_plan(resumption, approved=True)
         payload.update(resumption_plan_id=plan['plan_id'], recovery_review_id=plan['review_id'])
-    grant = run_worker(['prepare-recovery'], payload=payload)
+    grant = run_worker(['prepare-recovery'], payload=payload,**reader)
     if (grant['request']['controller_control_manifest_sha256'] != control_manifest_sha256
             or root_stop_epoch() != epoch):
         raise ControlError('control_recovery_review_stale')
     if resumption is not None:
         from .resumption_store import publish
         publish(plan, resumption.issuer, control_manifest_sha256=control_manifest_sha256)
-    run_operation(grant['request'], recovery_grant=grant)
+    run_operation(grant['request'], recovery_grant=grant,**reader)
     print('StreamHome operation recovery completed.')
     return 0

@@ -12,7 +12,10 @@ from .rpc import ControlError
 
 
 _OPERATION = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
-_JSON_PATH = re.compile(r"/etc/streamhome/(?:install\.json|control/(?:stop-epoch\.json|installation\.json|first-start\.json|resumption-start\.json|administration-owner\.json|first-start-attempts/" + _OPERATION + r"\.json|resumption/" + _OPERATION + r"/(?:plan|candidate_start|previous_start)\.json|operations/" + _OPERATION + r"/(?:(?:request|dispatch|os-receipt|bridge|repair-stop)|(?:recovery|bridge|os-receipt)-[1-9][0-9]{0,18}|recovery-review-" + _OPERATION + r")\.json|preparations/" + _OPERATION + r"/request\.json))$")
+_READER_PATH = re.compile(r'/etc/streamhome/control/operations/' + _OPERATION + r'/reader\.json$')
+_CONTROL_CUTOVER_PATH = re.compile(r'/etc/streamhome/control/operations/' + _OPERATION + r'/(?:control-artifact|control-permission|control-stop|control-cutover-[1-9][0-9]{0,18})\.json$')
+_CONTROL_REPAIR_PATH = re.compile(r'/etc/streamhome/control/operations/' + _OPERATION + r'/(?:control-repair-reader|control-repair-effect-[1-9][0-9]{0,18})\.json$')
+_JSON_PATH = re.compile(r"/etc/streamhome/(?:install\.json|control/(?:stop-epoch\.json|installation\.json|first-start\.json|resumption-start\.json|administration-owner\.json|first-start-attempts/" + _OPERATION + r"\.json|resumption/" + _OPERATION + r"/(?:plan|candidate_start|previous_start)\.json|operations/" + _OPERATION + r"/(?:(?:request|dispatch|os-receipt|bridge|repair-stop)|(?:recovery|update-recovery|bridge|os-receipt)-[1-9][0-9]{0,18}|(?:recovery-review|update-review)-" + _OPERATION + r")\.json|preparations/" + _OPERATION + r"/request\.json))$")
 _UNIT_PATHS = frozenset({"/etc/systemd/system/streamhome.service", "/etc/systemd/system/streamhome-operation@.service", "/etc/systemd/system/streamhome-provision@.service", "/etc/systemd/system/streamhome-prepare@.service", "/etc/systemd/system/streamhome-startup@.service", "/etc/polkit-1/rules.d/49-streamhome-operations.rules"})
 
 
@@ -53,9 +56,17 @@ def root_directory(path: Path, *, create: bool = False, gid: int = 0, mode: int 
 
 
 def atomic_root_bytes(path: Path, raw: bytes, *, gid: int = 0, mode: int = 0o644) -> None:
-    if (os.geteuid() != 0 or (str(path) not in _UNIT_PATHS and not _JSON_PATH.fullmatch(str(path)))
+    tunnel=re.fullmatch(r'/etc/streamhome/control/cloudflare/(?:connectors|pending)/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/(metadata\.json|token)',str(path))
+    tunnel_unit=str(path) in {'/etc/systemd/system/streamhome-tunnel@.service','/etc/systemd/system/streamhome-tunnel-reconcile.service'}
+    tunnel_active=str(path)=='/etc/streamhome/control/cloudflare/active.json'
+    if (os.geteuid() != 0 or (str(path) not in _UNIT_PATHS and not _JSON_PATH.fullmatch(str(path))
+            and not _READER_PATH.fullmatch(str(path)) and not _CONTROL_CUTOVER_PATH.fullmatch(str(path))
+            and not _CONTROL_REPAIR_PATH.fullmatch(str(path)) and not tunnel and not tunnel_unit and not tunnel_active)
             or not isinstance(raw, bytes) or len(raw) > 128 * 1024 or mode not in {0o600, 0o640, 0o644}):
         raise ControlError("control_root_destination_invalid")
+    if tunnel and (gid!=0 or mode!=(0o600 if tunnel[1]=='token' else 0o644)):
+        raise ControlError('control_root_destination_invalid')
+    if tunnel_active and (gid!=0 or mode!=0o644):raise ControlError('control_root_destination_invalid')
     parent = root_directory(path.parent)
     temporary = ".root-control-" + secrets.token_hex(16)
     try:

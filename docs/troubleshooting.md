@@ -2,51 +2,39 @@
 
 ## Maintenance page does not finish after an update
 
-The maintenance page is normal only during the short protected activation and health-check window. Current releases display the live phase, transaction identifier, elapsed time, rollback state, and any safe recovery code. They automatically detect a lost update controller and queue recovery once.
+A maintenance response can be expected during protected cutover. An unresolved
+`recovery_required` operation needs explicit review; do not delete its checkpoint,
+runtime generations, journal, database or media to clear the page.
 
-From the StreamHome installation directory, inspect the durable state without deleting application data:
-
-```bash
-cat .run/update-state.json
-tail -n 120 update.log
-cat .run/update-diagnostics.json 2>/dev/null || true
-./start.sh
-```
-
-`./start.sh` does not compete with a live updater. It waits for verified controller ownership and may resume a provably safe orphaned in-progress transaction. A deliberate `recovery_required` state is different: automatic destructive recovery stops and startup remains fail closed until explicit supported operator recovery is available. Do not delete `.run`, the staging checkout, `server/database.db`, `server/media`, `web/dist`, or `web/node_modules` while recovery is active, because they may contain the verified checkpoint and rollback artifacts.
-
-The lifecycle recovery tool includes a local read-only planner. It can inspect an
-exact operation and generation and report sanitized evidence-supported action
-names without changing authority or artifacts. Explicit `execute` also requires
-the exact evidence identity, then rotates fenced controller ownership before
-using the existing restore/update recovery path. It has no force-clear mode and
-never runs from `start.sh`. See
-[Backup and Recovery](backup-and-recovery.md) for the commands and retention
-rules.
-
-For an installation still running the legacy updater, use the current installer without deleting the StreamHome directory:
+For a managed installation:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
+sudo streamhome status
+sudo streamhome doctor
+sudo streamhome logs --lines 120
+sudo streamhome recover --operation OPERATION_UUID --review
 ```
 
-This retrieves the current recovery-capable controller before cutover.
+Only actions supported by the exact current evidence are offered. Continuation,
+repair and service resumption have separate permission boundaries. Repeating the
+installer does not install a different recovery controller or clear an operation.
+See [Installation](installation.md) and [Backup and Recovery](backup-and-recovery.md).
+
+Legacy checkout installations keep their release's supported inspection/start
+scripts. Their `.run` and source-relative database paths differ from managed
+paths; do not apply commands for a different layout.
 
 ## StreamHome does not start
 
-Run:
+For managed installations, inspect `sudo streamhome doctor` and
+`sudo streamhome logs --lines 120`, then use `sudo streamhome start` when the
+reported state permits it. Check for unrelated owners of the configured web port
+and internal port 8000. A listener conflict does not authorize terminating another
+service. Use `sudo streamhome configure` to review a different web port.
 
-```bash
-cd ~/StreamHome
-./stop.sh
-./start.sh
-```
-
-Inspect `backend.log` and `frontend.log`. Confirm ports 3000 and 8000 are not owned by unrelated services.
-
-`start.sh` waits up to 30 seconds for the database-backed API health endpoint and production web response. If either service fails, it prints both log tails, stops the partial process tree, and returns a nonzero status instead of reporting a false success.
-
-If a lifecycle-lock error appears, first confirm that no other `start.sh` or `stop.sh` command is running. Dead-owner locks are recovered automatically; do not remove a lock owned by a live process.
+For a legacy checkout, run its supported scripts from its actual installation
+directory and inspect that release's backend/frontend logs. Do not delete a lock
+owned by a live process or force-start around unresolved lifecycle authority.
 
 ## Setup returns to the unlock screen
 
@@ -58,19 +46,18 @@ Return to the TMDB step and validate the token again. The validation receipt is 
 
 ## Google Drive fails
 
-Run `./setup.sh` again to verify Rclone 1.68 or newer, then consult [Google Drive Storage](google-drive.md). Do not run `rclone config`; StreamHome uses its own encrypted configuration.
-
-When the system Rclone is missing or too old, setup installs the pinned application-owned build from a versioned official archive and verifies its embedded release checksum before atomic activation.
+Managed installations use their manifest-bound application Rclone runtime. Start
+with `sudo streamhome doctor` and the storage health checks, then consult
+[Google Drive Storage](google-drive.md). Do not replace application-managed
+credentials using a global `rclone config`.
 
 ## Database errors
 
-Run from `server/`:
-
-```bash
-PYTHONPATH=. python scratch/check_db.py
-```
-
-The only supported catalog database is `server/database.db`.
+The managed catalog is `/var/lib/streamhome/database.db`; legacy checkouts retain
+`server/database.db`. Inspect the installation's lifecycle and backup evidence
+before modifying either. `server/scratch/check_db.py` can initialize or change a
+database and is not a read-only production diagnostic. Test recovery procedures
+against a disposable copy before an authorized valuable-data operation.
 
 ## Release checks refuse to start
 

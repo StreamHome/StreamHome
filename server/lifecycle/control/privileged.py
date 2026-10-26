@@ -71,11 +71,34 @@ def supervisor_snapshot(selected, unit: dict | None = None) -> dict:
     return value
 
 
-def run_worker(arguments: list[str], *, payload: dict | None = None, timeout: int = 30, bundle: Path | None = None) -> dict:
+def run_worker(arguments: list[str], *, payload: dict | None = None, timeout: int = 30,
+               reader_operation_id: str | None = None, reader_rescue: bool = False,
+               control_repair_review: bool = False) -> dict:
     """Launch the installed reader after dropping all supplementary groups/UID."""
     require_root()
     selected = descriptor()
-    result = subprocess.run(["/usr/bin/python3", "-I", str(CONTROL / "provision"), *(["--rescue"] if _RESCUE_MODE else []), "--worker", *arguments],
+    if (type(control_repair_review) is not bool or control_repair_review and (reader_operation_id is not None
+            or reader_rescue or len(arguments)!=2 or arguments[0]!='bound-control-review')):
+        raise ControlError('control_operation_reader_changed')
+    if control_repair_review and (not isinstance(arguments[1],str)
+            or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',arguments[1])
+            or arguments[1]=='00000000-0000-0000-0000-000000000000'):
+        raise ControlError('control_operation_invalid')
+    if (type(reader_rescue) is not bool or reader_rescue and (reader_operation_id is None
+            or not arguments or arguments[0] not in {'bound-control-review','bound-control-prepare','bound-control-observe','bound-control-result'})):
+        raise ControlError('control_operation_reader_changed')
+    reader = ['--worker']
+    if reader_operation_id is not None:
+        if (not isinstance(reader_operation_id,str)
+                or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',reader_operation_id)
+                or reader_operation_id == '00000000-0000-0000-0000-000000000000'):
+            raise ControlError('control_operation_invalid')
+        reader = ['--operation-rescue-worker' if reader_rescue else '--operation-worker',reader_operation_id]
+    if control_repair_review:
+        reader=['--control-repair-review-worker']
+        arguments=arguments[1:]
+    rescue = ['--rescue'] if _RESCUE_MODE and reader_operation_id is None and not control_repair_review else []
+    result = subprocess.run(["/usr/bin/python3", "-I", str(CONTROL / "provision"), *rescue, *reader, *arguments],
                             input=b"" if payload is None else json.dumps(payload, allow_nan=False).encode(),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/", env=_OS_ENV,
                             user=selected.service_uid, group=selected.service_gid, extra_groups=[], umask=0o077, timeout=timeout)
@@ -176,6 +199,14 @@ def print_status(*, detail: bool = False, manifest: dict | None = None, manifest
 
 
 def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
+    result=_cli(arguments,manifest=manifest,manifest_sha256=manifest_sha256)
+    if result==0 and arguments and arguments[0] in {'start','configure','recover','repair'} and '--review' not in arguments:
+        from .cloudflare_connector import queue_after_change
+        queue_after_change(manifest=manifest)
+    return result
+
+
+def _cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
     parser = argparse.ArgumentParser(prog="streamhome", description="Manage the fixed StreamHome installation and inspect its systemd service.")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("status", help="Show installation and service status.")
@@ -183,13 +214,22 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
     commands.add_parser("doctor", help="Inspect installation, runtime and lifecycle evidence without changing it.")
     commands.add_parser("start", help="Start streamhome.service.")
     commands.add_parser("stop", help="Stop streamhome.service and close runtime launch admission.")
+    tunnel=commands.add_parser('tunnel',help='Register or inspect isolated existing Cloudflare tunnel connectors.')
+    tunnel_commands=tunnel.add_subparsers(dest='tunnel_command')
+    tunnel_commands.add_parser('list',help='List protected connector references without secrets.')
+    tunnel_commands.add_parser('status',help='Show owned connector services; routing is verified separately.')
+    add=tunnel_commands.add_parser('add',help='Register an inactive connector from a private existing token file.')
+    add.add_argument('--token-file',type=Path,required=True)
+    add.add_argument('--name',default='Existing tunnel')
     configuration = commands.add_parser("configure", help="Review deployment/boot settings and choose activation or save only.")
     configuration.add_argument("--request", type=Path, help="Apply an explicit revision-bound noninteractive JSON request.")
     repair = commands.add_parser("repair", help="Review dependency repair or an interrupted first-start attempt.")
     repair.add_argument("--request", type=Path, help="Explicit noninteractive repair request with current identity and consent.")
     repair.add_argument('--operation', help='Repair only exact dependencies bound to this unresolved operation.')
     repair.add_argument('--review', action='store_true', help='Print the exact bound repair plan without mutation.')
-    recovery = commands.add_parser("recover", help="Review continuation of an interrupted management operation.")
+    repair.add_argument('--control-artifact',type=Path,
+        help='Restore only an exact signed control copy bound to --operation, using its independent rescue reader.')
+    recovery = commands.add_parser("recover", help="Review recovery of an interrupted canonical operation.")
     recovery.add_argument("--operation", required=True, help="The exact unresolved operation UUID.")
     recovery_action = recovery.add_mutually_exclusive_group()
     recovery_action.add_argument('--rollback', dest='recovery_action', action='store_const', const='rollback',
@@ -212,6 +252,12 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
     if parsed.command in {None, "help"}:
         parser.print_help()
         return 0
+    if parsed.command=='tunnel':
+        if parsed.tunnel_command is None:
+            tunnel.print_help();return 0
+        from .cloudflare_connector import command
+        return command(parsed.tunnel_command,manifest=manifest,token_file=getattr(parsed,'token_file',None),
+            label=getattr(parsed,'name','Existing tunnel'))
     if parsed.command == "version":
         print("StreamHome control " + manifest["bundle_id"])
         print("Manifest SHA-256: " + manifest_sha256)
@@ -239,9 +285,11 @@ def cli(arguments: list[str], *, manifest: dict, manifest_sha256: str) -> int:
         from .administration import configure
         from .provisioning import administrative_lock
         with administrative_lock():
-            return configure(request_path=parsed.request)
+            return configure(request_path=parsed.request,control_manifest=manifest)
     if parsed.command == "repair":
         require_root()
+        if parsed.control_artifact is not None:
+            raise ControlError('control_independent_reader_required')
         if parsed.operation is not None:
             from .bound_repair import repair as repair_bound
             from .provisioning import administrative_lock
@@ -313,18 +361,54 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
     global _RESCUE_MODE
     _RESCUE_MODE = rescue
     try:
-        if arguments and arguments[0] in {'--repair-stopped-scoped', '--repair-running-scoped', '--recover-stopped-scoped', '--repair-bound-scoped'}:
+        if arguments and arguments[0]=='--repair-control':
+            require_root()
+            parser=argparse.ArgumentParser(prog=str(CONTROL/'provision')+' --repair-control')
+            parser.add_argument('--operation',required=True)
+            parser.add_argument('--artifact',type=Path,required=True)
+            parser.add_argument('--request',type=Path)
+            parsed=parser.parse_args(arguments[1:])
+            from .control_repair import repair as repair_control
+            from .provisioning import administrative_lock
+            with administrative_lock():
+                result=repair_control(parsed.operation,parsed.artifact,bundle=bundle,manifest=manifest,
+                    manifest_sha256=manifest_sha256,request_path=parsed.request)
+            from .stopped_repair import StoppedRepairHandoff,run_scoped
+            return run_scoped(result) if isinstance(result,StoppedRepairHandoff) else result
+        if arguments and arguments[0]=='--maintain-control':
+            require_root()
+            parser=argparse.ArgumentParser(prog=str(CONTROL/'provision')+' --maintain-control')
+            parser.add_argument('--artifact',type=Path,required=True)
+            parser.add_argument('--request',type=Path)
+            parsed=parser.parse_args(arguments[1:])
+            from .control_maintenance import maintain
+            from .provisioning import administrative_lock
+            with administrative_lock():
+                result=maintain(parsed.artifact,manifest=manifest,manifest_sha256=manifest_sha256,request_path=parsed.request)
+            from .stopped_repair import StoppedRepairHandoff,run_scoped
+            return run_scoped(result) if isinstance(result,StoppedRepairHandoff) else result
+        if arguments and arguments[0] in {'--repair-stopped-scoped', '--repair-running-scoped', '--recover-stopped-scoped', '--repair-bound-scoped','--maintain-control-scoped','--repair-control-scoped'}:
             require_root()
             parser = argparse.ArgumentParser(prog='StreamHome stopped repair')
             parser.add_argument('installation_id')
             parser.add_argument('preparation_id')
             parser.add_argument('stop_epoch')
             parser.add_argument('--request', type=Path)
-            parser.add_argument('--action', choices=('continue_recovery', 'rollback', 'safe_abort'), default='continue_recovery')
+            if arguments[0] in {'--maintain-control-scoped','--repair-control-scoped'}:parser.add_argument('--artifact',type=Path,required=True)
+            else:parser.add_argument('--action', choices=('continue_recovery', 'rollback', 'safe_abort'), default='continue_recovery')
             selected = parser.parse_args(arguments[1:])
             from .provisioning import administrative_lock
-            from .repair import repair
             with administrative_lock():
+                if arguments[0]=='--repair-control-scoped':
+                    from .control_repair import repair as repair_control
+                    return repair_control(selected.preparation_id,selected.artifact,bundle=bundle,manifest=manifest,
+                        manifest_sha256=manifest_sha256,request_path=selected.request,scope_epoch=selected.stop_epoch,
+                        expected_installation_id=selected.installation_id)
+                if arguments[0]=='--maintain-control-scoped':
+                    from .control_maintenance import maintain
+                    return maintain(selected.artifact,manifest=manifest,manifest_sha256=manifest_sha256,
+                        request_path=selected.request,scope_epoch=selected.stop_epoch,operation_id=selected.preparation_id,
+                        expected_installation_id=selected.installation_id)
                 if arguments[0] == '--repair-bound-scoped':
                     from .bound_repair import repair as repair_bound
                     return repair_bound(selected.preparation_id, request_path=selected.request,
@@ -335,6 +419,7 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
                     return recover(selected.preparation_id, request_path=selected.request,
                         control_manifest_sha256=manifest_sha256, action=selected.action,
                         scope_epoch=selected.stop_epoch, expected_installation_id=selected.installation_id)
+                from .repair import repair
                 return repair(request_path=selected.request, control_manifest_sha256=manifest_sha256,
                     scope_epoch=selected.stop_epoch, preparation_id=selected.preparation_id,
                     expected_installation_id=selected.installation_id,
@@ -349,11 +434,17 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
         if arguments == ["--after-start"]:
             from .startup import after_start
             return after_start()
+        if arguments==['--reconcile-tunnel']:
+            from .cloudflare_connector import reconcile
+            return reconcile(manifest=manifest)
         if arguments and arguments[0] == "--activate-pending":
             if len(arguments) != 2:
                 raise ControlError("control_message_invalid")
             from .startup import activate_pending
-            return activate_pending(arguments[1])
+            try:return activate_pending(arguments[1])
+            finally:
+                from .cloudflare_connector import queue_after_change
+                queue_after_change(manifest=manifest)
         if arguments and arguments[0] == "--provision-worker":
             selected = descriptor()
             if len(arguments) != 2 or os.geteuid() == 0 or os.geteuid() != selected.service_uid:
@@ -424,6 +515,9 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
             from .. import state
             authority = state.inspect_state(selected.paths.application)
             active = authority.active_operation
+            if active is not None and active.operation_type is state.OperationType.UPDATE:
+                from ..managed_update import execute
+                return execute(selected.paths.application, arguments[1], control_manifest_sha256=manifest_sha256)
             if active is not None and active.operation_type is state.OperationType.RESTORE:
                 from ..managed_restore import execute
                 return execute(selected.paths.application,arguments[1],control_manifest_sha256=manifest_sha256)
@@ -452,6 +546,10 @@ def dispatch(arguments: list[str], *, bundle: Path, manifest: dict, manifest_sha
             print('Closing TCP connections still reserve the requested port. Wait and retry, or choose another port.', file=sys.stderr)
         if code == 'control_web_port_conflict':
             print('Choose another web port or inspect its owner. No process was stopped.', file=sys.stderr)
+        if code=='control_maintenance_stop_required':
+            print('Stop the managed service with sudo streamhome stop, then request a fresh recovery review.',file=sys.stderr)
+        if code=='control_units_incompatible':
+            print('This package changes the qualified systemd unit protocol. Select a compatible control package.',file=sys.stderr)
         if os.geteuid() == 0 and arguments and arguments[0] in {"--install", "--resume-install", "--complete-install", "--retry-first-start"}:
             try:
                 from .provisioning import report_continuation

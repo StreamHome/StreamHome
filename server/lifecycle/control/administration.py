@@ -117,10 +117,18 @@ def _boot_enabled() -> bool:
     return value == "enabled"
 
 
-def _verify_owned_units() -> None:
-    from .units import unit_files
+def _verify_owned_units(*, expected: dict | None = None, alternate: dict | None = None) -> None:
     from .root_files import root_directory
-    for name, expected in unit_files().items():
+    from .unit_payload import parse
+    if expected is None:
+        from . import entry
+        selection=entry._decode(entry._read(entry.CONTROL/'selected.json',4096))
+        bundle,_,_=entry.verify_bundle(selection)
+        expected=parse(entry._read(bundle/'lib/lifecycle/control/units.py',32768))
+    from .root_files import _UNIT_PATHS
+    if set(expected) != _UNIT_PATHS or alternate is not None and set(alternate) != _UNIT_PATHS:
+        raise ControlError('control_units_changed')
+    for name, raw in expected.items():
         path = Path(name)
         parent = root_directory(path.parent)
         try:
@@ -128,12 +136,17 @@ def _verify_owned_units() -> None:
             with os.fdopen(descriptor_fd, "rb") as handle:
                 import stat
                 metadata = os.fstat(handle.fileno())
-                if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o7133 or metadata.st_nlink != 1 or handle.read(32769) != expected:
+                allowed=(raw,) if alternate is None else (raw,alternate[name])
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o7133 or metadata.st_nlink != 1 or handle.read(32769) not in allowed:
                     raise ControlError("control_units_changed")
         finally:
             os.close(parent)
-    if systemctl("show", "streamhome.service", "--property=DropInPaths", "--value"):
-        raise ControlError("control_unit_dropins_unqualified")
+    for name in sorted(expected):
+        # systemd cannot show a bare template. A fixed inactive instance reports
+        # its inherited template/prefix/type drop-ins without starting anything.
+        probe=Path(name).name.replace('@.service','@00000000-0000-0000-0000-000000000001.service')
+        if name.endswith('.service') and systemctl("show", probe, "--property=DropInPaths", "--value"):
+            raise ControlError("control_unit_dropins_unqualified")
 
 
 def publish_request(payload: dict) -> None:
@@ -148,6 +161,36 @@ def publish_request(payload: dict) -> None:
             raise ControlError("control_request_changed")
         return
     atomic_root_json(path, payload, gid=selected.service_gid, mode=0o640)
+
+
+def publish_operation_reader(operation_id: str, *, bundle: Path, manifest_sha256: str, rescue: bool = False) -> None:
+    """Pin an already verified installed reader before changing global selection.
+
+    This is protected OS metadata only. It neither claims canonical ownership nor
+    authorizes a start, and an existing operation's reader cannot be overwritten.
+    """
+    from .entry import CONTROL, _read
+    require_root()
+    operation = _identity(operation_id)
+    if (type(rescue) is not bool or not isinstance(bundle,Path) or bundle.parent != CONTROL/('rescue-versions' if rescue else 'versions')
+            or not isinstance(manifest_sha256,str) or not re.fullmatch(r'[0-9a-f]{64}',manifest_sha256)):
+        raise ControlError('control_bundle_mismatch')
+    identity = _identity(bundle.name)
+    descriptor_fd=root_directory(bundle);os.close(descriptor_fd)
+    raw=_read(bundle/'manifest.json')
+    if hashlib.sha256(raw).hexdigest() != manifest_sha256:
+        raise ControlError('control_bundle_mismatch')
+    selected=descriptor()
+    directory=OPERATIONS/operation
+    descriptor_fd=root_directory(directory,create=True,gid=selected.service_gid,mode=0o750)
+    os.close(descriptor_fd)
+    path=directory/'reader.json'
+    value={'schema_version':1,'operation_id':operation,'bundle_id':identity,'manifest_sha256':manifest_sha256}
+    if path.exists() or path.is_symlink():
+        if read_protected_json(path) != value:
+            raise ControlError('control_operation_reader_changed')
+        return
+    atomic_root_json(path,value,gid=selected.service_gid,mode=0o640)
 
 
 def _apply_fixed_boot_effect(payload: dict, observation: dict, *, recovery: bool = False,
@@ -207,9 +250,16 @@ def _apply_fixed_boot_effect(payload: dict, observation: dict, *, recovery: bool
     }, gid=selected.service_gid, mode=0o640)
 
 
-def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | None = None) -> dict:
+def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | None = None,
+                  reader_operation_id: str | None = None) -> dict:
     require_root()
     operation = _identity(payload.get("operation_id"))
+    if reader_operation_id is not None and reader_operation_id != operation:
+        raise ControlError('control_operation_reader_changed')
+    control_cutover=payload.get('action')=='provision_control' and payload.get('activation_mode')=='cutover'
+    if control_cutover and reader_operation_id != operation:
+        raise ControlError('control_operation_reader_changed')
+    reader = {'reader_operation_id':operation} if reader_operation_id is not None else {}
     if recovery_grant is None:
         publish_request(payload)
     else:
@@ -252,7 +302,7 @@ def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | N
         unit = operation_unit(operation)
         if unit["ActiveState"] == "active" and int(unit["MainPID"]) > 0 and unit["InvocationID"]:
             try:
-                observation = run_worker(["bridge-observe"], payload={"operation_id": operation, "controller_pid": int(unit["MainPID"]), "controller_invocation_id": unit["InvocationID"]})
+                observation = run_worker(["bridge-observe"], payload={"operation_id": operation, "controller_pid": int(unit["MainPID"]), "controller_invocation_id": unit["InvocationID"]},**reader)
             except (ControlError, subprocess.TimeoutExpired):
                 observation = None
             if observation is not None:
@@ -261,6 +311,14 @@ def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | N
                     print("[StreamHome] Management: " + str(last_stage), flush=True)
                 if (observation.get("os_effect_requested") is True and not effect_done
                         and (recovery_grant is None or recovery_grant.get('schema_version') != 4)):
+                    if control_cutover:
+                        from .control_activation import activate, activate_stopped, activate_stopped_recovery, prepared_for
+                        prepared=prepared_for(payload)
+                        if payload.get('initial_service_state')=='stopped':
+                            if recovery_grant is None:activate_stopped(prepared,payload)
+                            else:activate_stopped_recovery(prepared,recovery_grant)
+                        elif recovery_grant is not None:
+                            activate(prepared,recovery_grant)
                     if recovery_grant is None:
                         _apply_fixed_boot_effect(payload, observation)
                     else:
@@ -274,6 +332,10 @@ def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | N
                         and observation.get('stage') == 'prepared'):
                     from .repair_interruption import stop_prepared
                     stop_prepared(payload, observation)
+                if (effect_done and recovery_grant is None and control_cutover
+                        and payload.get('initial_service_state')=='running' and observation.get('stage')=='prepared'):
+                    from .repair_interruption import stop_control_prepared
+                    stop_control_prepared(payload,observation)
                 if (effect_done and recovery_grant is not None and recovery_grant.get('schema_version') == 3
                         and observation.get('stage') in {'verifying', 'accepted'}):
                     from .resumption_dispatch import start as start_resumed
@@ -281,7 +343,7 @@ def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | N
         if unit["ActiveState"] in {"inactive", "failed"}:
             try:
                 result = run_worker(["bound-repair-result" if recovery_grant is not None and recovery_grant.get('schema_version') == 4
-                                     else "operation-result", operation], timeout=120)
+                                     else "operation-result", operation], timeout=120,**reader)
             except ControlError:
                 result = {"completed": False}
             if result.get("completed") is True:
@@ -291,7 +353,7 @@ def run_operation(payload: dict, *, start: bool = True, recovery_grant: dict | N
     raise ControlError("control_operation_timeout")
 
 
-def configure(*, request_path: Path | None = None) -> int:
+def configure(*, request_path: Path | None = None, control_manifest: dict | None = None) -> int:
     require_root()
     selected = descriptor()
     if selected.status.value != "ready":
@@ -304,6 +366,9 @@ def configure(*, request_path: Path | None = None) -> int:
     enabled = _boot_enabled()
     current = ConfigurationDraft(desired, enabled)
     processes = process_snapshot()
+    from .cloudflare_connector import wizard_options,finalize_draft
+    pending_connectors={}
+    references,connector_draft=wizard_options(control_manifest or {},pending_connectors)
     def diagnostics(config):
         web, invocation = None, None
         if processes["initial_service_state"] == "running":
@@ -315,7 +380,8 @@ def configure(*, request_path: Path | None = None) -> int:
     if request_path is None:
         with open_console() as console:
             review = configure_wizard(console, current, running=processes["initial_service_state"] == "running",
-                                      active_deployment=active, diagnostics=diagnostics)
+                                      active_deployment=active, diagnostics=diagnostics,
+                                      connectors=references,connector_draft=connector_draft)
     else:
         # Explicit noninteractive input is data only and carries its own CAS and
         # consent. No shell/source/environment file is evaluated.
@@ -340,6 +406,7 @@ def configure(*, request_path: Path | None = None) -> int:
                 console.write("The backend cannot acknowledge normal admission. Applying this change will interrupt the owned runtime.")
                 if not console.confirm("Continue with the independent interrupting path?"):
                     return 0
+    finalize_draft(review.after.deployment,pending_connectors,manifest=control_manifest or {})
     payload = {"purpose": "configure", "operation_id": str(uuid.uuid4()), "review_id": str(uuid.uuid4()),
                "expected_generation": snapshot["lifecycle"]["generation"], "expected_desired_revision": snapshot["configuration"]["deployment"]["desired"]["revision"],
                "deployment": review.after.deployment.payload(), "activate_deployment": review.activate_deployment,

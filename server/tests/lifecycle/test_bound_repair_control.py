@@ -44,10 +44,44 @@ class BoundRepairRootControlTests(unittest.TestCase):
             effect.assert_not_called();systemctl.assert_not_called()
             self.assertEqual(worker.call_args.args[0], ['bound-repair-result', operation])
 
+    def test_restore_repair_uses_original_parent_bridge_and_never_management_claim(self):
+        operation=str(uuid.uuid4());installation=str(uuid.uuid4());epoch='b'*64;manifest='c'*64
+        snapshot={'operation_type':'restore','operation_id':operation,'installation_id':installation,
+            'generation':3,'evidence_sha256':'a'*64}
+        grant={'schema_version':3,'action':'repair_bound_environment','control_manifest_sha256':manifest}
+        with patch.object(bound_repair,'require_root'),patch.object(bound_repair,'operation_unit',
+            return_value={'ActiveState':'inactive','MainPID':'0'}),patch('lifecycle.control.stop._require_empty'),patch.object(
+            bound_repair,'require_stopped'),patch.object(bound_repair,'root_stop_epoch',return_value=epoch),patch.object(
+            bound_repair,'current_scope',return_value={'unit':'verified root scope'}),patch.object(
+            bound_repair,'run_worker',side_effect=[snapshot,snapshot,grant]) as worker,patch.object(
+            bound_repair,'_consent',return_value=True),patch('lifecycle.control.parent_recover._run') as parent,patch.object(
+            bound_repair,'run_operation') as management,redirect_stdout(io.StringIO()):
+            self.assertEqual(bound_repair.repair(operation,request_path=Path('/synthetic-reviewed-request'),
+                control_manifest_sha256=manifest,scope_epoch=epoch),0)
+        parent.assert_called_once_with(grant);management.assert_not_called()
+        self.assertEqual(worker.call_args.args[0],['bound-repair-prepare'])
+
     def test_root_bound_repair_imports_no_canonical_or_application_modules(self):
         code = "import sys;import lifecycle.control.bound_repair;assert not {'lifecycle.state','lifecycle.management_journal','config','application','database'}.intersection(sys.modules)"
         result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_update_repair_uses_existing_update_owner_without_management_or_runtime_start(self):
+        operation = str(uuid.uuid4());installation = str(uuid.uuid4());epoch = 'b'*64;manifest = 'c'*64
+        snapshot = {'operation_type': 'update', 'operation_id': operation, 'installation_id': installation,
+            'generation': 3, 'evidence_sha256': 'a'*64}
+        grant = {'schema_version': 3, 'action': 'repair_bound_environment', 'control_manifest_sha256': manifest}
+        with (patch.object(bound_repair, 'require_root'), patch.object(bound_repair, 'operation_unit',
+                return_value={'ActiveState': 'inactive', 'MainPID': '0'}), patch('lifecycle.control.stop._require_empty'),
+                patch.object(bound_repair, 'require_stopped'), patch.object(bound_repair, 'root_stop_epoch', return_value=epoch),
+                patch.object(bound_repair, 'current_scope', return_value={'unit': 'verified root scope'}),
+                patch.object(bound_repair, 'run_worker', side_effect=[snapshot, snapshot, grant]),
+                patch.object(bound_repair, '_consent', return_value=True),
+                patch('lifecycle.control.update_recover._run') as parent,
+                patch.object(bound_repair, 'run_operation') as management, redirect_stdout(io.StringIO())):
+            self.assertEqual(bound_repair.repair(operation, request_path=Path('/synthetic-reviewed-request'),
+                control_manifest_sha256=manifest, scope_epoch=epoch), 0)
+        parent.assert_called_once_with(grant);management.assert_not_called()
 
 
 if __name__ == '__main__':unittest.main()

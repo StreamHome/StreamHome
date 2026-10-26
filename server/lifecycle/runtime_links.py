@@ -83,11 +83,76 @@ def bind_management_runtime(root: Path, journal: contract.ManagementJournal, *, 
         _replace_links(root, journal.previous, journal.candidate, operation_id=journal.operation_id, generation=journal.generation)
 
 
+def bind_update_runtime(root: Path, *, proof, target: str,
+                        assert_children_stopped: Callable[[], None]) -> None:
+    """Publish the existing updater's exact prepared/previous pair, never a claim."""
+    from .managed_update import bound_journal
+    if target not in {'previous', 'candidate'}:
+        raise RuntimeBuildError('The update binding target is invalid.')
+    proof.require_current()
+    authority, journal, bound = bound_journal(root, proof.lease.operation_id)
+    if (proof.paths.root != root or proof.lease.generation != authority.generation
+            or proof.lease.owner_kind is not state.OwnerKind.UPDATER or bound.candidate is None):
+        raise state.OwnershipError('Update binding requires its exact prepared owner.')
+    chosen = bound.parent.execution if target == 'previous' else bound.candidate
+    if bound.accepted is not None:
+        if (chosen != bound.accepted or authority.active_operation.phase is not state.LifecyclePhase.VERIFYING
+                or journal['phase'] not in {'starting', 'recovering'}):
+            raise RuntimeBuildError('Accepted update bindings require their original forward target.')
+    elif (authority.active_operation.phase not in ({state.LifecyclePhase.EXCLUSIVE, state.LifecyclePhase.VERIFYING}
+                if target == 'previous' else {state.LifecyclePhase.EXCLUSIVE})
+            or journal['phase'] != ('rolling_back' if target == 'previous' else 'installing')):
+        raise RuntimeBuildError('Update bindings require the exact cutover or rollback phase.')
+    web = root/'web'
+    import stat
+    metadata = web.lstat()
+    if (not stat.S_ISDIR(metadata.st_mode) or web.is_symlink() or web.resolve(strict=True) != web
+            or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022):
+        raise RuntimeBuildError('The update web source directory is aliased or unprotected.')
+    verify_runtime(root, chosen)
+    assert_children_stopped()
+    proof.require_current()
+    with state.hold_operation_with_credential(root, operation_id=proof.lease.operation_id,
+            generation=authority.generation, expected_operation_type=state.OperationType.UPDATE,
+            expected_phase=authority.active_operation.phase) as current:
+        # Do not recursively acquire the state lock through a delegate's full
+        # capability proof. The same live lease and exact locked authority bind
+        # this short publication; the supervisor repeats its own custody proof.
+        if (current != authority or state.read_controller_lease(root) != proof.lease
+                or not state.controller_lease_is_current(proof.lease)
+                or bound_journal(root, proof.lease.operation_id) != (authority, journal, bound)):
+            raise state.OwnershipError('The update binding owner changed.')
+        repeated = web.lstat()
+        if ((repeated.st_dev, repeated.st_ino, repeated.st_uid, repeated.st_mode)
+                != (metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_mode)
+                or web.resolve(strict=True) != web):
+            raise RuntimeBuildError('The update web source directory changed before publication.')
+        assert_children_stopped()
+        previous = bound.candidate if target == 'previous' else bound.parent.execution
+        receipt = layout_for_root(root).state/'runtime-links.json'
+        if receipt.exists() or receipt.is_symlink():
+            from .control.provision_worker import _private_record
+            source = _private_record(receipt)
+            expected = {'schema_version': 1, 'operation_id': proof.lease.operation_id,
+                'generation': authority.generation, 'previous': contract.execution_tuple_sha256(previous),
+                'candidate': contract.execution_tuple_sha256(chosen), 'stage': 'applying'}
+            if (source.get('operation_id') == proof.lease.operation_id and source.get('previous') is not None
+                    and (source.get('generation') != authority.generation
+                        or source.get('stage') == 'applying' and source != expected)):
+                from .update_link_recovery import recover
+                recover(root, authority=authority, journal=journal, bound=bound, proof=proof,
+                    target=target, source=source, source_path=receipt,
+                    assert_children_stopped=assert_children_stopped)
+                return
+        _replace_links(root, previous, chosen, operation_id=proof.lease.operation_id,
+            generation=authority.generation)
+
+
 def _completed_previous_binding(root: Path, journal: contract.ManagementJournal, original: dict) -> bool:
-    """Explain a retained candidate receipt after an earlier accepted rollback.
+    """Explain an older base receipt after an accepted completed recovery.
 
     Recovery deliberately retains the original receipt. A later operation must
-    prove the exact accepted execution, terminal previous-runtime journal and
+    prove the exact accepted execution, terminal selected-runtime journal and
     completed paired-link recovery before using that older receipt as its base.
     """
     from .execution_state import ExecutionStateError, read_active_execution
@@ -100,27 +165,73 @@ def _completed_previous_binding(root: Path, journal: contract.ManagementJournal,
     if (active.execution != journal.previous or active.installation_id != journal.installation_id
             or active.operation_id == journal.operation_id or active.generation >= journal.generation):
         return False
+    if _completed_update_previous_binding(root,journal,original,active):
+        return True
     previous = management_store.inspect_management_journal(root, active.operation_id)
+    terminal={contract.ManagementStage.ROLLED_BACK:'previous',contract.ManagementStage.SUCCEEDED:'candidate'}
     if (previous.generation != active.generation or previous.installation_id != journal.installation_id
-            or previous.stage is not contract.ManagementStage.ROLLED_BACK or previous.recovery_target != 'previous'
+            or previous.stage not in terminal or previous.recovery_target != terminal[previous.stage]
             or previous.acceptance is None or contract.selected_execution(previous) != journal.previous):
         return False
     intent = inspect_takeover(root, previous.operation_id, previous.generation)
     if replace(previous, stage=contract.ManagementStage.RECOVERY_REQUIRED,
             acceptance=intent.target_journal.acceptance) != intent.target_journal:
-        raise RuntimeBuildError('The completed rollback no longer matches its retained review.')
+        raise RuntimeBuildError('The completed recovery no longer matches its retained review.')
     expected = {'schema_version': 1, 'operation_id': previous.operation_id, 'generation': previous.generation,
         'review_id': intent.review_id, 'previous': contract.execution_tuple_sha256(previous.previous),
-        'candidate': contract.execution_tuple_sha256(previous.candidate), 'target': 'previous',
+        'candidate': contract.execution_tuple_sha256(previous.candidate), 'target': previous.recovery_target,
         'source_receipt_sha256': _sha(original), 'stage': 'complete'}
-    # Several completed early aborts may retain the same much older base receipt.
-    # The latest accepted previous-runtime checkpoint binds its exact digest and
+    # Several completed recoveries may retain the same much older base receipt.
+    # The latest accepted runtime checkpoint binds its exact digest and
     # completed destination pair; it must not guess that the base was rewritten
     # by the immediately preceding operation.
     receipt = layout_for_root(root).state / f'runtime-link-recovery-{previous.operation_id}-{previous.generation}.json'
     if _read(receipt) != expected:
-        raise RuntimeBuildError('The completed rollback has no exact paired-link receipt.')
+        raise RuntimeBuildError('The completed recovery has no exact paired-link receipt.')
     return True
+
+
+def _completed_update_previous_binding(root, journal, original, active) -> bool:
+    """Explain the retained paired-link receipt of a completed UPDATE rollback.
+
+    The active execution alone is insufficient. The original owner's immutable
+    terminal history and exact complete link-recovery receipt must both bind the
+    accepted tuple and the digest of the older receipt being retained.
+    """
+    if original.get('operation_id')!=active.operation_id:return False
+    from . import update_history,update_execution
+    from .control.provision_worker import _private_record
+    from .control.rpc import ControlError
+    from .update_recovery import digest
+    try:
+        tentative=state.lifecycle_paths(root).lifecycle_dir/'update-history'/(active.operation_id+'.'+str(active.generation)+'.json')
+        tentative.lstat()
+        path=update_history._path(root,active.operation_id,active.generation)
+        record=_private_record(path)
+    except FileNotFoundError:return False
+    try:
+        if (not isinstance(record,dict) or type(record.get('schema_version')) is not int
+                or type(record.get('generation')) is not int or record!=update_history._record(record['journal'])):
+            raise RuntimeBuildError('The retained update completion changed.')
+        bound=update_execution.parse(record['journal'])
+        previous=contract.execution_tuple_sha256(bound.parent.execution)
+        candidate=contract.execution_tuple_sha256(bound.candidate) if bound.candidate else None
+        if (record['operation_id']!=active.operation_id or record['generation']!=active.generation
+                or bound.parent.installation_id!=journal.installation_id or bound.accepted!=journal.previous
+                or bound.accepted!=active.execution or candidate is None
+                or type(original.get('generation')) is not int
+                or not bound.parent.original_generation<original['generation']<=active.generation
+                or (original.get('previous'),original.get('candidate')) not in {(previous,candidate),(candidate,previous)}):
+            return False
+        expected={'schema_version':1,'operation_id':active.operation_id,'generation':active.generation,
+            'source_generation':original['generation'],'source_receipt_sha256':digest(original),
+            'target_execution_sha256':contract.execution_tuple_sha256(journal.previous),'stage':'complete'}
+        receipt=_private_record(layout_for_root(root).state/f'runtime-link-update-recovery-{active.operation_id}-{active.generation}.json')
+        if (not isinstance(receipt,dict) or type(receipt.get('schema_version')) is not int or receipt!=expected):
+            raise RuntimeBuildError('The completed update has no exact paired-link recovery receipt.')
+        return True
+    except (ControlError,KeyError,TypeError,ValueError) as exc:
+        raise RuntimeBuildError('The retained update binding is invalid.') from exc
 
 
 def recover_management_links(

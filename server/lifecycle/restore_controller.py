@@ -1142,7 +1142,9 @@ def prevalidate_candidate(root: str | os.PathLike[str], filename: str) -> Candid
     )
 
 
-def _copy_sqlite(source: Path, destination: Path, *, source_standalone: bool = True) -> None:
+def _copy_sqlite(source: Path, destination: Path, *, source_standalone: bool = True,
+                 checkpoint: Callable[[], None] | None = None,
+                 before_publish: Callable[[], None] | None = None) -> None:
     temporary = destination.with_name(f".{destination.name}.{secrets.token_hex(8)}.tmp")
     connection: sqlite3.Connection | None = None
     target: sqlite3.Connection | None = None
@@ -1164,7 +1166,16 @@ def _copy_sqlite(source: Path, destination: Path, *, source_standalone: bool = T
             uri=True,
         )
         target = sqlite3.connect(temporary)
-        connection.backup(target)
+        if checkpoint is None:
+            connection.backup(target)
+        else:
+            checkpoint()
+            last = 0.0
+            def progress(status, remaining, total):
+                nonlocal last
+                if time.monotonic() >= last:
+                    checkpoint();last = time.monotonic()+.25
+            connection.backup(target, pages=256, progress=progress)
         target.execute("PRAGMA journal_mode=DELETE")
         target.close()
         target = None
@@ -1177,6 +1188,10 @@ def _copy_sqlite(source: Path, destination: Path, *, source_standalone: bool = T
         finally:
             os.close(descriptor)
         validate_sqlite_database(temporary, standalone=True)
+        if checkpoint is not None:
+            checkpoint()
+        if before_publish is not None:
+            before_publish()
         os.replace(temporary, destination)
         os.chmod(destination, 0o600)
         _fsync_directory(destination.parent)
@@ -1546,7 +1561,8 @@ def _runtime_control():
 def _stop_supported_runtime(root: Path, web_port: int) -> None:
     from .layout import layout_for_root
     if layout_for_root(root).managed:
-        from .managed_restore import command
+        from .managed_restore import command,resumption_offline
+        if resumption_offline(root):return
         if command(root,'restore_stop_children') != {'stopped':True}:
             raise RestoreRecoveryRequired('managed runtime shutdown could not be proven')
         return
@@ -1576,7 +1592,8 @@ def _build_id(root: Path) -> str:
 def _start_maintenance(root: Path, operation_id: str, web_port: int) -> subprocess.Popen[bytes] | None:
     from .layout import layout_for_root
     if layout_for_root(root).managed:
-        from .managed_restore import command
+        from .managed_restore import command,resumption_offline
+        if resumption_offline(root):return None
         if command(root,'restore_maintenance') != {'maintenance':True}:
             raise RestoreRecoveryRequired('managed maintenance responder is unavailable')
         return None
@@ -1624,7 +1641,8 @@ def _start_maintenance(root: Path, operation_id: str, web_port: int) -> subproce
 def _start_backend(root: Path, operation_id: str, generation: int) -> tuple[ControllerProcess, str]:
     from .layout import layout_for_root
     if layout_for_root(root).managed:
-        from .managed_restore import command,ManagedChild
+        from .managed_restore import command,ManagedChild,wait_for_resumed_backend
+        wait_for_resumed_backend(root)
         value = command(root,'restore_backend')
         pid = value['backend_pid']
         return ManagedChild(pid,state._process_start_identity(pid),operation_id),value['build_id']
@@ -1779,7 +1797,18 @@ def _start_web(root: Path, web_port: int, build: str) -> ControllerProcess:
         value = command(root,'restore_finish_web')
         if value.get('build_id') != build:raise RestoreRecoveryRequired('managed web build changed')
         pid = value['web_pid']
-        return ManagedChild(pid,state._process_start_identity(pid),bound_journal(root)[0]['operation_id'])
+        process = ManagedChild(pid,state._process_start_identity(pid),bound_journal(root)[0]['operation_id'])
+        deadline = time.monotonic()+30
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RestoreRecoveryRequired('managed web runtime exited during startup')
+            readiness = command(root,'restore_web_readiness')
+            if readiness == {'ready':True,'build_id':build,'web_pid':pid}:
+                return process
+            if readiness != {'ready':False}:
+                raise RestoreRecoveryRequired('managed web readiness identity changed')
+            time.sleep(.1)
+        raise RestoreRecoveryRequired('managed web runtime did not become ready with the expected build')
     token = _runtime_token()
     environment = os.environ.copy()
     environment.update(
@@ -1914,7 +1943,8 @@ def _enter_fail_closed(
         pass
 
 
-def _verify_authority(root: Path, operation_id: str, generation: int, capability: str) -> state.LifecycleState:
+def _verify_authority(root: Path, operation_id: str, generation: int, capability: str,
+                      *, takeover_action: str | None = None) -> state.LifecycleState:
     current = state.validate_operation_owner_current_phase(
         root,
         operation_id=operation_id,
@@ -1928,6 +1958,13 @@ def _verify_authority(root: Path, operation_id: str, generation: int, capability
         or operation.owner_kind is not state.OwnerKind.RESTORE_CONTROLLER
     ):
         raise RestoreConflictError("restore lifecycle authority does not match")
+    from .layout import layout_for_root
+    if layout_for_root(root).managed:
+        from .parent_recovery import require_controller_permission, require_takeover_permission
+        if takeover_action is None:
+            require_controller_permission(root, operation_id, generation)
+        else:
+            require_takeover_permission(root, operation_id, generation, takeover_action)
     return current
 
 
@@ -2080,6 +2117,7 @@ def _run_controller(
     operator_journal_generation: int | None = None,
     pre_transfer_check: Callable[[], None] | None = None,
     on_transfer: Callable[[int], None] | None = None,
+    maintenance: Callable[[state.ControllerLeaseHandle, int, dict[str, Any]], None] | None = None,
 ) -> int:
     paths = restore_paths(root, operation_id)
     state.qualify_lifecycle_filesystem(root)
@@ -2088,11 +2126,15 @@ def _run_controller(
         require_private=False,
         description="canonical database directory",
     )
-    current = _verify_authority(root, operation_id, generation, capability)
+    current = _verify_authority(root, operation_id, generation, capability, takeover_action=operator_action)
     expected_phase = current.active_operation.phase if current.active_operation else state.LifecyclePhase.RESERVED
     if expected_phase is state.LifecyclePhase.RECOVERY_REQUIRED and operator_action is None:
         raise RestoreRecoveryRequired("recovery-required restore needs explicit operator action")
-    if operator_action not in {None, "safe_abort", "continue_recovery", "rollback"}:
+    maintenance_action = operator_action in {'repair_bound_environment','repair_bound_control'} and maintenance is not None
+    if (maintenance is not None and (not maintenance_action or pre_transfer_check is None
+            or on_transfer is None or acknowledgement_fd is not None or gate_fd is not None)):
+        raise RestoreConflictError('bound environment maintenance requires its exact permission callbacks')
+    if operator_action not in {None, "safe_abort", "continue_recovery", "rollback"} and not maintenance_action:
         raise RestoreConflictError("operator restore action is unsupported")
     if operator_action is not None and expected_phase is not state.LifecyclePhase.RECOVERY_REQUIRED:
         raise RestoreConflictError("operator restore action requires recovery-required authority")
@@ -2122,6 +2164,20 @@ def _run_controller(
             raise
         if on_transfer is not None:
             on_transfer(generation)
+        if maintenance_action:
+            # Reuse original canonical custody and journal transfer, without
+            # entering any restore resume/activation/acceptance/runtime path.
+            try:
+                lease.require_current()
+                maintenance(lease, generation, journal)
+                lease.require_current()
+                if (state.inspect_state(root) != transferred.state
+                        or inspect_restore_journal(root, operation_id) != journal):
+                    raise RestoreRecoveryRequired('bound environment maintenance changed parent authority')
+            except BaseException:
+                _mark_recovery_required(paths, generation, 'restore_environment_repair_failed')
+                raise
+            return 0
         if operator_action is not None:
             journal = resume_restore_journal_for_operator(
                 root,

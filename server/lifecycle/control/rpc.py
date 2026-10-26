@@ -95,7 +95,10 @@ def request(
 ) -> dict:
     payload = validate_request({"schema_version": 1, "request_id": str(uuid.uuid4()), "installation_id": installation_id,
                                 "invocation": invocation, "action": action, "arguments": arguments})
-    if not 0 < timeout <= 65:
+    from .notification import STARTUP_RECOVERY_SECONDS
+    maximum = (STARTUP_RECOVERY_SECONDS+30
+        if action in {'update_start_candidate', 'update_start_previous'} else 65)
+    if not 0 < timeout <= maximum:
         raise ControlError("control_timeout_invalid")
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -178,7 +181,7 @@ class Server:
             if peer.uid not in self.allowed_uids:
                 raise ControlError("control_peer_forbidden")
             async with self.limit:
-                async with asyncio.timeout(60):
+                async with asyncio.timeout(60) as deadline:
                     length = struct.unpack("!I", await asyncio.wait_for(reader.readexactly(4), 5))[0]
                     if not 0 < length <= MAX_MESSAGE:
                         raise ControlError("control_message_too_large")
@@ -186,6 +189,9 @@ class Server:
                     identity = payload["request_id"]
                     if payload["installation_id"] != self.installation_id or payload["invocation"] != self.invocation:
                         raise ControlError("control_incarnation_changed")
+                    if payload['action'] in {'update_start_candidate', 'update_start_previous'}:
+                        from .notification import STARTUP_RECOVERY_SECONDS
+                        deadline.reschedule(asyncio.get_running_loop().time()+STARTUP_RECOVERY_SECONDS+15)
                     result = await self.handler(peer, payload["action"], payload["arguments"])
                     writer.write(encode({"schema_version": 1, "request_id": identity, "ok": True, "result": result, "error": None}))
                     await writer.drain()

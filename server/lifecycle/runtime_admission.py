@@ -49,11 +49,16 @@ class RuntimeAdmission:
         self._lock = threading.RLock()
         self._settled = False
         self._pending: contract.ManagementJournal | None = None
+        self._pending_update = None
+        self._pending_update_claim = None
+        self._completed_update_claim = None
 
     def _same_process(self) -> bool:
         return os.getpid() == self.pid and state._process_start_identity(self.pid) == self.start
 
-    def _receipt(self, *, generation: int, pending: contract.ManagementJournal | None) -> None:
+    def _receipt(self, *, generation: int, pending: contract.ManagementJournal | None, update_pending=None) -> None:
+        if pending is not None and update_pending is not None:
+            raise RuntimeAdmissionError("Runtime continuation cannot have two owners.")
         paths = state.lifecycle_paths(self.context.installation_root)
         directory = paths.lifecycle_dir / "settlement"
         state._ensure_private_directory(directory, "runtime settlement directory")
@@ -63,8 +68,8 @@ class RuntimeAdmission:
             "startup_generation": self.context.generation, "settled_generation": generation,
             "startup_operation_id": self.context.operation_id,
             "execution_tuple_sha256": contract.execution_tuple_sha256(self.execution),
-            "pending_operation_id": pending.operation_id if pending else None,
-            "pending_journal_sha256": _journal_identity(pending) if pending else None,
+            "pending_operation_id": pending.operation_id if pending else update_pending.operation_id if update_pending else None,
+            "pending_journal_sha256": _journal_identity(pending) if pending else update_pending.sha256 if update_pending else None,
         })
 
     def _require_terminal_evidence(self) -> None:
@@ -82,6 +87,21 @@ class RuntimeAdmission:
                 or not math.isfinite(finished) or not math.isfinite(committed) or not 0 < committed <= finished
             ):
                 raise RuntimeAdmissionError("The exact accepted update has not published terminal evidence.")
+            if layout_for_root(self.context.installation_root).managed:
+                from .update_execution import parse
+                from .update_history import _path, _record
+                from .control.provision_worker import _private_record
+                from .execution_state import read_active_execution
+                bound = parse(journal)
+                active = read_active_execution(self.context.installation_root)
+                if (bound is None or bound.accepted != self.execution
+                        or bound.parent.installation_id != self.installation_id
+                        or active.execution != self.execution or active.installation_id != self.installation_id
+                        or active.operation_id != self.context.operation_id
+                        or active.generation != self.context.generation
+                        or _private_record(_path(self.context.installation_root, self.context.operation_id,
+                            self.context.generation)) != _record(journal)):
+                    raise RuntimeAdmissionError('Terminal UPDATE evidence does not identify this exact accepted runtime.')
         elif self.context.operation_type == state.OperationType.RESTORE.value:
             from .restore_controller import read_restore_journal
             journal = read_restore_journal(self.context.installation_root, self.context.operation_id)
@@ -123,9 +143,113 @@ class RuntimeAdmission:
                 self._receipt(generation=authority.generation, pending=None)
                 self._settled = True
 
+    def note_update_claim(self, operation_id: str) -> None:
+        """Retain this producer's actual reserved claim before journal publication."""
+        from .update_continuation import capture_claim
+        with self._lock:
+            if (not self._settled or not self._same_process() or self._pending is not None
+                    or self._pending_update is not None or self._pending_update_claim is not None):
+                raise RuntimeAdmissionError('The settled runtime cannot record another UPDATE claim.')
+            current = state.inspect_state(self.context.installation_root)
+            with state.hold_operation_with_credential(self.context.installation_root,
+                    operation_id=operation_id, generation=current.generation,
+                    expected_phase=state.LifecyclePhase.RESERVED,
+                    expected_operation_type=state.OperationType.UPDATE) as authority:
+                self._pending_update_claim = capture_claim(self.context.installation_root, authority,
+                    self.generation, self.installation_id, self.invocation, self.execution)
+
+    def abort_unjournaled_update_claim(self, claimed: state.LifecycleState) -> state.CompletionResult:
+        """Complete only this process's known, still unadopted original reservation."""
+        from .update_continuation import require_unjournaled
+        from .update_controller import _update_paths
+        import fcntl
+        with self._lock:
+            intent = self._pending_update_claim
+            if (not self._settled or not self._same_process() or self._pending is not None
+                    or self._pending_update is not None or intent is None or intent.authority != claimed):
+                raise RuntimeAdmissionError('The unjournaled UPDATE claim has no original process witness.')
+            if self._completed_update_claim is None:
+                _, lock_path, _ = _update_paths(self.context.installation_root,
+                    intent.parent.operation_id, claimed.generation)
+                descriptor = state._open_locked_file(lock_path)
+                try:
+                    require_unjournaled(self.context.installation_root, intent)
+                    self._completed_update_claim = state.complete_operation_with_credential(
+                        self.context.installation_root, operation_id=intent.parent.operation_id,
+                        generation=claimed.generation, expected_phase=state.LifecyclePhase.RESERVED,
+                        expected_operation_type=state.OperationType.UPDATE)
+                finally:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN);os.close(descriptor)
+            result = self._completed_update_claim
+            self._settle_completed_update_claim(state.inspect_state(self.context.installation_root))
+            return result
+
+    def _settle_completed_update_claim(self, current: state.LifecycleState) -> None:
+        from .update_continuation import require_completed_claim
+        require_completed_claim(self.context.installation_root, self._pending_update_claim,
+            self._completed_update_claim, self.generation, self.installation_id, self.invocation,
+            self.execution, current)
+        self._receipt(generation=self._completed_update_claim.state.generation, pending=None)
+        self.generation = self._completed_update_claim.state.generation
+        self._pending_update_claim = self._completed_update_claim = None
+
+    def acknowledge_update_reservation(self, operation_id: str) -> dict:
+        """Keep only this already settled backend live during its own preflight."""
+        from .managed_update import bound_journal
+        from .update_continuation import reservation, require_live
+        with self._lock:
+            if (not self._settled or not self._same_process() or self._pending is not None
+                    or self._pending_update is not None):
+                raise RuntimeAdmissionError('This runtime cannot acknowledge another UPDATE reservation.')
+            authority, payload, _ = bound_journal(self.context.installation_root, operation_id)
+            pending = reservation(payload)
+            if (self._pending_update_claim is not None
+                    and self._pending_update_claim.parent != pending.parent):
+                raise RuntimeAdmissionError('The UPDATE journal differs from its original in-memory claim.')
+            with state.hold_operation_with_credential(self.context.installation_root,
+                    operation_id=operation_id, generation=authority.generation,
+                    expected_phase=state.LifecyclePhase.RESERVED,
+                    expected_operation_type=state.OperationType.UPDATE) as current:
+                if require_live(self.context.installation_root, pending, self.generation,
+                        self.installation_id, self.invocation, self.execution) != current:
+                    raise RuntimeAdmissionError('The UPDATE reservation changed before acknowledgement.')
+                self._receipt(generation=self.generation, pending=None, update_pending=pending)
+                self._pending_update = pending
+                self._pending_update_claim = None
+            return {'acknowledged': True, 'operation_id': operation_id, 'generation': authority.generation,
+                'execution_sha256': contract.execution_tuple_sha256(self.execution)}
+
+    def retain_unstarted_update(self, operation_id: str) -> dict:
+        from .update_history import retain_unstarted
+        with self._lock:
+            if (not self._settled or not self._same_process() or self._pending is not None
+                    or self._pending_update is None or self._pending_update.operation_id != operation_id):
+                raise RuntimeAdmissionError('The terminal UPDATE has no original live process witness.')
+            return retain_unstarted(self.context.installation_root, self._pending_update, self.generation,
+                self.installation_id, self.invocation, self.execution)
+
+    def _update_admitted(self, current: state.LifecycleState) -> bool:
+        from .update_continuation import require_live, require_completed
+        from .update_controller import UpdateControllerError
+        from .control.rpc import ControlError
+        try:
+            if current.active_operation is not None:
+                return require_live(self.context.installation_root, self._pending_update, self.generation,
+                    self.installation_id, self.invocation, self.execution) == current
+            require_completed(self.context.installation_root, self._pending_update, self.generation,
+                self.installation_id, self.invocation, self.execution, current)
+            with state.hold_idle_authority(self.context.installation_root) as latest:
+                if latest != current:
+                    return False
+                self._receipt(generation=current.generation, pending=None)
+                self.generation, self._pending_update = current.generation, None
+            return True
+        except (state.LifecycleError, UpdateControllerError, ControlError, ValueError, OSError):
+            return False
+
     def acknowledge_continuation(self, operation_id: str, *, controller_pid: int, preparation: bool = False) -> dict:
         with self._lock:
-            if not self._settled or not self._same_process() or self._pending is not None and self._pending.operation_id != operation_id:
+            if not self._settled or not self._same_process() or self._pending_update is not None or self._pending is not None and self._pending.operation_id != operation_id:
                 raise RuntimeAdmissionError("The live runtime is not available for a new continuation acknowledgement.")
             journal = management_store.inspect_management_journal(self.context.installation_root, operation_id)
             with state.hold_operation_with_credential(
@@ -153,7 +277,7 @@ class RuntimeAdmission:
     def acknowledge_recovered_continuation(self, operation_id: str, *, controller_pid: int) -> dict:
         from .management_recovery_store import preserving_continuation_source
         with self._lock:
-            if not self._settled or not self._same_process() or self._pending is not None and self._pending.operation_id != operation_id:
+            if not self._settled or not self._same_process() or self._pending_update is not None or self._pending is not None and self._pending.operation_id != operation_id:
                 raise RuntimeAdmissionError("Only the original settled process can acknowledge preserving recovery.")
             journal = management_store.inspect_management_journal(self.context.installation_root, operation_id)
             with state.hold_operation_with_credential(self.context.installation_root,
@@ -183,8 +307,19 @@ class RuntimeAdmission:
             if not self._settled or not self._same_process():
                 return False
             current = state.inspect_state(self.context.installation_root)
+            if current.schema_version != state.MANAGEMENT_SCHEMA_VERSION:
+                return False
+            if self._completed_update_claim is not None:
+                from .control.rpc import ControlError
+                try:
+                    self._settle_completed_update_claim(current)
+                except (state.LifecycleError, ControlError, ValueError, OSError):
+                    return False
+                current = state.inspect_state(self.context.installation_root)
             operation = current.active_operation
             pending = self._pending
+            if self._pending_update is not None:
+                return self._update_admitted(current)
             if pending is None:
                 return operation is None and current.generation == self.generation
             if current.generation != pending.generation:

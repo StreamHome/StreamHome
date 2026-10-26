@@ -42,6 +42,19 @@ class LocalControlRPCTests(unittest.IsolatedAsyncioTestCase):
             await self.request(expected_uid=os.getuid()+1)
         self.assertEqual(self.calls, [])
 
+    async def test_only_guarded_update_start_accepts_extended_startup_deadline(self):
+        for action in ('update_start_candidate', 'update_start_previous'):
+            result = await asyncio.to_thread(rpc.request, self.path, expected_uid=os.getuid(),
+                installation_id=self.identity, invocation='a'*32, action=action,
+                arguments={}, timeout=930)
+            self.assertEqual(result, {'acknowledged': True})
+        with self.assertRaisesRegex(rpc.ControlError, 'control_timeout_invalid'):
+            await self.request(timeout=930)
+        with self.assertRaisesRegex(rpc.ControlError, 'control_timeout_invalid'):
+            await asyncio.to_thread(rpc.request, self.path, expected_uid=os.getuid(),
+                installation_id=self.identity, invocation='a'*32, action='update_start_candidate',
+                arguments={}, timeout=931)
+
     async def test_unknown_caller_is_rejected_before_reading_a_request(self):
         self.server.allowed_uids = frozenset()
         with self.assertRaises(rpc.ControlError):

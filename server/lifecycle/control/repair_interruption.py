@@ -37,6 +37,41 @@ def stop_prepared(payload: dict, observation: dict) -> None:
             or Path('/proc/sys/kernel/random/boot_id').read_text().strip() != payload['boot_id']):
         raise ControlError('control_repair_interruption_changed')
     scope = grant.get('issuer_scope')
+    _stop_owned(payload,observation,scope,selected,marker='repair-stop.json')
+
+
+def stop_control_prepared(payload: dict, observation: dict) -> None:
+    """Stop only after the original control scope and signed preparation verify."""
+    from .control_activation import prepared_for
+    from .artifact_stage import require_prepared
+    from .control_permission import require_initial
+    require_root()
+    selected=descriptor()
+    if (payload.get('action') != 'provision_control' or payload.get('activation_mode') != 'cutover'
+            or payload.get('initial_service_state') != 'running'):
+        raise ControlError('control_repair_interruption_changed')
+    permission=require_initial(payload)
+    prepared=prepared_for(payload);require_prepared(prepared)
+    candidate=payload.get('candidate',{})
+    if (candidate.get('control_bundle_id') != prepared.bundle_id
+            or candidate.get('control_manifest_sha256') != prepared.manifest_sha256):
+        raise ControlError('control_prepared_version_changed')
+    _stop_owned(payload,observation,permission['issuer']['scope'],selected,marker='control-stop.json',
+        before_stop=lambda:require_initial(payload))
+
+
+def _stop_owned(payload,observation,scope,selected,*,marker,before_stop=None):
+    """Shared exact unit/kernel proof; wrappers provide distinct root permissions."""
+    require_root()
+    operation=_identity(payload.get('operation_id'));directory=OPERATIONS/operation
+    if (marker not in {'repair-stop.json','control-stop.json'} or payload.get('initial_service_state') != 'running'
+            or payload.get('interruption_approved') is not True or payload.get('installation_id') != selected.installation_id
+            or read_protected_json(directory/'request.json') != payload
+            or observation.get('stage') != 'prepared' or observation.get('request_sha256') != _sha(payload)
+            or observation.get('generation') != payload['expected_generation']+1
+            or root_stop_epoch() != payload['stop_epoch']
+            or Path('/proc/sys/kernel/random/boot_id').read_text().strip() != payload['boot_id']):
+        raise ControlError('control_repair_interruption_changed')
     require_scope(scope, selected.installation_id)
     if scope['pid'] != os.getpid():
         raise ControlError('control_repair_interruption_changed')
@@ -62,7 +97,7 @@ def stop_prepared(payload: dict, observation: dict) -> None:
             or receipt.get('controller_invocation_id') != actor['InvocationID']):
         raise ControlError('control_os_receipt_changed')
     _verify_owned_units()
-    path = directory / 'repair-stop.json'
+    path = directory / marker
     if path.exists() or path.is_symlink():
         raise ControlError('control_repair_interruption_consumed')
     # This receipt authorizes no start. Stop propagation cancels this issuer
@@ -73,5 +108,6 @@ def stop_prepared(payload: dict, observation: dict) -> None:
     require_scope(scope, selected.installation_id)
     if root_stop_epoch() != payload['stop_epoch']:
         raise ControlError('control_operator_stopped')
+    if before_stop is not None:before_stop()
     systemctl('stop', 'streamhome.service', timeout=90)
     raise ControlError('control_operation_recovery_required')

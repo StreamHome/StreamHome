@@ -90,6 +90,20 @@ class FreshResumptionReviewTests(unittest.TestCase):
         self.assertFalse(previous.payload['boot_enabled'])
         self.assertTrue(previous.payload['previous_boot_enabled'])
 
+    def test_control_review_binds_old_controller_and_exact_selected_runtime_reader(self):
+        self.snapshot.update(management_action='provision_control',previous_control_manifest_sha256='b'*64,
+            selected_control_manifest_sha256='1'*64)
+        for action,digest in (('continue_recovery','1'*64),('rollback','b'*64)):
+            with self.subTest(action=action):
+                current=self.make(action)
+                self.request(current)
+                plan=review.launch_plan(current,approved=self.consent(current))
+                self.assertEqual(plan['schema_version'],3)
+                self.assertEqual(plan['control_manifest_sha256'],'b'*64)
+                self.assertEqual(plan['stages'][0]['control_manifest_sha256'],digest)
+        self.snapshot.pop('selected_control_manifest_sha256')
+        with self.assertRaises(ControlError):self.make()
+
     def test_waiting_for_a_fresh_response_has_a_finite_deadline(self):
         with patch.object(review.time, 'monotonic', side_effect=[100, 1001]), redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(ControlError, 'control_resumption_review_timeout'):

@@ -66,10 +66,15 @@ def observe(payload: dict) -> dict:
             or reviewed.supervisor_invocation_id != journal.supervisor_invocation_id):
         raise ControlError('control_resumption_review_changed')
     execution = journal_contract.selected_execution(journal)
+    if (plan['schema_version']==3
+            and execution.control_manifest_sha256 != resumption_contract.stage_reader(plan,payload['kind'])):
+        raise ControlError('control_resumption_review_changed')
     observed = {'installation_id': plan['installation_id'], 'operation_id': operation.operation_id,
         'owner_type': 'management', 'action': journal.action.value, 'generation': authority.generation,
         'execution_sha256': journal_contract.execution_tuple_sha256(execution), 'handoff_sha256': None,
         'accepted': journal.acceptance is not None, 'candidate_failed': False, 'previous_restored': False}
+    if plan['schema_version']==3:
+        observed['control_manifest_sha256']=execution.control_manifest_sha256
     stage = plan['stages'][0]
     if (observed['execution_sha256'] != stage['execution_sha256'] or stage['generation'] != authority.generation
             or stage['handoff_sha256'] is not None):

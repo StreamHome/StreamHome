@@ -46,6 +46,15 @@ def deployment_for_start(layout: RuntimeLayout) -> DeploymentConfig:
                 _,bound = bound_journal(layout.application,operation.operation_id)
                 if reference.revision != bound.execution.deployment_revision:
                     raise ConfigurationStoreError('The restore deployment differs from its original execution.')
+            if operation is not None and operation.operation_type is state.OperationType.UPDATE:
+                context = require_startup_context()
+                if context.mode.value != 'update_verify':
+                    raise ConfigurationStoreError('An unresolved update cannot select ordinary deployment settings.')
+                require_current_guarded_authority(context)
+                from .managed_update import verification_execution
+                execution = verification_execution(layout.application, os.environ)
+                if reference.revision != execution.deployment_revision:
+                    raise ConfigurationStoreError('The update deployment differs from its original binding.')
             if reference.revision in manifest.quarantined:
                 raise ConfigurationStoreError("The selected deployment is quarantined.")
             return store.read_revision(reference).settings
@@ -84,6 +93,11 @@ def execution_for_start(layout: RuntimeLayout):
         if read_active_execution(layout.application).execution != bound.execution:
             raise ConfigurationStoreError('The restore execution differs from its original binding.')
         return bound.execution
-    # Update and restore startup remain guarded by their existing controller
-    # protocols; their selected execution must be durably published separately.
+    if operation is not None and operation.operation_type is state.OperationType.UPDATE:
+        context = require_startup_context()
+        if context.mode.value != 'update_verify':
+            raise ConfigurationStoreError('An unresolved update cannot select an ordinary runtime.')
+        require_current_guarded_authority(context)
+        from .managed_update import verification_execution
+        return verification_execution(layout.application, os.environ)
     return read_active_execution(layout.application).execution

@@ -33,6 +33,35 @@ class RecoveryGrantTests(unittest.TestCase):
         return {**self.grant, 'schema_version': 3, 'request': current.payload(),
                 'issuer_scope': scope, 'resumption_plan_id': str(uuid.uuid4())}
 
+    def test_stopped_control_cutover_requires_a_scoped_non_resumption_grant(self):
+        payload=request_payload()
+        payload.update(action='provision_control',initial_service_state='stopped',supervisor=None,backend=None,
+            supervisor_invocation_id=None,boot_enabled=False,previous_boot_enabled=False)
+        payload['candidate']={**payload['previous'],'control_bundle_id':str(uuid.uuid4()),'control_manifest_sha256':'f'*64}
+        original=parse_management_request(payload)
+        current=replace(original,expected_generation=original.expected_generation+1,stop_epoch='d'*64)
+        value={**self.grant,'schema_version':2,'source_request_sha256':original.sha256,'request':current.payload(),
+            'issuer_scope':{'unit':'streamhome-install-'+original.installation_id+'-'+'2'*32+'.scope',
+                'invocation':'3'*32,'pid':100,'start_identity':'200'}}
+        with patch.object(grants.request_contract,'read_management_request',return_value=original):
+            self.assertEqual(grants.parse_grant(value),value)
+            unscoped={**value,'schema_version':1};unscoped.pop('issuer_scope')
+            with self.assertRaises(ControlError):grants.parse_grant(unscoped)
+            with self.assertRaises(ControlError):grants.parse_grant({**value,'schema_version':3,'resumption_plan_id':str(uuid.uuid4())})
+
+    def test_running_control_recovery_cannot_accept_a_new_reader_through_the_original_supervisor(self):
+        payload=request_payload();payload.update(action='provision_control',boot_enabled=False,previous_boot_enabled=False)
+        payload['candidate']={**payload['previous'],'control_bundle_id':str(uuid.uuid4()),'control_manifest_sha256':'f'*64}
+        original=parse_management_request(payload)
+        current=replace(original,expected_generation=original.expected_generation+1,backend=None)
+        value={**self.grant,'source_request_sha256':original.sha256,'request':current.payload()}
+        with patch.object(grants.request_contract,'read_management_request',return_value=original):
+            with self.assertRaises(ControlError):grants.parse_grant(value)
+            value.update(schema_version=3,resumption_plan_id=str(uuid.uuid4()),
+                issuer_scope={'unit':'streamhome-install-'+original.installation_id+'-'+'2'*32+'.scope',
+                    'invocation':'3'*32,'pid':100,'start_identity':'200'})
+            self.assertEqual(grants.parse_grant(value),value)
+
     def test_bound_repair_grant_retains_history_and_can_never_be_a_start_grant(self):
         value = self.resuming_grant();value.pop('resumption_plan_id')
         current = replace(self.original, expected_generation=self.current.expected_generation, backend=None,

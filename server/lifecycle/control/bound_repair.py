@@ -76,11 +76,26 @@ def repair(operation_id: str, *, request_path: Path | None, control_manifest_sha
     grant = run_worker(['bound-repair-prepare'], payload={'operation_id': operation_id,
         'expected_evidence_sha256': snapshot['evidence_sha256'], 'recovery_review_id': str(uuid.uuid4()),
         'issuer_scope': scope, 'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'stop_epoch': epoch}, timeout=180)
-    if (grant.get('schema_version') != 4 or grant.get('action') != ACTION
+    if snapshot.get('operation_type')=='restore':
+        if (grant.get('schema_version')!=3 or grant.get('action')!=ACTION
+                or grant.get('control_manifest_sha256')!=control_manifest_sha256 or root_stop_epoch()!=epoch):
+            raise ControlError('control_recovery_review_stale')
+        from .parent_recover import _run
+        _run(grant)
+        result={'stage':'environment_repaired_recovery_required'}
+    elif snapshot.get('operation_type') == 'update':
+        if (grant.get('schema_version') != 3 or grant.get('action') != ACTION
+                or grant.get('control_manifest_sha256') != control_manifest_sha256 or root_stop_epoch() != epoch):
+            raise ControlError('control_recovery_review_stale')
+        from .update_recover import _run
+        _run(grant)
+        result = {'stage': 'environment_repaired_recovery_required'}
+    elif (grant.get('schema_version') != 4 or grant.get('action') != ACTION
             or grant['request']['controller_control_manifest_sha256'] != control_manifest_sha256
             or root_stop_epoch() != epoch):
         raise ControlError('control_recovery_review_stale')
-    result = run_operation(grant['request'], recovery_grant=grant)
+    else:
+        result = run_operation(grant['request'], recovery_grant=grant)
     if result.get('stage') != 'environment_repaired_recovery_required':
         raise ControlError('control_operation_recovery_required')
     print('Exact dependencies were restored. The service is stopped and the original operation remains unresolved.')

@@ -33,12 +33,32 @@ from .tickets import read_protected_json
 
 
 JOURNAL = Path(JOURNAL_PATH)
+_ADMINISTRATIVE_CONTEXT = None
 
 
 @contextmanager
-def administrative_lock():
+def administrative_lock(*, reuse: bool = False):
     """Serialize privileged administrators; stop hooks deliberately bypass it."""
+    global _ADMINISTRATIVE_CONTEXT
     require_root()
+    if type(reuse) is not bool:
+        raise ControlError('control_administrator_lock_untrusted')
+    if reuse and _ADMINISTRATIVE_CONTEXT is not None:
+        import threading
+        context=_ADMINISTRATIVE_CONTEXT
+        if context['pid'] != os.getpid() or context['thread'] != threading.get_ident():
+            raise ControlError('control_administrator_busy')
+        metadata=os.fstat(context['handle'])
+        if ((metadata.st_dev,metadata.st_ino) != context['identity'] or metadata.st_uid != 0
+                or not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o7177 or metadata.st_nlink != 1):
+            raise ControlError('control_administrator_lock_untrusted')
+        try:fcntl.flock(context['handle'],fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError as exc:raise ControlError('control_administrator_busy') from exc
+        from .administration_lock import OWNER
+        if read_protected_json(OWNER,maximum=4096) != context['owner']:
+            raise ControlError('control_administrator_owner_changed')
+        yield
+        return
     parent = root_directory(Path("/etc/streamhome/control"), create=True)
     handle = None
     owner = None
@@ -53,10 +73,14 @@ def administrative_lock():
             raise ControlError("control_administrator_busy") from exc
         from .administration_lock import enter_owner
         owner = enter_owner()
+        import threading
+        _ADMINISTRATIVE_CONTEXT={'pid':os.getpid(),'thread':threading.get_ident(),'handle':handle,
+            'identity':(metadata.st_dev,metadata.st_ino),'owner':owner}
         yield
     finally:
         try:
             if owner is not None:
+                _ADMINISTRATIVE_CONTEXT=None
                 from .administration_lock import release_owner
                 release_owner(owner)
         finally:
@@ -732,9 +756,12 @@ def install(*, request_path: Path | None, manifest: dict, manifest_sha256: str, 
         except ListenerCheckError as exc:
             raise DeploymentConfigError(str(exc)) from exc
         return [f"Listener preflight passed: {config.web_bind}:{config.web_port}. External routing is not yet verified."]
+    from .cloudflare_connector import wizard_options,finalize_draft
+    pending_connectors={}
+    references,connector_draft=wizard_options(manifest,pending_connectors)
     if request_path is None:
         with open_console() as console:
-            draft = installation_wizard(console, diagnostics=diagnostics)
+            draft = installation_wizard(console, diagnostics=diagnostics,connectors=references,connector_draft=connector_draft)
     else:
         handle = os.open(request_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
         with os.fdopen(handle, "rb") as source:
@@ -747,6 +774,7 @@ def install(*, request_path: Path | None, manifest: dict, manifest_sha256: str, 
     selected_source = _select_public_source()
     if source_commit is not None and source_commit != selected_source:
         raise ControlError("control_source_changed_since_review")
+    finalize_draft(draft.deployment,pending_connectors,manifest=manifest)
     with administrative_lock():
         if inspect_installation() is not None or JOURNAL.exists() or JOURNAL.is_symlink():
             raise ControlError("control_installation_review_changed")

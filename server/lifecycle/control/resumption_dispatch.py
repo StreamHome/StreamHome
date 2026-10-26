@@ -1,4 +1,4 @@
-"""Fixed OS start/ExecStartPre bridge for one reviewed MANAGEMENT resumption."""
+"""Fixed OS start/ExecStartPre bridge for one independently reviewed resumption."""
 from __future__ import annotations
 
 import os
@@ -17,6 +17,32 @@ from .tickets import read_protected_json
 
 def qualify(grant: dict, *, control_manifest_sha256: str) -> dict:
     require_root()
+    if isinstance(grant, dict) and grant.get('operation_type') == 'update':
+        from . import update_grants
+        update_grants.parse_grant(grant)
+        if grant['schema_version'] != 2:
+            raise ControlError('control_resumption_review_changed')
+        value = store.live_state(grant['resumption_plan_id'], 'candidate_start',
+            control_manifest_sha256=control_manifest_sha256)
+        record = update_grants.require_resumption_plan(grant)
+        update_grants.require_live(grant)
+        if (record['plan'] != value['plan'] or record['issuer'] != value['issuer']
+                or grant['control_manifest_sha256'] != control_manifest_sha256):
+            raise ControlError('control_resumption_review_changed')
+        return value
+    if isinstance(grant, dict) and grant.get('operation_type') == 'restore':
+        from . import parent_grants
+        parent_grants.parse_grant(grant)
+        if grant['schema_version'] != 2:
+            raise ControlError('control_resumption_review_changed')
+        value = store.live_state(grant['resumption_plan_id'], 'candidate_start',
+            control_manifest_sha256=control_manifest_sha256)
+        record = parent_grants.require_resumption_plan(grant)
+        parent_grants.require_live(grant)
+        if (record['plan'] != value['plan'] or record['issuer'] != value['issuer']
+                or grant['control_manifest_sha256'] != control_manifest_sha256):
+            raise ControlError('control_resumption_review_changed')
+        return value
     if (not isinstance(grant, dict) or type(grant.get('schema_version')) is not int or grant['schema_version'] != 3
             or not isinstance(grant.get('request'), dict)):
         raise ControlError('control_resumption_review_changed')
@@ -41,7 +67,13 @@ def _observe(plan: dict, *, startup_hook: dict | None = None) -> dict:
                'controller_invocation_id': actor['InvocationID']}
     if startup_hook is not None:
         payload['startup_hook'] = startup_hook
-    return run_worker(['resumption-observe'], payload=payload, timeout=120)
+    reader = {'reader_operation_id':plan['operation_id']} if plan['schema_version']==3 else {}
+    observed = run_worker(['resumption-observe'], payload=payload, timeout=120,**reader)
+    if observed == {'pending': True}:
+        # The UID reader has proved the exact parent/grant but the canonical
+        # controller has not reached VERIFYING yet. This is no start authority.
+        raise ControlError('control_controller_changed')
+    return observed
 
 
 def _observed_unit(receipt: dict) -> bool:
@@ -70,7 +102,20 @@ def start(grant: dict, *, control_manifest_sha256: str) -> bool:
         # a consumed start, including when the original OS reply was lost.
         return _observed_unit(value['receipt'])
     _verify_owned_units()
-    observed = _observe(plan)
+    try:
+        observed = _observe(plan)
+    except ControlError as exc:
+        # The canonical controller may still be publishing VERIFYING evidence
+        # after the root progress observation. As in parent recovery, an
+        # unsuccessful speculative UID read grants no OS effect. The bounded
+        # caller may observe again only while this issuer/permission is live
+        # and no start stage has been consumed.
+        if exc.code not in {'control_controller_changed', 'control_worker_failed'}:
+            raise
+        fresh = qualify(grant, control_manifest_sha256=control_manifest_sha256)
+        if fresh['receipt'] is not None:
+            raise ControlError('control_resumption_outcome_unknown') from exc
+        return False
     store.consume_stage(plan['plan_id'], 'candidate_start', observed, control_manifest_sha256=control_manifest_sha256)
     qualify(grant, control_manifest_sha256=control_manifest_sha256)
     try:
@@ -90,10 +135,12 @@ def before_start(*, control_manifest_sha256: str) -> None:
     intent = contract.parse_start_intent(read_protected_json(store.START_INTENT))
     if intent['kind'] != 'candidate_start':
         raise ControlError('control_resumption_mode_unavailable')
-    value = store.live_state(intent['plan_id'], intent['kind'], control_manifest_sha256=control_manifest_sha256)
+    value = store.live_state(intent['plan_id'], intent['kind'], control_manifest_sha256=control_manifest_sha256,
+        runtime_reader=True)
     plan = value['plan']
-    grant = read_protected_json(OPERATIONS / plan['operation_id'] / f"recovery-{plan['generation']}.json")
-    qualify(grant, control_manifest_sha256=control_manifest_sha256)
+    name = ('update-recovery-' if plan['owner_type'] == 'update' else 'recovery-')+str(plan['generation'])+'.json'
+    grant = read_protected_json(OPERATIONS / plan['operation_id'] / name)
+    qualify(grant, control_manifest_sha256=plan['control_manifest_sha256'])
     if value['receipt'] is None or value['receipt']['status'] != 'consumed':
         raise ControlError('control_resumption_already_consumed')
     contract.require_start_intent(intent, plan, value['receipt'])

@@ -264,8 +264,51 @@ def _node_archive(archive: Path, directory: Path) -> None:
     extracted.rmdir()
 
 
+def require_runtime_root(root: Path, *, create: bool = False) -> Path:
+    """Do not follow an aliased or externally writable generation ancestor."""
+    runtime = root/'runtime'
+    try:
+        if create:
+            runtime.mkdir(mode=0o700, exist_ok=True)
+        metadata = runtime.lstat()
+    except OSError as exc:
+        raise RuntimeBuildError('The bound runtime root is unavailable.') from exc
+    if (not stat.S_ISDIR(metadata.st_mode) or runtime.is_symlink()
+            or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022):
+        raise RuntimeBuildError('The bound runtime root is aliased or unprotected.')
+    return runtime
+
+
+def preparation_source(root: Path, source_root: Path | None) -> Path:
+    """Read an exact target checkout without treating it as the runtime root.
+
+    An alternate source is private operation-scoped cache evidence. This only
+    selects committed build inputs; it does not authorize a release or cutover.
+    """
+    if source_root is None or source_root == root:
+        return root
+    from .layout import layout_for_root
+    layout = layout_for_root(root)
+    if not layout.managed or not isinstance(source_root, Path):
+        raise RuntimeBuildError("A target checkout requires a managed installation.")
+    base = layout.cache / 'update-preparation'
+    try:
+        relative = source_root.relative_to(base)
+        if len(relative.parts) != 2 or relative.parts[1] != 'checkout':
+            raise ValueError('unexpected target checkout path')
+        generation(relative.parts[0])
+        for directory in (layout.cache, base, source_root.parent, source_root):
+            state._validate_directory(directory, 'private target source checkout')
+        if source_root.resolve(strict=True) != source_root:
+            raise ValueError('aliased target checkout')
+    except (OSError, ValueError, state.LifecycleError) as exc:
+        raise RuntimeBuildError("The target source checkout is not private and canonical.") from exc
+    return source_root
+
+
 def prepare_runtime(root: Path, *, build_id: str, application_commit: str, stage: Callable = None,
-                    checkpoint: Callable[[], None] | None = None) -> PreparedRuntime:
+                    checkpoint: Callable[[], None] | None = None,
+                    source_root: Path | None = None) -> PreparedRuntime:
     """Build a new inactive generation at its permanent path, never move a venv."""
     if checkpoint is not None:
         checkpoint()
@@ -276,7 +319,8 @@ def prepare_runtime(root: Path, *, build_id: str, application_commit: str, stage
         raise RuntimeBuildError("Runtime preparation requires the canonical managed root.")
     if not re.fullmatch(r"[0-9a-f]{40}", application_commit) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", build_id):
         raise RuntimeBuildError("The application build identity is invalid.")
-    inputs = source_inputs(root, application_commit)
+    target_source = preparation_source(root, source_root)
+    inputs = source_inputs(target_source, application_commit)
     if checkpoint is not None:
         checkpoint()
     from contextlib import contextmanager, nullcontext
@@ -297,7 +341,7 @@ def prepare_runtime(root: Path, *, build_id: str, application_commit: str, stage
             fetch=lambda temporary: download(url, temporary, expected, checkpoint=checkpoint), checkpoint=checkpoint)
     ids = [str(uuid.uuid4()) for _ in range(4)]
     bundle, python_id, node_id, web_id = ids
-    runtime = root / "runtime"
+    runtime = require_runtime_root(root, create=True)
     for category in ("bundles", "python", "node", "web"):
         (runtime / category).mkdir(mode=0o700, parents=True, exist_ok=True)
         state._validate_directory(runtime / category, "runtime generation parent")
@@ -368,7 +412,7 @@ def prepare_runtime(root: Path, *, build_id: str, application_commit: str, stage
         (tools / "rclone").chmod(0o700)
         archive.unlink()
     with stage("Verifying the complete runtime generation"):
-        if source_inputs(root, application_commit) != inputs:
+        if preparation_source(root, source_root) != target_source or source_inputs(target_source, application_commit) != inputs:
             raise RuntimeBuildError("The application source changed during runtime preparation.")
         manifest = {
             "schema_version": 1, "bundle_id": bundle, "application_commit": application_commit, "application_build_id": build_id,
@@ -388,9 +432,10 @@ def prepare_runtime(root: Path, *, build_id: str, application_commit: str, stage
     return PreparedRuntime(bundle, python_id, node_id, web_id, file_sha256(bundle_dir / "manifest.json"), file_sha256(web_dir / "assets.json"))
 
 
-def verify_runtime(root: Path, execution) -> dict:
+def verify_runtime(root: Path, execution, *, source_root: Path | None = None) -> dict:
     """Verify a bound candidate before launch; inspection never repairs artifacts."""
-    bundle = root / "runtime/bundles" / generation(execution.runtime_bundle_id)
+    runtime = require_runtime_root(root)
+    bundle = runtime / "bundles" / generation(execution.runtime_bundle_id)
     path = bundle / "manifest.json"
     if path.is_symlink() or path.stat().st_size > 8 * 1024 * 1024 or file_sha256(path) != execution.runtime_manifest_sha256:
         raise RuntimeBuildError("The bound runtime manifest is unavailable or changed.")
@@ -399,7 +444,8 @@ def verify_runtime(root: Path, execution) -> dict:
             or manifest.get("application_commit") != execution.application_commit or manifest.get("application_build_id") != execution.application_build_id
             or manifest.get("python_id") != execution.python_environment_id or manifest.get("node_id") != execution.node_environment_id or manifest.get("web_id") != execution.web_bundle_id):
         raise RuntimeBuildError("The runtime manifest does not bind the selected execution.")
-    if {name: hashlib.sha256(raw).hexdigest() for name, raw in source_inputs(root, execution.application_commit).items()} != manifest.get("source"):
+    source = preparation_source(root, source_root)
+    if {name: hashlib.sha256(raw).hexdigest() for name, raw in source_inputs(source, execution.application_commit).items()} != manifest.get("source"):
         raise RuntimeBuildError("The application source no longer matches its runtime generation.")
     for category, identity, key in (("python", execution.python_environment_id, "python"), ("node", execution.node_environment_id, "node"), ("web", execution.web_bundle_id, "web")):
         if tree_inventory(root / "runtime" / category / generation(identity)) != manifest.get(key):

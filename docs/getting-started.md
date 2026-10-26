@@ -28,7 +28,7 @@ Run the general Linux installer:
 curl -fsSL https://raw.githubusercontent.com/StreamHome/StreamHome/main/install.sh | bash
 ```
 
-The installer checks out the current `main` branch, prepares dependencies and production assets, starts StreamHome, and prints the setup URL only after the API and web client are healthy. See [Installation](installation.md) for custom directories, no-start operation, ports, and supported package managers.
+The managed installer reviews the port, access mode and boot policy, then prepares application-owned dependencies at fixed paths. Run `sudo streamhome bootstrap` to obtain the one-time setup code. See [Installation](installation.md) for the qualified Ubuntu target, service commands, configuration and recovery. Installation paths are not configurable.
 
 After installation, StreamHome should display or provide the URL for its setup interface.
 

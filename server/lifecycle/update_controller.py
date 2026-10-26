@@ -63,7 +63,7 @@ DETAIL_PHASE_TRANSITIONS = {
     "installing": frozenset({"installing", "starting", "rolling_back", "recovering", "rollback_failed"}),
     "starting": frozenset({"starting", "recovering", "rolling_back", "rollback_failed"}),
     "rolling_back": frozenset({"rolling_back", "recovering", "rolled_back", "rollback_failed"}),
-    "recovering": frozenset({"recovering", "succeeded", "rolled_back", "rollback_failed"}),
+    "recovering": frozenset({"recovering", "rolling_back", "succeeded", "rolled_back", "rollback_failed"}),
     "succeeded": frozenset({"succeeded", "recovering"}),
     "rolled_back": frozenset({"rolled_back", "recovering"}),
     "failed": frozenset({"failed", "recovering"}),
@@ -98,6 +98,8 @@ DETAIL_PHASES_BY_LIFECYCLE = {
             "recovering",
             "failed",
             "rollback_failed",
+            "succeeded",
+            "rolled_back",
         }
     ),
 }
@@ -154,6 +156,13 @@ class UpdateControllerHandoff:
     process: subprocess.Popen[bytes]
     operation_id: str
     generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedUpdateHandoff:
+    operation_id: str
+    generation: int
+    controller_pid: int
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -262,6 +271,11 @@ def _read_update_journal(path: Path) -> dict[str, Any]:
         raise UpdateControllerPersistenceError("update journal is unreadable") from exc
     if not isinstance(payload, dict):
         raise UpdateControllerPersistenceError("update journal must be an object")
+    try:
+        from .update_execution import parse
+        parse(payload)
+    except ValueError as exc:
+        raise UpdateControllerPersistenceError("update execution binding is invalid") from exc
     return payload
 
 
@@ -478,6 +492,20 @@ def _validate_update_journal_semantics(
             raise UpdateControllerConflict("rollback journal is missing target identity")
 
 
+def _require_managed_progress_permission(root: Path, payload: Mapping[str, Any], *, allow_repair_transfer=False) -> None:
+    """Later managed owners cannot publish progress under an expired root issuer."""
+    from .update_execution import parse
+    try:
+        bound = parse(payload)
+    except ValueError as exc:
+        raise UpdateControllerConflict('managed update execution binding is invalid') from exc
+    if bound is not None and payload['lifecycle_generation'] >= bound.parent.original_generation+1:
+        from .update_recovery import require_controller_permission
+        grant = require_controller_permission(root, payload, bound, payload['lifecycle_generation'])
+        if grant is not None and grant['action'] in {'repair_bound_environment','repair_bound_control'} and not allow_repair_transfer:
+            raise UpdateControllerConflict('Bound repair permission cannot authorize update progress.')
+
+
 def mutate_update_journal(
     root: str | os.PathLike[str],
     *,
@@ -533,9 +561,12 @@ def mutate_update_journal(
             if operation is None or operation.owner_kind is not state.OwnerKind.UPDATER:
                 raise UpdateControllerConflict("update lifecycle authority does not match")
             next_detail_phase = changes.get("phase", current_detail_phase)
+            retry_failed_rollback = (current_detail_phase == 'rollback_failed'
+                and next_detail_phase == 'recovering')
             if (
                 not isinstance(next_detail_phase, str)
                 or next_detail_phase not in DETAIL_PHASE_TRANSITIONS[current_detail_phase]
+                    and not retry_failed_rollback
             ):
                 raise UpdateControllerConflict("update journal transition is not allowed")
             updated = dict(payload)
@@ -543,6 +574,17 @@ def mutate_update_journal(
             updated["transaction_id"] = operation_id
             updated["lifecycle_generation"] = generation
             updated["lifecycle_phase"] = expected_lifecycle.value
+            if retry_failed_rollback:
+                from .update_execution import parse as parse_managed_update
+                from .update_recovery import require_controller_permission
+                bound = parse_managed_update(updated)
+                if (not layout_for_root(root).managed or bound is None or bound.accepted is not None
+                        or expected_lifecycle is not state.LifecyclePhase.EXCLUSIVE
+                        or generation <= bound.parent.original_generation+1):
+                    raise UpdateControllerConflict('Failed rollback requires a fresh managed recovery owner.')
+                grant = require_controller_permission(root, updated, bound, generation)
+                if grant is None or grant['action'] != 'continue_recovery':
+                    raise UpdateControllerConflict('Failed rollback requires explicit continuation permission.')
             if payload.get("runtime_committed") is True:
                 if changes.get("runtime_committed") is False:
                     raise UpdateControllerConflict("runtime_committed cannot be reverted")
@@ -566,6 +608,12 @@ def mutate_update_journal(
                 updated["queued_at"] = None
             updated["updated_at"] = now
             _validate_update_journal_semantics(updated, authority=authority)
+            _require_managed_progress_permission(root, updated)
+            from .update_execution import require_transition
+            try:
+                require_transition(payload, updated)
+            except ValueError as exc:
+                raise UpdateControllerConflict("update execution binding changed") from exc
             _private_atomic_write(
                 journal_path,
                 (json.dumps(updated, indent=2, sort_keys=True) + "\n").encode("utf-8"),
@@ -606,6 +654,7 @@ def _record_transferred_generation(
             or journal_generation > previous_generation
         ):
             raise UpdateControllerConflict("update journal does not own the transferred lifecycle operation")
+        original_payload = dict(payload)
         payload["lifecycle_generation"] = generation
         payload["lifecycle_phase"] = lifecycle_phase.value
         payload["target_commit"] = target_commit
@@ -619,6 +668,13 @@ def _record_transferred_generation(
             expected_operation_type=state.OperationType.UPDATE,
         ) as authority:
             _validate_update_journal_semantics(payload, authority=authority)
+            # Generation transfer cannot reinterpret the original/candidate tuple.
+            from .update_execution import require_transition
+            try:
+                require_transition(original_payload, payload)
+            except ValueError as exc:
+                raise UpdateControllerConflict("transferred update execution binding changed") from exc
+            _require_managed_progress_permission(root, payload, allow_repair_transfer=True)
             _private_atomic_write(
                 journal_path,
                 (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
@@ -883,6 +939,8 @@ def _controller_environment(
         "STREAMHOME_LIFECYCLE_STARTUP_MODE",
         "STREAMHOME_LIFECYCLE_FIRST_ADOPTION",
         "STREAMHOME_LIFECYCLE_CONTROLLER_FD",
+        "STREAMHOME_MANAGED_UPDATE",
+        "STREAMHOME_MANAGED_UPDATE_GATE_FD",
     ):
         environment.pop(key, None)
     environment.update(
@@ -908,6 +966,16 @@ def _materialize_target_controller(root: Path, operation_id: str, target_commit:
     )
     if result.returncode != 0 or not result.stdout.startswith(b"#!/usr/bin/env bash\n"):
         raise UpdateControllerConflict("validated target update controller is unavailable")
+    if result.stdout.splitlines()[1:2] == [b'# StreamHome compatibility entry: scripts/runtime/update.sh']:
+        # Materialize the actual controller from the same validated commit.
+        # A detached compatibility wrapper would resolve paths relative to the
+        # runtime directory and could execute a different checked-out release.
+        result = subprocess.run(
+            ["git", "-C", str(root), "show", f"{target_commit}:scripts/runtime/update.sh"],
+            check=False, capture_output=True, timeout=30,
+        )
+        if result.returncode != 0 or not result.stdout.startswith(b"#!/usr/bin/env bash\n"):
+            raise UpdateControllerConflict("validated target update controller is unavailable")
     destination = layout_for_root(root).durable_runtime / f"update-controller.{operation_id}.sh"
     try:
         destination.unlink()
@@ -971,7 +1039,27 @@ def _run_controller(
     operator_action: str | None = None,
     pre_transfer_check: Callable[[], None] | None = None,
     on_transfer: Callable[[int], None] | None = None,
+    managed_initial: bool = False,
+    managed_recovery: bool = False,
+    maintenance: Callable[[state.ControllerLeaseHandle, int, dict], None] | None = None,
 ) -> int:
+    if (type(managed_initial) is not bool or type(managed_recovery) is not bool
+            or managed_initial and managed_recovery
+            or layout_for_root(root).managed != (managed_initial or managed_recovery)):
+        raise UpdateControllerConflict("Managed UPDATE requires its protected operation-unit adapter.")
+    maintenance_action = (managed_recovery and operator_action in {'repair_bound_environment','repair_bound_control'}
+        and maintenance is not None)
+    if maintenance is not None and (not maintenance_action or pre_transfer_check is None or on_transfer is None
+            or acknowledgement_fd is not None):
+        raise UpdateControllerConflict('Bound update repair requires its exact permission callbacks.')
+    if managed_initial and (recovery or operator_action is not None):
+        raise UpdateControllerConflict("Initial managed UPDATE cannot authorize operator recovery.")
+    if managed_recovery:
+        if (not recovery or operator_action not in {'continue_recovery', 'safe_abort'} and not maintenance_action
+                or pre_transfer_check is None or on_transfer is None):
+            raise UpdateControllerConflict('Managed UPDATE recovery requires its exact root continuation.')
+        from .update_recovery import require_takeover_permission
+        require_takeover_permission(root, operation_id, generation, operator_action)
     state.qualify_lifecycle_filesystem(root)
     state.qualify_local_filesystem(
         root,
@@ -991,11 +1079,13 @@ def _run_controller(
         )
     ):
         raise UpdateControllerConflict("update lifecycle authority is not resumable")
-    if operator_action not in {None, "safe_abort", "continue_recovery"}:
+    if operator_action not in {None, "safe_abort", "continue_recovery"} and not maintenance_action:
         raise UpdateControllerConflict("operator update action is unsupported")
-    if operator_action is not None and operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED:
+    if (operator_action is not None and operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED
+            and not (managed_recovery and operator_action == 'safe_abort'
+                and operation.phase is state.LifecyclePhase.RESERVED)):
         raise UpdateControllerConflict("operator update action requires recovery-required authority")
-    pre_cutover = operation.phase is state.LifecyclePhase.RESERVED
+    pre_cutover = operation.phase is state.LifecyclePhase.RESERVED and operator_action is None
     if pre_cutover:
         try:
             validate_pre_cutover_baseline(root, previous_commit)
@@ -1005,6 +1095,13 @@ def _run_controller(
     capability = state.load_controller_capability(
         root, operation_id=operation_id, generation=generation
     )
+    if managed_recovery and not maintenance_action:
+        original_check = pre_transfer_check
+        def protected_transfer_check():
+            original_check()
+            from .update_recovery import prepare_transfer
+            prepare_transfer(root, operation_id, generation, operator_action)
+        pre_transfer_check = protected_transfer_check
     lease, transferred = state.acquire_transferred_controller_lease(
         root,
         operation_id=operation_id,
@@ -1020,6 +1117,7 @@ def _run_controller(
     current_generation = transferred.state.generation
     current_phase = transferred_operation.phase
     controller_process: subprocess.Popen[bytes] | None = None
+    managed_gate_read = managed_gate_write = None
     try:
         _record_transferred_generation(
             root,
@@ -1032,7 +1130,23 @@ def _run_controller(
         )
         if on_transfer is not None:
             on_transfer(current_generation)
+        if maintenance_action:
+            lease.require_current()
+            journal_path, _, _ = _update_paths(root, operation_id, current_generation)
+            journal = read_update_journal(journal_path)
+            maintenance(lease, current_generation, journal)
+            lease.require_current()
+            if (state.inspect_state(root) != transferred.state or read_update_journal(journal_path) != journal):
+                raise UpdateControllerConflict('Bound update repair changed its original parent authority.')
+            return 0
+        if managed_initial:
+            from .managed_update import prepare_initial
+            prepare_initial(root, lease)
         if operator_action == "safe_abort":
+            if managed_recovery:
+                from .update_abort import complete
+                complete(root, lease)
+                return 0
             journal_path, _, _ = _update_paths(root, operation_id, current_generation)
             payload = _read_update_journal(journal_path)
             _validate_update_journal_semantics(payload, authority=transferred.state)
@@ -1080,6 +1194,8 @@ def _run_controller(
                 if recovery_payload.get("runtime_committed") is True
                 else state.LifecyclePhase.EXCLUSIVE
             )
+            if managed_recovery:
+                _require_managed_progress_permission(root, recovery_payload)
             state.transition_operation_with_credential(
                 root,
                 operation_id=operation_id,
@@ -1088,6 +1204,8 @@ def _run_controller(
                 next_phase=state.LifecyclePhase.EXCLUSIVE,
             )
             if recovery_phase is state.LifecyclePhase.VERIFYING:
+                if managed_recovery:
+                    _require_managed_progress_permission(root, recovery_payload)
                 state.transition_operation_with_credential(
                     root,
                     operation_id=operation_id,
@@ -1101,7 +1219,9 @@ def _run_controller(
                 operation_id=operation_id,
                 generation=current_generation,
                 expected_lifecycle_phase=recovery_phase,
-                expected_detail_phases=frozenset({"starting", "recovering"}),
+                expected_detail_phases=(frozenset({'starting', 'recovering', 'succeeded', 'rolled_back', 'failed', 'rollback_failed'})
+                    if managed_recovery
+                    else frozenset({"starting", "recovering"})),
                 changes={
                     "phase": "recovering",
                     "message": "Explicit operator recovery is continuing the protected update.",
@@ -1109,7 +1229,13 @@ def _run_controller(
                 },
             )
         create_cutover_permit(root, operation_id, current_generation)
-        if recovery:
+        if managed_recovery:
+            from .update_execution import parse as parse_update
+            selected = parse_update(recovery_payload).accepted
+            source_commit = selected.application_commit if selected is not None else target_commit
+            controller = _materialize_target_controller(root, operation_id, source_commit)
+            command = ['bash', str(controller), '--recover-interrupted', str(root)]
+        elif recovery:
             command = [str(root / "update.sh"), "--recover-interrupted", str(root)]
         else:
             controller = _materialize_target_controller(root, operation_id, target_commit)
@@ -1131,6 +1257,12 @@ def _run_controller(
             automatic=automatic,
             install_mode=install_mode,
         )
+        if managed_initial or managed_recovery:
+            if b'# StreamHome managed update engine: 1' not in controller.read_bytes().splitlines()[:4]:
+                raise UpdateControllerConflict('The exact target lacks managed UPDATE engine support.')
+            managed_gate_read, managed_gate_write = os.pipe2(os.O_CLOEXEC)
+            environment.update(STREAMHOME_MANAGED_UPDATE='true',
+                STREAMHOME_MANAGED_UPDATE_GATE_FD=str(managed_gate_read), PATH='/usr/bin:/bin')
         if pre_cutover:
             # Materialization and ownership handoff may outlive an owner's clean
             # checkout change. The process-local cutover checks again after drain.
@@ -1141,7 +1273,19 @@ def _run_controller(
             stdin=subprocess.DEVNULL,
             close_fds=True,
             env=environment,
+            **({'pass_fds': (managed_gate_read,)} if managed_initial or managed_recovery else {}),
         )
+        if managed_initial or managed_recovery:
+            os.close(managed_gate_read);managed_gate_read = None
+            identity = state._process_start_identity(controller_process.pid)
+            if identity is None:
+                raise UpdateControllerConflict('The managed UPDATE script exited before registration.')
+            mutate_update_journal(root, operation_id=operation_id, generation=current_generation,
+                expected_lifecycle_phase=current_phase,
+                expected_detail_phases=frozenset({'recovering'} if managed_recovery else {'preflight'}),
+                changes={'controller_pid': controller_process.pid, 'controller_start_ticks': identity})
+            _write_all(managed_gate_write, b'1')
+            os.close(managed_gate_write);managed_gate_write = None
         if acknowledgement_fd is not None:
             _write_all(
                 acknowledgement_fd,
@@ -1157,7 +1301,7 @@ def _run_controller(
             os.close(acknowledgement_fd)
             acknowledgement_fd = None
         return_code = controller_process.wait()
-        if operator_action is not None and return_code != 0:
+        if (operator_action is not None or managed_initial) and return_code != 0:
             current = state.inspect_state(root)
             current_operation = current.active_operation
             if (
@@ -1171,6 +1315,12 @@ def _run_controller(
                     current_generation,
                     current_operation.phase,
                 )
+                try:
+                    reconcile_operator_journal_recovery_required(root, operation_id=operation_id,
+                        generation=current_generation, current_phase=state.LifecyclePhase.RECOVERY_REQUIRED,
+                        pre_cutover_baseline_rejected=current_operation.phase is state.LifecyclePhase.RESERVED)
+                except (UpdateControllerError, state.LifecycleError, OSError):
+                    pass
         return return_code
     except Exception as exc:
         if controller_process is not None and controller_process.poll() is None:
@@ -1180,6 +1330,15 @@ def _run_controller(
             except subprocess.TimeoutExpired:
                 controller_process.kill()
                 controller_process.wait(timeout=5)
+        if managed_initial and controller_process is None:
+            try:
+                from .managed_update import retire_failed_preflight
+                if retire_failed_preflight(root, lease):
+                    return 1
+            except (OSError, ValueError, RuntimeError):
+                # Lost/indeterminate proof retains the original failed parent.
+                # The guarded operator protocol must resolve it explicitly.
+                pass
         failure_phase = current_phase
         if operator_action is not None:
             try:
@@ -1197,14 +1356,25 @@ def _run_controller(
             _mark_pre_cutover_baseline_rejected(root, operation_id, current_generation)
         else:
             _mark_recovery_required(root, operation_id, current_generation, failure_phase)
+        if managed_initial or managed_recovery:
+            try:
+                reconcile_operator_journal_recovery_required(root, operation_id=operation_id,
+                    generation=current_generation, current_phase=state.LifecyclePhase.RECOVERY_REQUIRED,
+                    pre_cutover_baseline_rejected=failure_phase is state.LifecyclePhase.RESERVED)
+            except (UpdateControllerError, state.LifecycleError, OSError):
+                pass
         raise
     finally:
+        for descriptor in (managed_gate_read, managed_gate_write):
+            if descriptor is not None:
+                os.close(descriptor)
         if acknowledgement_fd is not None:
             os.close(acknowledgement_fd)
-        try:
-            remove_cutover_permit(root, operation_id, current_generation)
-        except UpdateControllerError:
-            pass
+        if not (managed_recovery and operator_action in {'safe_abort', 'repair_bound_environment','repair_bound_control'}):
+            try:
+                remove_cutover_permit(root, operation_id, current_generation)
+            except UpdateControllerError:
+                pass
         # The Python supervisor alone owns controller.lock. The shell and its
         # descendants never inherit that descriptor.
         if not lease._released:
@@ -1223,7 +1393,8 @@ def _operator_recovery_identity(
         operation is None
         or operation.operation_id != operation_id
         or operation.operation_type is not state.OperationType.UPDATE
-        or operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED
+        or operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED and not (
+            layout_for_root(root).managed and operation.phase is state.LifecyclePhase.RESERVED)
         or current.generation != generation
     ):
         raise UpdateControllerConflict("operator update authority does not match")
@@ -1239,6 +1410,14 @@ def _operator_recovery_identity(
         expected_journal_generation,
         current.active_operation,
     )
+    if layout_for_root(root).managed and payload.get('lifecycle_phase') != operation.phase.value:
+        from .update_recovery_observation import read_binding
+        observed, witnessed_payload, _, witness = read_binding(root, operation_id)
+        if observed != current or witnessed_payload != payload or witness is None:
+            raise UpdateControllerConflict('The update phase gap is unproven.')
+        from dataclasses import replace
+        journal_authority = state.LifecycleState(current.schema_version, expected_journal_generation,
+            replace(operation, phase=state.LifecyclePhase(payload['lifecycle_phase'])))
     previous = pre_cutover_previous_commit(root, payload, journal_authority)
     if previous is not None:
         payload["previous_commit"] = previous
@@ -1293,6 +1472,7 @@ def run_operator_recovery(
         operator_action=action,
         pre_transfer_check=pre_transfer_check,
         on_transfer=on_transfer,
+        managed_recovery=layout_for_root(installation).managed,
     )
 
 
@@ -1307,7 +1487,7 @@ def spawn_update_controller(
     install_mode: str,
     update_branch: str,
     log_handle: Any,
-) -> UpdateControllerHandoff:
+) -> UpdateControllerHandoff | ManagedUpdateHandoff:
     installation = state.resolve_installation_root(root)
     if not COMMIT_RE.fullmatch(target_commit) or not COMMIT_RE.fullmatch(previous_commit):
         raise ValueError("update commits must be full SHA-1 identities")
@@ -1315,6 +1495,11 @@ def spawn_update_controller(
         raise ValueError("update install mode is invalid")
     if not BRANCH_RE.fullmatch(update_branch) or ".." in update_branch:
         raise ValueError("update branch is invalid")
+    if layout_for_root(installation).managed:
+        from .managed_update import spawn_initial
+        return spawn_initial(installation, operation_id=operation_id, generation=generation,
+            target_commit=target_commit, previous_commit=previous_commit, automatic=automatic,
+            install_mode=install_mode, update_branch=update_branch)
     acknowledgement_read, acknowledgement_write = os.pipe()
     process: subprocess.Popen[bytes] | None = None
     try:

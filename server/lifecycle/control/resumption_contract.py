@@ -40,14 +40,27 @@ def parse_plan(value: dict) -> dict:
     fields = {'schema_version', 'plan_id', 'installation_id', 'operation_id', 'review_id', 'owner_type',
               'action', 'generation', 'boot_id', 'stop_epoch', 'control_manifest_sha256',
               'issuer_sha256', 'expires_at_monotonic', 'prior_running', 'interruption_approved', 'resumption_approved', 'stages'}
+    parent = isinstance(value,dict) and type(value.get('schema_version')) is int and value['schema_version']==2
+    control = isinstance(value,dict) and type(value.get('schema_version')) is int and value['schema_version']==3
+    if parent:
+        fields |= {'parent_binding_sha256','recovery_action'}
     if (not isinstance(value, dict) or set(value) != fields or type(value['schema_version']) is not int
-            or value['schema_version'] != 1 or value['prior_running'] is not True
+            or value['schema_version'] not in {1,2,3} or value['prior_running'] is not True
             or value['interruption_approved'] is not True or value['resumption_approved'] is not True
             or not isinstance(value['owner_type'], str) or value['owner_type'] not in {'management', 'update', 'restore'}
-            or not isinstance(value['action'], str) or value['action'] not in {'configure_apply', 'repair_environment', 'provision_control', 'repair_bound_environment'}
-            or value['action'] != 'repair_bound_environment' and value['owner_type'] != 'management'
+            or not isinstance(value['action'], str)
+            or control and (value['owner_type'] != 'management' or value['action'] != 'provision_control')
+            or not parent and (value['action'] not in {'configure_apply', 'repair_environment', 'provision_control', 'repair_bound_environment'}
+                or value['action'] != 'repair_bound_environment' and value['owner_type'] != 'management')
+            or parent and (value['owner_type'] not in {'restore', 'update'}
+                or value['action'] != value['owner_type']+'_recovery'
+                or not isinstance(value['recovery_action'],str)
+                or value['recovery_action'] not in ({'continue_recovery'} if value['owner_type']=='update'
+                    else {'continue_recovery','rollback'}))
             or type(value['generation']) is not int or not 1 <= value['generation'] < 2**63):
         _invalid()
+    if parent:
+        _digest(value['parent_binding_sha256'])
     for name in ('plan_id', 'installation_id', 'operation_id', 'review_id', 'boot_id'):
         _uuid(value[name])
     for name in ('stop_epoch', 'control_manifest_sha256', 'issuer_sha256'):
@@ -56,16 +69,25 @@ def parse_plan(value: dict) -> dict:
     if type(expiry) not in {int, float} or not math.isfinite(expiry) or not 0 < expiry < 10**12:
         _invalid()
     stages = value['stages']
-    if not isinstance(stages, list) or len(stages) not in {1, 2}:
+    if not isinstance(stages, list) or len(stages) not in ({1} if parent else {1,2}):
         _invalid()
     for index, stage in enumerate(stages):
-        if (not isinstance(stage, dict) or set(stage) != {'kind', 'execution_sha256', 'generation', 'handoff_sha256'}
+        stage_fields = {'kind', 'execution_sha256', 'generation', 'handoff_sha256'}
+        if control:stage_fields.add('control_manifest_sha256')
+        if (not isinstance(stage, dict) or set(stage) != stage_fields
                 or stage['kind'] != ('candidate_start' if index == 0 else 'previous_start')
                 or type(stage['generation']) is not int
                 or not 1 <= stage['generation'] < 2**63
                 or stage['generation'] not in {value['generation'], value['generation'] + 1}):
             _invalid()
         _digest(stage['execution_sha256'])
+        if control:
+            _digest(stage['control_manifest_sha256'])
+            # A fresh rollback review may select the original runtime as its
+            # sole candidate_start. Distinct roles need not have distinct hashes;
+            # the canonical observer must still prove that exact selected tuple.
+            if index == 1 and stage['control_manifest_sha256'] != value['control_manifest_sha256']:
+                _invalid()
         if stage['generation'] == value['generation']:
             if stage['handoff_sha256'] is not None:
                 _invalid()
@@ -74,6 +96,19 @@ def parse_plan(value: dict) -> dict:
     if stages[0]['generation'] != value['generation'] or len(stages) == 2 and stages[0]['execution_sha256'] == stages[1]['execution_sha256']:
         _invalid()
     return value
+
+
+def stage_reader(plan: dict, kind: str) -> str:
+    """Return exactly the runtime reader reviewed for this finite stage.
+
+    The plan's top-level digest always binds the controller/issuing reader. A
+    control cutover separately binds each runtime reader; they are not aliases.
+    """
+    parse_plan(plan)
+    stage=next((stage for stage in plan['stages'] if stage['kind']==kind),None)
+    if stage is None:
+        raise ControlError('control_resumption_stage_unavailable')
+    return stage['control_manifest_sha256'] if plan['schema_version']==3 else plan['control_manifest_sha256']
 
 
 def authorize_stage(plan: dict, kind: str, observation: dict, *, boot_id: str, stop_epoch: str,
@@ -87,6 +122,10 @@ def authorize_stage(plan: dict, kind: str, observation: dict, *, boot_id: str, s
     parse_plan(plan)
     fields = {'installation_id', 'operation_id', 'owner_type', 'action', 'generation',
               'execution_sha256', 'handoff_sha256', 'accepted', 'candidate_failed', 'previous_restored'}
+    if plan['schema_version']==2:
+        fields |= {'parent_binding_sha256','recovery_action'}
+    if plan['schema_version']==3:
+        fields.add('control_manifest_sha256')
     if (not isinstance(observation, dict) or set(observation) != fields
             or any(type(observation[name]) is not bool for name in ('accepted', 'candidate_failed', 'previous_restored'))
             or type(observation['generation']) is not int or type(candidate_consumed) is not bool
@@ -95,7 +134,13 @@ def authorize_stage(plan: dict, kind: str, observation: dict, *, boot_id: str, s
             or stop_epoch != plan['stop_epoch'] or issuer_sha256 != plan['issuer_sha256']
             or any(observation[name] != plan[name] for name in ('installation_id', 'operation_id', 'owner_type', 'action'))):
         raise ControlError('control_resumption_review_changed')
+    if plan['schema_version']==2 and (any(observation[name] != plan[name]
+            for name in ('parent_binding_sha256','recovery_action'))
+            or observation['accepted'] and plan['recovery_action']!='continue_recovery'):
+        raise ControlError('control_resumption_review_changed')
     stage = next((stage for stage in plan['stages'] if stage['kind'] == kind), None)
+    if plan['schema_version']==3 and observation['control_manifest_sha256'] != stage_reader(plan,kind):
+        raise ControlError('control_resumption_review_changed')
     if (stage is None or any(observation[name] != stage[name] for name in ('generation', 'execution_sha256', 'handoff_sha256'))
             or kind == 'candidate_start' and (candidate_consumed or observation['candidate_failed'] or observation['previous_restored'])
             or kind == 'previous_start' and (not candidate_consumed or observation['accepted']

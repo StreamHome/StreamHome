@@ -204,6 +204,122 @@ class RuntimeBuildTests(unittest.TestCase):
         with self.assertRaises(runtime.RuntimeBuildError):
             runtime.source_inputs(self.root, 'a'*40)
 
+    def test_target_source_is_private_exact_git_input_and_never_installed_checkout(self):
+        from types import SimpleNamespace
+        cache = self.root / 'cache'
+        base = cache / 'update-preparation'
+        operation = base / str(uuid.uuid4())
+        source = operation / 'checkout'
+        for directory in (cache, base, operation, source):
+            directory.mkdir(mode=0o700)
+        names = ('server/main.py', 'server/requirements.txt', 'server/requirements.lock',
+            'web/package.json', 'web/package-lock.json')
+        for name in names:
+            path = source / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text('synthetic committed target')
+        def git(*args):
+            return subprocess.check_output(['/usr/bin/git', '-C', str(source), *args],
+                stderr=subprocess.DEVNULL, text=True).strip()
+        git('init', '-q')
+        git('add', 'server', 'web')
+        git('-c', 'user.name=Runtime test', '-c', 'user.email=runtime@example.invalid',
+            'commit', '-qm', 'test: isolated target source')
+        commit = git('rev-parse', 'HEAD')
+        layout = SimpleNamespace(managed=True, cache=cache)
+        with patch('lifecycle.layout.layout_for_root', return_value=layout):
+            selected = runtime.preparation_source(self.root, source)
+            self.assertEqual(set(runtime.source_inputs(selected, commit)), set(names))
+            self.assertFalse((self.root / 'server').exists())
+            (source / 'server/main.py').write_text('changed after target review')
+            with self.assertRaises(runtime.RuntimeBuildError):
+                runtime.source_inputs(selected, commit)
+            # The same bytes at an alias are insufficient path evidence.
+            alias = operation / 'alias'
+            alias.symlink_to(source, target_is_directory=True)
+            for invalid in (alias, base / 'not-a-uuid' / 'checkout'):
+                with self.assertRaises(runtime.RuntimeBuildError):
+                    runtime.preparation_source(self.root, invalid)
+            source.chmod(0o755)
+            with self.assertRaises(runtime.RuntimeBuildError):
+                runtime.preparation_source(self.root, source)
+            source.chmod(0o700)
+            moved = operation / 'preserved'
+            source.rename(moved)
+            source.symlink_to(moved, target_is_directory=True)
+            with self.assertRaises(runtime.RuntimeBuildError):
+                runtime.preparation_source(self.root, source)
+        self.assertEqual(runtime.preparation_source(self.root, None), self.root)
+
+    def test_runtime_ancestor_alias_and_external_writes_fail_before_generation_creation(self):
+        protected = runtime.require_runtime_root(self.root, create=True)
+        self.assertEqual(protected.stat().st_mode & 0o777, 0o700)
+        (protected / 'evidence').write_text('retained original bytes')
+        protected.chmod(0o775)
+        with self.assertRaises(runtime.RuntimeBuildError):runtime.require_runtime_root(self.root, create=True)
+        protected.chmod(0o700)
+        retained = self.root / 'retained-runtime'
+        protected.rename(retained);protected.symlink_to(retained, target_is_directory=True)
+        for create in (False, True):
+            with self.subTest(create=create), self.assertRaises(runtime.RuntimeBuildError):
+                runtime.require_runtime_root(self.root, create=create)
+        self.assertEqual((retained / 'evidence').read_text(), 'retained original bytes')
+        self.assertEqual(list(retained.iterdir()), [retained / 'evidence'])
+
+    def test_preflight_runtime_verification_uses_target_source_without_changing_installed_source(self):
+        import json
+        from types import SimpleNamespace
+        cache = self.root / 'cache'
+        base = cache / 'update-preparation'
+        operation = base / str(uuid.uuid4())
+        source = operation / 'checkout'
+        for directory in (cache, base, operation, source):
+            directory.mkdir(mode=0o700)
+        names = ('server/main.py', 'server/requirements.txt', 'server/requirements.lock',
+            'web/package.json', 'web/package-lock.json')
+        for checkout, value in ((self.root, 'installed source'), (source, 'candidate source')):
+            for name in names:
+                file = checkout / name
+                file.parent.mkdir(exist_ok=True)
+                file.write_text(value)
+            def git(*args):
+                return subprocess.check_output(['/usr/bin/git', '-C', str(checkout), *args],
+                    stderr=subprocess.DEVNULL, text=True).strip()
+            git('init', '-q');git('add', 'server', 'web')
+            git('-c', 'user.name=Runtime test', '-c', 'user.email=runtime@example.invalid',
+                'commit', '-qm', 'test: bound source')
+        commit = git('rev-parse', 'HEAD')
+        bundle, python, node, web = (str(uuid.uuid4()) for _ in range(4))
+        (self.root / 'runtime').mkdir(mode=0o700)
+        paths = {}
+        for category, identity in (('bundles', bundle), ('python', python), ('node', node), ('web', web)):
+            paths[category] = self.root / 'runtime' / category / identity
+            paths[category].mkdir(parents=True)
+        (paths['bundles'] / 'tools').mkdir()
+        (paths['web'] / 'assets.json').write_text('{}')
+        manifest = {'schema_version': 1, 'bundle_id': bundle, 'application_commit': commit,
+            'application_build_id': commit[:12], 'python_id': python, 'node_id': node, 'web_id': web,
+            'source': {name: hashlib.sha256(raw).hexdigest() for name, raw in runtime.source_inputs(source, commit).items()},
+            'tools': runtime.tree_inventory(paths['bundles'] / 'tools')}
+        for category in ('python', 'node', 'web'):
+            manifest[category] = runtime.tree_inventory(paths[category])
+        file = paths['bundles'] / 'manifest.json'
+        file.write_bytes(runtime.canonical_bytes(manifest))
+        execution = SimpleNamespace(runtime_bundle_id=bundle, runtime_manifest_sha256=runtime.file_sha256(file),
+            application_commit=commit, application_build_id=commit[:12], python_environment_id=python,
+            node_environment_id=node, web_bundle_id=web,
+            web_asset_manifest_sha256=runtime.file_sha256(paths['web'] / 'assets.json'))
+        layout = SimpleNamespace(managed=True, cache=cache)
+        with patch('lifecycle.layout.layout_for_root', return_value=layout):
+            self.assertEqual(runtime.verify_runtime(self.root, execution, source_root=source), manifest)
+            with self.assertRaises(runtime.RuntimeBuildError):
+                runtime.verify_runtime(self.root, execution)
+            (source / 'server/main.py').write_text('unreviewed candidate mutation')
+            with self.assertRaises(runtime.RuntimeBuildError):
+                runtime.verify_runtime(self.root, execution, source_root=source)
+        self.assertEqual((self.root / 'server/main.py').read_text(), 'installed source')
+        self.assertEqual(json.loads(file.read_bytes()), manifest)
+
     def test_failed_package_stage_keeps_private_evidence_and_raises(self):
         with self.assertRaises(runtime.RuntimeBuildError):
             runtime.run_stage(['/usr/bin/false'], cwd=self.root, environment=runtime.clean_environment(self.root), log=self.root/'failure.log', timeout=1)

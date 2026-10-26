@@ -272,13 +272,13 @@ def _ensure_private_directory(path: Path, description: str) -> None:
         raise RecoveryExecutionError(f"{description} is unavailable") from exc
 
 
-def _new_action_paths(root: Path, operation_id: str, generation: int) -> OperatorActionPaths:
+def _new_action_paths(root: Path, operation_id: str, generation: int, *, action_id: str | None = None) -> OperatorActionPaths:
     lifecycle = state.lifecycle_paths(root)
     actions_root = lifecycle.lifecycle_dir / "operator-actions"
     _ensure_private_directory(actions_root, "operator action directory")
     operation_dir = actions_root / operation_id
     _ensure_private_directory(operation_dir, "operator operation directory")
-    token = secrets.token_hex(8)
+    token = secrets.token_hex(8) if action_id is None else _canonical_operation_id(action_id).replace('-', '')
     return OperatorActionPaths(
         operation_dir,
         operation_dir / "action.lock",
@@ -606,7 +606,7 @@ def _interrupted_planned_action(
         directory_state = operation_dir.lstat()
         if not stat.S_ISDIR(directory_state.st_mode) or operation_dir.is_symlink():
             return None, True
-        matches: list[OperatorActionRecord] = []
+        matches: list[tuple[Path, OperatorActionRecord]] = []
         for path in operation_dir.glob("action.*.json"):
             record = read_operator_action_record(path)
             if (
@@ -622,14 +622,30 @@ def _interrupted_planned_action(
                 and record.controller_generation is None
                 and record.generation + 1 == generation
             ):
-                matches.append(record)
+                matches.append((path, record))
     except FileNotFoundError:
         return None, False
     except (OSError, RecoveryPlanningError):
         return None, True
+    if matches and operation_type == 'update' and layout_for_root(root).managed:
+        # The protected review selects one existing canonical intent. Earlier
+        # interrupted attempts stay retained and cannot make a fresh retry
+        # ambiguous merely because they share its source generation.
+        from .control import update_grants
+        from .control.rpc import ControlError
+        try:
+            grant = update_grants.read_grant(operation_id, generation, live=False)
+        except ControlError:
+            return None, True
+        expected = operation_dir/f"action.{grant['generation']}.{grant['review_id'].replace('-', '')}.json"
+        matches = [(path, record) for path, record in matches if path == expected
+            and record.evidence_identity == grant['canonical_evidence_identity']
+            and record.requested_action == grant['action']]
+        if not matches:
+            return None, True
     if len(matches) > 1:
         return None, True
-    return (matches[0] if matches else None), False
+    return (matches[0][1] if matches else None), False
 
 
 def _controller_status(root: Path, operation_id: str, generation: int) -> str:
@@ -665,8 +681,19 @@ def _controller_status(root: Path, operation_id: str, generation: int) -> str:
         lease = state.read_controller_lease(root)
         if lease is None:
             return "unknown" if lock_status == "held" else "inactive"
-        if lease.operation_id != operation_id or lease.generation != generation:
+        if lease.operation_id != operation_id:
             return "unknown"
+        if lease.generation != generation:
+            if lock_status == 'free' and not state.controller_lease_is_current(lease) and layout_for_root(root).managed:
+                from .update_recovery_observation import read_binding
+                from .control.rpc import ControlError
+                try:
+                    observed, journal, _, witness = read_binding(root, operation_id)
+                    if witness is not None and observed.generation == generation and lease.generation == journal['lifecycle_generation']:
+                        return 'inactive'
+                except (ControlError, update_controller.UpdateControllerError, ValueError):
+                    pass
+            return 'unknown'
         if state.controller_lease_is_current(lease):
             return "active" if lock_status == "held" else "unknown"
         return "unknown" if lock_status == "held" else "inactive"
@@ -766,6 +793,9 @@ def _verified_process_snapshot(runtime_control: Any) -> dict[int, Any] | None:
 
 
 def _runtime_status(root: Path) -> str:
+    if layout_for_root(root).managed:
+        from .control.runtime_observation import runtime_status
+        return runtime_status(root)
     try:
         from scratch import runtime_control
 
@@ -1016,6 +1046,7 @@ def _durable_recovery_evidence(
     operation_type: state.OperationType,
     *,
     normalized_generation: int | None = None,
+    normalized_lifecycle_phase: str | None = None,
 ) -> str:
     """Hash exact private recovery facts without projecting those facts publicly."""
 
@@ -1058,11 +1089,14 @@ def _durable_recovery_evidence(
             ):
                 raise ValueError("update journal generation is invalid")
             _, _, permit_path = update_controller._update_paths(
-                root, operation_id, raw_journal_generation
+                root, operation_id, (normalized_generation if normalized_generation is not None
+                    and layout_for_root(root).managed else raw_journal_generation)
             )
             journal.pop("updated_at", None)
             if normalized_generation is not None:
                 journal["lifecycle_generation"] = normalized_generation
+            if normalized_lifecycle_phase is not None:
+                journal['lifecycle_phase'] = normalized_lifecycle_phase
             raw_staging = journal.get("staging_dir")
             staging_commit: str | None = None
             staging_dirty: str | None = None
@@ -1091,13 +1125,14 @@ def _durable_recovery_evidence(
             facts = {
                 "journal": journal,
                 "installedCommit": _installed_commit(root),
-                "checkpoint": _evidence_file_identity(
-                    layout_for_root(root).durable_runtime / "pre-update-database.db"
-                ),
+                "checkpoint": _evidence_file_identity(_update_checkpoint_path(root, journal)),
                 "permit": _evidence_file_identity(permit_path),
                 "stagingCommit": staging_commit,
                 "stagingDirty": staging_dirty,
             }
+            if layout_for_root(root).managed:
+                from .update_recovery import runtime_link_source
+                facts['runtimeLinkSource'] = runtime_link_source(root)
         encoded = json.dumps(
             facts, separators=(",", ":"), sort_keys=True
         ).encode("utf-8")
@@ -1156,6 +1191,31 @@ def _queued_update_was_not_launched(root: Path, journal: Mapping[str, Any]) -> b
     )
 
 
+def _update_checkpoint_path(root: Path, journal: Mapping[str, Any]) -> Path:
+    from .update_execution import parse
+    if layout_for_root(root).managed and parse(journal) is not None:
+        from .update_checkpoint import path_for
+        return path_for(root, str(journal['transaction_id']))
+    return layout_for_root(root).durable_runtime / 'pre-update-database.db'
+
+
+def _update_checkpoint_status(root: Path, journal: Mapping[str, Any]) -> str:
+    from .control.rpc import ControlError
+    from .update_execution import parse
+    bound = parse(journal) if layout_for_root(root).managed else None
+    path = _update_checkpoint_path(root, journal)
+    if bound is None:
+        return _sqlite_status(path)
+    if _path_is_absent(path):
+        return 'absent' if bound.checkpoint is None or bound.accepted is not None else 'invalid'
+    try:
+        from .update_checkpoint import require_checkpoint
+        require_checkpoint(root, bound)
+        return 'valid'
+    except (OSError, ValueError, ControlError, state.LifecycleError, restore_controller.RestoreError):
+        return 'invalid'
+
+
 def _update_plan(
     root: Path,
     operation_id: str,
@@ -1165,6 +1225,7 @@ def _update_plan(
     controller_status: str,
     runtime_status: str,
     journal_authority_generation: int | None = None,
+    journal_authority_phase: str | None = None,
 ) -> tuple[dict[str, str], bool | None, str, list[str]]:
     journal_path, _, _ = update_controller._update_paths(root, operation_id, generation)
     try:
@@ -1176,6 +1237,11 @@ def _update_plan(
                 journal_authority_generation,
                 authority.active_operation,
             )
+        if journal_authority_phase is not None:
+            from dataclasses import replace
+            journal_authority = state.LifecycleState(journal_authority.schema_version,
+                journal_authority.generation, replace(journal_authority.active_operation,
+                    phase=state.LifecyclePhase(journal_authority_phase)))
         previous = update_controller.pre_cutover_previous_commit(root, journal, journal_authority)
         if previous is not None:
             journal["previous_commit"] = previous
@@ -1185,10 +1251,9 @@ def _update_plan(
     except update_controller.UpdateControllerError:
         return ({"journal": "invalid"}, None, "update_evidence_invalid", [])
 
-    checkpoint = layout_for_root(root).durable_runtime / "pre-update-database.db"
     artifacts = {
         "journal": "valid",
-        "databaseCheckpoint": _sqlite_status(checkpoint),
+        "databaseCheckpoint": _update_checkpoint_status(root, journal),
         "staging": _safe_staging_status(root, journal.get("staging_dir")),
         "targetCommit": "valid" if _git_commit_exists(root, journal.get("target_commit")) else "invalid",
         "previousCommit": "valid" if _git_commit_exists(root, journal.get("previous_commit")) else "invalid",
@@ -1203,7 +1268,14 @@ def _update_plan(
     detail = str(journal.get("phase") or "")
     actions: list[str] = []
     if committed:
-        if artifacts["targetCommit"] == "valid" and installed == target:
+        from .update_execution import parse as parse_update_execution
+        managed = parse_update_execution(journal) if layout_for_root(root).managed else None
+        if managed is not None:
+            selected = managed.accepted
+            artifacts["acceptedExecutionBinding"] = "valid" if selected is not None else "invalid"
+            if selected is not None and installed == selected.application_commit and _git_commit_exists(root, selected.application_commit):
+                actions.append("continue_recovery")
+        elif artifacts["targetCommit"] == "valid" and installed == target:
             actions.append("continue_recovery")
     else:
         if (
@@ -1231,6 +1303,24 @@ def _update_plan(
             and artifacts["targetCommit"] == "valid"
         ):
             actions.append("continue_recovery")
+        if layout_for_root(root).managed:
+            from .update_execution import parse as parse_update_execution
+            managed = parse_update_execution(journal)
+            if (managed is not None and managed.verification == managed.parent.execution
+                    and detail in {'starting', 'recovering', 'failed', 'rolled_back'}
+                    and installed == previous and artifacts['previousCommit'] == 'valid'
+                    and artifacts['databaseCheckpoint'] == 'valid'):
+                actions.append('continue_recovery')
+            if (managed is not None and managed.candidate is not None
+                    and detail == 'rollback_failed'
+                    and installed in {previous, target}
+                    and artifacts['previousCommit'] == 'valid'
+                    and artifacts['targetCommit'] == 'valid'
+                    and artifacts['databaseCheckpoint'] == 'valid'):
+                # A dead owner can leave the original rollback fenced here.
+                # Only the managed operation-bound snapshot permits a fresh,
+                # explicit continuation through the original rollback engine.
+                actions.append('continue_recovery')
         # Phase 5 does not persist an operation/generation-bound identity for
         # pre-update-database.db. SQLite validity (or absence) cannot prove that
         # checkpoint belongs to this transaction, so the planner never advertises
@@ -1251,6 +1341,7 @@ def _projection_with_evidence(
     artifacts: Mapping[str, str],
     actions: Sequence[str],
     durable_evidence: str,
+    lifecycle_phase: str = 'recovery_required',
 ) -> dict[str, Any]:
     projection = {
         "schemaVersion": 1,
@@ -1258,7 +1349,7 @@ def _projection_with_evidence(
         "operationReference": operation_id[:12],
         "operationType": operation_type,
         "generation": generation,
-        "lifecyclePhase": state.LifecyclePhase.RECOVERY_REQUIRED.value,
+        "lifecyclePhase": lifecycle_phase,
         "controllerActive": controller_status == "active",
         "controllerStatus": controller_status,
         "runtimeStatus": runtime_status,
@@ -1270,19 +1361,22 @@ def _projection_with_evidence(
         "readOnly": True,
         "cleanupEligible": False,
     }
+    facts = {
+        "operationId": operation_id,
+        "generation": generation,
+        "operationType": operation_type,
+        "reasonCode": reason,
+        "boundary": boundary,
+        "artifacts": artifacts,
+        "permittedActions": list(actions),
+        "controllerStatus": controller_status,
+        "runtimeStatus": runtime_status,
+        "durableEvidence": durable_evidence,
+    }
+    if lifecycle_phase != state.LifecyclePhase.RECOVERY_REQUIRED.value:
+        facts['lifecyclePhase'] = lifecycle_phase
     evidence_payload = json.dumps(
-        {
-            "operationId": operation_id,
-            "generation": generation,
-            "operationType": operation_type,
-            "reasonCode": reason,
-            "boundary": boundary,
-            "artifacts": artifacts,
-            "permittedActions": list(actions),
-            "controllerStatus": controller_status,
-            "runtimeStatus": runtime_status,
-            "durableEvidence": durable_evidence,
-        },
+        facts,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
@@ -1305,11 +1399,13 @@ def _plan_recovery_exact(
         raise RecoveryPlanningConflict("operation generation is invalid")
     authority = state.inspect_state(installation)
     operation = authority.active_operation
+    reserved_update = (operation is not None and operation.operation_type is state.OperationType.UPDATE
+        and operation.phase is state.LifecyclePhase.RESERVED and layout_for_root(installation).managed)
     if (
         operation is None
         or operation.operation_id != canonical_id
         or authority.generation != generation
-        or operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED
+        or operation.phase is not state.LifecyclePhase.RECOVERY_REQUIRED and not reserved_update
     ):
         raise RecoveryPlanningConflict("exact recovery-required lifecycle authority does not match")
     if operation.operation_type is state.OperationType.MANAGEMENT:
@@ -1321,7 +1417,11 @@ def _plan_recovery_exact(
     )
     runtime_status = _runtime_status(installation)
     durable_evidence = _durable_recovery_evidence(
-        installation, canonical_id, operation.operation_type
+        installation, canonical_id, operation.operation_type,
+        normalized_generation=(generation if layout_for_root(installation).managed
+            and operation.operation_type is state.OperationType.UPDATE else None),
+        normalized_lifecycle_phase=(operation.phase.value if layout_for_root(installation).managed
+            and operation.operation_type is state.OperationType.UPDATE else None),
     )
     interrupted, interrupted_ambiguous = _interrupted_planned_action(
         installation,
@@ -1372,6 +1472,22 @@ def _plan_recovery_exact(
         )
         boundary_name = "accepted"
     else:
+        journal_authority_phase = None
+        if layout_for_root(installation).managed:
+            path, _, _ = update_controller._update_paths(installation, canonical_id, generation)
+            raw = update_controller.read_update_journal(path)
+            if (raw.get('lifecycle_phase') != operation.phase.value
+                    or raw.get('lifecycle_generation') != generation and journal_generation == generation):
+                from .update_recovery_observation import read_binding
+                from .control.rpc import ControlError
+                try:
+                    observed, payload, _, witness = read_binding(installation, canonical_id)
+                    if observed != authority or witness is None or payload != raw:
+                        raise RecoveryPlanningConflict('Update phase gap is unproven.')
+                    journal_authority_phase = raw['lifecycle_phase']
+                    journal_generation = raw['lifecycle_generation']
+                except ControlError as exc:
+                    raise RecoveryPlanningConflict('Update phase gap is unproven.') from exc
         artifacts, boundary, reason, actions = _update_plan(
             installation,
             canonical_id,
@@ -1380,27 +1496,38 @@ def _plan_recovery_exact(
             controller_status=controller_status,
             runtime_status=runtime_status,
             journal_authority_generation=journal_generation,
+            journal_authority_phase=journal_authority_phase,
         )
         boundary_name = "runtimeCommitted"
     if interrupted is not None and not interrupted_ambiguous:
+        historical_runtime = runtime_status
+        historical_phase = state.LifecyclePhase.RECOVERY_REQUIRED.value
+        if operation.operation_type is state.OperationType.UPDATE and layout_for_root(installation).managed:
+            from .control import update_grants
+            historical_grant = update_grants.read_grant(canonical_id, generation, live=False)
+            historical_runtime = historical_grant['runtime_status']
+            historical_phase = historical_grant['source_lifecycle_phase']
         prior_durable_evidence = _durable_recovery_evidence(
             installation,
             canonical_id,
             operation.operation_type,
             normalized_generation=interrupted.generation,
+            normalized_lifecycle_phase=(historical_phase if operation.operation_type is state.OperationType.UPDATE
+                and layout_for_root(installation).managed else None),
         )
         prior = _projection_with_evidence(
             operation_id=canonical_id,
             operation_type=operation.operation_type.value,
             generation=interrupted.generation,
             controller_status=controller_status,
-            runtime_status=runtime_status,
+            runtime_status=historical_runtime,
             reason=reason,
             boundary_name=boundary_name,
             boundary=boundary,
             artifacts=artifacts,
             actions=actions,
             durable_evidence=prior_durable_evidence,
+            lifecycle_phase=historical_phase,
         )
         if (
             prior["evidenceIdentity"] != interrupted.evidence_identity
@@ -1412,6 +1539,8 @@ def _plan_recovery_exact(
     if interrupted_ambiguous:
         actions = []
         reason = "operator_action_evidence_invalid"
+    if reserved_update:
+        actions = [action for action in actions if action == 'safe_abort']
     return _projection_with_evidence(
         operation_id=canonical_id,
         operation_type=operation.operation_type.value,
@@ -1424,6 +1553,7 @@ def _plan_recovery_exact(
         artifacts=artifacts,
         actions=actions,
         durable_evidence=durable_evidence,
+        lifecycle_phase=operation.phase.value,
     )
 
 
@@ -1535,6 +1665,19 @@ def _terminal_update_evidence(payload: Mapping[str, Any], operation_id: str) -> 
     ):
         return False
     committed = payload.get("runtime_committed")
+    from .update_execution import parse as parse_update
+    try:
+        bound = parse_update(payload)
+    except ValueError:
+        return False
+    if bound is not None:
+        committed_at = payload.get('runtime_committed_at')
+        if (bound.accepted is None or payload.get('lifecycle_phase') != 'verifying'
+                or type(committed_at) not in {int, float} or not 0 < committed_at <= finished_at < float('inf')):
+            return False
+        if phase == 'rolled_back':
+            return bound.accepted == bound.parent.execution and payload.get('failed_target') == target
+        return bound.accepted == bound.candidate and payload.get('failed_target') in (None, '')
     if phase == "succeeded":
         committed_at = payload.get("runtime_committed_at")
         return bool(
@@ -1553,9 +1696,32 @@ def _verified_update_exit_twelve(
     root: Path, operation_id: str, controller_generation: int
 ) -> bool:
     """Recognize only the updater's exact already-reconciled success contract."""
-
+    from .control.rpc import ControlError
     try:
         authority = state.inspect_state(root)
+        if layout_for_root(root).managed:
+            from . import update_execution, update_history
+            from .control.provision_worker import _private_record
+            from .execution_state import read_active_execution
+            record = _private_record(update_history._path(root, operation_id, controller_generation))
+            journal = record.get('journal')
+            if (not isinstance(journal, dict) or record != update_history._record(journal)
+                    or record['generation'] != controller_generation or record['operation_id'] != operation_id
+                    or authority.generation < controller_generation
+                    or authority.active_operation is not None
+                        and authority.active_operation.operation_id == operation_id
+                    or not _terminal_update_evidence(journal, operation_id)):
+                return False
+            bound = update_execution.parse(journal)
+            if bound is None or bound.accepted is None:
+                return False
+            active = read_active_execution(root)
+            lease = state.read_controller_lease(root)
+            if lease is not None and lease.operation_id == operation_id and state.controller_lease_is_current(lease):
+                return False
+            return (active.installation_id == bound.parent.installation_id
+                and active.operation_id == operation_id and active.generation == controller_generation
+                and active.execution == bound.accepted and _installed_commit(root) == bound.accepted.application_commit)
         journal = update_controller.read_update_journal(layout_for_root(root).durable_runtime / "update-state.json")
         if (
             authority.active_operation is not None
@@ -1570,7 +1736,7 @@ def _verified_update_exit_twelve(
         if journal["phase"] == "succeeded":
             return journal["runtime_committed"] is True and installed == journal["target_commit"]
         return journal["runtime_committed"] is False and installed == journal["previous_commit"]
-    except (state.LifecycleError, update_controller.UpdateControllerError, OSError):
+    except (state.LifecycleError, update_controller.UpdateControllerError, OSError, ValueError, ControlError):
         return False
 
 
@@ -1687,6 +1853,10 @@ def _cleanup_update_resolution(
     controller_generation: int,
     action: str,
 ) -> bool:
+    if layout_for_root(root).managed:
+        # Legacy shared paths/staging are not an UPDATE-owned cleanup set.
+        # Managed snapshot retirement already requires its original live owner.
+        return False
     journal_path, _, permit_path = update_controller._update_paths(
         root, operation_id, controller_generation
     )
@@ -1872,6 +2042,22 @@ def _resolution_is_exact(
     controller_generation: int,
 ) -> bool:
     authority = state.inspect_state(root)
+    if record.operation_type == state.OperationType.UPDATE.value and layout_for_root(root).managed:
+        if record.requested_action != 'safe_abort':
+            return _verified_update_exit_twelve(root, record.operation_id, controller_generation)
+        from . import update_history
+        from .control.provision_worker import _private_record
+        from .control.rpc import ControlError
+        try:
+            retained = _private_record(update_history._path(root, record.operation_id, controller_generation))
+            journal = retained['journal']
+            if (retained != update_history._record(journal) or retained['operation_id'] != record.operation_id
+                    or retained['generation'] != controller_generation or journal.get('error') != 'operator_safe_abort'):
+                return False
+            update_history.require_retained(root, journal, authority)
+            return True
+        except (OSError, KeyError, ValueError, ControlError, state.LifecycleError):
+            return False
     if authority.active_operation is not None:
         return False
     if record.operation_type == state.OperationType.RESTORE.value:
@@ -2033,10 +2219,14 @@ def execute_recovery(
     generation: int,
     action: str,
     evidence_identity: str,
+    execution_guard: Callable[[], None] | None = None,
+    action_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute exactly one fresh-plan-supported operator recovery action."""
 
     installation = state.resolve_installation_root(root)
+    if execution_guard is not None:
+        execution_guard()
     canonical_id = _canonical_operation_id(operation_id)
     if action not in ACTION_IDENTIFIERS:
         raise RecoveryPlanningConflict("operator action is unsupported")
@@ -2055,10 +2245,18 @@ def execute_recovery(
         or action not in initial_plan["permittedActions"]
     ):
         raise RecoveryEvidenceStale("operator plan is stale or does not permit the action")
-    paths = _new_action_paths(installation, canonical_id, generation)
+    if layout_for_root(installation).managed and initial_plan['operationType'] == 'update':
+        from .control import update_grants
+        permission = update_grants.read_grant(canonical_id, generation+1)
+        if (action_id != permission['review_id'] or action != permission['action']
+                or evidence_identity != permission['canonical_evidence_identity']):
+            raise RecoveryEvidenceStale('managed update intent differs from its protected review')
+    paths = _new_action_paths(installation, canonical_id, generation, action_id=action_id)
     record: OperatorActionRecord | None = None
     transferred_generation: int | None = None
     with _operator_action_lock(paths):
+        if action_id is not None and (paths.record_path.exists() or paths.record_path.is_symlink()):
+            raise RecoveryExecutionError('the exact recovery intent already exists')
         fresh_plan = plan_recovery(
             installation,
             operation_id=canonical_id,
@@ -2084,6 +2282,8 @@ def execute_recovery(
         _write_action_record(paths.record_path, record)
 
         def pre_transfer_check() -> None:
+            if execution_guard is not None:
+                execution_guard()
             current = _plan_recovery_exact(
                 installation,
                 operation_id=canonical_id,
@@ -2108,6 +2308,8 @@ def execute_recovery(
                 status="executing",
                 controller_generation=next_generation,
             )
+            if execution_guard is not None:
+                execution_guard()
 
         try:
             if record.operation_type == state.OperationType.RESTORE.value:
