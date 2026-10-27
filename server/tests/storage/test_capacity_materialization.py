@@ -13,7 +13,7 @@ from sqlmodel import SQLModel
 import db as database
 from config import settings
 from models import StorageReservation
-from services.storage_capacity import StorageCapacity, StorageCapacityError, _remaining_from_sample
+from services.storage_capacity import StorageCapacity, StorageCapacityError, _owned_entries, _remaining_from_sample
 from services.storage_inventory import scan_managed
 
 
@@ -143,6 +143,49 @@ class MaterializedCapacityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_remaining_from_sample(rows, sample), 130)
         self.assertEqual(_remaining_from_sample(rows, sample, filesystem='a'), 70)
         self.assertEqual(_remaining_from_sample(rows, sample, scope='cloud'), 70)
+
+
+class InventoryAccountingTests(unittest.TestCase):
+    def test_owned_paths_keep_component_boundaries_and_deduplicate_aliases(self):
+        root = Path.cwd() / 'inventory'
+        sample = {'_entries': [
+            (str(root / 'job' / 'output.mp4'), 1, 1, 30),
+            (str(root / 'job' / 'alias.mp4'), 1, 1, 30),
+            (str(root / 'job-old' / 'output.mp4'), 1, 2, 40),
+            (str(root / 'jobs' / 'output.mp4'), 1, 3, 50),
+        ]}
+        original = list(sample['_entries'])
+        with patch.object(Path, 'stat', side_effect=AssertionError('Accounting must use the sample')):
+            self.assertEqual(_owned_entries(str(root / 'job'), sample), {(1, 1): 30})
+            self.assertEqual(_owned_entries(str(root / 'job' / 'output.mp4'), sample), {(1, 1): 30})
+        self.assertEqual(sample, {'_entries': original})
+
+    def test_backup_companions_are_exact_paths_and_require_backup_ownership(self):
+        path = str(Path.cwd() / 'inventory' / 'database.db')
+        names = [path, *(path + suffix for suffix in ('-journal', '-wal', '-shm', '.manifest.json'))]
+        sample = {'_entries': [(name, 1, index, 10) for index, name in enumerate(names)]}
+        sample['_entries'].extend([
+            (path + '-wal.old', 1, 5, 100),
+            (str(Path(path + '-wal') / 'child'), 1, 6, 100),
+        ])
+        self.assertEqual(_owned_entries(path, sample), {(1, 0): 10})
+        self.assertEqual(_owned_entries(path, sample, sqlite_backup=True),
+                         {(1, index): 10 for index in range(5)})
+
+    def test_inventory_path_parsing_does_not_multiply_by_reservation_count(self):
+        root = Path.cwd() / 'inventory'
+        claims, files_per_claim = 16, 32
+        rows = [StorageReservation(id=str(index), owner='writer', scope='local', filesystem='local',
+                    path=str(root / f'job-{index}'), peak_bytes=100) for index in range(claims)]
+        sample = {'_entries': [(str(root / f'job-{index}' / f'{file}.bin'), 1,
+                    index * files_per_claim + file, 1)
+                    for index in range(claims) for file in range(files_per_claim)]}
+        with patch('services.storage_capacity.Path', wraps=Path) as paths:
+            self.assertEqual(_remaining_from_sample(rows, sample), claims * (100 - files_per_claim))
+        # Permit linear inventory preparation and pairwise claim-conflict checks,
+        # but reject reparsing the entire inventory for every reservation.
+        self.assertLessEqual(paths.call_count, 2 * len(sample['_entries']) + 2 * claims ** 2)
+        self.assertEqual(set(sample), {'_entries'})
 
 
 if __name__ == '__main__':

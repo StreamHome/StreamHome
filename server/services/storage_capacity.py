@@ -41,13 +41,27 @@ def filesystem_for(path: Path | str) -> tuple[str, Path]:
     return str(candidate.stat().st_dev), candidate
 
 
-def _owned_entries(path: str, measured: dict, *, sqlite_backup: bool = False) -> dict[tuple[int, int], int]:
-    root = Path(os.path.abspath(path))
-    companions = {Path(str(root) + suffix) for suffix in ('-journal', '-wal', '-shm', '.manifest.json')} if sqlite_backup else set()
+_SampleEntry = tuple[tuple[str, ...], int, int, int]
+
+
+def _sample_entries(measured: dict) -> list[_SampleEntry]:
+    """Prepare one observation without resolving paths or caching across scans."""
+    return [(Path(os.path.normcase(name)).parts, device, inode, size)
+            for name, device, inode, size in measured.get('_entries', [])]
+
+
+def _owned_entries(path: str, measured: dict, *, sqlite_backup: bool = False,
+                   entries: list[_SampleEntry] | None = None) -> dict[tuple[int, int], int]:
+    root = os.path.abspath(path)
+    parts = Path(os.path.normcase(root)).parts
+    depth = len(parts)
+    companions = {Path(os.path.normcase(root + suffix)).parts
+                  for suffix in ('-journal', '-wal', '-shm', '.manifest.json')} if sqlite_backup else set()
+    if entries is None:
+        entries = _sample_entries(measured)
     result = {}
-    for name, device, inode, size in measured.get('_entries', []):
-        candidate = Path(name)
-        if candidate == root or root in candidate.parents or candidate in companions:
+    for candidate, device, inode, size in entries:
+        if candidate[:depth] == parts or candidate in companions:
             result[(device, inode)] = size
     return result
 
@@ -62,8 +76,10 @@ def _remaining_from_sample(rows, measured: dict, *, scope: str = 'local', filesy
     selected = [row for row in rows if row.scope == scope and (filesystem is None or row.filesystem == filesystem)]
     if scope != 'local':
         return sum(max(0, row.peak_bytes - row.written_bytes) for row in selected)
-    tracked = {row.id: _owned_entries(row.path, measured, sqlite_backup=row.owner == 'backup.snapshot') for row in rows
-               if row.scope == 'local' and row.track_materialized and row.peak_bytes > 0}
+    tracked_rows = [row for row in rows if row.scope == 'local' and row.track_materialized and row.peak_bytes > 0]
+    entries = _sample_entries(measured) if tracked_rows else []
+    tracked = {row.id: _owned_entries(row.path, measured, sqlite_backup=row.owner == 'backup.snapshot',
+                                     entries=entries) for row in tracked_rows}
     conflicts = set()
     for index, row in enumerate(rows):
         if row.id not in tracked:
