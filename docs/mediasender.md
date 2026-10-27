@@ -1044,6 +1044,21 @@ Check:
 * redirects do not lead to a blocked or inaccessible address;
 * the source is an actual media file or supported manifest.
 
+### Ingestion is rejected for storage capacity
+
+Ingestion estimates the muxed output from available source size, bitrate and
+duration metadata. Missing metadata uses a conservative fallback. Each preview
+generation has its own reservation; publication separately admits the measured
+copy and any retained files. An audio-language inspection does not require an
+additional extracted-media copy.
+
+Source declarations are estimates, not guaranteed sizes or final media evidence.
+The server monitors actual output and preview usage, requests additional capacity
+as headroom runs low, and stops the writer if growth cannot be admitted. Monitoring
+is periodic, so native buffered writes can cross a threshold between observations.
+The managed budget, concurrent reservations and physical disk reserve remain in
+force. Increasing a configured budget does not increase physical free space.
+
 ### Direct MP4 fails while HLS works
 
 Confirm that the submitted URL is recognized as a direct media file rather than an HLS manifest.

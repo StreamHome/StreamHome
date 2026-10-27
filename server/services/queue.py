@@ -738,7 +738,9 @@ class DownloadQueueManager:
         task_completed = False
         mutation = None
         ownership = None
-        capacity_reservations: list[str] = []
+        from lifecycle.ingestion_capacity import IngestionCapacity
+        from services.ingestion_estimate import estimate_ingestion, MIB
+        ingestion_capacity = IngestionCapacity(task_id)
         capacity_monitor = None
         capacity_failure = None
         preview_id: Optional[str] = None
@@ -877,31 +879,22 @@ class DownloadQueueManager:
             probed_duration = float(probe_res.get("video_duration") or 0)
             if probed_duration > 0:
                 duration_secs = probed_duration
-            estimated_bytes = (
-                int(duration_secs * self.ESTIMATED_MEDIA_BYTES_PER_SECOND)
-                + self.STORAGE_SAFETY_MARGIN_BYTES
-            )
-            self._reserve_storage(task_id, estimated_bytes)
-            # Both staging rewrites/extracted audio and publication copies can
-            # coexist. The shared authority admits their peak on each device.
+            estimate = estimate_ingestion(duration_secs, probe_res, separate_audio=bool(audio_url),
+                                          subtitle_count=len(subtitles_list),
+                                          fallback_bytes_per_second=self.ESTIMATED_MEDIA_BYTES_PER_SECOND)
+            # Only this staging output belongs to this claim. Preview generations
+            # and measured publication copies have independent, nonoverlapping roots.
             try:
-                temporary_ceiling = estimated_bytes * 3
-                temporary_reservation = await storage_capacity.reserve(f"ingestion-temp:{task_id}", temporary_ceiling, staging_task_root)
-                capacity_reservations.append(temporary_reservation)
+                await ingestion_capacity.admit('temp', staging_task_root, estimate.workspace_bytes)
             except StorageCapacityError as exc:
                 raise IngestionTaskError(IngestionFailure(exc.code, "Local storage cannot admit the complete ingestion workspace.")) from exc
             owner_task = asyncio.current_task()
 
             async def watch_capacity():
                 nonlocal capacity_failure
-                written = 0
                 try:
                     while True:
-                        size = await run_cancellation_safe_thread(self._staging_size, staging_task_root)
-                        if size > temporary_ceiling:
-                            raise StorageCapacityError("storage_reservation_exceeded")
-                        written = size
-                        await storage_capacity.progress(temporary_reservation, written)
+                        await ingestion_capacity.check()
                         await asyncio.sleep(0.25)
                 except asyncio.CancelledError:
                     raise
@@ -1031,10 +1024,13 @@ class DownloadQueueManager:
                     preview_task = await preview_db.get(DownloadTask, task_id)
                     if preview_task is None:
                         raise RuntimeError("The ingestion task disappeared before attempt allocation.")
-                    preview_id = ingest_preview_service.next_generation(task_id, preview_task.current_preview_id)
-                    preview_task.current_preview_id = preview_id
+                    next_preview_id = ingest_preview_service.next_generation(task_id, preview_task.current_preview_id)
+                    await ingestion_capacity.admit(f'preview-{attempt}', ingest_preview_service.task_path(next_preview_id),
+                                                   estimate.preview_bytes)
+                    preview_task.current_preview_id = next_preview_id
                     preview_db.add(preview_task)
                     await preview_db.commit()
+                    preview_id = next_preview_id
                 success, failure = await download_and_merge(
                     task_id=task_id, video_url=video_url, audio_url=audio_url,
                     headers=headers, audio_headers=audio_headers, output_path=output_abs_path, duration_secs=duration_secs,
@@ -1043,6 +1039,7 @@ class DownloadQueueManager:
                     audio_timeline_offset=float(probe_res.get("audio_timeline_offset") or 0.0),
                     client_address=validation_client,
                 )
+                await ingestion_capacity.seal(f'preview-{attempt}', headroom=MIB)
                 
                 async with AsyncSession(engine) as preview_db:
                     current_task = await preview_db.get(DownloadTask, task_id)
@@ -1067,6 +1064,10 @@ class DownloadQueueManager:
 
             if not success:
                 raise IngestionTaskError(last_failure)
+
+            # The muxed file is complete. Retain a small metadata allowance, but
+            # do not reserve another full copy inside the staging workspace.
+            await ingestion_capacity.seal('temp', headroom=64 * MIB)
 
             if success:
                 extracted_languages = await extract_audio_and_strip_video(
@@ -1198,6 +1199,9 @@ class DownloadQueueManager:
         except IngestionTaskError as err:
             logger.error(f"[Queue Manager] Task {task_id} failed: {err.failure.display}")
             await self._record_task_failure(task_id, err.failure, submitted_video_url, preview_id=preview_id)
+        except StorageCapacityError as err:
+            await self._record_task_failure(task_id, IngestionFailure(err.code,
+                'Local storage cannot admit ingestion growth.'), submitted_video_url, preview_id=preview_id)
         except asyncio.CancelledError:
             if capacity_failure is not None:
                 await self._record_task_failure(task_id, capacity_failure, submitted_video_url, preview_id=preview_id)
@@ -1249,8 +1253,7 @@ class DownloadQueueManager:
                 self.storage_reservations.pop(task_id, None)
                 from services.state import remove_task_metrics
                 remove_task_metrics(task_id)
-            for reservation in capacity_reservations:
-                await settle(storage_capacity.release(reservation))
+            await ingestion_capacity.close()
 
     async def _record_task_failure(self, task_id: str, failure: IngestionFailure, submitted_video_url: str, *, preview_id: Optional[str] = None) -> None:
         try:

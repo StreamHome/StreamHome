@@ -209,10 +209,11 @@ class ControlledSourceTests(unittest.IsolatedAsyncioTestCase):
         self.routes["/key"] = (200, {}, b"0123456789abcdef")
         self.routes["/init.mp4"] = (200, {}, b"synthetic init")
         self.routes["/segment.ts"] = (200, {}, b"synthetic segment")
+        relays = []
         with self.dns({"origin.test": "127.0.0.1", "keys.test": "127.0.0.1"}):
             async with controlled_media_input(f"http://origin.test:{self.port}/master",
                                                headers={"Authorization": "Bearer synthetic"},
-                                               client_address="8.8.8.8") as local:
+                                               client_address="8.8.8.8", owner_callback=relays.append) as local:
                 self.assertTrue(local.endswith(".m3u8"))
                 async with httpx.AsyncClient(trust_env=False) as consumer:
                     master = (await consumer.get(local)).text
@@ -224,6 +225,8 @@ class ControlledSourceTests(unittest.IsolatedAsyncioTestCase):
                     targets.append(next(line for line in playlist.splitlines() if line.startswith("http")))
                     for target in targets:
                         self.assertEqual((await consumer.get(target)).status_code, 200)
+        self.assertEqual(relays[0].storage_hints.snapshot(),
+                         {'bit_rate': 5000, 'duration_seconds': 1.0, 'source_bytes': 0})
         key_request = next(headers for path, headers in self.requests if path == "/key")
         self.assertNotIn("authorization", key_request)
         segment_request = next(headers for path, headers in self.requests if path == "/segment.ts")
@@ -254,9 +257,10 @@ class ControlledSourceTests(unittest.IsolatedAsyncioTestCase):
     async def test_disguised_hls_and_direct_ranges_keep_separate_input_options(self) -> None:
         self.routes["/disguised.mp4"] = (200, {}, b"#EXTM3U\n#EXT-X-ENDLIST\n")
         self.routes["/video.mp4"] = (200, {"Content-Type": "video/mp4"}, b"0123456789")
+        relays = []
         async with controlled_media_input(f"http://127.0.0.1:{self.port}/disguised.mp4", client_address="127.0.0.1") as local:
             self.assertIn("-allowed_extensions", ffmpeg_network_input_options(local))
-        async with controlled_media_input(f"http://127.0.0.1:{self.port}/video.mp4", client_address="127.0.0.1") as local:
+        async with controlled_media_input(f"http://127.0.0.1:{self.port}/video.mp4", client_address="127.0.0.1", owner_callback=relays.append) as local:
             self.assertNotIn("-allowed_extensions", ffmpeg_network_input_options(local))
             async with httpx.AsyncClient(trust_env=False) as consumer:
                 response = await consumer.get(local, headers={"Range": "bytes=3-6"})
@@ -264,6 +268,7 @@ class ControlledSourceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.content, b"3456")
                 self.assertEqual(response.headers["content-range"], "bytes 3-6/10")
             self.assertTrue(is_controlled_input(local))
+        self.assertEqual(relays[0].storage_hints.source_bytes, 10)
         self.assertFalse(is_controlled_input(local))
         with self.assertRaises(UnsafeIngestionSource):
             ffmpeg_network_input_options(local)
@@ -425,8 +430,18 @@ class ControlledSourceTests(unittest.IsolatedAsyncioTestCase):
         for path in self.root.iterdir():
             if path.suffix in {".mp4", ".m3u8", ".ts"} or path.name == "key":
                 self.routes["/" + path.name] = (200, {}, path.read_bytes())
-        for name in ("source.mp4", "playlist.m3u8"):
+        self.routes['/master.m3u8'] = (200, {}, b'#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=400000\nplaylist.m3u8\n')
+        for name in ("source.mp4", "master.m3u8"):
             with self.subTest(source=name):
+                probed = await probe_media_stream(f'http://127.0.0.1:{self.port}/{name}',
+                    headers={'User-Agent': 'SyntheticMediaSender'}, client_address='127.0.0.1')
+                self.assertIsNone(probed['failure'])
+                hints = probed['video_storage_hints']
+                if name == 'master.m3u8':
+                    self.assertEqual(hints['bit_rate'], 400000)
+                    self.assertAlmostEqual(hints['duration_seconds'], 2, places=1)
+                else:
+                    self.assertEqual(hints['source_bytes'], source.stat().st_size)
                 output = self.root / (name + ".result.mp4")
                 success, failure = await asyncio.wait_for(download_and_merge(
                     "controlled-" + name, f"http://127.0.0.1:{self.port}/{name}", None,

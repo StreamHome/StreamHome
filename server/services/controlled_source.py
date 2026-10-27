@@ -24,6 +24,7 @@ from lifecycle.media_work import settle
 from services.hls_context import SourceContextPolicy
 from services.ingestion_errors import write_task_diagnostics
 from services.source_denial import denial_context
+from services.ingestion_estimate import SourceStorageHints, positive_number
 from services.ingestion_security import (
     UnsafeIngestionSource,
     pinned_source_client,
@@ -107,6 +108,7 @@ class SourceRelay:
         self.failure_count = 0
         self.failures: list[dict] = []
         self.status_counts: dict[str, int] = {}
+        self.storage_hints = SourceStorageHints()
 
     async def start(self) -> None:
         # This client is only a timeout owner. validated_stream_request always
@@ -185,6 +187,12 @@ class SourceRelay:
                 first = await anext(response.aiter_bytes(64 * 1024).__aiter__(), b"")
                 content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
                 detected = content_type in {"application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"} or first.lstrip(b"\xef\xbb\xbf\r\n \t").startswith(b"#EXTM3U")
+                if not (manifest or detected) and response.headers.get('content-encoding', 'identity') == 'identity':
+                    total = response.headers.get('content-length') if response.status_code == 200 else None
+                    content_range = re.fullmatch(r'bytes \d+-\d+/(\d+)', response.headers.get('content-range', ''))
+                    if response.status_code == 206 and content_range:
+                        total = content_range.group(1)
+                    self.storage_hints.source_bytes = int(positive_number(total, SOURCE_LIMIT_BYTES))
                 return _Resource(response.extensions["streamhome_final_url"],
                                  response.extensions["streamhome_final_headers"], manifest or detected)
             except BaseException as error:
@@ -231,6 +239,7 @@ class SourceRelay:
             raise UnsafeIngestionSource("Playlist encoding is unavailable.") from exc
         if not text.lstrip().startswith("#EXTM3U"):
             raise UnsafeIngestionSource("Source did not provide an HLS playlist.")
+        self.storage_hints.observe_manifest(text)
 
         sequence = 0
         elapsed = 0.0

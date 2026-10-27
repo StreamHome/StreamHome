@@ -3,12 +3,15 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import asyncio
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 import db as database
 from config import settings
@@ -134,6 +137,61 @@ class MaterializedCapacityTests(unittest.IsolatedAsyncioTestCase):
             sample = scan_managed(include_entries=True)
         self.assertEqual(sample['written_bytes'], 15)
         self.assertEqual({entry[3] for entry in sample['_entries']}, {15})
+
+    async def test_resize_preserves_baseline_and_does_not_double_count_written_bytes(self):
+        settings.STORAGE_POLICY = {**settings.STORAGE_POLICY, 'local_budget_bytes': 200}
+        path = self.media / 'workspace'
+        path.mkdir()
+        (path / 'existing').write_bytes(b'a' * 20)
+        identifier = await self.capacity.reserve('writer', 100, path)
+        (path / 'output').write_bytes(b'b' * 40)
+        await self.capacity.progress(identifier, 40)
+        await self.capacity.resize(identifier, 150)
+        self.assertEqual(await self.capacity.remaining(), 110)
+        async with AsyncSession(self.engine) as db:
+            row = await db.get(StorageReservation, identifier)
+            self.assertEqual((row.baseline_bytes, row.peak_bytes), (20, 150))
+        await self.capacity.resize(identifier, 40)
+        self.assertEqual(await self.capacity.remaining(), 0)
+        with self.assertRaises(StorageCapacityError):
+            await self.capacity.resize(identifier, 39)
+
+    async def test_rejected_growth_retains_original_claim_against_concurrent_admission(self):
+        settings.STORAGE_POLICY = {**settings.STORAGE_POLICY, 'local_budget_bytes': 150}
+        identifier = await self.capacity.reserve('writer', 100, self.media / 'first')
+        await self.capacity.reserve('other', 50, self.media / 'second')
+        with self.assertRaises(StorageCapacityError) as error:
+            await self.capacity.resize(identifier, 101)
+        self.assertEqual(error.exception.code, 'storage_local_budget_exceeded')
+        self.assertEqual(await self.capacity.remaining(), 150)
+
+    async def test_resize_keeps_physical_floor_and_missing_claim_fails_closed(self):
+        identifier = await self.capacity.reserve('writer', 50, self.media / 'first')
+        with patch('services.storage_capacity.shutil.disk_usage', return_value=shutil._ntuple_diskusage(100, 20, 80)):
+            with self.assertRaises(StorageCapacityError) as error:
+                await self.capacity.resize(identifier, 60)
+        self.assertEqual(error.exception.code, 'storage_disk_space_insufficient')
+        self.assertEqual(await self.capacity.remaining(), 50)
+        await self.capacity.release(identifier)
+        with self.assertRaises(StorageCapacityError):
+            await self.capacity.resize(identifier, 60)
+
+    async def test_pressure_commit_cannot_accept_rejected_growth(self):
+        settings.STORAGE_POLICY = {**settings.STORAGE_POLICY, 'offload_enabled': True}
+        identifier = await self.capacity.reserve('writer', 100, self.media / 'first')
+        with patch('lifecycle.storage_worker.storage_worker.wake'):
+            with self.assertRaises(StorageCapacityError):
+                await self.capacity.resize(identifier, 101)
+        self.assertEqual(await self.capacity.remaining(), 100)
+
+    async def test_independent_authorities_cannot_admit_growth_and_a_new_writer_over_budget(self):
+        settings.STORAGE_POLICY = {**settings.STORAGE_POLICY, 'local_budget_bytes': 180}
+        identifier = await self.capacity.reserve('first', 100, self.media / 'first')
+        other = StorageCapacity()
+        outcomes = await asyncio.gather(self.capacity.resize(identifier, 150),
+            other.reserve('second', 50, self.media / 'second'), return_exceptions=True)
+        self.assertEqual(sum(isinstance(result, StorageCapacityError) for result in outcomes), 1)
+        self.assertLessEqual(await self.capacity.remaining(), 180)
 
     def test_device_scopes_and_cloud_progress_remain_distinct(self):
         rows = [StorageReservation(id='a', owner='a', scope='local', filesystem='a', path='/a', peak_bytes=100),

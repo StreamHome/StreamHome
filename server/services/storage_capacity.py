@@ -15,6 +15,7 @@ import shutil
 import time
 import uuid
 import weakref
+from types import SimpleNamespace
 
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -154,7 +155,7 @@ class StorageCapacity:
 
     async def _reserve(self, owner: str, additional_bytes: int, path: Path | str, *,
                        scope: str = 'local', operation_id: str | None = None,
-                       track_materialized: bool = True) -> str:
+                       track_materialized: bool = True, reservation_id: str | None = None) -> str:
         if type(additional_bytes) is not int or additional_bytes < 0 or additional_bytes > 2 ** 63 - 1:
             raise StorageCapacityError('storage_invalid_reservation', status_code=422)
         if scope not in {'local', 'cloud'} or not owner or len(owner) > 128:
@@ -187,6 +188,23 @@ class StorageCapacity:
                 await db.connection()
                 await db.exec(__import__('sqlalchemy').text('BEGIN IMMEDIATE'))
                 rows = (await db.exec(select(StorageReservation).where(StorageReservation.state == 'active'))).all()
+                resizing = next((row for row in rows if row.id == reservation_id), None)
+                if reservation_id is not None:
+                    if resizing is None or (resizing.owner, resizing.scope, resizing.filesystem, resizing.path) != (owner, scope, filesystem, os.path.abspath(path)):
+                        raise StorageCapacityError('storage_reservation_missing')
+                    materialized = max(0, sum(_owned_entries(resizing.path, measured).values()) - resizing.baseline_bytes)
+                    if additional_bytes < max(resizing.written_bytes, materialized):
+                        raise StorageCapacityError('storage_reservation_exceeded')
+                    if additional_bytes <= resizing.peak_bytes:
+                        resizing.peak_bytes, resizing.updated_at = additional_bytes, time.time()
+                        db.add(resizing)
+                        await db.commit()
+                        return resizing.id
+                    # Pressure reporting commits this session on rejection. Keep
+                    # the proposed peak detached until every admission check passes.
+                    rows = [SimpleNamespace(**(row.model_dump() | {'peak_bytes': additional_bytes}))
+                            if row.id == reservation_id else row for row in rows]
+                new_bytes = 0 if resizing is not None else additional_bytes
                 scope_remaining = _remaining_from_sample(rows, measured, scope=scope)
                 # Physical free-space may be sampled after a native writer has
                 # shrunk its files. Retain full peaks for the device guard; its
@@ -194,15 +212,21 @@ class StorageCapacity:
                 device_remaining = sum(r.peak_bytes for r in rows if r.scope == scope and r.filesystem == filesystem) if scope == 'local' else _remaining_from_sample(rows, measured, scope=scope, filesystem=filesystem)
                 budget = policy['local_budget_bytes' if scope == 'local' else 'cloud_budget_bytes']
                 written = measured['written_bytes' if scope == 'local' else 'used_bytes']
-                if budget is not None and written + scope_remaining + additional_bytes > budget:
+                if budget is not None and written + scope_remaining + new_bytes > budget:
                     if scope == 'local':
                         await self._pressure(db, policy, owner, additional_bytes, filesystem, 'storage_local_budget_exceeded', existing)
                     raise StorageCapacityError('storage_local_budget_exceeded' if scope == 'local' else 'storage_cloud_budget_exceeded')
                 reserve = policy['disk_reserve_bytes'] if scope == 'local' else 0
-                if free - device_remaining - reserve < additional_bytes:
+                if free - device_remaining - reserve < new_bytes:
                     if scope == 'local':
                         await self._pressure(db, policy, owner, additional_bytes, filesystem, 'storage_disk_space_insufficient', existing)
                     raise StorageCapacityError('storage_disk_space_insufficient' if scope == 'local' else 'storage_account_quota_exceeded')
+                if resizing is not None:
+                    resizing.peak_bytes = additional_bytes
+                    resizing.updated_at = time.time()
+                    db.add(resizing)
+                    await db.commit()
+                    return resizing.id
                 identifier = str(uuid.uuid4())
                 db.add(StorageReservation(id=identifier, owner=owner, operation_id=operation_id,
                     scope=scope, filesystem=filesystem, path=os.path.abspath(path) if scope == 'local' else str(path),
@@ -218,6 +242,19 @@ class StorageCapacity:
                             db.add(pressure)
                 await db.commit()
                 return identifier
+
+    async def resize(self, reservation_id: str, peak_bytes: int) -> None:
+        """Atomically replace one local peak without releasing its ownership/baseline."""
+        async with AsyncSession(database.engine, expire_on_commit=False) as db:
+            row = await db.get(StorageReservation, reservation_id)
+            if row is None or row.state != 'active' or row.scope != 'local':
+                raise StorageCapacityError('storage_reservation_missing')
+            owner, path, operation_id, tracked = row.owner, row.path, row.operation_id, row.track_materialized
+        from lifecycle.media_work import settle
+        _, cancelled = await settle(self._reserve(owner, peak_bytes, path, operation_id=operation_id,
+            track_materialized=tracked, reservation_id=reservation_id))
+        if cancelled:
+            raise asyncio.CancelledError()
 
     async def progress(self, reservation_id: str, written_bytes: int) -> None:
         scope = await self._reservation_scope(reservation_id)

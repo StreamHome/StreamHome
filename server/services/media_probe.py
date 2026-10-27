@@ -224,10 +224,16 @@ async def probe_media_stream(
             
         if is_http_media_source(url) and not is_controlled_input(url):
             try:
+                relays = []
                 async with controlled_media_input(url, headers=source_headers, client_address=client_address,
                                                   source_type=normalized_source_type, task_id=task_id,
-                                                  input_role=input_role, attempt=attempt) as local_url:
-                    return await run_ffprobe(local_url, normalized_source_type, {}, input_role)
+                                                  input_role=input_role, attempt=attempt, owner_callback=relays.append) as local_url:
+                    result = await run_ffprobe(local_url, normalized_source_type, {}, input_role)
+                if relays:
+                    hints = relays[0].storage_hints.snapshot()
+                    hints['bit_rate'] = max(hints['bit_rate'], result.get('storage_hints', {}).get('bit_rate', 0))
+                    result['storage_hints'] = hints
+                return result
             except Exception as error:
                 return {"has_video": False, "has_audio": False, "height": 0,
                         "source_type": normalized_source_type, "diagnostics": type(error).__name__,
@@ -238,7 +244,7 @@ async def probe_media_stream(
             "-v",
             "error",
             "-show_entries",
-            "stream=index,codec_type,height,width,start_time,duration,duration_ts,time_base:stream_tags=DURATION:format=format_name,duration",
+            "stream=index,codec_type,height,width,start_time,duration,duration_ts,time_base,bit_rate:stream_tags=DURATION:format=format_name,duration,bit_rate",
             "-of",
             "json",
         ]
@@ -305,6 +311,9 @@ async def probe_media_stream(
                 "has_audio": has_audio,
                 "height": int(video_stream.get("height") or 0),
                 "width": int(video_stream.get("width") or 0),
+                "audio_tracks": sum(s.get('codec_type') == 'audio' for s in streams),
+                "storage_hints": {'bit_rate': max(0, _finite_float((data.get('format') or {}).get('bit_rate')),
+                    sum(max(0, _finite_float(s.get('bit_rate'))) for s in streams))},
                 "video_stream_index": int(video_stream.get("index") or 0),
                 "source_type": detected_source_type,
                 "diagnostics": "",
@@ -397,6 +406,9 @@ async def probe_media_stream(
         "video_duration_provenance": video_res.get("duration_provenance", "unknown"),
         "video_estimated_duration": video_res.get("estimated_duration"),
         "audio_duration": max(0.0, _finite_float(audio_res.get("duration"))),
+        "video_storage_hints": video_res.get('storage_hints', {}),
+        "audio_storage_hints": audio_res.get('storage_hints', {}),
+        "video_audio_tracks": video_res.get('audio_tracks', 0),
         "failure": failure,
     }
 
